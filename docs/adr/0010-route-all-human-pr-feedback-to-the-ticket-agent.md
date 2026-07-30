@@ -1,0 +1,3 @@
+# Route all human pull-request feedback to the Ticket Agent
+
+For the intended private-repository workflow, every review, inline comment, and pull-request conversation comment from a human repository collaborator is delivered to the accountable Ticket Agent, which decides whether to modify code, answer a question, or simply acknowledge it. Submitted review comments are batched, feedback received during active work is queued within the same Ticket Session, and GitHub event identities are deduplicated. Comments produced by bots or the Ticket Agent itself are excluded to prevent feedback loops without imposing slash commands or a separate reviewer allowlist on trusted collaborators.

@@ -1,0 +1,3 @@
+# Derive business state from delivery facts
+
+Delivery Plans use only Building, Active, Paused, Needs Attention, Completed, and Cancelled, while Executable Tickets use Queued, Running, Waiting Review, Needs Attention, Delivered, and Cancelled. Worker, lease, pipeline, GitHub label, issue, and pull-request states are subordinate technical facts projected into this model and reconciled idempotently. In particular a ticket becomes Delivered only when its pull request is merged and its revision is reachable from the target `main`; checks passing, an issue closing, or a pull request closing without merge can never independently establish delivery.

@@ -1,0 +1,3 @@
+# Keep orchestration outside the no-mistakes fork
+
+The `workflow` codebase owns Delivery Plans, deterministic frontier scheduling, Ticket Sessions, containers, workspaces, Run Leases, budgets, GitHub write fencing, and human-facing projections. A pinned `no-mistakes` fork remains a thin Delivery Controller extension for review-event ingestion, long-lived revision cycles, gateway-backed SCM mutations, and distinct merged versus closed-unmerged outcomes. Generic changes should be proposed upstream and every upstream update must pass workflow integration tests before adoption, preventing a global agent platform from becoming an unmaintainable fork of a per-repository delivery tool.

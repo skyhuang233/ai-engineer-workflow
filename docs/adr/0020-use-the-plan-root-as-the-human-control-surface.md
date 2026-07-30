@@ -1,0 +1,3 @@
+# Use GitHub issues as the human control surfaces
+
+The workflow has no dedicated web dashboard: each Plan Root is its plan status and control surface, with one continuously updated status comment linking every ticket, accountable agent, run, blocker, pull request, revision, gate result, and last activity. A single repository-level Workflow Inbox is the canonical queue for every question requiring human input, while pull-request conversation remains the code-review channel to Ticket Agents. High-frequency heartbeats, leases, and machine transitions stay in the Control Plane store, and immutable audit events retain responsibility transfers and delivery history without turning GitHub into the runtime database.

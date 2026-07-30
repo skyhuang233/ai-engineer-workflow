@@ -1,0 +1,3 @@
+# Separate planning state from runtime state
+
+GitHub Issues and pull requests are the durable record of requested outcomes, dependencies, acceptance criteria, review, and delivery history. A separate Control Plane owns volatile execution facts such as assignment, leases, heartbeats, attempts, workspace identity, base commit, and pull-request mapping; Worker Runs are ephemeral and never act as the global source of truth. This adds a persistent runtime store, but avoids forcing GitHub's collaboration model to provide atomic claiming, high-frequency liveness, retry coordination, and race prevention.

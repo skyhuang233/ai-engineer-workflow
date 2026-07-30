@@ -1,0 +1,3 @@
+# Separate Ticket Session, Worker Run, and container lifetimes
+
+An Executable Ticket owns a Ticket Session that preserves responsibility and context until the ticket is Delivered or Cancelled. A Ticket Session may span multiple bounded Worker Runs, and each active run receives a replaceable container that is destroyed after its candidate and evidence are exported or the run terminates abnormally. Keeping logical context independent of compute avoids holding containers and leases throughout human review, permits node recovery, and still lets review revisions resume the same accountable session rather than starting without prior understanding.

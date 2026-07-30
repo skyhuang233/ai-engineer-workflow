@@ -1,0 +1,3 @@
+# Keep one Delivery Cycle through review
+
+Each Executable Ticket has one long-lived `no-mistakes` Delivery Cycle bound to its stable branch and pull request. `checks-passed` is a non-terminal waiting-for-review state; Review Feedback returns the same cycle to the accountable Ticket Agent, whose next Candidate Revision starts an ordered Revision Round and reruns the complete pipeline against the new head. The cycle terminates only when the ticket is Delivered or Cancelled; closing a pull request without merge instead freezes the plan in Needs Attention, avoiding competing monitors and state migration between validation runs while requiring `no-mistakes` to support review-driven state re-entry.

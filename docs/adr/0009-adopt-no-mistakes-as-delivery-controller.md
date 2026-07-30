@@ -1,0 +1,3 @@
+# Adopt no-mistakes as the Delivery Controller
+
+The Control Plane coordinates the issue dependency graph, Ticket Agents, Run Leases, containers, Ticket Workspaces, and incremental GitHub polling, while `no-mistakes` owns each ticket's rebase, automated review, tests, documentation checks, lint, push, pull request, and CI lifecycle. The Control Plane detects and deduplicates actionable pull-request feedback; we will extend `no-mistakes` to consume that routed feedback in the owning Ticket Session and rerun the same delivery chain after revisions rather than rebuilding its existing pipeline. This preserves a narrow orchestration boundary and concentrates delivery behavior in the open-source component already responsible for it.

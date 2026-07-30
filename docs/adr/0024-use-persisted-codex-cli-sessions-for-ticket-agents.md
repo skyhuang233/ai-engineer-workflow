@@ -1,0 +1,3 @@
+# Use persisted Codex CLI sessions for Ticket Agents
+
+The initially supported Ticket Agent runtime is Codex CLI, with each Ticket Session bound to one native session id. The first Worker Run starts `codex exec --json`, subsequent runs use `codex exec resume <session-id>` with new review or recovery input, and both Codex's native session state and the Ticket Workspace persist outside replaceable containers; ephemeral mode is forbidden. The Control Plane stores and routes the opaque session id rather than reconstructing model context, while a runtime adapter boundary allows App Server or other agents only when a concrete requirement justifies them.

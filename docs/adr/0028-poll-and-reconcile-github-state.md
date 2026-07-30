@@ -1,0 +1,3 @@
+# Poll and reconcile GitHub state
+
+The local Control Plane discovers reviews, comments, CI results, and pull-request changes through durable incremental polling of only relevant active plan objects, with event-identity deduplication, adaptive intervals, rate-limit awareness, retry backoff, and persisted cursors. Periodic full reconciliation repairs ordering-boundary or cursor mistakes and restores state after downtime. A future webhook may wake the poller sooner but can never become the sole correctness source, avoiding public ingress infrastructure while making delivery robust to duplicate, delayed, and missed notifications.

@@ -1,0 +1,3 @@
+# Limit concurrent Worker Runs without per-container quotas
+
+Capacity control uses one global `max_parallel_runs` limit and deliberately does not impose per-container CPU, memory, or disk quotas. The Control Plane monitors aggregate host pressure and pauses new dispatch when capacity is unsafe, but does not kill active Ticket Agents; completed Plan workspaces are reclaimed after a retention period, and host exhaustion is handled as a bounded infrastructure failure. This favors minimal Docker configuration while explicitly accepting that one trusted run may degrade or exhaust shared host resources.

@@ -1,0 +1,3 @@
+# Model and cancel work as Delivery Plans
+
+Every Spec issue is a non-executable Plan Root whose native sub-issue tree defines the complete membership of its Delivery Plan; `to-tickets` must attach all generated tickets to that root while dependency edges independently control execution order. Closing an unmerged pull request freezes the plan and produces an impact report covering tickets, pull requests, agents, merged work, and cross-plan dependencies, after which a human chooses whether to replace the ticket or cancel the whole plan. Confirmed cancellation terminates unfinished work but never automatically reverts merged changes, and cross-plan dependents remain blocked for replanning rather than becoming eligible merely because a blocker was closed.
