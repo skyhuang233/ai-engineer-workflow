@@ -43,3 +43,18 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 - **Frontier query**: list the map's open children (`gh issue list --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
 - **Claim**: `gh issue edit <n> --add-assignee @me` — the session's first write.
 - **Resolve**: `gh issue comment <n> --body "<answer>"`, then `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.
+
+## Delivery Plan machine contract
+
+The Plan Root carries the `workflow:plan` label. Only native sub-issues with
+the `workflow:ticket` label are Executable Tickets; the root itself is never
+imported as a ticket. Activation is admitted only after every native child is
+typed and every blocked-by edge points to another child without cycles or
+duplicate edges. A closed blocker must already carry the derived
+`workflow:delivered` label.
+
+The control plane records its state in a hidden, replaceable block delimited by
+`<!-- workflow:status:start -->` and `<!-- workflow:status:end -->`. It leaves
+the surrounding Plan Root specification untouched. Successful activation adds
+the `workflow:active` label only after the immutable plan version is stored;
+until that final marker is written, the version remains non-dispatchable.

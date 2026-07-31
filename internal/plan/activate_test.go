@@ -1,0 +1,123 @@
+package plan
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+type fakeReader struct {
+	snapshot Snapshot
+}
+
+func (f fakeReader) ReadPlan(context.Context, string, int64) (Snapshot, error) {
+	return f.snapshot, nil
+}
+
+type fakeProjector struct {
+	body  string
+	label string
+	err   error
+}
+
+func (f *fakeProjector) UpdateIssueBody(_ context.Context, _ string, _ int64, body string) error {
+	f.body = body
+	return f.err
+}
+
+func (f *fakeProjector) AddIssueLabel(_ context.Context, _ string, _ int64, label string) error {
+	f.label = label
+	return f.err
+}
+
+type fakeStore struct {
+	version Version
+	marked  string
+}
+
+func (f *fakeStore) BeginActivation(_ context.Context, _ Snapshot, fingerprint, source string) (Version, error) {
+	if f.version.ID == "" {
+		f.version = Version{ID: "pv-test", Fingerprint: fingerprint, SourceRevision: source, State: "projecting"}
+	}
+	return f.version, nil
+}
+
+func (f *fakeStore) MarkActive(_ context.Context, id string) error {
+	f.marked = id
+	f.version.State = "active"
+	return nil
+}
+
+func TestActivatorProjectsAndCommitsOnlyAfterProjection(t *testing.T) {
+	reader := fakeReader{snapshot: Snapshot{
+		Repository: "owner/repo",
+		Root:       Issue{ID: 100, Number: 10, Body: "approved spec", Labels: []string{PlanLabel}},
+		Children:   []Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{TicketLabel}, State: "open"}},
+		BlockedBy:  map[int64][]Issue{},
+	}}
+	projector := &fakeProjector{}
+	store := &fakeStore{}
+	version, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.State != "active" || store.marked != "pv-test" {
+		t.Fatalf("version = %#v, marked = %q", version, store.marked)
+	}
+	if projector.label != ActiveLabel {
+		t.Fatalf("active label = %q, want %q", projector.label, ActiveLabel)
+	}
+	if projector.body == "" || !containsText(projector.body, "approved spec", ProjectionStart, "pv-test") {
+		t.Fatalf("projection body = %q", projector.body)
+	}
+}
+
+func TestActivatorLeavesVersionProjectingWhenGitHubProjectionFails(t *testing.T) {
+	reader := fakeReader{snapshot: Snapshot{
+		Repository: "owner/repo",
+		Root:       Issue{ID: 100, Number: 10, Labels: []string{PlanLabel}},
+		Children:   []Issue{{ID: 1, Number: 11, Labels: []string{TicketLabel}, State: "open"}},
+	}}
+	projector := &fakeProjector{err: errors.New("timeout")}
+	store := &fakeStore{}
+	if _, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10); err == nil {
+		t.Fatal("Activate() succeeded despite projection failure")
+	}
+	if store.marked != "" || store.version.State != "projecting" {
+		t.Fatalf("store = %#v, marked = %q; incomplete activation became active", store.version, store.marked)
+	}
+}
+
+func TestActivatorRejectsMalformedProjectionBeforePersistingVersion(t *testing.T) {
+	reader := fakeReader{snapshot: Snapshot{
+		Repository: "owner/repo",
+		Root:       Issue{ID: 100, Number: 10, Body: ProjectionStart, Labels: []string{PlanLabel}},
+		Children:   []Issue{{ID: 1, Number: 11, Labels: []string{TicketLabel}, State: "open"}},
+	}}
+	projector := &fakeProjector{}
+	store := &fakeStore{}
+	if _, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10); !errors.Is(err, ErrMalformedStatus) {
+		t.Fatalf("Activate() error = %v, want ErrMalformedStatus", err)
+	}
+	if store.version.ID != "" {
+		t.Fatalf("malformed projection persisted version %#v", store.version)
+	}
+}
+
+func containsText(value string, expected ...string) bool {
+	for _, item := range expected {
+		if !containsString(value, item) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(value, target string) bool {
+	for i := 0; i+len(target) <= len(value); i++ {
+		if value[i:i+len(target)] == target {
+			return true
+		}
+	}
+	return false
+}
