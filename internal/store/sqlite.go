@@ -704,6 +704,38 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
+		applied = 7
+	}
+	if applied < 8 {
+		statements := []string{
+			`CREATE TABLE gateway_runtime (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    writes_paused INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+)`,
+			`CREATE TABLE workflow_inbox (
+    item_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'resolved')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 8: %w", err)
+			}
+		}
+		timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO gateway_runtime(singleton, writes_paused, reason, updated_at) VALUES (1, 0, '', ?)`, timestamp); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)", timestamp); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

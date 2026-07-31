@@ -138,14 +138,28 @@ type apiError struct {
 	Path       string
 	StatusCode int
 	Message    string
+	Body       string
 	RetryAt    time.Time
 }
 
 func (e *apiError) Error() string {
-	return fmt.Sprintf("github API %s %s: %s", e.Method, e.Path, e.Message)
+	detail := e.Message
+	if detail == "" {
+		detail = e.Body
+	}
+	return fmt.Sprintf("github API %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, detail)
 }
 
+func (e *apiError) AuthenticationFailure() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+}
+
+type APIError = apiError
+
 func NewClient(baseURL, token string, httpClient *http.Client) *Client {
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -255,6 +269,35 @@ func parseWorkflowInboxAnswers(body string) map[string]string {
 		answers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
 	return answers
+}
+
+func (c *Client) RequestJSON(ctx context.Context, method, path string, body, destination any) error {
+	return c.requestJSON(ctx, method, path, body, destination)
+}
+
+func (c *Client) RequestBytes(ctx context.Context, path, accept string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	response, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, 16<<20))
+	if readErr != nil {
+		return nil, readErr
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Body: strings.TrimSpace(string(data))}
+	}
+	return data, nil
 }
 
 // ReadPlan uses GitHub's native sub-issue and blocked-by endpoints. It reads
@@ -476,7 +519,8 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
-		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message)), RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
+		detail := strings.TrimSpace(string(message))
+		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
 	}
 	if destination == nil {
 		return nil

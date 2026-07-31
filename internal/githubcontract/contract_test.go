@@ -53,6 +53,8 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 		"POST /repos/owner/integration/git/refs",
 		"PUT /repos/owner/integration/contents/.workflow-credential-contract",
 		"POST /repos/owner/integration/issues",
+		"POST /repos/owner/integration/labels",
+		"POST /repos/owner/integration/issues/12/labels",
 		"POST /repos/owner/integration/pulls",
 		"POST /repos/owner/integration/issues/13/comments",
 		"PATCH /repos/owner/integration/pulls/13",

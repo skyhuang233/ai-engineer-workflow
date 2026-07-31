@@ -15,7 +15,7 @@ import (
 type memoryCredential struct{ secret string }
 
 func (m memoryCredential) Get(context.Context, string) (string, error) { return m.secret, nil }
-func (m memoryCredential) Set(context.Context, string, string) error  { return nil }
+func (m memoryCredential) Set(context.Context, string, string) error   { return nil }
 
 func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *testing.T) {
 	config := validConfig()
@@ -42,8 +42,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	defer server.Close()
 	credentials := memoryCredential{secret: token}
 	verification := store.GatewayCredentialVerification{
-		FingerprintSHA256: credential.Fingerprint(token),
-		Owner: config.GitHub.Credential.Owner,
+		FingerprintSHA256:     credential.Fingerprint(token),
+		Owner:                 config.GitHub.Credential.Owner,
 		IntegrationRepository: config.GitHub.TestRepository,
 	}
 	if result := (GitHubCredentialCheck{
@@ -64,4 +64,3 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		}
 	}
 }
-

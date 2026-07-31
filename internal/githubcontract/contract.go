@@ -1,15 +1,14 @@
 package githubcontract
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
+
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 )
 
 const contractBranch = "workflow-credential-contract"
@@ -19,7 +18,7 @@ type Verifier struct {
 	Client  *http.Client
 }
 
-func (v Verifier) Verify(ctx context.Context, token, owner, repository string) error {
+func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (resultErr error) {
 	if !strings.HasPrefix(strings.TrimSpace(token), "github_pat_") {
 		return errors.New("a fine-grained PAT is required")
 	}
@@ -29,6 +28,29 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) e
 	if v.Client == nil {
 		v.Client = http.DefaultClient
 	}
+	var branchCreated bool
+	var issueNumber, pullNumber int
+	defer func() {
+		var cleanupErrors []string
+		if pullNumber != 0 {
+			if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/pulls/%d", repository, pullNumber), map[string]string{"state": "closed"}, nil); err != nil {
+				cleanupErrors = append(cleanupErrors, "close PR: "+err.Error())
+			}
+		}
+		if issueNumber != 0 {
+			if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/issues/%d", repository, issueNumber), map[string]string{"state": "closed"}, nil); err != nil {
+				cleanupErrors = append(cleanupErrors, "close issue: "+err.Error())
+			}
+		}
+		if branchCreated {
+			if _, err := v.call(ctx, token, http.MethodDelete, "repos/"+repository+"/git/refs/heads/"+contractBranch, nil, nil); err != nil {
+				cleanupErrors = append(cleanupErrors, "delete branch: "+err.Error())
+			}
+		}
+		if resultErr == nil && len(cleanupErrors) > 0 {
+			resultErr = errors.New("credential contract cleanup failed: " + strings.Join(cleanupErrors, "; "))
+		}
+	}()
 	var identity struct {
 		Login string `json:"login"`
 	}
@@ -68,7 +90,7 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) e
 			return fmt.Errorf("recreate credential-contract branch: %w", createErr)
 		}
 	}
-	defer v.call(ctx, token, http.MethodDelete, "repos/"+repository+"/git/refs/heads/"+contractBranch, nil, nil)
+	branchCreated = true
 
 	content := base64.StdEncoding.EncodeToString([]byte("Gateway Credential live contract\n"))
 	_, err = v.call(ctx, token, http.MethodPut, "repos/"+repository+"/contents/.workflow-credential-contract",
@@ -84,7 +106,16 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) e
 	if err != nil {
 		return fmt.Errorf("verify Issues write permission: %w", err)
 	}
-	defer v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/issues/%d", repository, issue.Number), map[string]string{"state": "closed"}, nil)
+	issueNumber = issue.Number
+	label := map[string]string{"name": "workflow-contract", "color": "0969da", "description": "Temporary workflow integration contract"}
+	status, labelErr := v.call(ctx, token, http.MethodPost, "repos/"+repository+"/labels", label, &struct{}{})
+	if labelErr != nil && status != http.StatusUnprocessableEntity {
+		return fmt.Errorf("verify label update permission: %w", labelErr)
+	}
+	if _, err := v.call(ctx, token, http.MethodPost, fmt.Sprintf("repos/%s/issues/%d/labels", repository, issue.Number),
+		map[string][]string{"labels": {"workflow-contract"}}, &struct{}{}); err != nil {
+		return fmt.Errorf("verify label application permission: %w", err)
+	}
 
 	var pull struct {
 		Number int `json:"number"`
@@ -94,7 +125,7 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) e
 	if err != nil {
 		return fmt.Errorf("verify Pull requests write permission: %w", err)
 	}
-	defer v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/pulls/%d", repository, pull.Number), map[string]string{"state": "closed"}, nil)
+	pullNumber = pull.Number
 	if _, err := v.call(ctx, token, http.MethodPost, fmt.Sprintf("repos/%s/issues/%d/comments", repository, pull.Number),
 		map[string]string{"body": "Gateway Credential write contract verified."}, &struct{}{}); err != nil {
 		return fmt.Errorf("verify issue comment permission: %w", err)
@@ -103,35 +134,14 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) e
 }
 
 func (v Verifier) call(ctx context.Context, token, method, path string, body, destination any) (int, error) {
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
-		}
-		reader = bytes.NewReader(encoded)
+	client := githubapi.NewClient(v.APIBase, strings.TrimSpace(token), v.Client)
+	err := client.RequestJSON(ctx, method, "/"+path, body, destination)
+	if err == nil {
+		return http.StatusOK, nil
 	}
-	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(v.APIBase, "/")+"/"+path, reader)
-	if err != nil {
-		return 0, err
+	var apiErr *githubapi.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode, err
 	}
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if body != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-	response, err := v.Client.Do(request)
-	if err != nil {
-		return 0, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return response.StatusCode, fmt.Errorf("%s: %s", response.Status, strings.TrimSpace(string(data)))
-	}
-	if destination == nil || response.StatusCode == http.StatusNoContent {
-		return response.StatusCode, nil
-	}
-	return response.StatusCode, json.NewDecoder(response.Body).Decode(destination)
+	return 0, err
 }

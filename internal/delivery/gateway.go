@@ -12,6 +12,15 @@ import (
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
+var (
+	ErrGatewayCredentialRejected = errors.New("Gateway Credential was rejected")
+	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
+)
+
+type authenticationFailure interface {
+	AuthenticationFailure() bool
+}
+
 type Observation struct {
 	Applied           bool
 	RemoteHead        string
@@ -67,6 +76,11 @@ func (g Gateway) Submit(ctx context.Context, request store.DeliveryRequest) (sto
 func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
+	}
+	if paused, reason, err := g.Store.GatewayWritesPaused(ctx); err != nil {
+		return err
+	} else if paused {
+		return fmt.Errorf("%w: %s", ErrGatewayWritesPaused, reason)
 	}
 	outbox, err := g.Store.ClaimDeliveryOutbox(ctx, key, g.now())
 	if err != nil {
@@ -132,6 +146,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 	})
 	if err != nil {
+		if isCredentialRejection(err) {
+			return g.pauseForCredential(ctx, outbox, err)
+		}
 		if errors.Is(err, store.ErrDeliveryRejected) {
 			return g.reject(ctx, outbox, err)
 		}
@@ -190,6 +207,9 @@ func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox)
 	defer cancel()
 	observation, err := g.Remote.Observe(operationCtx, outbox.Request)
 	if err != nil {
+		if isCredentialRejection(err) {
+			return g.pauseForCredential(ctx, outbox, err)
+		}
 		if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
 			return finishErr
 		}
@@ -222,4 +242,21 @@ func (g Gateway) retry(ctx context.Context, outbox store.DeliveryOutbox, err err
 		return finishErr
 	}
 	return err
+}
+
+func (g Gateway) pauseForCredential(ctx context.Context, outbox store.DeliveryOutbox, cause error) error {
+	reason := "Gateway Credential was rejected; replace and verify it to resume writes"
+	if err := g.Store.PauseGatewayWrites(ctx, reason, g.now()); err != nil {
+		return fmt.Errorf("%v; persist Gateway pause: %w", cause, err)
+	}
+	_ = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now())
+	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)
+}
+
+func isCredentialRejection(err error) bool {
+	if errors.Is(err, ErrGatewayCredentialRejected) {
+		return true
+	}
+	var failure authenticationFailure
+	return errors.As(err, &failure) && failure.AuthenticationFailure()
 }

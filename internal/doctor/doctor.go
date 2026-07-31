@@ -76,10 +76,11 @@ type Config struct {
 }
 
 var (
-	shaPattern    = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	imagePattern  = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
-	repoPattern   = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	shaPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	sha256Pattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	imagePattern   = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+	repoPattern    = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	versionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
 func LoadConfig(path string) (Config, error) {
@@ -117,8 +118,8 @@ func (c Config) Validate() error {
 		return errors.New("no-mistakes fork release is required")
 	case !sha256Pattern.MatchString(c.NoMistakes.LinuxAMD64SHA256):
 		return errors.New("no-mistakes Linux asset checksum must be SHA-256")
-	case strings.TrimSpace(c.Worker.Version) == "":
-		return errors.New("worker version is required")
+	case !versionPattern.MatchString(c.Worker.Version):
+		return errors.New("worker version must be a path-safe version")
 	case !strings.HasPrefix(c.Worker.ImageRepository, "ghcr.io/") || strings.Contains(c.Worker.ImageRepository, "@"):
 		return errors.New("worker image repository must be an unpinned GHCR repository")
 	case !repoPattern.MatchString(c.Worker.ReleaseRepository):

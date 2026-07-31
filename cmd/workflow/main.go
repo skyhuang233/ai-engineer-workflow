@@ -55,7 +55,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  workflow doctor [--config path] [--release-manifest path] [--database path] [--report path]")
+	fmt.Fprintln(os.Stderr, "  workflow doctor [--config path] [--database path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow credential provision [--config path] [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
@@ -67,17 +67,11 @@ func usage() {
 func runDoctor(args []string) {
 	flags := flag.NewFlagSet("doctor", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	manifestPath := flags.String("release-manifest", "worker-release.json", "accepted Worker Release Manifest")
 	databasePath := flags.String("database", filepath.Join(os.TempDir(), "workflow-doctor.db"), "SQLite probe database")
 	reportPath := flags.String("report", "", "optional Markdown report path")
 	_ = flags.Parse(args)
 
 	config, err := doctor.LoadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	manifest, err := doctor.LoadWorkerReleaseManifest(*manifestPath, config)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -95,6 +89,11 @@ func runDoctor(args []string) {
 	}
 	credentialStore := credential.NewStore()
 	secret, _ := credentialStore.Get(context.Background(), credential.GatewayTarget)
+	manifest, manifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	runner := doctor.Runner{Checks: []doctor.Check{
 		doctor.CommandCheck{
 			CheckName: "Codex CLI",
@@ -140,11 +139,6 @@ func runDoctor(args []string) {
 	if !report.Passed() {
 		os.Exit(1)
 	}
-	manifestJSON, err := os.ReadFile(*manifestPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
 	database, err = store.Open(context.Background(), *databasePath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -153,7 +147,7 @@ func runDoctor(args []string) {
 	defer database.Close()
 	if err := database.ActivateWorkerRelease(context.Background(), store.WorkerRelease{
 		Version: manifest.WorkerVersion, SourceCommit: manifest.SourceCommit,
-		ImageDigest: manifest.Image, ManifestJSON: string(manifestJSON),
+		ImageReference: manifest.Image, ManifestJSON: string(manifestJSON),
 		VerifiedAt: report.GeneratedAt, ActivatedAt: report.GeneratedAt,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -186,13 +180,13 @@ func credentialCommand() {
 		exitError(fmt.Errorf("a fine-grained PAT is required"))
 	}
 	credentialStore := credential.NewStore()
-	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
-		exitError(err)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
-		exitError(fmt.Errorf("credential was stored but the live contract failed: %w", err))
+		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
+	}
+	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
+		exitError(err)
 	}
 	database, err := store.Open(ctx, *databasePath)
 	if err != nil {
@@ -205,6 +199,9 @@ func credentialCommand() {
 		IntegrationRepository: config.GitHub.TestRepository,
 		VerifiedAt:            time.Now().UTC(),
 	}); err != nil {
+		exitError(err)
+	}
+	if err := database.ResumeGatewayWrites(ctx, time.Now().UTC()); err != nil {
 		exitError(err)
 	}
 	fmt.Println("Gateway Credential stored in Windows Credential Manager and live write contract verified")

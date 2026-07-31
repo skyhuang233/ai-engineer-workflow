@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -339,6 +340,44 @@ func TestGatewayDerivesRepositoryFromLeasedTicket(t *testing.T) {
 	}
 	if queued.Request.Repository != "owner/repo" {
 		t.Fatalf("repository = %q, want ticket-owned repository", queued.Request.Repository)
+	}
+}
+
+func TestRejectedCredentialPausesAllGatewayWritesAndCreatesOneInboxItem(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{
+		applyErr:     &githubapi.APIError{Method: "POST", Path: "/repos/owner/repo", StatusCode: 401, Body: "Bad credentials"},
+		observations: []delivery.Observation{{RemoteHead: "base"}},
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	item, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
+	if err != nil || item.State != "open" {
+		t.Fatalf("inbox item = %#v, %v", item, err)
+	}
+	applyCalls := remote.applyCalls
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("paused dispatch error = %v", err)
+	}
+	if remote.applyCalls != applyCalls {
+		t.Fatal("paused Gateway performed another remote write")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending {
+		t.Fatalf("preserved outbox = %#v, %v", outbox, err)
 	}
 }
 

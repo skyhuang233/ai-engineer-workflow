@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/credential"
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -157,7 +156,7 @@ type GitHubCredentialCheck struct {
 	APIBase      string
 }
 
-func (GitHubCredentialCheck) Name() string { return "GitHub credential scope" }
+func (GitHubCredentialCheck) Name() string { return "Gateway Credential contract" }
 
 func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 	if c.Credentials == nil || !sha256Pattern.MatchString(c.Verification.FingerprintSHA256) {
@@ -272,26 +271,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 }
 
 func githubGET(ctx context.Context, apiBase, token, path string, destination any) error {
-	if apiBase == "" {
-		apiBase = "https://api.github.com"
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(apiBase, "/")+"/"+path, nil)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return fmt.Errorf("GitHub API %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-	return json.NewDecoder(response.Body).Decode(destination)
+	return githubapi.NewClient(apiBase, token, nil).RequestJSON(ctx, http.MethodGet, "/"+path, nil, destination)
 }
 
 func randomToken() (string, error) {

@@ -30,14 +30,33 @@ jobs:
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Preserve immutable release identity on reruns
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="worker-v${{ steps.pins.outputs.worker_version }}"
+          if target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .target_commitish 2>/dev/null)"; then
+            test "$target" = "$GITHUB_SHA" || {
+              echo "Worker version already belongs to a different accepted commit" >&2
+              exit 1
+            }
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        if: steps.existing.outputs.exists != 'true'
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        if: steps.existing.outputs.exists != 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and publish accepted main commit
         id: build
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
@@ -45,6 +64,7 @@ jobs:
           push: true
           tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}
       - name: Create authoritative Worker Release Manifest
+        if: steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -63,6 +83,7 @@ jobs:
             > worker-release.json
           jq --exit-status . worker-release.json
       - name: Publish Worker Release Manifest
+        if: steps.existing.outputs.exists != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: worker-v${{ steps.pins.outputs.worker_version }}
@@ -70,4 +91,3 @@ jobs:
           name: Worker v${{ steps.pins.outputs.worker_version }}
           body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
           files: worker-release.json
-

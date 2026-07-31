@@ -15,18 +15,18 @@ var (
 )
 
 type WorkerRelease struct {
-	Version      string
-	SourceCommit string
-	ImageDigest  string
-	ManifestJSON string
-	VerifiedAt   time.Time
-	ActivatedAt  time.Time
+	Version        string
+	SourceCommit   string
+	ImageReference string
+	ManifestJSON   string
+	VerifiedAt     time.Time
+	ActivatedAt    time.Time
 }
 
 func (s *Store) ActivateWorkerRelease(ctx context.Context, release WorkerRelease) error {
 	if release.Version == "" || release.ManifestJSON == "" ||
 		!fullCommitPattern.MatchString(release.SourceCommit) ||
-		!imageDigestPattern.MatchString(release.ImageDigest) {
+		!imageDigestPattern.MatchString(release.ImageReference) {
 		return errors.New("invalid Worker Release")
 	}
 	if release.VerifiedAt.IsZero() {
@@ -43,17 +43,25 @@ func (s *Store) ActivateWorkerRelease(ctx context.Context, release WorkerRelease
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO worker_releases(image_digest, version, source_commit, manifest_json, verified_at, activated_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(image_digest) DO UPDATE SET version=excluded.version, source_commit=excluded.source_commit,
-manifest_json=excluded.manifest_json, verified_at=excluded.verified_at, activated_at=excluded.activated_at`,
-		release.ImageDigest, release.Version, release.SourceCommit, release.ManifestJSON,
+	result, err := tx.ExecContext(ctx, `INSERT INTO worker_releases(image_digest, version, source_commit, manifest_json, verified_at, activated_at)
+VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(image_digest) DO NOTHING`,
+		release.ImageReference, release.Version, release.SourceCommit, release.ManifestJSON,
 		release.VerifiedAt.Format(time.RFC3339Nano), release.ActivatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("record Worker Release: %w", err)
 	}
+	if inserted, _ := result.RowsAffected(); inserted == 0 {
+		var version, sourceCommit, manifestJSON string
+		if err := tx.QueryRowContext(ctx, `SELECT version, source_commit, manifest_json FROM worker_releases WHERE image_digest = ?`,
+			release.ImageReference).Scan(&version, &sourceCommit, &manifestJSON); err != nil {
+			return err
+		}
+		if version != release.Version || sourceCommit != release.SourceCommit || manifestJSON != release.ManifestJSON {
+			return errors.New("immutable Worker Release record conflicts with existing digest")
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO active_worker_image(singleton, image_digest) VALUES (1, ?)
-ON CONFLICT(singleton) DO UPDATE SET image_digest=excluded.image_digest`, release.ImageDigest); err != nil {
+ON CONFLICT(singleton) DO UPDATE SET image_digest=excluded.image_digest`, release.ImageReference); err != nil {
 		return fmt.Errorf("activate Worker Release: %w", err)
 	}
 	return tx.Commit()
@@ -64,7 +72,7 @@ func (s *Store) ActiveWorkerRelease(ctx context.Context) (WorkerRelease, error) 
 	var verified, activated string
 	err := s.db.QueryRowContext(ctx, `SELECT r.version, r.source_commit, r.image_digest, r.manifest_json, r.verified_at, r.activated_at
 FROM active_worker_image a JOIN worker_releases r ON r.image_digest = a.image_digest WHERE a.singleton = 1`).
-		Scan(&release.Version, &release.SourceCommit, &release.ImageDigest, &release.ManifestJSON, &verified, &activated)
+		Scan(&release.Version, &release.SourceCommit, &release.ImageReference, &release.ManifestJSON, &verified, &activated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerRelease{}, ErrNotFound
 	}

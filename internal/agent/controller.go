@@ -90,6 +90,18 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
+	activeRelease, err := c.Store.ActiveWorkerRelease(ctx)
+	if err != nil {
+		return Candidate{}, fmt.Errorf("resolve Active Worker Image: %w", err)
+	}
+	var releaseManifest struct {
+		CodexVersion      string `json:"codex_version"`
+		NoMistakesVersion string `json:"no_mistakes_version"`
+	}
+	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
+		releaseManifest.CodexVersion == "" || releaseManifest.NoMistakesVersion == "" {
+		return Candidate{}, errors.New("Active Worker Image has an invalid release manifest")
+	}
 	schemaPath := c.Workspace.schemaPath(ws.CodexState)
 	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
 		return Candidate{}, fmt.Errorf("write Candidate output schema: %w", err)
@@ -104,10 +116,11 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	spec := worker.Spec{
 		RunID:   request.Claim.RunID,
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
-		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
-		Environment: environment,
-		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
-		ExtraHosts:  []string{worker.GatewayHostMapping},
+		AgentIdentity: session.AgentIdentity, ImageDigest: activeRelease.ImageReference,
+		ToolVersions: map[string]string{"codex": releaseManifest.CodexVersion, "no-mistakes": releaseManifest.NoMistakesVersion},
+		Environment:  environment,
+		Mounts:       []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
+		ExtraHosts:   []string{worker.GatewayHostMapping},
 	}
 	if err := spec.Validate(); err != nil {
 		return Candidate{}, err

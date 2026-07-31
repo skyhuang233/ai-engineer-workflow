@@ -16,6 +16,9 @@
   metadata/actions read and contents/issues/pull-requests write. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite
   records only its SHA-256 fingerprint and successful live-contract evidence.
+  GitHub does not expose an API that proves a fine-grained PAT has no additional
+  permissions; selecting exactly this configuration is the owner's declaration,
+  while the live contract machine-verifies every required positive capability.
 
 Provision or rotate the Gateway Credential. This hidden-input command performs
 real, idempotent writes in the dedicated integration repository and cleans up
@@ -32,7 +35,6 @@ Run the complete target-host contract with:
 ```powershell
 go run ./cmd/workflow doctor `
   --config config/toolchain.json `
-  --release-manifest C:\ProgramData\workflow\worker-release.json `
   --database C:\ProgramData\workflow\workflow.db `
   --report docs/operations/doctor-report.md
 ```
