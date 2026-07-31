@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/plan"
 )
 
 func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
@@ -107,6 +109,35 @@ func TestConcurrentClaimsHaveOneWinnerAndOneFencingConflict(t *testing.T) {
 	}
 }
 
+func TestCapacityComparisonUsesFixedWidthLeaseTimestamps(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	snapshot.BlockedBy = map[int64][]plan.Issue{}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: 100 * time.Millisecond, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("second claim error = %v, want ErrCapacity", err)
+	}
+}
+
 func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -141,5 +172,36 @@ func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	}
 	if _, err := db.CurrentClaim(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("delivered CurrentClaim error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPlanProjectionUsesBlockerIssueNumbers(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocked plan.ProjectionTicket
+	for _, ticket := range projection.Tickets {
+		if ticket.Number == 12 {
+			blocked = ticket
+		}
+	}
+	if len(blocked.Blockers) != 1 || blocked.Blockers[0] != 11 {
+		t.Fatalf("projection blockers = %#v, want issue number 11", projection.Tickets)
 	}
 }

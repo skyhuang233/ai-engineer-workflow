@@ -131,7 +131,7 @@ FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, request.VersionID, 
 		if err != nil {
 			return TicketClaim{}, err
 		}
-		nowText := request.Now.Format(time.RFC3339Nano)
+		nowText := formatTimestamp(request.Now)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_sessions(session_id, version_id, issue_id, owner, state, current_lease_generation, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID, request.Owner, SessionRunning, nowText, nowText); err != nil {
 			return TicketClaim{}, err
@@ -160,14 +160,14 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 			}
 		}
 		currentGeneration++
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, request.Owner, SessionRunning, currentGeneration, request.Now.Format(time.RFC3339Nano), sessionID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, request.Owner, SessionRunning, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
 			return TicketClaim{}, err
 		}
 	}
 
 	if currentGeneration == 0 {
 		currentGeneration = 1
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, currentGeneration, request.Now.Format(time.RFC3339Nano), sessionID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
 			return TicketClaim{}, err
 		}
 	}
@@ -185,19 +185,19 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 	}
 	expiresAt := request.Now.Add(request.LeaseTTL)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, lease_generation, state, started_at)
-VALUES (?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, currentGeneration, RunRunning, request.Now.Format(time.RFC3339Nano)); err != nil {
+VALUES (?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, currentGeneration, RunRunning, formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, currentGeneration, LeaseActive, expiresAt.Format(time.RFC3339Nano), request.Now.Format(time.RFC3339Nano)); err != nil {
+VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, currentGeneration, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_run_id = ?, owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, runID, request.Owner, SessionRunning, currentGeneration, request.Now.Format(time.RFC3339Nano), sessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_run_id = ?, owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, runID, request.Owner, SessionRunning, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
 VALUES (?, ?, ?, 0, ?)
-ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`, request.VersionID, selected.IssueID, plan.StateRunning, request.Now.Format(time.RFC3339Nano)); err != nil {
+ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`, request.VersionID, selected.IssueID, plan.StateRunning, formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -237,7 +237,7 @@ func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issue
 		return err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	result, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
 SELECT version_id, issue_id, ?, 1, ? FROM plan_tickets WHERE version_id = ? AND issue_id = ?
 ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivered = 1, updated_at = excluded.updated_at`, plan.StateDelivered, now, versionID, issueID)
@@ -340,7 +340,7 @@ WHERE t.version_id = ?`, versionID)
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, now.Format(time.RFC3339Nano)).Scan(&snapshot.ActiveRuns); err != nil {
+WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
 		return snapshot, err
 	}
 	return snapshot, nil

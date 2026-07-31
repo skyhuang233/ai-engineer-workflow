@@ -7,20 +7,20 @@ import (
 )
 
 type Projection struct {
-	VersionID string
-	State     string
-	Tickets   []ProjectionTicket
+	VersionID string             `json:"version_id"`
+	State     string             `json:"state"`
+	Tickets   []ProjectionTicket `json:"tickets"`
 }
 
 type ProjectionTicket struct {
-	Number          int64
-	Title           string
-	State           string
-	Owner           string
-	SessionID       string
-	RunID           string
-	LeaseGeneration int64
-	Blockers        []int64
+	Number          int64   `json:"number"`
+	Title           string  `json:"title"`
+	State           string  `json:"state,omitempty"`
+	Owner           string  `json:"owner,omitempty"`
+	SessionID       string  `json:"session_id,omitempty"`
+	RunID           string  `json:"run_id,omitempty"`
+	LeaseGeneration int64   `json:"lease_generation,omitempty"`
+	Blockers        []int64 `json:"blockers,omitempty"`
 }
 
 // RenderProjection replaces only the control plane's hidden block. Human

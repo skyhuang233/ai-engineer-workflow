@@ -234,8 +234,11 @@ func (OSExecutor) Run(ctx context.Context, command []string) ([]byte, error) {
 }
 
 type CommandExpectation struct {
-	Command  []string
-	Contains []string
+	Command      []string
+	Contains     []string
+	Tool         string
+	ExactVersion string
+	ExactCommit  string
 }
 
 type CommandCheck struct {
@@ -310,9 +313,19 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 	if c.Executor == nil {
 		return Result{Status: Fail, Summary: "command executor is missing"}
 	}
-	expectations := append([]CommandExpectation{c.Version}, c.Capabilities...)
-	var evidence []string
-	for _, expectation := range expectations {
+	output, err := c.Executor.Run(ctx, c.Version.Command)
+	trimmed := strings.TrimSpace(string(output))
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("%s: %v (%s)", strings.Join(c.Version.Command, " "), err, trimmed)}
+	}
+	version, commit, err := parseCommandVersion(c.Version.Tool, trimmed)
+	if err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	if version != c.Version.ExactVersion || commit != c.Version.ExactCommit {
+		return Result{Status: Fail, Summary: fmt.Sprintf("%s reports version %q commit %q, want %q %q", c.Version.Tool, version, commit, c.Version.ExactVersion, c.Version.ExactCommit)}
+	}
+	for _, expectation := range c.Capabilities {
 		output, err := c.Executor.Run(ctx, expectation.Command)
 		trimmed := strings.TrimSpace(string(output))
 		if err != nil {
@@ -323,9 +336,31 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 				return Result{Status: Fail, Summary: fmt.Sprintf("%s does not report required capability %q", strings.Join(expectation.Command, " "), required)}
 			}
 		}
-		if len(evidence) == 0 {
-			evidence = append(evidence, trimmed)
-		}
 	}
-	return Result{Status: Pass, Summary: strings.Join(evidence, "; ")}
+	return Result{Status: Pass, Summary: trimmed}
+}
+
+var (
+	codexVersionPattern      = regexp.MustCompile(`^codex-cli[[:space:]]+([^[:space:]]+)$`)
+	noMistakesVersionPattern = regexp.MustCompile(`^no-mistakes version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$`)
+)
+
+func parseCommandVersion(tool, output string) (string, string, error) {
+	var matches []string
+	switch tool {
+	case "codex":
+		matches = codexVersionPattern.FindStringSubmatch(output)
+	case "no-mistakes":
+		matches = noMistakesVersionPattern.FindStringSubmatch(output)
+	default:
+		return "", "", fmt.Errorf("unsupported version parser %q", tool)
+	}
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("%s emitted an unrecognized version string %q", tool, output)
+	}
+	commit := ""
+	if len(matches) > 2 {
+		commit = matches[2]
+	}
+	return matches[1], commit, nil
 }

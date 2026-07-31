@@ -3,10 +3,11 @@ package plan
 import "sort"
 
 const (
-	StateQueued    = "queued"
-	StateRunning   = "running"
-	StateActive    = "active"
-	StateDelivered = "delivered"
+	StateQueued         = "queued"
+	StateRunning        = "running"
+	StateActive         = "active"
+	StateDelivered      = "delivered"
+	StateNeedsAttention = "needs_attention"
 )
 
 // FrontierTicket is the small immutable/runtime join needed by the scheduler.

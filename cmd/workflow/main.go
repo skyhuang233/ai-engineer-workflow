@@ -33,8 +33,9 @@ func main() {
 			CheckName: "Codex CLI",
 			Executor:  doctor.OSExecutor{},
 			Version: doctor.CommandExpectation{
-				Command:  []string{"codex", "--version"},
-				Contains: []string{config.Codex.Version},
+				Command:      []string{"codex", "--version"},
+				Tool:         "codex",
+				ExactVersion: config.Codex.Version,
 			},
 			Capabilities: []doctor.CommandExpectation{{
 				Command:  []string{"codex", "exec", "--help"},
@@ -45,8 +46,10 @@ func main() {
 			CheckName: "no-mistakes CLI",
 			Executor:  doctor.OSExecutor{},
 			Version: doctor.CommandExpectation{
-				Command:  []string{"no-mistakes", "--version"},
-				Contains: []string{config.NoMistakes.Version, config.NoMistakes.UpstreamCommit[:7]},
+				Command:      []string{"no-mistakes", "--version"},
+				Tool:         "no-mistakes",
+				ExactVersion: config.NoMistakes.Version,
+				ExactCommit:  config.NoMistakes.UpstreamCommit[:7],
 			},
 		},
 		doctor.CodexResumeCheck{Executor: doctor.OSExecutor{}},

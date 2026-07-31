@@ -21,6 +21,17 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+type apiError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Message    string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("github API %s %s: %s", e.Method, e.Path, e.Message)
+}
+
 func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
@@ -137,7 +148,7 @@ func (c *Client) requestJSON(ctx context.Context, method, path string, body any,
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
-		return fmt.Errorf("github API %s %s: %s", method, path, strings.TrimSpace(string(message)))
+		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message))}
 	}
 	if destination == nil {
 		return nil

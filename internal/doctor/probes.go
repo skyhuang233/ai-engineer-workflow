@@ -198,12 +198,16 @@ func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 type GitHubCheck struct {
 	GitHub     GitHubPin
 	NoMistakes NoMistakesPin
+	Executor   Executor
 }
 
 func (GitHubCheck) Name() string { return "GitHub protected integration contract" }
 
 func (c GitHubCheck) Run(ctx context.Context) Result {
-	executor := OSExecutor{}
+	executor := c.Executor
+	if executor == nil {
+		executor = OSExecutor{}
+	}
 	repository, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository})
 	if err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("read private test repository: %v (%s)", err, strings.TrimSpace(string(repository)))}
@@ -218,9 +222,39 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if !repo.Private || repo.DefaultBranch != c.GitHub.DefaultBranch {
 		return Result{Status: Fail, Summary: fmt.Sprintf("repository private=%t default_branch=%s", repo.Private, repo.DefaultBranch)}
 	}
-	runs, err := executor.Run(ctx, []string{"gh", "run", "list", "-R", c.GitHub.TestRepository, "--workflow", "workflow-contract", "--limit", "1", "--json", "status,conclusion"})
-	if err != nil || !strings.Contains(string(runs), `"conclusion":"success"`) {
-		return Result{Status: Fail, Summary: fmt.Sprintf("required workflow has not succeeded: %v (%s)", err, strings.TrimSpace(string(runs)))}
+	branch, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository + "/branches/" + c.GitHub.DefaultBranch})
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read default branch head: %v (%s)", err, strings.TrimSpace(string(branch)))}
+	}
+	var branchResponse struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	if json.Unmarshal(branch, &branchResponse) != nil || branchResponse.Commit.SHA == "" {
+		return Result{Status: Fail, Summary: "default branch did not report a head SHA"}
+	}
+	runs, err := executor.Run(ctx, []string{"gh", "run", "list", "-R", c.GitHub.TestRepository, "--workflow", "workflow-contract", "--branch", c.GitHub.DefaultBranch, "--limit", "20", "--json", "status,conclusion,headSha"})
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("list required workflow runs: %v (%s)", err, strings.TrimSpace(string(runs)))}
+	}
+	var workflowRuns []struct {
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		HeadSHA    string `json:"headSha"`
+	}
+	if json.Unmarshal(runs, &workflowRuns) != nil {
+		return Result{Status: Fail, Summary: "required workflow runs were not valid JSON"}
+	}
+	contractPassed := false
+	for _, run := range workflowRuns {
+		if run.HeadSHA == branchResponse.Commit.SHA && run.Status == "completed" && run.Conclusion == "success" {
+			contractPassed = true
+			break
+		}
+	}
+	if !contractPassed {
+		return Result{Status: Fail, Summary: "required workflow has not succeeded for the current default-branch revision"}
 	}
 	protection, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository + "/branches/" + c.GitHub.DefaultBranch + "/protection"})
 	if err != nil {

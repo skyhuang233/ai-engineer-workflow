@@ -50,7 +50,7 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 	}
 	// Validate the marker shape before creating the durable projecting version.
 	// The real block is rendered again after the store allocates its version ID.
-	if _, err := RenderProjection(snapshot.Root.Body, Projection{VersionID: "pending", State: "Active"}); err != nil {
+	if _, err := RenderProjection(snapshot.Root.Body, Projection{VersionID: "pending", State: "Building"}); err != nil {
 		return Version{}, err
 	}
 	fingerprint, err := snapshot.Fingerprint()
@@ -61,30 +61,38 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 	if err != nil {
 		return Version{}, err
 	}
-	projection, err := projectionFor(snapshot, version)
+	projection, err := projectionFor(snapshot, version, "Building")
 	if err != nil {
 		return Version{}, err
-	}
-	updatedBody, err := RenderProjection(snapshot.Root.Body, projection)
-	if err != nil {
-		return Version{}, err
-	}
-	if err := a.Projector.UpdateIssueBody(ctx, repository, rootNumber, updatedBody); err != nil {
-		return Version{}, fmt.Errorf("project plan root: %w", err)
-	}
-	if err := a.Projector.AddIssueLabel(ctx, repository, rootNumber, ActiveLabel); err != nil {
-		return Version{}, fmt.Errorf("activate plan root: %w", err)
 	}
 	if version.State != "active" {
+		updatedBody, err := RenderProjection(snapshot.Root.Body, projection)
+		if err != nil {
+			return Version{}, err
+		}
+		if err := a.Projector.UpdateIssueBody(ctx, repository, rootNumber, updatedBody); err != nil {
+			return Version{}, fmt.Errorf("project plan root: %w", err)
+		}
+		if err := a.Projector.AddIssueLabel(ctx, repository, rootNumber, ActiveLabel); err != nil {
+			return Version{}, fmt.Errorf("activate plan root: %w", err)
+		}
 		if err := a.Store.MarkActive(ctx, version.ID); err != nil {
 			return Version{}, err
 		}
 		version.State = "active"
 	}
+	projection.State = "Active"
+	updatedBody, err := RenderProjection(snapshot.Root.Body, projection)
+	if err != nil {
+		return Version{}, err
+	}
+	if err := a.Projector.UpdateIssueBody(ctx, repository, rootNumber, updatedBody); err != nil {
+		return Version{}, fmt.Errorf("reconcile active plan root: %w", err)
+	}
 	return version, nil
 }
 
-func projectionFor(snapshot Snapshot, version Version) (Projection, error) {
+func projectionFor(snapshot Snapshot, version Version, state string) (Projection, error) {
 	tickets := make(map[int64]ProjectionTicket)
 	for _, ticket := range snapshot.Tickets() {
 		tickets[ticket.ID] = ProjectionTicket{Number: ticket.Number, Title: ticket.Title}
@@ -103,5 +111,5 @@ func projectionFor(snapshot Snapshot, version Version) (Projection, error) {
 	for _, ticket := range tickets {
 		ordered = append(ordered, ticket)
 	}
-	return Projection{VersionID: version.ID, State: "Active", Tickets: ordered}, nil
+	return Projection{VersionID: version.ID, State: state, Tickets: ordered}, nil
 }

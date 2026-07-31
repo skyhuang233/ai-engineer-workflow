@@ -43,6 +43,12 @@ type Store struct {
 
 type PlanVersion = plan.Version
 
+const timestampLayout = "2006-01-02T15:04:05.000000000Z"
+
+func formatTimestamp(value time.Time) string {
+	return value.UTC().Format(timestampLayout)
+}
+
 // Open configures SQLite as the durable runtime store and runs all pending
 // migrations before returning a usable Store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -150,7 +156,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 				return fmt.Errorf("migration 1: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 		applied = 1
@@ -199,7 +205,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 				return fmt.Errorf("migration 2: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 		applied = 2
@@ -216,7 +222,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 )`); err != nil {
 			return fmt.Errorf("migration 3: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
@@ -257,7 +263,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 				return fmt.Errorf("migration 4: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
@@ -305,7 +311,23 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 				return fmt.Errorf("migration 5: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 6 {
+		statements := []string{
+			`ALTER TABLE delivery_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE delivery_outbox ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT ''`,
+			`UPDATE run_leases SET expires_at = strftime('%Y-%m-%dT%H:%M:%f000000Z', expires_at)`,
+			`UPDATE delivery_outbox SET updated_at = strftime('%Y-%m-%dT%H:%M:%f000000Z', updated_at), next_attempt_at = strftime('%Y-%m-%dT%H:%M:%f000000Z', updated_at)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 6: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
@@ -361,7 +383,7 @@ func (s *Store) BeginActivation(ctx context.Context, snapshot plan.Snapshot, fin
 		return PlanVersion{}, err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := formatTimestamp(time.Now())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO plans(repository, root_issue_id, root_issue_number, state, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(repository, root_issue_id) DO NOTHING`, snapshot.Repository, snapshot.Root.ID, snapshot.Root.Number, StateProjecting, now, now); err != nil {
@@ -447,7 +469,7 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, time.Now().UTC().Format(time.RFC3339Nano), versionID, StateProjecting)
+	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, formatTimestamp(time.Now()), versionID, StateProjecting)
 	if err != nil {
 		return err
 	}

@@ -78,8 +78,9 @@ func TestCommandCheckMatchesPinnedVersionAndCapabilities(t *testing.T) {
 		CheckName: "codex",
 		Executor:  executor,
 		Version: CommandExpectation{
-			Command:  []string{"codex", "--version"},
-			Contains: []string{"0.146.0"},
+			Command:      []string{"codex", "--version"},
+			Tool:         "codex",
+			ExactVersion: "0.146.0",
 		},
 		Capabilities: []CommandExpectation{{
 			Command:  []string{"codex", "exec", "--help"},
@@ -104,12 +105,27 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 		CheckName: "no-mistakes",
 		Executor:  fakeExecutor{err: errors.New("executable not found")},
 		Version: CommandExpectation{
-			Command:  []string{"no-mistakes", "--version"},
-			Contains: []string{"v1.41.2", "867d64d"},
+			Command:      []string{"no-mistakes", "--version"},
+			Tool:         "no-mistakes",
+			ExactVersion: "v1.41.2",
+			ExactCommit:  "867d64d",
 		},
 	}
 	if result := check.Run(context.Background()); result.Status != Fail {
 		t.Fatalf("Run() = %#v, want FAIL", result)
+	}
+}
+
+func TestCommandCheckRejectsVersionAndCommitPrefixCollisions(t *testing.T) {
+	check := CommandCheck{
+		CheckName: "no-mistakes",
+		Executor: fakeExecutor{outputs: map[string]string{
+			"no-mistakes --version": "no-mistakes version v1.41.20 (867d64d0) 2026-07-24T06:16:02Z",
+		}},
+		Version: CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: "867d64d"},
+	}
+	if result := check.Run(context.Background()); result.Status != Fail {
+		t.Fatalf("Run() = %#v, want exact-version failure", result)
 	}
 }
 
@@ -155,6 +171,19 @@ func TestCodexResumeCheckUsesReturnedSessionID(t *testing.T) {
 	}
 	if got := strings.Join(executor.commands[1], " "); !strings.Contains(got, "resume") || !strings.Contains(got, "session-7") {
 		t.Fatalf("resume command = %q", got)
+	}
+}
+
+func TestGitHubCheckRequiresContractRunForCurrentDefaultHead(t *testing.T) {
+	config := validConfig()
+	executor := fakeExecutor{outputs: map[string]string{
+		"gh api repos/skyhuang233/workflow-integration-test":                                                                                          `{"private":true,"default_branch":"main"}`,
+		"gh api repos/skyhuang233/workflow-integration-test/branches/main":                                                                            `{"commit":{"sha":"current"}}`,
+		"gh run list -R skyhuang233/workflow-integration-test --workflow workflow-contract --branch main --limit 20 --json status,conclusion,headSha": `[{"status":"completed","conclusion":"success","headSha":"old"}]`,
+	}}
+	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Executor: executor}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "current default-branch revision") {
+		t.Fatalf("GitHub check = %#v, want stale-run failure", result)
 	}
 }
 

@@ -62,9 +62,12 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err := os.WriteFile(c.Workspace.schemaPath(ws.CodexState), []byte(outputSchema), 0o600); err != nil {
 		return Candidate{}, err
 	}
-	baseCommit, clean, err := c.Workspace.status(ctx, ws)
+	baseCommit, currentBranch, clean, err := c.Workspace.status(ctx, ws)
 	if err != nil {
 		return Candidate{}, err
+	}
+	if currentBranch != ws.Branch {
+		return c.failRun(ctx, request, ws, session, baseCommit, "workspace branch changed before the worker started", "")
 	}
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
@@ -97,9 +100,12 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if runErr != nil || result.ExitCode != 0 {
 		return c.failRun(ctx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(result.Output))
 	}
-	commit, clean, err := c.Workspace.status(ctx, ws)
+	commit, currentBranch, clean, err := c.Workspace.status(ctx, ws)
 	if err != nil {
 		return Candidate{}, err
+	}
+	if currentBranch != ws.Branch {
+		return c.failRun(ctx, request, ws, session, baseCommit, fmt.Sprintf("worker changed workspace branch to %q", currentBranch), string(result.Output))
 	}
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "worker completed with a dirty workspace", string(result.Output))
@@ -111,6 +117,15 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if commit == baseCommit {
 		return c.failRun(ctx, request, ws, session, baseCommit, "worker produced no new commit", string(result.Output))
 	}
+	var candidateOutput struct {
+		Commit string `json:"commit"`
+	}
+	if err := json.Unmarshal(structured, &candidateOutput); err != nil {
+		return c.failRun(ctx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(result.Output))
+	}
+	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
+		return c.failRun(ctx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(result.Output))
+	}
 	if err := c.Store.AcceptCandidate(ctx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: time.Now().UTC()}); err != nil {
 		return Candidate{}, err
 	}
@@ -118,7 +133,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 }
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {
-	diagnostic, err := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, output, reason)
+	diagnostic, err := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, baseCommit, output, reason)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -150,12 +165,21 @@ func parseOutput(output []byte, existing string) (string, []byte, error) {
 		if line == "" {
 			continue
 		}
-		var value map[string]any
+		var value struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+		}
 		if err := json.Unmarshal([]byte(line), &value); err != nil {
 			continue
 		}
-		if _, ok := value["result"]; ok || value["type"] == "result" || value["type"] == "turn.completed" {
-			structured = append([]byte(nil), []byte(line)...)
+		if value.Type == "item.completed" && value.Item.Type == "agent_message" {
+			candidate := []byte(strings.TrimSpace(value.Item.Text))
+			if validateStructuredOutput(candidate) == nil {
+				structured = append([]byte(nil), candidate...)
+			}
 		}
 	}
 	if sessionID == "" {
@@ -165,6 +189,31 @@ func parseOutput(output []byte, existing string) (string, []byte, error) {
 		return "", nil, errors.New("Codex output did not contain a session and structured result")
 	}
 	return sessionID, structured, nil
+}
+
+func validateStructuredOutput(output []byte) error {
+	var value struct {
+		Summary any   `json:"summary"`
+		Commit  any   `json:"commit"`
+		Tests   []any `json:"tests"`
+	}
+	if len(output) == 0 || json.Unmarshal(output, &value) != nil {
+		return errors.New("structured result is not a JSON object")
+	}
+	if summary, ok := value.Summary.(string); !ok || strings.TrimSpace(summary) == "" {
+		return errors.New("structured result requires a nonempty summary")
+	}
+	if value.Commit != nil {
+		if _, ok := value.Commit.(string); !ok {
+			return errors.New("structured result commit must be a string")
+		}
+	}
+	for _, test := range value.Tests {
+		if _, ok := test.(string); !ok {
+			return errors.New("structured result tests must be strings")
+		}
+	}
+	return nil
 }
 
 func parseSessionID(output []byte, existing string) (string, error) {

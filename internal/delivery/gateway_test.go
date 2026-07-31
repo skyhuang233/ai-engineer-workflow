@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +27,73 @@ func (f *fakeRemote) Observe(context.Context, store.DeliveryRequest) (delivery.O
 	}
 	observation := f.observations[0]
 	f.observations = f.observations[1:]
+	if observation.RemoteHead != "" {
+		observation.RemoteExists = true
+	}
 	return observation, nil
+}
+
+type blockingRemote struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	return delivery.Observation{RemoteHead: "base", RemoteExists: true}, nil
+}
+
+func (r *blockingRemote) Apply(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	close(r.entered)
+	<-r.release
+	return delivery.Observation{Applied: true, RemoteHead: "accepted", RemoteExists: true}, nil
+}
+
+func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	}, time.Date(2026, 7, 31, 0, 3, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 3, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, second.ClaimToken, store.OutboxPending, "second failure", time.Date(2026, 7, 31, 0, 5, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, first.ClaimToken, store.OutboxSucceeded, "", time.Date(2026, 7, 31, 0, 5, 1, 0, time.UTC)); !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("stale completion error = %v, want fencing conflict", err)
+	}
+	third, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 2, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, third.ClaimToken, store.OutboxPending, "third failure", time.Date(2026, 7, 31, 0, 5, 2, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.State != store.OutboxRejected || !strings.Contains(finished.LastError, "retries exhausted") {
+		t.Fatalf("exhausted outbox = %#v", finished)
+	}
+	projection, err := db.PlanProjectionAt(ctx, claim.VersionID, time.Date(2026, 7, 31, 0, 5, 3, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("projection after retry exhaustion = %#v", projection)
+	}
 }
 
 func (f *fakeRemote) Apply(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
@@ -95,6 +162,41 @@ func TestGatewayRejectsZombieCommandAfterLeaseReplacement(t *testing.T) {
 	}
 }
 
+func TestGatewayAllowsFirstCandidatePushToExpectAbsentBranch(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{observations: []delivery.Observation{{}}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("first push apply calls = %d", remote.applyCalls)
+	}
+}
+
+func TestGatewayRejectsUnstructuredPlanBodyReplacement(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	_, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryProjectPlan, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", RootNumber: 10, Body: "replace the human specification",
+	})
+	if err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("unstructured plan replacement error = %v, want ErrDeliveryRejected", err)
+	}
+}
+
 func TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
@@ -128,6 +230,40 @@ func TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite(t *testing.T) {
 	}
 	if len(audits) < 2 || audits[len(audits)-1].Decision != "rejected" {
 		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &blockingRemote{entered: make(chan struct{}), release: make(chan struct{})}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan error, 1)
+	go func() { dispatched <- gateway.Dispatch(ctx, queued.IdempotencyKey) }()
+	<-remote.entered
+	takeover := make(chan error, 1)
+	go func() {
+		takeover <- db.RecordRunFailure(ctx, store.RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics", Error: "replace", Now: time.Date(2026, 7, 31, 1, 0, 1, 0, time.UTC)})
+	}()
+	select {
+	case err := <-takeover:
+		t.Fatalf("lease takeover completed before external write returned: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(remote.release)
+	if err := <-dispatched; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-takeover; err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -16,7 +18,7 @@ import (
 // are already present in the Ticket Workspace and must be pushed through the
 // gateway's controlled credential boundary.
 type GitPusher interface {
-	Push(context.Context, string, string, string) error
+	Push(context.Context, string, string, string, string, bool) error
 }
 
 type DeliveryRemote struct {
@@ -29,17 +31,24 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
 	if request.Operation == store.DeliveryProjectPlan {
+		if request.PlanProjection == nil {
+			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
+		}
 		issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
 		if err != nil {
 			return delivery.Observation{}, err
 		}
-		return delivery.Observation{Applied: issue.Body == request.Body}, nil
+		expected, err := plan.RenderProjection(issue.Body, *request.PlanProjection)
+		if err != nil {
+			return delivery.Observation{}, err
+		}
+		return delivery.Observation{Applied: issue.Body == expected}, nil
 	}
-	head, err := r.Client.branchHead(ctx, request.Repository, request.Branch)
+	head, exists, err := r.Client.branchHead(ctx, request.Repository, request.Branch)
 	if err != nil {
 		return delivery.Observation{}, err
 	}
-	observation := delivery.Observation{RemoteHead: head}
+	observation := delivery.Observation{RemoteHead: head, RemoteExists: exists}
 	if request.Operation == store.DeliveryPushCandidate {
 		observation.Applied = head == request.CommitSHA
 		return observation, nil
@@ -79,10 +88,10 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		if r.Pusher == nil {
 			return delivery.Observation{}, fmt.Errorf("candidate push adapter is missing")
 		}
-		if err := r.Pusher.Push(ctx, request.Repository, request.Branch, request.CommitSHA); err != nil {
+		if err := r.Pusher.Push(ctx, request.Repository, request.Branch, request.CommitSHA, request.ExpectedRemoteHead, request.ExpectRemoteAbsent); err != nil {
 			return delivery.Observation{}, err
 		}
-		return delivery.Observation{Applied: true, RemoteHead: request.CommitSHA}, nil
+		return delivery.Observation{Applied: true, RemoteHead: request.CommitSHA, RemoteExists: true}, nil
 	case store.DeliveryUpsertPR:
 		pull, found, err := r.findPullRequest(ctx, request)
 		if err != nil {
@@ -108,7 +117,18 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		}
 		return delivery.Observation{Applied: true, PullRequestNumber: request.PullRequestNumber}, nil
 	case store.DeliveryProjectPlan:
-		if err := r.Client.UpdateIssueBody(ctx, request.Repository, request.RootNumber, request.Body); err != nil {
+		if request.PlanProjection == nil {
+			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
+		}
+		issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
+		if err != nil {
+			return delivery.Observation{}, err
+		}
+		body, err := plan.RenderProjection(issue.Body, *request.PlanProjection)
+		if err != nil {
+			return delivery.Observation{}, err
+		}
+		if err := r.Client.UpdateIssueBody(ctx, request.Repository, request.RootNumber, body); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
@@ -160,11 +180,20 @@ func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.Deliv
 
 func (r DeliveryRemote) listComments(ctx context.Context, repository string, number int64) ([]commentResponse, error) {
 	var comments []commentResponse
-	err := r.Client.getJSON(ctx, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10)+"/comments?per_page=100", &comments)
-	return comments, err
+	for page := 1; ; page++ {
+		var batch []commentResponse
+		path := "/repos/" + repository + "/issues/" + strconv.FormatInt(number, 10) + "/comments?per_page=100&page=" + strconv.Itoa(page)
+		if err := r.Client.getJSON(ctx, path, &batch); err != nil {
+			return nil, err
+		}
+		comments = append(comments, batch...)
+		if len(batch) < 100 {
+			return comments, nil
+		}
+	}
 }
 
-func (c *Client) branchHead(ctx context.Context, repository, branch string) (string, error) {
+func (c *Client) branchHead(ctx context.Context, repository, branch string) (string, bool, error) {
 	var response struct {
 		Object struct {
 			SHA string `json:"sha"`
@@ -172,10 +201,14 @@ func (c *Client) branchHead(ctx context.Context, repository, branch string) (str
 	}
 	path := "/repos/" + repository + "/git/ref/heads/" + url.PathEscape(branch)
 	if err := c.getJSON(ctx, path, &response); err != nil {
-		return "", err
+		var apiErr *apiError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return "", false, nil
+		}
+		return "", false, err
 	}
 	if response.Object.SHA == "" {
-		return "", fmt.Errorf("GitHub returned an empty branch head")
+		return "", false, fmt.Errorf("GitHub returned an empty branch head")
 	}
-	return response.Object.SHA, nil
+	return response.Object.SHA, true, nil
 }

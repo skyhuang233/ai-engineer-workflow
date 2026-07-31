@@ -824,14 +824,102 @@ gh_afk_render_issue_context() {
   fi
 }
 
+gh_afk_rollback_claim_label() {
+  local number="$1"
+  local attempts="$2"
+  local delay="$3"
+  local attempt
+  local error_file
+
+  error_file="$(mktemp)"
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if gh issue edit "$number" --remove-label "in-progress" >/dev/null 2>"$error_file"; then
+      rm -f "$error_file"
+      return 0
+    fi
+    if gh_afk_retry_read gh issue view "$number" --json labels --jq '([.labels[].name] // []) | index("in-progress") == null' 2>/dev/null | grep -Fxq true; then
+      rm -f "$error_file"
+      return 0
+    fi
+    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
+      break
+    fi
+    [ "$delay" -eq 0 ] || sleep "$delay"
+  done
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  return 1
+}
+
 gh_afk_claim_issue() {
   local number="$1"
   local agent_name="$2"
   local timestamp
+  local body
+  local attempts="${GH_AFK_RETRY_ATTEMPTS:-5}"
+  local delay="${GH_AFK_RETRY_BASE_DELAY_SECONDS:-2}"
+  local attempt
+  local error_file
+  local status
 
   timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  gh issue edit "$number" --add-label "in-progress" >/dev/null
-  gh issue comment "$number" --body "Claimed by $agent_name AFK loop at $timestamp." >/dev/null
+  body="Claimed by $agent_name AFK loop at $timestamp."
+  if ! [[ "$attempts" =~ ^[1-9][0-9]*$ ]]; then
+    attempts=5
+  fi
+  if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+    delay=2
+  fi
+
+  error_file="$(mktemp)"
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if gh issue edit "$number" --add-label "in-progress" >/dev/null 2>"$error_file"; then
+      break
+    else
+      status="$?"
+    fi
+    if gh_afk_retry_read gh issue view "$number" --json labels --jq '([.labels[].name] // []) | index("in-progress") != null' 2>/dev/null | grep -Fxq true; then
+      break
+    fi
+    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
+      cat "$error_file" >&2
+      rm -f "$error_file"
+      if ! gh_afk_rollback_claim_label "$number" "$attempts" "$delay"; then
+        echo "Failed to roll back incomplete claim for issue #$number." >&2
+      fi
+      return "$status"
+    fi
+    [ "$delay" -eq 0 ] || sleep "$delay"
+  done
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if gh_afk_retry_read gh issue view "$number" --json comments 2>/dev/null | jq -e --arg body "$body" 'any(.comments[]?; .body == $body)' >/dev/null; then
+      rm -f "$error_file"
+      return 0
+    fi
+    : >"$error_file"
+    if gh issue comment "$number" --body "$body" >/dev/null 2>"$error_file"; then
+      rm -f "$error_file"
+      return 0
+    else
+      status="$?"
+    fi
+    if gh_afk_retry_read gh issue view "$number" --json comments 2>/dev/null | jq -e --arg body "$body" 'any(.comments[]?; .body == $body)' >/dev/null; then
+      rm -f "$error_file"
+      return 0
+    fi
+    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
+      break
+    fi
+    [ "$delay" -eq 0 ] || sleep "$delay"
+  done
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  if ! gh_afk_rollback_claim_label "$number" "$attempts" "$delay"; then
+    echo "Failed to roll back incomplete claim for issue #$number." >&2
+  fi
+  return "$status"
 }
 
 gh_afk_release_issue_claim() {

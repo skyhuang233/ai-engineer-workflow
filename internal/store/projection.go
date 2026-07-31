@@ -54,6 +54,11 @@ WHERE t.version_id = ?`, versionID)
 			ticket.Owner = ""
 			ticket.RunID = ""
 			ticket.LeaseGeneration = 0
+		} else if runtimeState == plan.StateNeedsAttention {
+			ticket.State = "Needs Attention"
+			ticket.Owner = ""
+			ticket.RunID = ""
+			ticket.LeaseGeneration = 0
 		} else if runtimeState == plan.StateRunning && runState == RunRunning && leaseState == LeaseActive {
 			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
 			if parseErr == nil && expiresAt.After(now) {
@@ -74,7 +79,10 @@ WHERE t.version_id = ?`, versionID)
 	if err := rows.Err(); err != nil {
 		return plan.Projection{}, err
 	}
-	dependencyRows, err := s.db.QueryContext(ctx, `SELECT blocked_issue_id, blocker_issue_id FROM plan_dependencies WHERE version_id = ?`, versionID)
+	dependencyRows, err := s.db.QueryContext(ctx, `SELECT d.blocked_issue_id, blocker.issue_number
+FROM plan_dependencies d
+JOIN plan_tickets blocker ON blocker.version_id = d.version_id AND blocker.issue_id = d.blocker_issue_id
+WHERE d.version_id = ?`, versionID)
 	if err != nil {
 		return plan.Projection{}, err
 	}

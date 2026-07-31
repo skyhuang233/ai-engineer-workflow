@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,10 +19,13 @@ import (
 )
 
 type fakeRuntime struct {
-	results []worker.Result
-	specs   []worker.Spec
-	err     error
-	dirty   bool
+	results         []worker.Result
+	specs           []worker.Spec
+	err             error
+	dirty           bool
+	failAfterCommit bool
+	switchBranch    bool
+	ignoredFile     bool
 }
 
 func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, error) {
@@ -34,6 +38,14 @@ func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, e
 		return worker.Result{}, err
 	}
 	if r.dirty {
+		if r.ignoredFile {
+			if err := os.MkdirAll(filepath.Join(spec.WorkspacePath, "ignored"), 0o755); err != nil {
+				return worker.Result{}, err
+			}
+			if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "ignored", "evidence.log"), []byte("ignored evidence\n"), 0o644); err != nil {
+				return worker.Result{}, err
+			}
+		}
 		result := r.results[0]
 		r.results = r.results[1:]
 		return result, r.err
@@ -48,8 +60,18 @@ func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, e
 			_ = output
 		}
 	}
+	if r.switchBranch {
+		cmd := exec.Command("git", "switch", "-c", "unexpected")
+		cmd.Dir = spec.WorkspacePath
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return worker.Result{}, fmt.Errorf("switch branch: %w (%s)", err, output)
+		}
+	}
 	result := r.results[0]
 	r.results = r.results[1:]
+	if r.failAfterCommit {
+		return result, r.err
+	}
 	return result, nil
 }
 
@@ -60,7 +82,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
-	runtime := &fakeRuntime{dirty: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
+	runtime := &fakeRuntime{dirty: true, ignoredFile: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
 	if _, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"}); err == nil {
 		t.Fatal("failed worker run returned nil error")
@@ -89,6 +111,12 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(diagnostic), "residue", "agent.txt")); err != nil {
 		t.Fatalf("uncommitted residue evidence: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(diagnostic), "ignored", "ignored", "evidence.log")); err != nil {
+		t.Fatalf("ignored residue evidence: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(session.WorkspacePath, "ignored", "evidence.log")); !os.IsNotExist(err) {
+		t.Fatalf("ignored worker residue still exists, err = %v", err)
 	}
 	audit, err := db.WorkerAudit(ctx, claim.RunID)
 	if err != nil {
@@ -166,7 +194,7 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	}
 
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
-	first := &fakeRuntime{results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-session-1"}` + "\n" + `{"type":"result","summary":"implemented"}`), ContainerID: "container-1"}}}
+	first := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "implemented"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
 	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"})
 	if err != nil {
@@ -201,7 +229,7 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 		t.Fatalf("replacement session = %q, want %q", nextClaim.SessionID, claim.SessionID)
 	}
 
-	second := &fakeRuntime{results: []worker.Result{{Output: []byte(`{"type":"result","session_id":"codex-session-1","summary":"revised"}`), ContainerID: "container-2"}}}
+	second := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "revised"), ContainerID: "container-2"}}}
 	controller = agent.Controller{Store: db, Workspace: manager, Runtime: second, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
 	if _, err := controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "review the implementation"}); err != nil {
 		t.Fatal(err)
@@ -225,6 +253,52 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	}
 }
 
+func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name    string
+		runtime *fakeRuntime
+	}{
+		{name: "committed failure", runtime: &fakeRuntime{failAfterCommit: true, err: errors.New("worker crashed after commit"), results: []worker.Result{{Output: codexOutput("codex-failed", "partial"), ContainerID: "container-failed"}}}},
+		{name: "branch change", runtime: &fakeRuntime{switchBranch: true, results: []worker.Result{{Output: codexOutput("codex-failed", "partial"), ContainerID: "container-failed"}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := initRepository(t)
+			root := t.TempDir()
+			db, _, claim := createClaim(t, ctx, root)
+			defer db.Close()
+			manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+			controller := agent.Controller{Store: db, Workspace: manager, Runtime: test.runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+			if _, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err == nil {
+				t.Fatal("abnormal worker run returned nil error")
+			}
+			diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			patch, err := os.ReadFile(filepath.Join(filepath.Dir(diagnostic), "revision.patch"))
+			if err != nil || !strings.Contains(string(patch), "candidate initial") {
+				t.Fatalf("revision evidence = %q, err = %v", patch, err)
+			}
+			session, err := db.TicketSession(ctx, claim.VersionID, claim.TicketID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			branch := exec.Command("git", "branch", "--show-current")
+			branch.Dir = session.WorkspacePath
+			if output, err := branch.Output(); err != nil || strings.TrimSpace(string(output)) != "ticket-1" {
+				t.Fatalf("restored branch = %q, err = %v", output, err)
+			}
+		})
+	}
+}
+
+func codexOutput(sessionID, summary string) []byte {
+	message, _ := json.Marshal(map[string]string{"summary": summary})
+	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
+	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
+}
+
 func initRepository(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "source")
@@ -243,7 +317,10 @@ func initRepository(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("base\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run("add", "README.md")
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md", ".gitignore")
 	run("commit", "-m", "base")
 	return dir
 }

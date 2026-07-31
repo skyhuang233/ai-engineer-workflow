@@ -1,0 +1,104 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
+)
+
+type recordingPusher struct {
+	expected string
+	absent   bool
+}
+
+func (p *recordingPusher) Push(_ context.Context, _, _, _, expected string, absent bool) error {
+	p.expected = expected
+	p.absent = absent
+	return nil
+}
+
+func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	pusher := &recordingPusher{}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()), Pusher: pusher}
+	request := store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "candidate", ExpectRemoteAbsent: true}
+	observation, err := remote.Observe(context.Background(), request)
+	if err != nil || observation.RemoteExists {
+		t.Fatalf("absent observation = %#v, err = %v", observation, err)
+	}
+	if _, err := remote.Apply(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !pusher.absent || pusher.expected != "" {
+		t.Fatalf("push expectation = expected %q absent %t", pusher.expected, pusher.absent)
+	}
+}
+
+func TestDeliveryRemoteRendersPlanProjectionAgainstFreshHumanBody(t *testing.T) {
+	var patched string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "body": "fresh human specification"})
+		case r.Method == http.MethodPatch:
+			body, _ := io.ReadAll(r.Body)
+			var payload struct {
+				Body string `json:"body"`
+			}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode patch payload: %v", err)
+			}
+			patched = payload.Body
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	if _, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryProjectPlan, Repository: "owner/repo", RootNumber: 10, PlanProjection: &projection}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(patched, "fresh human specification") || !strings.Contains(patched, plan.ProjectionStart) {
+		t.Fatalf("projected payload = %s", patched)
+	}
+}
+
+func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/git/ref/") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "head"}})
+			return
+		}
+		pages++
+		comments := make([]map[string]string, 100)
+		for i := range comments {
+			comments[i] = map[string]string{"body": "other"}
+		}
+		if r.URL.Query().Get("page") == "2" {
+			comments = []map[string]string{{"body": "<!-- workflow-idempotency:key -->"}}
+		}
+		_ = json.NewEncoder(w).Encode(comments)
+	}))
+	defer server.Close()
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	observation, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryReplyEvidence, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, IdempotencyKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observation.Applied || pages != 2 {
+		t.Fatalf("observation = %#v, pages = %d", observation, pages)
+	}
+}

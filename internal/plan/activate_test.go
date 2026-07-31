@@ -15,13 +15,15 @@ func (f fakeReader) ReadPlan(context.Context, string, int64) (Snapshot, error) {
 }
 
 type fakeProjector struct {
-	body  string
-	label string
-	err   error
+	body   string
+	bodies []string
+	label  string
+	err    error
 }
 
 func (f *fakeProjector) UpdateIssueBody(_ context.Context, _ string, _ int64, body string) error {
 	f.body = body
+	f.bodies = append(f.bodies, body)
 	return f.err
 }
 
@@ -69,6 +71,9 @@ func TestActivatorProjectsAndCommitsOnlyAfterProjection(t *testing.T) {
 	}
 	if projector.body == "" || !containsText(projector.body, "approved spec", ProjectionStart, "pv-test") {
 		t.Fatalf("projection body = %q", projector.body)
+	}
+	if len(projector.bodies) != 2 || !containsText(projector.bodies[0], "`Building`") || !containsText(projector.bodies[1], "`Active`") {
+		t.Fatalf("projection sequence = %#v", projector.bodies)
 	}
 }
 

@@ -66,19 +66,23 @@ func (m WorkspaceManager) schemaPath(state string) string {
 	return filepath.Join(state, "output-schema.json")
 }
 
-func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit string, clean bool, err error) {
+func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit, branch string, clean bool, err error) {
 	commit, err = gitOutput(ctx, ws.Path, "rev-parse", "HEAD")
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
+	}
+	branch, err = gitOutput(ctx, ws.Path, "branch", "--show-current")
+	if err != nil {
+		return "", "", false, err
 	}
 	status, err := gitOutput(ctx, ws.Path, "status", "--porcelain")
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	return strings.TrimSpace(commit), strings.TrimSpace(status) == "", nil
+	return strings.TrimSpace(commit), strings.TrimSpace(branch), strings.TrimSpace(status) == "", nil
 }
 
-func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, output, runErr string) (string, error) {
+func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, baseCommit, output, runErr string) (string, error) {
 	dir := filepath.Join(filepath.Dir(ws.CodexState), "diagnostics", runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -88,25 +92,41 @@ func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, o
 	if statusErr != nil {
 		status = "git status failed: " + statusErr.Error()
 	}
-	diff, diffErr := gitOutput(ctx, ws.Path, "diff", "--binary")
+	head, headErr := gitOutput(ctx, ws.Path, "rev-parse", "HEAD")
+	if headErr != nil {
+		head = "git rev-parse HEAD failed: " + headErr.Error()
+	}
+	diff, diffErr := gitOutput(ctx, ws.Path, "diff", "--binary", baseCommit)
 	if diffErr != nil {
 		diff = "git diff failed: " + diffErr.Error()
 	}
-	if err := os.WriteFile(filepath.Join(dir, "working-tree.patch"), []byte(diff), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "revision.patch"), []byte(diff), 0o600); err != nil {
 		return "", err
 	}
-	if err := m.copyUntrackedEvidence(ctx, ws, dir); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(strings.TrimSpace(head)+"\nbase: "+baseCommit+"\n"), 0o600); err != nil {
 		return "", err
 	}
-	body := "error: " + runErr + "\nstatus:\n" + status + "\noutput:\n" + output + "\nresidue: working-tree.patch and residue/"
+	if err := m.copyResidue(ctx, ws, dir, false); err != nil {
+		return "", err
+	}
+	if err := m.copyResidue(ctx, ws, dir, true); err != nil {
+		return "", err
+	}
+	body := "error: " + runErr + "\nhead: " + strings.TrimSpace(head) + "\nbase: " + baseCommit + "\nstatus:\n" + status + "\noutput:\n" + output + "\nevidence: revision.patch, head.txt, residue/, and ignored/"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func (m WorkspaceManager) copyUntrackedEvidence(ctx context.Context, ws workspace, dir string) error {
-	files, err := gitOutput(ctx, ws.Path, "ls-files", "--others", "--exclude-standard", "-z")
+func (m WorkspaceManager) copyResidue(ctx context.Context, ws workspace, dir string, ignored bool) error {
+	args := []string{"ls-files", "--others", "--exclude-standard", "-z"}
+	destinationRoot := "residue"
+	if ignored {
+		args = []string{"ls-files", "--others", "--ignored", "--exclude-standard", "-z"}
+		destinationRoot = "ignored"
+	}
+	files, err := gitOutput(ctx, ws.Path, args...)
 	if err != nil {
 		return err
 	}
@@ -122,7 +142,7 @@ func (m WorkspaceManager) copyUntrackedEvidence(ctx context.Context, ws workspac
 		if info.IsDir() {
 			continue
 		}
-		destination := filepath.Join(dir, "residue", filepath.FromSlash(name))
+		destination := filepath.Join(dir, destinationRoot, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 			return err
 		}
@@ -141,10 +161,13 @@ func (m WorkspaceManager) restore(ctx context.Context, ws workspace, commit stri
 	if commit == "" {
 		return errors.New("restore commit is empty")
 	}
-	if err := runGit(ctx, ws.Path, "reset", "--hard", commit); err != nil {
+	if err := runGit(ctx, ws.Path, "reset", "--hard"); err != nil {
 		return err
 	}
-	return runGit(ctx, ws.Path, "clean", "-fd")
+	if err := runGit(ctx, ws.Path, "switch", "-C", ws.Branch, commit); err != nil {
+		return err
+	}
+	return runGit(ctx, ws.Path, "clean", "-fdx")
 }
 
 func runGit(ctx context.Context, dir string, args ...string) error {

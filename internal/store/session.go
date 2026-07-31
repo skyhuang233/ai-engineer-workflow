@@ -112,7 +112,7 @@ func (s *Store) BindAgent(ctx context.Context, binding AgentBinding) (TicketSess
 		return TicketSession{}, ErrSessionConflict
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE ticket_sessions SET agent_identity = ?, workspace_path = ?, codex_state_path = ?, branch = ?, updated_at = ? WHERE session_id = ?`,
-		binding.AgentIdentity, binding.WorkspacePath, binding.CodexStatePath, binding.Branch, time.Now().UTC().Format(time.RFC3339Nano), binding.SessionID)
+		binding.AgentIdentity, binding.WorkspacePath, binding.CodexStatePath, binding.Branch, formatTimestamp(time.Now()), binding.SessionID)
 	if err != nil {
 		return TicketSession{}, err
 	}
@@ -143,7 +143,7 @@ func (s *Store) RecordWorkerAudit(ctx context.Context, audit WorkerAudit) error 
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_audits(run_id, container_id, image_digest, mounts_json, tool_versions_json, github_write_credentials, created_at)
 SELECT r.run_id, ?, ?, ?, ?, ?, ? FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(versions), boolInt(audit.GitHubWriteCredentials), time.Now().UTC().Format(time.RFC3339Nano), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
+WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
 	if err != nil {
 		return err
 	}
@@ -187,7 +187,7 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, runID
 	if existing != "" && existing != codexSessionID {
 		return ErrSessionConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = ?, updated_at = ? WHERE session_id = ?`, codexSessionID, time.Now().UTC().Format(time.RFC3339Nano), sessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = ?, updated_at = ? WHERE session_id = ?`, codexSessionID, formatTimestamp(time.Now()), sessionID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -234,7 +234,7 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 	var sessionID, currentSessionID, existingCodexSessionID string
 	var generation int64
 	err = tx.QueryRowContext(ctx, `SELECT r.session_id, s.session_id, s.codex_session_id, l.generation FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-	WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, candidate.LeaseToken, RunRunning, LeaseActive, candidate.Now.Format(time.RFC3339Nano)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID, &generation)
+	WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, candidate.LeaseToken, RunRunning, LeaseActive, formatTimestamp(candidate.Now)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -247,7 +247,7 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 	if existingCodexSessionID != "" && existingCodexSessionID != candidate.CodexSessionID {
 		return ErrSessionConflict
 	}
-	now := candidate.Now.Format(time.RFC3339Nano)
+	now := formatTimestamp(candidate.Now)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, created_at) VALUES (?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), now); err != nil {
 		return err
 	}
@@ -285,7 +285,7 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 	if err != nil {
 		return err
 	}
-	now := failure.Now.Format(time.RFC3339Nano)
+	now := formatTimestamp(failure.Now)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?)`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
 		return err
 	}

@@ -180,13 +180,56 @@ test_non_transient_error_is_not_retried() (
   fi
 )
 
+test_claim_retries_comment_after_label_succeeds() (
+  export GH_AFK_RETRY_ATTEMPTS=3
+  export GH_AFK_RETRY_BASE_DELAY_SECONDS=0
+  export GH_AFK_RETRY_MAX_DELAY_SECONDS=0
+
+  local comment_calls
+  comment_calls="$(mktemp)"
+  trap 'rm -f "$comment_calls"' EXIT
+
+  sleep() {
+    :
+  }
+
+  gh() {
+    if [ "$1 $2 $3" = "issue edit 7" ]; then
+      return 0
+    fi
+    if [ "$1 $2 $3" = "issue view 7" ]; then
+      printf '{"comments":[]}'
+      return 0
+    fi
+    if [ "$1 $2 $3" = "issue comment 7" ]; then
+      printf 'call\n' >> "$comment_calls"
+      if [ "$(wc -l < "$comment_calls" | tr -d ' ')" -eq 1 ]; then
+        echo 'HTTP 503: Service Unavailable' >&2
+        return 1
+      fi
+      return 0
+    fi
+    return 1
+  }
+
+  if ! gh_afk_claim_issue "7" "Codex"; then
+    echo "expected claim comment retry to succeed" >&2
+    return 1
+  fi
+  if [ "$(wc -l < "$comment_calls" | tr -d ' ')" -ne 2 ]; then
+    echo "expected exactly two claim comment attempts" >&2
+    return 1
+  fi
+)
+
 failures=0
 
 for test_case in \
   test_candidate_retries_transient_blocker_read \
   test_label_lookup_retries_without_create \
   test_exhausted_transport_error_is_not_malformed \
-  test_non_transient_error_is_not_retried
+  test_non_transient_error_is_not_retried \
+  test_claim_retries_comment_after_label_succeeds
 do
   if "$test_case"; then
     echo "ok - $test_case"
