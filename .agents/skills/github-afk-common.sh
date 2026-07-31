@@ -14,7 +14,19 @@ gh_afk_require_tools() {
     return 1
   fi
 
-  gh auth status >/dev/null
+  if gh auth status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # GITHUB_TOKEN overrides credentials stored by gh. If only that override is
+  # invalid, keep the AFK run scoped to the working saved credential.
+  if [ -n "${GITHUB_TOKEN:-}" ] && (unset GITHUB_TOKEN; gh auth status) >/dev/null 2>&1; then
+    echo "Ignoring invalid GITHUB_TOKEN; using the GitHub CLI saved credential." >&2
+    unset GITHUB_TOKEN
+    return 0
+  fi
+
+  gh auth status
 }
 
 gh_afk_ensure_label() {
