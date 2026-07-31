@@ -326,6 +326,22 @@ func TestGatewayBoundsUncertainReconciliation(t *testing.T) {
 	}
 }
 
+func TestGatewayDerivesRepositoryFromLeasedTicket(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	}, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Request.Repository != "owner/repo" {
+		t.Fatalf("repository = %q, want ticket-owned repository", queued.Request.Repository)
+	}
+}
+
 func TestGatewayRejectsZombieCommandAfterLeaseReplacement(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)

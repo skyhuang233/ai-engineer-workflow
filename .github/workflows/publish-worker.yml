@@ -1,0 +1,73 @@
+name: publish-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/worker/**"
+      - "config/toolchain.json"
+      - ".github/workflows/publish-worker.yml"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish-worker
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Read accepted release inputs
+        id: pins
+        shell: bash
+        run: |
+          echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish accepted main commit
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: deploy/worker/Dockerfile
+          push: true
+          tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}
+      - name: Create authoritative Worker Release Manifest
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          jq --null-input \
+            --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg image "${{ steps.pins.outputs.image_repository }}@${IMAGE_DIGEST}" \
+            --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+            --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
+            --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
+            '{schema_version:1, worker_version:$worker_version, source_commit:$source_commit,
+              image:$image, codex_version:$codex_version, no_mistakes_version:$no_mistakes_version,
+              no_mistakes_commit:$no_mistakes_commit, github_actions_run_id:$github_actions_run_id}' \
+            > worker-release.json
+          jq --exit-status . worker-release.json
+      - name: Publish Worker Release Manifest
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: worker-v${{ steps.pins.outputs.worker_version }}
+          target_commitish: ${{ github.sha }}
+          name: Worker v${{ steps.pins.outputs.worker_version }}
+          body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
+          files: worker-release.json
+

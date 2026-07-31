@@ -1,0 +1,15 @@
+---
+status: accepted
+---
+
+# Use a fine-grained PAT for Gateway writes
+
+The single-host GitHub Write Gateway uses an owner-wide fine-grained PAT configured for all repositories with only Metadata read, Actions read, Contents write, Issues write, and Pull requests write. This deliberately avoids editing the PAT whenever the owner adds a project, accepting a larger credential blast radius while relying on Control Plane admission and ticket-derived Gateway authorization to constrain actual operations. Credential reachability never grants workflow authority: the Gateway accepts operations only for repositories belonging to an Active Delivery Plan and derives the repository from the leased Ticket Session rather than any caller-supplied field. The trusted Control Plane may store and rotate this Gateway Credential, but Worker containers and embedded Delivery Controllers never receive it; it grants no package, workflow, administration, secret, environment, merge, or direct-`main` capability through the Gateway interface. A GitHub App would provide shorter-lived installation tokens but is deferred because its application, private-key, installation, and refresh lifecycle is not justified for the current single-owner host.
+
+The PAT is stored as a Windows Credential Manager generic credential and loaded only into Control Plane memory; it is never persisted in environment configuration, repository files, SQLite, reports, logs, or Worker state. Arbitrary code execution by another process under the same trusted Windows user is outside the threat model, so the workflow does not add a second vault, per-use confirmation, or same-user isolation around Credential Manager.
+
+Missing, expired, revoked, or rejected credentials pause new Gateway writes as Needs Attention without terminating local Worker work or discarding Ticket Workspaces, sessions, commits, or durable outbox requests. One deduplicated Workflow Inbox item requests credential replacement; after the owner updates Credential Manager and verification succeeds, the Gateway resumes the queued idempotent writes.
+
+The fine-grained PAT has no proactive expiration because the trusted single-owner host and narrow Gateway interface make periodic rotation an operational interruption without a required threat-model benefit. It is replaced only when GitHub rejects or revokes it, the owner revokes it, or the required permissions change.
+
+Credential provisioning, rotation, or permission changes run one real idempotent write contract against the dedicated integration repository, covering a temporary ticket branch, candidate push, pull request, issue/label update, and evidence reply before cleanup. Routine doctor runs are read-only and verify the stored fingerprint, owner identity, and API health; they do not create recurring test pull requests or Actions noise.

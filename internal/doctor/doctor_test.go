@@ -23,9 +23,12 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"upstream commit", func(c *Config) { c.NoMistakes.UpstreamCommit = "main" }},
 		{"fork release", func(c *Config) { c.NoMistakes.ForkRelease = "" }},
 		{"asset checksum", func(c *Config) { c.NoMistakes.LinuxAMD64SHA256 = "latest" }},
-		{"worker image digest", func(c *Config) { c.Worker.Image = "workflow-worker:latest" }},
-		{"private test repository", func(c *Config) { c.GitHub.TestRepository = "" }},
+		{"worker version", func(c *Config) { c.Worker.Version = "" }},
+		{"worker image repository", func(c *Config) { c.Worker.ImageRepository = "latest" }},
+		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
+		{"integration repository", func(c *Config) { c.GitHub.TestRepository = "" }},
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
+		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -131,7 +134,7 @@ func TestCommandCheckRejectsVersionAndCommitPrefixCollisions(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Codex:         ToolPin{Version: "0.146.0"},
 		NoMistakes: NoMistakesPin{
 			Version:            "v1.41.2",
@@ -142,19 +145,23 @@ func validConfig() Config {
 			LinuxAMD64SHA256:   "a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825",
 		},
 		Worker: WorkerPin{
-			Image:        "workflow-worker:0.1.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			LocalBuildID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			Version:           "0.1.0",
+			ImageRepository:   "ghcr.io/skyhuang233/workflow-worker",
+			ReleaseRepository: "skyhuang233/workflow",
 		},
 		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
-			TestRepository:      "skyhuang233/workflow-integration-test",
-			DefaultBranch:       "main",
-			RequiredCheck:       "workflow-contract",
-			RequiredReviewCount: 1,
+			TestRepository: "skyhuang233/workflow-integration-test",
+			DefaultBranch:  "main",
+			RequiredCheck:  "workflow-contract",
 			Credential: GitHubCredentialPin{
-				Kind:                "fine-grained-pat",
-				AllowedRepositories: []string{"skyhuang233/workflow", "skyhuang233/workflow-integration-test"},
-				Permissions:         map[string]string{"contents": "write", "pull_requests": "write"},
+				Kind:            "fine-grained-pat",
+				Owner:           "skyhuang233",
+				AllRepositories: true,
+				Permissions: map[string]string{
+					"actions": "read", "contents": "write", "issues": "write",
+					"metadata": "read", "pull_requests": "write",
+				},
 			},
 		},
 		Upgrade: UpgradePolicy{Rule: "Upgrade only after compatibility and integration tests pass."},

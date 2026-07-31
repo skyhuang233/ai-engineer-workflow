@@ -1,0 +1,34 @@
+name: worker-contract
+
+on:
+  pull_request:
+    paths:
+      - "deploy/worker/**"
+      - "config/toolchain.json"
+      - ".github/workflows/worker-contract.yml"
+      - ".github/workflows/publish-worker.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Read accepted tool versions
+        id: pins
+        shell: bash
+        run: |
+          echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Build without publishing
+        run: docker build --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" --file deploy/worker/Dockerfile .
+      - name: Verify Worker contract
+        shell: bash
+        run: |
+          output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu 'codex --version; no-mistakes --version')"
+          grep --fixed-strings "${{ steps.pins.outputs.codex_version }}" <<<"$output"
+          grep --fixed-strings "${{ steps.pins.outputs.no_mistakes_version }}" <<<"$output"
+

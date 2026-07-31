@@ -21,14 +21,14 @@ jobs:
           cache: true
       - name: Exercise the control-plane contract seam
         run: go test ./internal/plan ./internal/store ./internal/agent ./internal/delivery ./internal/github
-      - name: Verify the dedicated GitHub repository contract
+      - name: Verify the public Owner-Guarded repository contract
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           repository="$(gh api "repos/${GITHUB_REPOSITORY}")"
           default_branch="$(jq -r '.default_branch' <<<"$repository")"
-          jq -e '.private == true and (.default_branch | length > 0)' <<<"$repository" >/dev/null
+          jq -e '.private == false and (.default_branch | length > 0)' <<<"$repository" >/dev/null
           gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${default_branch}" --jq '.object.sha' | grep -Eq '^[0-9a-f]{40}$'
           gh api "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=1" >/dev/null
           gh api "repos/${GITHUB_REPOSITORY}/pulls?state=all&per_page=1" >/dev/null

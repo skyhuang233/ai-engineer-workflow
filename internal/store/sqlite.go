@@ -664,6 +664,46 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (24, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
+		applied = 5
+	}
+	if applied < 6 {
+		statements := []string{
+			`CREATE TABLE worker_releases (
+    image_digest TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    source_commit TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+)`,
+			`CREATE TABLE active_worker_image (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    image_digest TEXT NOT NULL REFERENCES worker_releases(image_digest)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 6: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		applied = 6
+	}
+	if applied < 7 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE gateway_credential_verifications (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    fingerprint_sha256 TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    integration_repository TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 7: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

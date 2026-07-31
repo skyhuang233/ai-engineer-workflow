@@ -775,8 +775,8 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		}
 		return DeliveryTarget{VersionID: versionID, Repository: request.Repository, RootNumber: request.RootNumber}, request, nil
 	}
-	if request.RunID == "" || request.LeaseToken == "" || request.LeaseGeneration <= 0 || request.Repository == "" {
-		return DeliveryTarget{}, request, fmt.Errorf("%w: run lease and repository are required", ErrDeliveryRejected)
+	if request.RunID == "" || request.LeaseToken == "" || request.LeaseGeneration <= 0 {
+		return DeliveryTarget{}, request, fmt.Errorf("%w: run lease is required", ErrDeliveryRejected)
 	}
 	switch request.Operation {
 	case DeliveryPushCandidate, DeliveryUpsertPR, DeliveryReplyEvidence, DeliveryProjectPlan, DeliveryAddIssueLabel:
@@ -811,9 +811,10 @@ AND `+currentActiveUnfrozenPlanPredicate,
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
 	target.LeaseExpiresAt = expiresAt
-	if request.Repository != target.Repository {
+	if request.Repository != "" && request.Repository != target.Repository {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: repository does not belong to ticket", ErrDeliveryRejected)
 	}
+	request.Repository = target.Repository
 	if request.Branch != "" && request.Branch != target.Branch {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: branch does not belong to ticket", ErrDeliveryRejected)
 	}

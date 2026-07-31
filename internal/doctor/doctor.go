@@ -4,7 +4,6 @@ package doctor
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,8 +38,9 @@ type NoMistakesPin struct {
 }
 
 type WorkerPin struct {
-	Image        string `json:"image"`
-	LocalBuildID string `json:"local_build_id"`
+	Version           string `json:"version"`
+	ImageRepository   string `json:"image_repository"`
+	ReleaseRepository string `json:"release_repository"`
 }
 
 type RuntimePolicy struct {
@@ -48,20 +48,17 @@ type RuntimePolicy struct {
 }
 
 type GitHubPin struct {
-	TestRepository      string              `json:"test_repository"`
-	DefaultBranch       string              `json:"default_branch"`
-	RequiredCheck       string              `json:"required_check"`
-	RequiredReviewCount int                 `json:"required_review_count"`
-	Credential          GitHubCredentialPin `json:"credential"`
+	TestRepository string              `json:"test_repository"`
+	DefaultBranch  string              `json:"default_branch"`
+	RequiredCheck  string              `json:"required_check"`
+	Credential     GitHubCredentialPin `json:"credential"`
 }
 
 type GitHubCredentialPin struct {
-	Kind                string            `json:"kind"`
-	AllowedRepositories []string          `json:"allowed_repositories"`
-	Permissions         map[string]string `json:"permissions"`
-	ApprovedBy          string            `json:"approved_by"`
-	ApprovedAt          string            `json:"approved_at"`
-	FingerprintSHA256   string            `json:"fingerprint_sha256"`
+	Kind            string            `json:"kind"`
+	Owner           string            `json:"owner"`
+	AllRepositories bool              `json:"all_repositories"`
+	Permissions     map[string]string `json:"permissions"`
 }
 
 type UpgradePolicy struct {
@@ -104,7 +101,7 @@ func LoadConfig(path string) (Config, error) {
 
 func (c Config) Validate() error {
 	switch {
-	case c.SchemaVersion != 1:
+	case c.SchemaVersion != 2:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
@@ -120,10 +117,12 @@ func (c Config) Validate() error {
 		return errors.New("no-mistakes fork release is required")
 	case !sha256Pattern.MatchString(c.NoMistakes.LinuxAMD64SHA256):
 		return errors.New("no-mistakes Linux asset checksum must be SHA-256")
-	case !imagePattern.MatchString(c.Worker.Image):
-		return errors.New("worker image must use an immutable sha256 digest")
-	case !strings.HasPrefix(c.Worker.LocalBuildID, "sha256:") || !sha256Pattern.MatchString(strings.TrimPrefix(c.Worker.LocalBuildID, "sha256:")):
-		return errors.New("worker local build ID must be SHA-256")
+	case strings.TrimSpace(c.Worker.Version) == "":
+		return errors.New("worker version is required")
+	case !strings.HasPrefix(c.Worker.ImageRepository, "ghcr.io/") || strings.Contains(c.Worker.ImageRepository, "@"):
+		return errors.New("worker image repository must be an unpinned GHCR repository")
+	case !repoPattern.MatchString(c.Worker.ReleaseRepository):
+		return errors.New("worker release repository must be owner/name")
 	case c.Runtime.MaxWorkerAttempts < 1:
 		return errors.New("runtime max worker attempts must be positive")
 	case !repoPattern.MatchString(c.GitHub.TestRepository):
@@ -132,19 +131,35 @@ func (c Config) Validate() error {
 		return errors.New("GitHub default branch is required")
 	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
 		return errors.New("GitHub required check is required")
-	case c.GitHub.RequiredReviewCount < 1:
-		return errors.New("at least one human review is required")
-	case c.GitHub.Credential.Kind != "fine-grained-pat" && c.GitHub.Credential.Kind != "github-app":
-		return errors.New("GitHub credential must be a fine-grained PAT or GitHub App")
-	case len(c.GitHub.Credential.AllowedRepositories) == 0:
-		return errors.New("GitHub credential repository allowlist is required")
-	case len(c.GitHub.Credential.Permissions) == 0:
-		return errors.New("GitHub credential permission declaration is required")
+	case c.GitHub.Credential.Kind != "fine-grained-pat":
+		return errors.New("GitHub credential must be a fine-grained PAT")
+	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
+		return errors.New("GitHub credential owner is required")
+	case !c.GitHub.Credential.AllRepositories:
+		return errors.New("GitHub credential must cover all repositories")
+	case !validGatewayPermissions(c.GitHub.Credential.Permissions):
+		return errors.New("GitHub credential permissions must match the Gateway contract")
 	case strings.TrimSpace(c.Upgrade.Rule) == "":
 		return errors.New("toolchain upgrade rule is required")
 	default:
 		return nil
 	}
+}
+
+func validGatewayPermissions(actual map[string]string) bool {
+	expected := map[string]string{
+		"actions": "read", "contents": "write", "issues": "write",
+		"metadata": "read", "pull_requests": "write",
+	}
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name, access := range expected {
+		if actual[name] != access {
+			return false
+		}
+	}
+	return true
 }
 
 type Result struct {
@@ -295,11 +310,6 @@ func (c CodexResumeCheck) Run(ctx context.Context) Result {
 		return Result{Status: Fail, Summary: "resumed Codex session did not recall prior-turn context"}
 	}
 	return Result{Status: Pass, Summary: "persistent session ID created and resumed successfully"}
-}
-
-func credentialFingerprint(token string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
-	return fmt.Sprintf("%x", sum)
 }
 
 func jsonEventString(output []byte, eventType, field string) string {
