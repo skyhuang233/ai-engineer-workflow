@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -34,7 +36,8 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	databasePath string
 }
 
 type PlanVersion = plan.Version
@@ -42,6 +45,10 @@ type PlanVersion = plan.Version
 // Open configures SQLite as the durable runtime store and runs all pending
 // migrations before returning a usable Store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	databasePath := ""
+	if dsn != ":memory:" && !strings.HasPrefix(dsn, "file:") {
+		databasePath = dsn
+	}
 	if dsn == ":memory:" {
 		dsn = "file:workflow?mode=memory&cache=shared"
 	}
@@ -50,7 +57,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
+	store := &Store{db: db, databasePath: databasePath}
 	if err := store.configure(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -76,6 +83,9 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	if err := s.backupDatabase(ctx); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -209,7 +219,83 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return err
 		}
 	}
+	if applied < 4 {
+		statements := []string{
+			`ALTER TABLE ticket_sessions ADD COLUMN agent_identity TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ticket_sessions ADD COLUMN codex_session_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ticket_sessions ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ticket_sessions ADD COLUMN codex_state_path TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ticket_sessions ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ticket_sessions ADD COLUMN accepted_commit TEXT NOT NULL DEFAULT ''`,
+			`CREATE TABLE worker_audits (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    container_id TEXT NOT NULL,
+    image_digest TEXT NOT NULL,
+    mounts_json TEXT NOT NULL,
+    tool_versions_json TEXT NOT NULL,
+    github_write_credentials INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE TABLE candidate_revisions (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    session_id TEXT NOT NULL REFERENCES ticket_sessions(session_id),
+    codex_session_id TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    structured_output TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE TABLE run_diagnostics (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    diagnostics_path TEXT NOT NULL,
+    error TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 4: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+func (s *Store) backupDatabase(ctx context.Context) error {
+	if s.databasePath == "" {
+		return nil
+	}
+	if _, err := os.Stat(s.databasePath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("checkpoint sqlite before migration backup: %w", err)
+	}
+	data, err := os.ReadFile(s.databasePath)
+	if err != nil {
+		return fmt.Errorf("read sqlite migration backup: %w", err)
+	}
+	backupPath := s.databasePath + ".migration.bak"
+	if err := os.WriteFile(backupPath, data, 0o600); err != nil {
+		return fmt.Errorf("write sqlite migration backup: %w", err)
+	}
+	backup, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		return fmt.Errorf("open sqlite migration backup: %w", err)
+	}
+	defer backup.Close()
+	var result string
+	if err := backup.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		return fmt.Errorf("verify sqlite migration backup: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("verify sqlite migration backup: integrity check = %q", result)
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

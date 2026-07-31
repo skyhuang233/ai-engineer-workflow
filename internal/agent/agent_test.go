@@ -1,0 +1,249 @@
+package agent_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/skyhuang233/workflow/internal/agent"
+	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/worker"
+)
+
+type fakeRuntime struct {
+	results []worker.Result
+	specs   []worker.Spec
+	err     error
+	dirty   bool
+}
+
+func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, error) {
+	r.specs = append(r.specs, spec)
+	marker := "initial"
+	if len(spec.Command) > 2 && spec.Command[2] == "resume" {
+		marker = "resume"
+	}
+	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte("candidate "+marker+"\n"), 0o644); err != nil {
+		return worker.Result{}, err
+	}
+	if r.dirty {
+		result := r.results[0]
+		r.results = r.results[1:]
+		return result, r.err
+	}
+	for _, args := range [][]string{{"add", "agent.txt"}, {"commit", "-m", "candidate"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = spec.WorkspacePath
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Agent", "GIT_AUTHOR_EMAIL=agent@example.com", "GIT_COMMITTER_NAME=Agent", "GIT_COMMITTER_EMAIL=agent@example.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return worker.Result{}, err
+		} else if len(output) > 0 {
+			_ = output
+		}
+	}
+	result := r.results[0]
+	r.results = r.results[1:]
+	return result, nil
+}
+
+func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	if _, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"}); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.CodexSessionID != "codex-failed" {
+		t.Fatalf("failed-run Codex session = %q, want codex-failed", session.CodexSessionID)
+	}
+	status := exec.Command("git", "status", "--porcelain")
+	status.Dir = session.WorkspacePath
+	if output, err := status.CombinedOutput(); err != nil || string(output) != "" {
+		t.Fatalf("restored workspace status = %q, err = %v", output, err)
+	}
+	if _, err := os.Stat(filepath.Join(session.WorkspacePath, "agent.txt")); !os.IsNotExist(err) {
+		t.Fatalf("uncommitted worker file still exists, err = %v", err)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(diagnostic); err != nil {
+		t.Fatalf("diagnostic snapshot %q: %v", diagnostic, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(diagnostic), "residue", "agent.txt")); err != nil {
+		t.Fatalf("uncommitted residue evidence: %v", err)
+	}
+	audit, err := db.WorkerAudit(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.ContainerID != "container-failed" || audit.GitHubWriteCredentials {
+		t.Fatalf("audit = %#v", audit)
+	}
+	next, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.SessionID != claim.SessionID || next.Attempt != claim.Attempt+1 || next.LeaseGeneration != claim.LeaseGeneration+1 {
+		t.Fatalf("replacement claim = %#v, want same session and next run", next)
+	}
+}
+
+func createClaim(t *testing.T, ctx context.Context, root string) (*store.Store, store.PlanVersion, store.TicketClaim) {
+	t.Helper()
+	db, err := store.Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, version, claim
+}
+
+func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "human specification", Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	first := &fakeRuntime{results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-session-1"}` + "\n" + `{"type":"result","summary":"implemented"}`), ContainerID: "container-1"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
+	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.CodexSessionID != "codex-session-1" || candidate.Commit == "" {
+		t.Fatalf("candidate = %#v", candidate)
+	}
+	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --output-schema "+filepath.Join(root, "codex", claim.SessionID, "output-schema.json")+" implement the ticket" {
+		t.Fatalf("first worker spec = %#v", first.specs)
+	}
+	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
+		t.Fatalf("first worker isolation = %#v", first.specs[0])
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextClaim.SessionID != claim.SessionID {
+		t.Fatalf("replacement session = %q, want %q", nextClaim.SessionID, claim.SessionID)
+	}
+
+	second := &fakeRuntime{results: []worker.Result{{Output: []byte(`{"type":"result","session_id":"codex-session-1","summary":"revised"}`), ContainerID: "container-2"}}}
+	controller = agent.Controller{Store: db, Workspace: manager, Runtime: second, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
+	if _, err := controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "review the implementation"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.specs) != 1 || strings.Join(second.specs[0].Command, " ") != "codex exec resume codex-session-1 --json --output-schema "+filepath.Join(root, "codex", claim.SessionID, "output-schema.json")+" review the implementation" {
+		t.Fatalf("replacement worker spec = %#v", second.specs)
+	}
+	if second.specs[0].WorkspacePath != first.specs[0].WorkspacePath || second.specs[0].CodexStatePath != first.specs[0].CodexStatePath || second.specs[0].Branch != first.specs[0].Branch || second.specs[0].AgentIdentity != first.specs[0].AgentIdentity {
+		t.Fatalf("replacement lost durable identity: first=%#v second=%#v", first.specs[0], second.specs[0])
+	}
+
+	session, err := db.TicketSession(ctx, version.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.CodexSessionID != "codex-session-1" || session.WorkspacePath != first.specs[0].WorkspacePath || session.Branch != "ticket-1" {
+		t.Fatalf("persisted session = %#v", session)
+	}
+	if !json.Valid(candidate.StructuredOutput) {
+		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)
+	}
+}
+
+func initRepository(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	run("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md")
+	run("commit", "-m", "base")
+	return dir
+}
