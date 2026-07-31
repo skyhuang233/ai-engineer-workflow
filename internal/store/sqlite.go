@@ -19,13 +19,14 @@ const (
 )
 
 var (
-	ErrVersionConflict = errors.New("plan has already been activated with a different version")
-	ErrNotFound        = errors.New("plan not found")
-	ErrFencingConflict = errors.New("fencing conflict: ticket is already owned")
-	ErrNoReadyTickets  = errors.New("no ready tickets")
-	ErrCapacity        = errors.New("run capacity is full")
-	ErrNotReady        = errors.New("ticket is not ready")
-	ErrInvalidClaim    = errors.New("invalid ticket claim")
+	ErrVersionConflict    = errors.New("plan has already been activated with a different version")
+	ErrNotFound           = errors.New("plan not found")
+	ErrFencingConflict    = errors.New("fencing conflict: ticket is already owned")
+	ErrNoReadyTickets     = errors.New("no ready tickets")
+	ErrCapacity           = errors.New("run capacity is full")
+	ErrNotReady           = errors.New("ticket is not ready")
+	ErrInvalidClaim       = errors.New("invalid ticket claim")
+	ErrDeliveryInProgress = errors.New("delivery outbox item is already being processed")
 )
 
 const (
@@ -257,6 +258,54 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
+	if applied < 5 {
+		statements := []string{
+			`CREATE TABLE ticket_deliveries (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    repository TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    pull_request_number INTEGER NOT NULL DEFAULT 0,
+    pull_request_node_id TEXT NOT NULL DEFAULT '',
+    remote_head TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (version_id, issue_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE TABLE delivery_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'succeeded', 'rejected')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+)`,
+			`CREATE TABLE delivery_audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    operation TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE INDEX delivery_outbox_state_idx ON delivery_outbox(state, updated_at)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 5: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
