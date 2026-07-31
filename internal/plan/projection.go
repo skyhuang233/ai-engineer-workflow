@@ -13,9 +13,14 @@ type Projection struct {
 }
 
 type ProjectionTicket struct {
-	Number   int64
-	Title    string
-	Blockers []int64
+	Number          int64
+	Title           string
+	State           string
+	Owner           string
+	SessionID       string
+	RunID           string
+	LeaseGeneration int64
+	Blockers        []int64
 }
 
 // RenderProjection replaces only the control plane's hidden block. Human
@@ -50,14 +55,29 @@ func renderBlock(projection Projection) string {
 	if len(tickets) == 0 {
 		b.WriteString("No executable tickets.\n")
 	} else {
-		b.WriteString("| Ticket | Blocked by |\n| --- | --- |\n")
+		runtime := false
+		for _, ticket := range tickets {
+			if ticket.State != "" || ticket.Owner != "" || ticket.SessionID != "" || ticket.RunID != "" || ticket.LeaseGeneration != 0 {
+				runtime = true
+				break
+			}
+		}
+		if runtime {
+			b.WriteString("| Ticket | State | Owner | Session | Run | Lease | Blocked by |\n| --- | --- | --- | --- | --- | --- | --- |\n")
+		} else {
+			b.WriteString("| Ticket | Blocked by |\n| --- | --- |\n")
+		}
 		for _, ticket := range tickets {
 			blockers := make([]string, len(ticket.Blockers))
 			for i, blocker := range ticket.Blockers {
 				blockers[i] = fmt.Sprintf("#%d", blocker)
 			}
 			sort.Strings(blockers)
-			fmt.Fprintf(&b, "| #%d %s | %s |\n", ticket.Number, escapeCell(ticket.Title), strings.Join(blockers, ", "))
+			if runtime {
+				fmt.Fprintf(&b, "| #%d %s | %s | %s | %s | %s | %d | %s |\n", ticket.Number, escapeCell(ticket.Title), escapeCell(ticket.State), escapeCell(ticket.Owner), escapeCell(ticket.SessionID), escapeCell(ticket.RunID), ticket.LeaseGeneration, strings.Join(blockers, ", "))
+			} else {
+				fmt.Fprintf(&b, "| #%d %s | %s |\n", ticket.Number, escapeCell(ticket.Title), strings.Join(blockers, ", "))
+			}
 		}
 	}
 	fmt.Fprintf(&b, "%s", ProjectionEnd)

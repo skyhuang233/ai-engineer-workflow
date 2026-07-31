@@ -19,6 +19,18 @@ const (
 var (
 	ErrVersionConflict = errors.New("plan has already been activated with a different version")
 	ErrNotFound        = errors.New("plan not found")
+	ErrFencingConflict = errors.New("fencing conflict: ticket is already owned")
+	ErrNoReadyTickets  = errors.New("no ready tickets")
+	ErrCapacity        = errors.New("run capacity is full")
+	ErrNotReady        = errors.New("ticket is not ready")
+	ErrInvalidClaim    = errors.New("invalid ticket claim")
+)
+
+const (
+	SessionRunning = "running"
+	SessionClosed  = "closed"
+	RunRunning     = "running"
+	LeaseActive    = "active"
 )
 
 type Store struct {
@@ -130,6 +142,72 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
+		applied = 1
+	}
+	if applied < 2 {
+		statements := []string{
+			`CREATE TABLE ticket_sessions (
+    session_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('running', 'closed')),
+    current_run_id TEXT,
+    current_lease_generation INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (version_id, issue_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE TABLE worker_runs (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES ticket_sessions(session_id),
+    attempt INTEGER NOT NULL,
+    lease_generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed', 'superseded', 'cancelled')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE (session_id, attempt),
+    UNIQUE (session_id, lease_generation)
+)`,
+			`CREATE TABLE run_leases (
+    lease_token TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES worker_runs(run_id),
+    session_id TEXT NOT NULL REFERENCES ticket_sessions(session_id),
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'expired', 'revoked')),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (session_id, generation)
+)`,
+			`CREATE INDEX worker_runs_running_idx ON worker_runs(state)`,
+			`CREATE INDEX run_leases_live_idx ON run_leases(state, expires_at)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 2: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		applied = 2
+	}
+	if applied < 3 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE ticket_runtime (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting_review', 'needs_attention', 'delivered', 'cancelled')),
+    delivered INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (version_id, issue_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 3: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -185,6 +263,14 @@ VALUES (?, ?, ?, ?, ?, ?)`, versionID, planID, fingerprint, sourceRevision, Stat
 	for _, ticket := range snapshot.Tickets() {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO plan_tickets(version_id, issue_id, issue_number, title, body, state, delivered)
 VALUES (?, ?, ?, ?, ?, ?, ?)`, versionID, ticket.ID, ticket.Number, ticket.Title, ticket.Body, ticket.State, boolInt(ticket.IsDelivered())); err != nil {
+			return PlanVersion{}, err
+		}
+		runtimeState := plan.StateQueued
+		if ticket.IsDelivered() {
+			runtimeState = plan.StateDelivered
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
+VALUES (?, ?, ?, ?, ?)`, versionID, ticket.ID, runtimeState, boolInt(ticket.IsDelivered()), now); err != nil {
 			return PlanVersion{}, err
 		}
 	}

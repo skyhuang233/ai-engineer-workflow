@@ -1,0 +1,145 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := db.ClaimReady(ctx, ClaimRequest{
+		VersionID:       version.ID,
+		TicketID:        1,
+		Owner:           "agent-1",
+		MaxParallelRuns: 1,
+		LeaseTTL:        time.Minute,
+		Now:             time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.TicketID != 1 || claimed.SessionID == "" || claimed.RunID == "" || claimed.LeaseToken == "" || claimed.LeaseGeneration != 1 {
+		t.Fatalf("claim = %#v", claimed)
+	}
+
+	recovered, err := db.CurrentClaim(ctx, version.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.RunID != claimed.RunID || recovered.SessionID != claimed.SessionID || recovered.LeaseToken != claimed.LeaseToken {
+		t.Fatalf("recovered = %#v, want %#v", recovered, claimed)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 2, LeaseTTL: time.Minute}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("blocked ticket claim error = %v, want ErrNotReady", err)
+	}
+}
+
+func TestConcurrentClaimsHaveOneWinnerAndOneFencingConflict(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for _, owner := range []string{"agent-a", "agent-b"} {
+		wg.Add(1)
+		go func(owner string) {
+			defer wg.Done()
+			_, claimErr := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: owner, MaxParallelRuns: 2, LeaseTTL: time.Minute})
+			results <- claimErr
+		}(owner)
+	}
+	wg.Wait()
+	close(results)
+
+	var successes, conflicts int
+	for claimErr := range results {
+		switch {
+		case claimErr == nil:
+			successes++
+		case errors.Is(claimErr, ErrFencingConflict):
+			conflicts++
+		default:
+			t.Fatalf("claim error = %v, want nil or ErrFencingConflict", claimErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes = %d, conflicts = %d, want one each", successes, conflicts)
+	}
+}
+
+func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 2, LeaseTTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	frontier, err := db.ReadyFrontier(ctx, version.ID, 2, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 1 || frontier[0].IssueID != 2 {
+		t.Fatalf("frontier after delivery = %#v, want ticket 2", frontier)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delivered CurrentClaim error = %v, want ErrNotFound", err)
+	}
+}
