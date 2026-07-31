@@ -20,9 +20,12 @@ func (r *reader) ReadPlan(context.Context, string, int64) (plan.Snapshot, error)
 
 type projector struct{ body string }
 
-func (p *projector) UpdateIssueBody(_ context.Context, _ string, _ int64, body string) error {
-	p.body = body
-	return nil
+func (p *projector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection plan.Projection) error {
+	body, err := plan.RenderProjection(p.body, projection)
+	if err == nil {
+		p.body = body
+	}
+	return err
 }
 
 func (p *projector) AddIssueLabel(context.Context, string, int64, string) error { return nil }
@@ -57,7 +60,7 @@ func TestDispatcherClaimsAndProjectsRunningTicket(t *testing.T) {
 	}
 
 	rootReader := &reader{snapshot: snapshot}
-	rootProjector := &projector{}
+	rootProjector := &projector{body: snapshot.Root.Body + "\n\nhuman edit after snapshot"}
 	claim, err := (scheduler.Dispatcher{
 		Store:           db,
 		Reader:          rootReader,
@@ -69,7 +72,7 @@ func TestDispatcherClaimsAndProjectsRunningTicket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"human specification", "Running", "agent-1", claim.SessionID, claim.RunID} {
+	for _, expected := range []string{"human specification", "human edit after snapshot", "Running", "agent-1", claim.SessionID, claim.RunID} {
 		if !strings.Contains(rootProjector.body, expected) {
 			t.Fatalf("projected body %q does not contain %q", rootProjector.body, expected)
 		}

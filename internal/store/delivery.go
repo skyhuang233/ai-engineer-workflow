@@ -64,6 +64,7 @@ type DeliveryTarget struct {
 	PullRequestNumber int64
 	PullRequestNodeID string
 	RemoteHead        string
+	LeaseExpiresAt    time.Time
 }
 
 type DeliveryOutbox struct {
@@ -79,6 +80,7 @@ type DeliveryOutbox struct {
 	ClaimToken     string
 	NextAttemptAt  *time.Time
 	ReconcileOnly  bool
+	Uncertain      bool
 }
 
 type DeliveryResult struct {
@@ -144,14 +146,16 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 	var existingJSON string
 	var existing DeliveryOutbox
 	var existingCreated, existingUpdated, existingCompleted, existingNext string
-	err = tx.QueryRowContext(ctx, `SELECT id, idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, COALESCE(completed_at, ''), claim_token, next_attempt_at FROM delivery_outbox WHERE idempotency_key = ?`, key).
-		Scan(&existing.ID, &existing.IdempotencyKey, &existing.Request.Operation, &existingJSON, &existing.State, &existing.Attempts, &existing.LastError, &existingCreated, &existingUpdated, &existingCompleted, &existing.ClaimToken, &existingNext)
+	var existingUncertain int
+	err = tx.QueryRowContext(ctx, `SELECT id, idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, COALESCE(completed_at, ''), claim_token, next_attempt_at, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).
+		Scan(&existing.ID, &existing.IdempotencyKey, &existing.Request.Operation, &existingJSON, &existing.State, &existing.Attempts, &existing.LastError, &existingCreated, &existingUpdated, &existingCompleted, &existing.ClaimToken, &existingNext, &existingUncertain)
 	if err == nil {
 		var decoded DeliveryRequest
 		if err := json.Unmarshal([]byte(existingJSON), &decoded); err != nil {
 			return DeliveryOutbox{}, err
 		}
 		existing.Request = decoded
+		existing.Uncertain = existingUncertain != 0
 		existing.CreatedAt, err = time.Parse(time.RFC3339Nano, existingCreated)
 		if err != nil {
 			return DeliveryOutbox{}, err
@@ -233,7 +237,7 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 	return target, nil
 }
 
-func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, now time.Time, apply func(DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
+func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, now time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
 	if apply == nil {
 		return DeliveryResult{}, ErrInvalidClaim
 	}
@@ -242,37 +246,32 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 	} else {
 		now = now.UTC()
 	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = state WHERE run_id = ? AND lease_token = ? AND generation = ?`, request.RunID, request.LeaseToken, request.LeaseGeneration)
-	if err != nil {
-		return DeliveryResult{}, err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return DeliveryResult{}, fmt.Errorf("%w: lease is not current", ErrDeliveryRejected)
-	}
 	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
-	deliveryResult, err := apply(normalized)
+	if err := tx.Commit(); err != nil {
+		return DeliveryResult{}, err
+	}
+	remaining := target.LeaseExpiresAt.Sub(now)
+	if remaining <= 0 {
+		return DeliveryResult{}, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	deliveryResult, err := apply(operationCtx, normalized)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
-	if deliveryResult.PullRequestNumber != 0 && (normalized.Operation == DeliveryUpsertPR || normalized.Operation == DeliveryReplyEvidence) {
-		mapping, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = ?, pull_request_node_id = ?, remote_head = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryResult.PullRequestNodeID, deliveryResult.RemoteHead, formatTimestamp(now), target.VersionID, target.TicketID, target.Repository, target.Branch)
-		if err != nil {
-			return DeliveryResult{}, err
-		}
-		if count, _ := mapping.RowsAffected(); count != 1 {
-			return DeliveryResult{}, ErrNotFound
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return DeliveryResult{}, err
+	if err := operationCtx.Err(); err != nil {
+		return DeliveryResult{}, fmt.Errorf("delivery lease expired during external write: %w", err)
 	}
 	return deliveryResult, nil
 }
@@ -280,8 +279,9 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox, error) {
 	var result DeliveryOutbox
 	var raw, created, updated, completed, next string
-	err := s.db.QueryRowContext(ctx, `SELECT id, idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, COALESCE(completed_at, ''), claim_token, next_attempt_at FROM delivery_outbox WHERE idempotency_key = ?`, key).
-		Scan(&result.ID, &result.IdempotencyKey, &result.Request.Operation, &raw, &result.State, &result.Attempts, &result.LastError, &created, &updated, &completed, &result.ClaimToken, &next)
+	var uncertain int
+	err := s.db.QueryRowContext(ctx, `SELECT id, idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, COALESCE(completed_at, ''), claim_token, next_attempt_at, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).
+		Scan(&result.ID, &result.IdempotencyKey, &result.Request.Operation, &raw, &result.State, &result.Attempts, &result.LastError, &created, &updated, &completed, &result.ClaimToken, &next, &uncertain)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, ErrNotFound
 	}
@@ -291,6 +291,7 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 	if err := json.Unmarshal([]byte(raw), &result.Request); err != nil {
 		return DeliveryOutbox{}, err
 	}
+	result.Uncertain = uncertain != 0
 	result.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 	if err != nil {
 		return DeliveryOutbox{}, err
@@ -329,7 +330,8 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	defer tx.Rollback()
 	var state, updatedText, nextAttemptText, raw string
 	var attempts int
-	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw); errors.Is(err, sql.ErrNoRows) {
+	var uncertain int
+	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw, &uncertain); errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, ErrNotFound
 	} else if err != nil {
 		return DeliveryOutbox{}, err
@@ -358,7 +360,7 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 			return DeliveryOutbox{}, ErrDeliveryInProgress
 		}
 	}
-	reconcileOnly := state == OutboxProcessing && attempts >= maxDeliveryAttempts
+	reconcileOnly := uncertain != 0 || state == OutboxProcessing
 	if attempts >= maxDeliveryAttempts && !reconcileOnly {
 		var request DeliveryRequest
 		if err := json.Unmarshal([]byte(raw), &request); err != nil {
@@ -399,6 +401,14 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 }
 
 func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now)
+}
+
+func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now)
+}
+
+func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time) error {
 	if state != OutboxPending && state != OutboxSucceeded && state != OutboxRejected {
 		return ErrInvalidClaim
 	}
@@ -426,7 +436,7 @@ func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	nextAttempt := formatTimestamp(now)
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
-	} else if attempts >= maxDeliveryAttempts {
+	} else if attempts >= maxDeliveryAttempts && !uncertain {
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
@@ -440,12 +450,57 @@ func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	} else {
 		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(attempts-1))))
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', next_attempt_at = ?, updated_at = ?, completed_at = CASE WHEN ? = '' THEN completed_at ELSE ? END WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, state, lastError, nextAttempt, formatTimestamp(now), completed, completed, key, OutboxProcessing, claimToken)
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', next_attempt_at = ?, updated_at = ?, completed_at = CASE WHEN ? = '' THEN completed_at ELSE ? END, uncertain = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, state, lastError, nextAttempt, formatTimestamp(now), completed, completed, boolInt(uncertain), key, OutboxProcessing, claimToken)
 	if err != nil {
 		return err
 	}
 	count, _ := result.RowsAffected()
 	if count == 0 {
+		return ErrFencingConflict
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CompleteDeliveryOutbox(ctx context.Context, key, claimToken string, deliveryResult DeliveryResult, now time.Time) error {
+	if claimToken == "" {
+		return ErrFencingConflict
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var raw string
+	if err := tx.QueryRowContext(ctx, `SELECT request_json FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&raw); errors.Is(err, sql.ErrNoRows) {
+		return ErrFencingConflict
+	} else if err != nil {
+		return err
+	}
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return err
+	}
+	if deliveryResult.PullRequestNumber != 0 && request.Operation == DeliveryUpsertPR {
+		result, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = ?, pull_request_node_id = ?, remote_head = ?, updated_at = ?
+WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?)
+AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryResult.PullRequestNodeID, deliveryResult.RemoteHead, formatTimestamp(now), request.RunID, request.Repository, request.Branch)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return ErrNotFound
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = '', claim_token = '', uncertain = 0, updated_at = ?, completed_at = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, OutboxSucceeded, formatTimestamp(now), formatTimestamp(now), key, OutboxProcessing, claimToken)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
 		return ErrFencingConflict
 	}
 	return tx.Commit()
@@ -556,6 +611,7 @@ WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id 
 	if err != nil || !expiresAt.After(now) {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
+	target.LeaseExpiresAt = expiresAt
 	if request.Repository != target.Repository {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: repository does not belong to ticket", ErrDeliveryRejected)
 	}

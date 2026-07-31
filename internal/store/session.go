@@ -36,6 +36,7 @@ type WorkerAudit struct {
 	ContainerID            string
 	ImageDigest            string
 	Mounts                 any
+	ExtraHosts             any
 	ToolVersions           any
 	GitHubWriteCredentials bool
 }
@@ -62,6 +63,7 @@ type WorkerAuditRecord struct {
 	ContainerID            string
 	ImageDigest            string
 	MountsJSON             string
+	ExtraHostsJSON         string
 	ToolVersionsJSON       string
 	GitHubWriteCredentials bool
 }
@@ -141,9 +143,13 @@ func (s *Store) RecordWorkerAudit(ctx context.Context, audit WorkerAudit) error 
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_audits(run_id, container_id, image_digest, mounts_json, tool_versions_json, github_write_credentials, created_at)
-SELECT r.run_id, ?, ?, ?, ?, ?, ? FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
+	extraHosts, err := json.Marshal(audit.ExtraHosts)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_audits(run_id, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials, created_at)
+SELECT r.run_id, ?, ?, ?, ?, ?, ?, ? FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(extraHosts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
 	if err != nil {
 		return err
 	}
@@ -157,8 +163,8 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit
 func (s *Store) WorkerAudit(ctx context.Context, runID string) (WorkerAuditRecord, error) {
 	var record WorkerAuditRecord
 	var credentials int
-	err := s.db.QueryRowContext(ctx, `SELECT run_id, container_id, image_digest, mounts_json, tool_versions_json, github_write_credentials FROM worker_audits WHERE run_id = ?`, runID).
-		Scan(&record.RunID, &record.ContainerID, &record.ImageDigest, &record.MountsJSON, &record.ToolVersionsJSON, &credentials)
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials FROM worker_audits WHERE run_id = ?`, runID).
+		Scan(&record.RunID, &record.ContainerID, &record.ImageDigest, &record.MountsJSON, &record.ExtraHostsJSON, &record.ToolVersionsJSON, &credentials)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerAuditRecord{}, ErrNotFound
 	}
@@ -215,6 +221,8 @@ func (s *Store) CandidateRevision(ctx context.Context, runID string) (CandidateR
 }
 
 func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	if candidate.RunID == "" || candidate.LeaseToken == "" || candidate.CodexSessionID == "" || candidate.CommitSHA == "" || len(candidate.StructuredOutput) == 0 {
 		return ErrInvalidClaim
 	}
@@ -264,6 +272,8 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 }
 
 func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	if failure.RunID == "" || failure.LeaseToken == "" || failure.DiagnosticsPath == "" {
 		return ErrInvalidClaim
 	}

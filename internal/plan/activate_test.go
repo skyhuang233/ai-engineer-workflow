@@ -15,16 +15,24 @@ func (f fakeReader) ReadPlan(context.Context, string, int64) (Snapshot, error) {
 }
 
 type fakeProjector struct {
-	body   string
-	bodies []string
-	label  string
-	err    error
+	body          string
+	bodies        []string
+	label         string
+	err           error
+	beforeProject func(*fakeProjector)
 }
 
-func (f *fakeProjector) UpdateIssueBody(_ context.Context, _ string, _ int64, body string) error {
+func (f *fakeProjector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection Projection) error {
+	if f.beforeProject != nil {
+		f.beforeProject(f)
+	}
+	body, err := RenderProjection(f.body, projection)
+	if err != nil {
+		return err
+	}
 	f.body = body
 	f.bodies = append(f.bodies, body)
-	return f.err
+	return errors.Join(err, f.err)
 }
 
 func (f *fakeProjector) AddIssueLabel(_ context.Context, _ string, _ int64, label string) error {
@@ -57,7 +65,7 @@ func TestActivatorProjectsAndCommitsOnlyAfterProjection(t *testing.T) {
 		Children:   []Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{TicketLabel}, State: "open"}},
 		BlockedBy:  map[int64][]Issue{},
 	}}
-	projector := &fakeProjector{}
+	projector := &fakeProjector{body: reader.snapshot.Root.Body}
 	store := &fakeStore{}
 	version, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10)
 	if err != nil {
@@ -83,13 +91,34 @@ func TestActivatorLeavesVersionProjectingWhenGitHubProjectionFails(t *testing.T)
 		Root:       Issue{ID: 100, Number: 10, Labels: []string{PlanLabel}},
 		Children:   []Issue{{ID: 1, Number: 11, Labels: []string{TicketLabel}, State: "open"}},
 	}}
-	projector := &fakeProjector{err: errors.New("timeout")}
+	projector := &fakeProjector{body: reader.snapshot.Root.Body, err: errors.New("timeout")}
 	store := &fakeStore{}
 	if _, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10); err == nil {
 		t.Fatal("Activate() succeeded despite projection failure")
 	}
 	if store.marked != "" || store.version.State != "projecting" {
 		t.Fatalf("store = %#v, marked = %q; incomplete activation became active", store.version, store.marked)
+	}
+}
+
+func TestActivatorPreservesHumanEditsMadeBetweenProjectionWrites(t *testing.T) {
+	reader := fakeReader{snapshot: Snapshot{
+		Repository: "owner/repo",
+		Root:       Issue{ID: 100, Number: 10, Body: "approved spec", Labels: []string{PlanLabel}},
+		Children:   []Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{TicketLabel}, State: "open"}},
+		BlockedBy:  map[int64][]Issue{},
+	}}
+	projector := &fakeProjector{body: reader.snapshot.Root.Body}
+	projector.beforeProject = func(projector *fakeProjector) {
+		if len(projector.bodies) == 1 {
+			projector.body += "\n\nhuman edit during activation"
+		}
+	}
+	if _, err := (Activator{Reader: reader, Projector: projector, Store: &fakeStore{}}).Activate(context.Background(), "owner/repo", 10); err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(projector.body, "human edit during activation") {
+		t.Fatalf("active projection overwrote concurrent edit: %q", projector.body)
 	}
 }
 

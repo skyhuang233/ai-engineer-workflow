@@ -93,9 +93,6 @@ func (c *Client) listIssues(ctx context.Context, path string) ([]plan.Issue, err
 	}
 }
 
-// UpdateIssueBody is the only GitHub write used by this slice. The caller
-// passes a body produced by plan.RenderProjection; no human-maintained body
-// text is reconstructed here.
 func (c *Client) UpdateIssueBody(ctx context.Context, repository string, number int64, body string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return err
@@ -104,6 +101,18 @@ func (c *Client) UpdateIssueBody(ctx context.Context, repository string, number 
 		Body string `json:"body"`
 	}{Body: body}
 	return c.requestJSON(ctx, http.MethodPatch, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10), payload, nil)
+}
+
+func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) error {
+	issue, err := c.getIssue(ctx, repository, number)
+	if err != nil {
+		return err
+	}
+	body, err := plan.RenderProjection(issue.Body, projection)
+	if err != nil {
+		return err
+	}
+	return c.UpdateIssueBody(ctx, repository, number, body)
 }
 
 func (c *Client) AddIssueLabel(ctx context.Context, repository string, number int64, label string) error {
@@ -176,16 +185,7 @@ func (i issueResponse) issue() plan.Issue {
 	for _, label := range i.Labels {
 		labels = append(labels, label.Name)
 	}
-	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt, Delivered: contains(labels, "workflow:delivered")}
-}
-
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt}
 }
 
 // ValidateRepository prevents accidental path traversal when a repository is

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -53,6 +54,37 @@ func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	}
 	if recovered.ID != first.ID || recovered.State != StateActive {
 		t.Fatalf("recovered = %#v, want persisted active version", recovered)
+	}
+}
+
+func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	before, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("opening a current database overwrote its migration backup")
 	}
 }
 

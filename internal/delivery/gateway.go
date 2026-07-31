@@ -32,6 +32,19 @@ type Gateway struct {
 	Now    func() time.Time
 }
 
+type uncertainWriteError struct {
+	applyErr   error
+	observeErr error
+}
+
+func (e *uncertainWriteError) Error() string {
+	return fmt.Sprintf("%v; observe uncertain result: %v", e.applyErr, e.observeErr)
+}
+
+func (e *uncertainWriteError) Unwrap() error {
+	return e.applyErr
+}
+
 func (g Gateway) now() time.Time {
 	if g.Now != nil {
 		return g.Now().UTC()
@@ -64,37 +77,36 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
 	}
-	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now(), func(request store.DeliveryRequest) (store.DeliveryResult, error) {
-		if outbox.ReconcileOnly {
-			observation, observeErr := g.Remote.Observe(ctx, request)
-			if observeErr != nil {
-				return store.DeliveryResult{}, observeErr
+	observation, observeErr := g.Remote.Observe(ctx, outbox.Request)
+	if observeErr != nil {
+		if outbox.ReconcileOnly || outbox.Uncertain {
+			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, observeErr.Error(), g.now()); finishErr != nil {
+				return finishErr
 			}
-			if !observation.Applied {
-				return store.DeliveryResult{}, errors.New("delivery retries exhausted without observing the requested mutation")
-			}
-			return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
+			return observeErr
 		}
-		if request.ExpectedRemoteHead != "" || request.ExpectRemoteAbsent {
-			observation, observeErr := g.Remote.Observe(ctx, request)
-			if observeErr != nil {
-				return store.DeliveryResult{}, observeErr
-			}
-			if request.ExpectRemoteAbsent && observation.RemoteExists {
-				return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
-			}
-			if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
-				return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
-			}
-		}
-		observation, applyErr := g.Remote.Apply(ctx, request)
+		return g.retry(ctx, outbox, observeErr)
+	}
+	if observation.Applied {
+		return g.succeed(ctx, outbox, resultFrom(observation))
+	}
+	if outbox.Request.ExpectRemoteAbsent && observation.RemoteExists {
+		err := fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
+		return g.reject(ctx, outbox, err)
+	}
+	if outbox.Request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != outbox.Request.ExpectedRemoteHead) {
+		err := fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, outbox.Request.ExpectedRemoteHead)
+		return g.reject(ctx, outbox, err)
+	}
+	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now(), func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+		observation, applyErr := g.Remote.Apply(operationCtx, request)
 		if applyErr != nil {
 			observed, observeErr := g.Remote.Observe(ctx, request)
 			if observeErr == nil && observed.Applied {
 				observation = observed
 				applyErr = nil
 			} else if observeErr != nil {
-				applyErr = fmt.Errorf("%v; observe uncertain result: %w", applyErr, observeErr)
+				applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
 			}
 		}
 		if applyErr != nil {
@@ -104,9 +116,11 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrDeliveryRejected) {
-			_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", err.Error(), g.now())
-			finishErr := g.Store.FinishDeliveryOutbox(ctx, key, outbox.ClaimToken, store.OutboxRejected, err.Error(), g.now())
-			if finishErr != nil {
+			return g.reject(ctx, outbox, err)
+		}
+		var uncertain *uncertainWriteError
+		if errors.As(err, &uncertain) {
+			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
 				return finishErr
 			}
 			return err
@@ -116,8 +130,20 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	return g.succeed(ctx, outbox, result)
 }
 
-func (g Gateway) succeed(ctx context.Context, outbox store.DeliveryOutbox, _ store.DeliveryResult) error {
-	return g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxSucceeded, "", g.now())
+func resultFrom(observation Observation) store.DeliveryResult {
+	return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}
+}
+
+func (g Gateway) succeed(ctx context.Context, outbox store.DeliveryOutbox, result store.DeliveryResult) error {
+	return g.Store.CompleteDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, result, g.now())
+}
+
+func (g Gateway) reject(ctx context.Context, outbox store.DeliveryOutbox, err error) error {
+	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", err.Error(), g.now())
+	if finishErr := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, err.Error(), g.now()); finishErr != nil {
+		return finishErr
+	}
+	return err
 }
 
 func (g Gateway) retry(ctx context.Context, outbox store.DeliveryOutbox, err error) error {

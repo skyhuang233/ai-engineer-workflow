@@ -7,7 +7,7 @@ import (
 )
 
 func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
-	spec := Spec{Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1", AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, Environment: map[string]string{"GITHUB_TOKEN": "secret"}}
+	spec := Spec{Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1", AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, Environment: map[string]string{"GITHUB_TOKEN": "secret"}, ExtraHosts: []string{GatewayHostMapping}}
 	if !errors.Is(spec.Validate(), ErrGitHubCredential) {
 		t.Fatalf("Validate error = %v, want ErrGitHubCredential", spec.Validate())
 	}
@@ -15,6 +15,24 @@ func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
 	spec.ToolVersions = nil
 	if spec.Validate() == nil {
 		t.Fatal("Validate accepted a spec without tool versions")
+	}
+}
+
+func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
+	spec := Spec{
+		Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"},
+		ExtraHosts: []string{GatewayHostMapping},
+	}
+	args := dockerArgs(spec)
+	found := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--add-host" && args[i+1] == GatewayHostMapping {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("docker args omit Gateway host mapping: %#v", args)
 	}
 }
 

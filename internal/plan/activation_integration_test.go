@@ -20,9 +20,12 @@ type integrationProjector struct {
 	label string
 }
 
-func (p *integrationProjector) UpdateIssueBody(_ context.Context, _ string, _ int64, body string) error {
-	p.body = body
-	return nil
+func (p *integrationProjector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection plan.Projection) error {
+	body, err := plan.RenderProjection(p.body, projection)
+	if err == nil {
+		p.body = body
+	}
+	return err
 }
 
 func (p *integrationProjector) AddIssueLabel(_ context.Context, _ string, _ int64, label string) error {
@@ -46,7 +49,7 @@ func TestActivationPathPersistsOneVersionAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	projector := &integrationProjector{}
+	projector := &integrationProjector{body: snapshot.Root.Body}
 	reader := &integrationReader{snapshot: snapshot}
 	activator := plan.Activator{Reader: reader, Projector: projector, Store: runtimeStore}
 	first, err := activator.Activate(ctx, snapshot.Repository, snapshot.Root.Number)

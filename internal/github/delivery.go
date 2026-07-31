@@ -120,15 +120,7 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		if request.PlanProjection == nil {
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
-		issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
-		if err != nil {
-			return delivery.Observation{}, err
-		}
-		body, err := plan.RenderProjection(issue.Body, *request.PlanProjection)
-		if err != nil {
-			return delivery.Observation{}, err
-		}
-		if err := r.Client.UpdateIssueBody(ctx, request.Repository, request.RootNumber, body); err != nil {
+		if err := r.Client.UpdatePlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil

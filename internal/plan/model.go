@@ -58,7 +58,7 @@ func (i Issue) IsPlanRoot() bool {
 }
 
 func (i Issue) IsDelivered() bool {
-	return i.Delivered || i.HasLabel("workflow:delivered")
+	return i.Delivered
 }
 
 // Snapshot is one read of the GitHub Plan Root and its native graph. Children
