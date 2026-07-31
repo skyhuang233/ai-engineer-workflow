@@ -29,14 +29,115 @@ gh_afk_require_tools() {
   gh auth status
 }
 
+gh_afk_is_transient_github_error() {
+  local error_file="$1"
+
+  grep -Eiq \
+    'TLS handshake timeout|dial tcp|connectex:|connection reset by peer|connection timed out|i/o timeout|unexpected EOF|(^|: )EOF$|could not resolve host|temporary failure|HTTP (502|503|504)|Bad Gateway|Service Unavailable|Gateway Timeout|stream error' \
+    "$error_file"
+}
+
+gh_afk_retry_read() {
+  local attempts="${GH_AFK_RETRY_ATTEMPTS:-5}"
+  local delay="${GH_AFK_RETRY_BASE_DELAY_SECONDS:-2}"
+  local max_delay="${GH_AFK_RETRY_MAX_DELAY_SECONDS:-30}"
+  local attempt
+  local status
+  local stdout_file
+  local stderr_file
+
+  if ! [[ "$attempts" =~ ^[1-9][0-9]*$ ]]; then
+    attempts=5
+  fi
+  if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+    delay=2
+  fi
+  if ! [[ "$max_delay" =~ ^[0-9]+$ ]]; then
+    max_delay=30
+  fi
+  if [ "$delay" -gt "$max_delay" ]; then
+    delay="$max_delay"
+  fi
+
+  stdout_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if "$@" >"$stdout_file" 2>"$stderr_file"; then
+      cat "$stdout_file"
+      cat "$stderr_file" >&2
+      rm -f "$stdout_file" "$stderr_file"
+      return 0
+    else
+      status="$?"
+    fi
+
+    if [ "$attempt" -ge "$attempts" ] \
+      || ! gh_afk_is_transient_github_error "$stderr_file"; then
+      cat "$stdout_file"
+      cat "$stderr_file" >&2
+      rm -f "$stdout_file" "$stderr_file"
+      return "$status"
+    fi
+
+    cat "$stderr_file" >&2
+    echo "Transient GitHub read failure; retrying in ${delay}s (attempt $attempt/$attempts)." >&2
+    if [ "$delay" -gt 0 ]; then
+      sleep "$delay"
+    fi
+
+    : >"$stdout_file"
+    : >"$stderr_file"
+
+    if [ "$delay" -lt "$max_delay" ]; then
+      delay=$((delay * 2))
+      if [ "$delay" -gt "$max_delay" ]; then
+        delay="$max_delay"
+      fi
+    fi
+  done
+
+  rm -f "$stdout_file" "$stderr_file"
+  return 1
+}
+
 gh_afk_ensure_label() {
   local name="$1"
   local color="$2"
   local description="$3"
+  local labels
+  local create_error_file
+  local create_status
 
-  if ! gh label list --limit 1000 --json name --jq '.[].name' | grep -Fxq "$name"; then
-    gh label create "$name" --color "$color" --description "$description" >/dev/null
+  if ! labels="$(gh_afk_retry_read gh label list --limit 1000 --json name --jq '.[].name')"; then
+    echo "Cannot ensure label '$name': unable to list repository labels." >&2
+    return 1
   fi
+
+  if grep -Fxq "$name" <<<"$labels"; then
+    return 0
+  fi
+
+  create_error_file="$(mktemp)"
+  if gh label create "$name" --color "$color" --description "$description" \
+    >/dev/null 2>"$create_error_file"; then
+    rm -f "$create_error_file"
+    return 0
+  else
+    create_status="$?"
+  fi
+
+  # A create request may have reached GitHub even when its response was lost.
+  # Re-read before reporting failure so an existing label remains idempotent.
+  if labels="$(gh_afk_retry_read gh label list --limit 1000 --json name --jq '.[].name')" \
+    && grep -Fxq "$name" <<<"$labels"; then
+    rm -f "$create_error_file"
+    return 0
+  fi
+
+  cat "$create_error_file" >&2
+  rm -f "$create_error_file"
+  return "$create_status"
 }
 
 gh_afk_ensure_labels() {
@@ -129,7 +230,7 @@ gh_afk_has_issue_contract_sections() {
 gh_afk_structured_issue_comment_body() {
   local number="$1"
 
-  gh issue view "$number" --json comments --jq '
+  gh_afk_retry_read gh issue view "$number" --json comments --jq '
     (.comments // [])
     | map(.body // "")
     | map(select(
@@ -474,9 +575,9 @@ gh_afk_check_issue_candidate() {
   fi
 
   for dep in $refs; do
-    if ! dep_state="$(gh issue view "$dep" --json state --jq '.state')"; then
-      echo "Malformed ready-for-agent issue #$number ($title): cannot read blocker #$dep." >&2
-      return 2
+    if ! dep_state="$(gh_afk_retry_read gh issue view "$dep" --json state --jq '.state')"; then
+      echo "Cannot evaluate ready-for-agent issue #$number ($title): GitHub is unavailable while reading blocker #$dep." >&2
+      return 3
     fi
     if [ "$dep_state" != "CLOSED" ]; then
       echo "Skipping issue #$number: blocker #$dep is $dep_state." >&2
@@ -492,7 +593,7 @@ gh_afk_issue_last_claim_agent() {
   local agent_name="$2"
   local claim_body
 
-  if ! claim_body="$(gh issue view "$number" --json comments --jq '
+  if ! claim_body="$(gh_afk_retry_read gh issue view "$number" --json comments --jq '
     (.comments // [])
     | map(.body // "")
     | map(select(test("^Claimed by .+ AFK loop at ")))
@@ -600,7 +701,7 @@ gh_afk_select_issue() {
   local skipped_for_dependency=0
 
   issues_file="$(mktemp)"
-  if ! gh issue list \
+  if ! gh_afk_retry_read gh issue list \
     --state open \
     --label ready-for-agent \
     --limit 1000 \
@@ -697,7 +798,7 @@ gh_afk_render_issue_context() {
   local contract_body
   local parent_number
 
-  body="$(gh issue view "$number" --json body --jq '.body // ""')"
+  body="$(gh_afk_retry_read gh issue view "$number" --json body --jq '.body // ""')"
   if contract_body="$(gh_afk_resolve_issue_contract_body "$number" "$body")"; then
     body="$contract_body"
   fi
@@ -705,7 +806,7 @@ gh_afk_render_issue_context() {
 
   echo "# Selected GitHub issue"
   echo ""
-  gh issue view "$number" --comments
+  gh_afk_retry_read gh issue view "$number" --comments
   echo ""
 
   if printf '%s' "$body" | gh_afk_has_text; then
@@ -718,7 +819,7 @@ gh_afk_render_issue_context() {
   if [ -n "$parent_number" ]; then
     echo "# Parent issue context"
     echo ""
-    gh issue view "$parent_number" --comments
+    gh_afk_retry_read gh issue view "$parent_number" --comments
     echo ""
   fi
 }
