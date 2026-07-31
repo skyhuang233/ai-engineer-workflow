@@ -51,16 +51,28 @@ func (s Spec) Validate() error {
 		return errors.New("worker tool versions are required")
 	}
 	for name := range s.Environment {
-		if isGitHubCredential(name) {
+		if IsGitHubCredentialName(name) {
 			return fmt.Errorf("%w: %s", ErrGitHubCredential, name)
 		}
 	}
 	return nil
 }
 
-func isGitHubCredential(name string) bool {
+// IsGitHubCredentialName is the single production classifier used to keep
+// GitHub write credentials outside Worker processes and containers.
+func IsGitHubCredentialName(name string) bool {
 	name = strings.ToUpper(name)
-	return name == "GH_TOKEN" || name == "GITHUB_TOKEN" || name == "GH_ENTERPRISE_TOKEN" || name == "GITHUB_ENTERPRISE_TOKEN" || strings.Contains(name, "GITHUB_TOKEN")
+	return name == "GH_TOKEN" ||
+		name == "GITHUB_TOKEN" ||
+		name == "GH_ENTERPRISE_TOKEN" ||
+		name == "GITHUB_ENTERPRISE_TOKEN" ||
+		name == "GH_PAT" ||
+		name == "GITHUB_PAT" ||
+		name == "GH_OAUTH_TOKEN" ||
+		name == "GITHUB_OAUTH_TOKEN" ||
+		strings.Contains(name, "GITHUB_TOKEN") ||
+		strings.Contains(name, "GITHUB_PAT") ||
+		strings.Contains(name, "GITHUB_OAUTH")
 }
 
 // ProcessRuntime is the host-process adapter used by local development and
@@ -99,7 +111,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if !isGitHubCredential(key) {
+		if !IsGitHubCredentialName(key) {
 			value := spec.Environment[key]
 			if key == "CODEX_HOME" {
 				value = containerPath(value, spec.Mounts)
@@ -166,7 +178,7 @@ func (r ProcessRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 func explicitEnvironment(values map[string]string) []string {
 	result := make([]string, 0, len(values)+1)
 	for name, value := range values {
-		if isGitHubCredential(name) {
+		if IsGitHubCredentialName(name) {
 			continue
 		}
 		result = append(result, name+"="+value)

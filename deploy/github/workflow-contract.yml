@@ -1,0 +1,16 @@
+name: workflow-contract
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: workflow-contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm protected integration repository
+        run: echo "workflow integration contract is available"

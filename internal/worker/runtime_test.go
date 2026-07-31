@@ -18,6 +18,27 @@ func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
 	}
 }
 
+func TestGitHubCredentialClassifierCoversTokenAliases(t *testing.T) {
+	for _, name := range []string{
+		"GH_TOKEN",
+		"GITHUB_TOKEN",
+		"GH_ENTERPRISE_TOKEN",
+		"GITHUB_ENTERPRISE_TOKEN",
+		"GH_PAT",
+		"GITHUB_PAT",
+		"GH_OAUTH_TOKEN",
+		"GITHUB_OAUTH_TOKEN",
+		"MY_GITHUB_TOKEN",
+	} {
+		if !IsGitHubCredentialName(name) {
+			t.Errorf("IsGitHubCredentialName(%q) = false", name)
+		}
+	}
+	if IsGitHubCredentialName("WORKFLOW_GATEWAY_PROBE_TOKEN") {
+		t.Fatal("Gateway probe token was misclassified as a GitHub credential")
+	}
+}
+
 func TestContainerPathMapsHostMounts(t *testing.T) {
 	host := filepath.Join(t.TempDir(), "codex")
 	mounts := []Mount{{Source: host, Target: "/codex-state"}}
