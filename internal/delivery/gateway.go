@@ -36,6 +36,10 @@ type Remote interface {
 	Apply(context.Context, store.DeliveryRequest) (Observation, error)
 }
 
+type credentialAwareRemote interface {
+	CredentialAvailable(context.Context) error
+}
+
 type Gateway struct {
 	Store  *store.Store
 	Remote Remote
@@ -81,6 +85,15 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return err
 	} else if paused {
 		return fmt.Errorf("%w: %s", ErrGatewayWritesPaused, reason)
+	}
+	if remote, ok := g.Remote.(credentialAwareRemote); ok {
+		if err := remote.CredentialAvailable(ctx); err != nil {
+			reason := "Gateway Credential is missing; provision and verify it to resume writes"
+			if pauseErr := g.Store.PauseGatewayWrites(ctx, reason, g.now()); pauseErr != nil {
+				return fmt.Errorf("%v; persist Gateway pause: %w", err, pauseErr)
+			}
+			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
+		}
 	}
 	outbox, err := g.Store.ClaimDeliveryOutbox(ctx, key, g.now())
 	if err != nil {

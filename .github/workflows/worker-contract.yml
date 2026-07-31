@@ -23,12 +23,20 @@ jobs:
           echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Build without publishing
-        run: docker build --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" --file deploy/worker/Dockerfile .
+        run: |
+          docker build \
+            --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
+            --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
+            --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+            --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+            --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" \
+            --file deploy/worker/Dockerfile .
       - name: Verify Worker contract
         shell: bash
         run: |
           output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu 'codex --version; no-mistakes --version')"
           grep --fixed-strings "${{ steps.pins.outputs.codex_version }}" <<<"$output"
           grep --fixed-strings "${{ steps.pins.outputs.no_mistakes_version }}" <<<"$output"
-

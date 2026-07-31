@@ -182,24 +182,31 @@ func credentialCommand() {
 	credentialStore := credential.NewStore()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
-		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
-	}
-	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
-		exitError(err)
-	}
 	database, err := store.Open(ctx, *databasePath)
 	if err != nil {
 		exitError(err)
 	}
 	defer database.Close()
+	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
+		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
+	}
+	if err := database.PauseGatewayWrites(ctx, "Gateway Credential rotation is in progress", time.Now().UTC()); err != nil {
+		exitError(err)
+	}
+	previousToken, previousErr := credentialStore.Get(context.Background(), credential.GatewayTarget)
+	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
+		exitError(fmt.Errorf("replace Gateway Credential; writes remain paused because replacement state is uncertain: %w", err))
+	}
 	if err := database.RecordGatewayCredentialVerification(ctx, store.GatewayCredentialVerification{
 		FingerprintSHA256:     credential.Fingerprint(token),
 		Owner:                 config.GitHub.Credential.Owner,
 		IntegrationRepository: config.GitHub.TestRepository,
 		VerifiedAt:            time.Now().UTC(),
 	}); err != nil {
-		exitError(err)
+		if previousErr == nil && previousToken != "" {
+			_ = credentialStore.Set(context.Background(), credential.GatewayTarget, previousToken)
+		}
+		exitError(fmt.Errorf("record verification; Gateway writes remain paused and the prior credential was restored when available: %w", err))
 	}
 	if err := database.ResumeGatewayWrites(ctx, time.Now().UTC()); err != nil {
 		exitError(err)

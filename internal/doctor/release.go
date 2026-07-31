@@ -73,13 +73,24 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 		Event      string `json:"event"`
 		Status     string `json:"status"`
 		Conclusion string `json:"conclusion"`
+		WorkflowID int64  `json:"workflow_id"`
+	}
+	var workflow struct {
+		ID    int64  `json:"id"`
+		Path  string `json:"path"`
+		State string `json:"state"`
+	}
+	workflowPath := "/repos/" + config.Worker.ReleaseRepository + "/actions/workflows/publish-worker.yml"
+	if err := client.RequestJSON(ctx, http.MethodGet, workflowPath, nil, &workflow); err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker publisher workflow: %w", err)
 	}
 	runPath := fmt.Sprintf("/repos/%s/actions/runs/%d", config.Worker.ReleaseRepository, manifest.GitHubActionsRunID)
 	if err := client.RequestJSON(ctx, http.MethodGet, runPath, nil, &run); err != nil {
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker publisher run: %w", err)
 	}
 	if run.HeadSHA != manifest.SourceCommit || run.HeadBranch != "main" || run.Event != "push" ||
-		run.Status != "completed" || run.Conclusion != "success" {
+		run.Status != "completed" || run.Conclusion != "success" || run.WorkflowID != workflow.ID ||
+		workflow.Path != ".github/workflows/publish-worker.yml" || workflow.State != "active" {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release was not produced by a successful main push workflow")
 	}
 	return manifest, raw, nil

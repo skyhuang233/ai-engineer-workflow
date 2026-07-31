@@ -29,6 +29,13 @@ type DeliveryRemote struct {
 	GitBinary string
 }
 
+func (r DeliveryRemote) CredentialAvailable(context.Context) error {
+	if r.Client == nil || strings.TrimSpace(r.Client.Token) == "" {
+		return delivery.ErrGatewayCredentialRejected
+	}
+	return nil
+}
+
 func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	if r.Client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")

@@ -133,13 +133,13 @@ func (c Config) Validate() error {
 	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
 		return errors.New("GitHub required check is required")
 	case c.GitHub.Credential.Kind != "fine-grained-pat":
-		return errors.New("GitHub credential must be a fine-grained PAT")
+		return errors.New("Gateway Credential must be a fine-grained PAT")
 	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
-		return errors.New("GitHub credential owner is required")
+		return errors.New("Gateway Credential owner is required")
 	case !c.GitHub.Credential.AllRepositories:
-		return errors.New("GitHub credential must cover all repositories")
+		return errors.New("Gateway Credential must cover all repositories")
 	case !validGatewayPermissions(c.GitHub.Credential.Permissions):
-		return errors.New("GitHub credential permissions must match the Gateway contract")
+		return errors.New("Gateway Credential permissions must match the Gateway contract")
 	case strings.TrimSpace(c.Upgrade.Rule) == "":
 		return errors.New("toolchain upgrade rule is required")
 	default:

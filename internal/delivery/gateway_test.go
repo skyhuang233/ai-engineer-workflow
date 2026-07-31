@@ -15,13 +15,16 @@ import (
 )
 
 type fakeRemote struct {
-	observations []delivery.Observation
-	observeErrs  []error
-	applyErr     error
-	applyCalls   int
-	observeCalls int
-	requests     []store.DeliveryRequest
+	observations  []delivery.Observation
+	observeErrs   []error
+	applyErr      error
+	applyCalls    int
+	observeCalls  int
+	requests      []store.DeliveryRequest
+	credentialErr error
 }
+
+func (f *fakeRemote) CredentialAvailable(context.Context) error { return f.credentialErr }
 
 func (f *fakeRemote) Observe(_ context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	f.observeCalls++
@@ -165,6 +168,32 @@ func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
 	}
 	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("projection after retry exhaustion = %#v", projection)
+	}
+}
+
+func TestMissingCredentialPausesBeforeAnyRemoteCall(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{credentialErr: delivery.ErrGatewayCredentialRejected}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatal("missing Gateway Credential reached the remote")
+	}
+	if _, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey); err != nil {
+		t.Fatal(err)
 	}
 }
 

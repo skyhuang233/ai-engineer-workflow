@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - name: Read accepted release inputs
         id: pins
         shell: bash
@@ -30,8 +32,30 @@ jobs:
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Detect Worker release input changes
+        id: changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          required=false
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}:config/toolchain.json" 2>/dev/null; then
+            required=true
+          else
+            git show "${BEFORE_SHA}:config/toolchain.json" |
+              jq --sort-keys '{codex,no_mistakes,worker}' > /tmp/worker-inputs-before.json
+            jq --sort-keys '{codex,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
+            if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
+               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker; then
+              required=true
+            fi
+          fi
+          echo "required=$required" >> "$GITHUB_OUTPUT"
       - name: Preserve immutable release identity on reruns
         id: existing
+        if: steps.changes.outputs.required == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,24 +71,29 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and publish accepted main commit
         id: build
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: deploy/worker/Dockerfile
           push: true
           tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}
+          build-args: |
+            CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
+            NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
+            NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}
+            NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}
       - name: Create authoritative Worker Release Manifest
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -83,7 +112,7 @@ jobs:
             > worker-release.json
           jq --exit-status . worker-release.json
       - name: Publish Worker Release Manifest
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: worker-v${{ steps.pins.outputs.worker_version }}

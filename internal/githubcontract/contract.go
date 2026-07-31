@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	githubapi "github.com/skyhuang233/workflow/internal/github"
 )
@@ -31,24 +33,26 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	var branchCreated bool
 	var issueNumber, pullNumber int
 	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		var cleanupErrors []string
 		if pullNumber != 0 {
-			if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/pulls/%d", repository, pullNumber), map[string]string{"state": "closed"}, nil); err != nil {
+			if _, err := v.call(cleanupCtx, token, http.MethodPatch, fmt.Sprintf("repos/%s/pulls/%d", repository, pullNumber), map[string]string{"state": "closed"}, nil); err != nil {
 				cleanupErrors = append(cleanupErrors, "close PR: "+err.Error())
 			}
 		}
 		if issueNumber != 0 {
-			if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/issues/%d", repository, issueNumber), map[string]string{"state": "closed"}, nil); err != nil {
+			if _, err := v.call(cleanupCtx, token, http.MethodPatch, fmt.Sprintf("repos/%s/issues/%d", repository, issueNumber), map[string]string{"state": "closed"}, nil); err != nil {
 				cleanupErrors = append(cleanupErrors, "close issue: "+err.Error())
 			}
 		}
 		if branchCreated {
-			if _, err := v.call(ctx, token, http.MethodDelete, "repos/"+repository+"/git/refs/heads/"+contractBranch, nil, nil); err != nil {
+			if _, err := v.call(cleanupCtx, token, http.MethodDelete, "repos/"+repository+"/git/refs/heads/"+contractBranch, nil, nil); err != nil {
 				cleanupErrors = append(cleanupErrors, "delete branch: "+err.Error())
 			}
 		}
-		if resultErr == nil && len(cleanupErrors) > 0 {
-			resultErr = errors.New("credential contract cleanup failed: " + strings.Join(cleanupErrors, "; "))
+		if len(cleanupErrors) > 0 {
+			resultErr = errors.Join(resultErr, errors.New("credential contract cleanup failed: "+strings.Join(cleanupErrors, "; ")))
 		}
 	}()
 	var identity struct {
@@ -68,6 +72,9 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	}
 	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository+"/actions/workflows", nil, &struct{}{}); err != nil {
 		return fmt.Errorf("verify Actions read permission: %w", err)
+	}
+	if err := v.reconcileStaleArtifacts(ctx, token, owner, repository); err != nil {
+		return err
 	}
 	var base struct {
 		Object struct {
@@ -129,6 +136,37 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	if _, err := v.call(ctx, token, http.MethodPost, fmt.Sprintf("repos/%s/issues/%d/comments", repository, pull.Number),
 		map[string]string{"body": "Gateway Credential write contract verified."}, &struct{}{}); err != nil {
 		return fmt.Errorf("verify issue comment permission: %w", err)
+	}
+	return nil
+}
+
+func (v Verifier) reconcileStaleArtifacts(ctx context.Context, token, owner, repository string) error {
+	var pulls []struct {
+		Number int `json:"number"`
+	}
+	pullsPath := "repos/" + repository + "/pulls?state=open&head=" + url.QueryEscape(owner+":"+contractBranch)
+	if _, err := v.call(ctx, token, http.MethodGet, pullsPath, nil, &pulls); err != nil {
+		return fmt.Errorf("list stale credential-contract PRs: %w", err)
+	}
+	for _, pull := range pulls {
+		if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/pulls/%d", repository, pull.Number), map[string]string{"state": "closed"}, nil); err != nil {
+			return fmt.Errorf("close stale credential-contract PR: %w", err)
+		}
+	}
+	var issues []struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+	}
+	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository+"/issues?state=open&labels=workflow-contract", nil, &issues); err != nil {
+		return fmt.Errorf("list stale credential-contract issues: %w", err)
+	}
+	for _, issue := range issues {
+		if issue.Title != "[workflow-contract] Gateway Credential verification" {
+			continue
+		}
+		if _, err := v.call(ctx, token, http.MethodPatch, fmt.Sprintf("repos/%s/issues/%d", repository, issue.Number), map[string]string{"state": "closed"}, nil); err != nil {
+			return fmt.Errorf("close stale credential-contract issue: %w", err)
+		}
 	}
 	return nil
 }

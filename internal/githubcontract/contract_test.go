@@ -26,6 +26,10 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case r.URL.Path == "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls"):
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues"):
+			_, _ = w.Write([]byte(`[]`))
 		case r.URL.Path == "/repos/owner/integration/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/contents/"):
