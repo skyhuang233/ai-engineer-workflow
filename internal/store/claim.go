@@ -188,7 +188,7 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 		return TicketClaim{}, err
 	}
 	if attempt > maxWorkerAttempts(request.MaxAttempts) {
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(request.Now), request.VersionID, selected.IssueID); err != nil {
+		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, "worker retry budget exhausted", request.Now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -349,7 +349,7 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
 	if attempt > limit {
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "worker retry budget exhausted", now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {

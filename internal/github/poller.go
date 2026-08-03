@@ -16,6 +16,7 @@ type PollResult struct {
 }
 
 type ReviewLauncher func(context.Context, store.TicketClaim, string) error
+type ControlPass func(context.Context) error
 
 type Poller struct {
 	Store                 *store.Store
@@ -35,6 +36,10 @@ func (p Poller) now() time.Time {
 }
 
 func (p Poller) Poll(ctx context.Context, repository string) (PollResult, error) {
+	return p.PollWith(ctx, repository, nil)
+}
+
+func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
 	if p.Store == nil || p.Client == nil {
 		return PollResult{}, fmt.Errorf("GitHub poller dependencies are incomplete")
 	}
@@ -54,24 +59,33 @@ func (p Poller) Poll(ctx context.Context, repository string) (PollResult, error)
 		return PollResult{}, err
 	}
 	full := err != nil || cursor.LastFullReconcileAt.IsZero() || now.Sub(cursor.LastFullReconcileAt) >= p.fullReconcileInterval()
+	if before != nil {
+		if err := before(ctx); err != nil {
+			return p.recordFailure(ctx, repository, now, err)
+		}
+	}
 	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
-		if recordErr := p.Store.RecordGitHubPollFailure(ctx, repository, now); recordErr != nil {
-			return PollResult{}, errors.Join(err, recordErr)
-		}
-		updated, cursorErr := p.Store.GitHubPollCursor(ctx, repository)
-		if cursorErr == nil && updated.ConsecutiveFailures >= p.maxFailures() {
-			if attentionErr := p.Store.MarkRepositoryNeedsAttention(ctx, repository, now); attentionErr != nil {
-				return PollResult{}, errors.Join(err, attentionErr)
-			}
-			return PollResult{}, store.ErrNeedsAttention
-		}
-		return PollResult{}, err
+		return p.recordFailure(ctx, repository, now, err)
 	}
 	if err := p.Store.RecordGitHubPollSuccess(ctx, repository, now, full); err != nil {
 		return PollResult{}, err
 	}
 	return result, nil
+}
+
+func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
+	if recordErr := p.Store.RecordGitHubPollFailure(ctx, repository, now); recordErr != nil {
+		return PollResult{}, errors.Join(cause, recordErr)
+	}
+	updated, cursorErr := p.Store.GitHubPollCursor(ctx, repository)
+	if cursorErr == nil && updated.ConsecutiveFailures >= p.maxFailures() {
+		if attentionErr := p.Store.MarkRepositoryNeedsAttention(ctx, repository, now); attentionErr != nil {
+			return PollResult{}, errors.Join(cause, attentionErr)
+		}
+		return PollResult{}, store.ErrNeedsAttention
+	}
+	return PollResult{}, cause
 }
 
 func (p Poller) maxFailures() int {

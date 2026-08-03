@@ -150,7 +150,7 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
 	if consecutiveFailures >= limit {
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "review revision retry budget exhausted", now); err != nil {
 			return TicketClaim{}, "", err
 		}
 		if err := tx.Commit(); err != nil {
@@ -227,7 +227,7 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 	if inserted == 0 {
 		return false, tx.Commit()
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID); err != nil {
+	if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "pull request closed without merge", now); err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = 'running' AND session_id IN (SELECT session_id FROM ticket_sessions WHERE version_id = ?)`, formatTimestamp(now), versionID); err != nil {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -19,6 +20,7 @@ type WorkflowQuestion struct {
 	Prompt     string
 	State      string
 	Answer     string
+	RootNumber int64
 }
 
 type GitHubPollCursor struct {
@@ -107,10 +109,7 @@ WHERE delivered = 0 AND version_id IN (
 		if err := rows.Scan(&versionID); err != nil {
 			return err
 		}
-		questionID := fmt.Sprintf("poll-failure-%s", versionID)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, prompt, state, created_at)
-VALUES (?, ?, ?, 0, 'poll_failure', ?, 'open', ?)
-ON CONFLICT(repository, version_id, issue_id, kind) DO NOTHING`, questionID, repository, versionID, "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", formatTimestamp(now)); err != nil {
+		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
 			return err
 		}
 	}
@@ -118,6 +117,20 @@ ON CONFLICT(repository, version_id, issue_id, kind) DO NOTHING`, questionID, rep
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) WorkflowQuestion(ctx context.Context, repository, questionID string) (WorkflowQuestion, error) {
+	var question WorkflowQuestion
+	err := s.db.QueryRowContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number
+FROM workflow_questions q
+JOIN plan_versions v ON v.version_id = q.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE q.question_id = ? AND q.repository = ?`, questionID, repository).
+		Scan(&question.ID, &question.Repository, &question.VersionID, &question.IssueID, &question.Kind, &question.Prompt, &question.State, &question.Answer, &question.RootNumber)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WorkflowQuestion{}, ErrNotFound
+	}
+	return question, err
 }
 
 func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time) error {
@@ -147,8 +160,70 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
 			return err
 		}
+	} else if kind == "needs_attention" {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM workflow_questions WHERE question_id = ?) AND issue_id = (SELECT issue_id FROM workflow_questions WHERE question_id = ?) AND delivered = 0`, plan.StateQueued, formatTimestamp(now), questionID, questionID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+func ensureWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, versionID string, issueID int64, kind, prompt string, now time.Time) error {
+	questionID := fmt.Sprintf("%s-%s-%d", strings.ReplaceAll(kind, "_", "-"), versionID, issueID)
+	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, prompt, state, created_at)
+VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+ON CONFLICT(repository, version_id, issue_id, kind) DO NOTHING`, questionID, repository, versionID, issueID, kind, prompt, formatTimestamp(now))
+	return err
+}
+
+func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time) error {
+	var repository string
+	var number int64
+	err := tx.QueryRowContext(ctx, `SELECT p.repository, t.issue_number
+FROM plan_tickets t
+JOIN plan_versions v ON v.version_id = t.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository, &number)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+		return err
+	}
+	prompt := fmt.Sprintf("Ticket #%d needs attention: %s Reply with an id-addressed retry decision after resolving the cause.", number, reason)
+	return ensureWorkflowQuestionTx(ctx, tx, repository, versionID, issueID, "needs_attention", prompt, now)
+}
+
+func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT issue_id FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID)
+	if err != nil {
+		return err
+	}
+	var issueIDs []int64
+	for rows.Next() {
+		var issueID int64
+		if err := rows.Scan(&issueID); err != nil {
+			rows.Close()
+			return err
+		}
+		issueIDs = append(issueIDs, issueID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, issueID := range issueIDs {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) RecordGitHubPollFailure(ctx context.Context, repository string, now time.Time) error {

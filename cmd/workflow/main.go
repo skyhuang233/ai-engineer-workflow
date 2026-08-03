@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
@@ -274,12 +275,13 @@ func runPollGitHub(args []string) {
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
+	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *interval <= 0 || *maxParallelRuns <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, read credential, workspace configuration, Gateway URL, positive interval, and positive parallelism")
+	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, read credential, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -291,12 +293,30 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
+	var workers sync.WaitGroup
+	var workerError error
+	var workerErrorMu sync.Mutex
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
-		go func() {
-			if err := runClaimWorker(context.WithoutCancel(ctx), db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent); err != nil {
+		run := func() {
+			err := runClaimWorker(ctx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
+			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
+				if *once {
+					workerErrorMu.Lock()
+					workerError = errors.Join(workerError, err)
+					workerErrorMu.Unlock()
+				}
 			}
-		}()
+		}
+		if *once {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				run()
+			}()
+			return nil
+		}
+		go run()
 		return nil
 	}
 	launcher := func(ctx context.Context, claim store.TicketClaim, prompt string) error {
@@ -314,25 +334,31 @@ func runPollGitHub(args []string) {
 	poll := func() error {
 		ctx := context.Background()
 		client := github.NewClient(*githubURL, *token, nil)
-		projector := delivery.PlanProjector{Gateway: delivery.Gateway{Store: db}}
-		activator := plan.Activator{Reader: client, Projector: projector, Store: db}
-		if _, err := activator.Activate(ctx, *repository, *rootNumber); err != nil {
-			return err
-		}
-		dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute}
-		if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
-			return err
-		}
-		claim, claimErr := dispatcher.Claim(ctx, *repository, *rootNumber, 0, "workflow-control-plane")
-		if claimErr == nil {
-			branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
-			if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
+		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
+		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
+			activator := plan.Activator{Reader: client, Projector: projector, Store: db}
+			if _, err := activator.Activate(ctx, *repository, *rootNumber); err != nil {
 				return err
 			}
-		} else if !errors.Is(claimErr, store.ErrNoReadyTickets) && !errors.Is(claimErr, store.ErrCapacity) && !errors.Is(claimErr, store.ErrNotReady) {
-			return claimErr
-		}
-		result, err := poller.Poll(ctx, *repository)
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute}
+			if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
+				return err
+			}
+			for {
+				claim, claimErr := dispatcher.Claim(ctx, *repository, *rootNumber, 0, "workflow-control-plane")
+				if claimErr == nil {
+					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
+					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
+						return err
+					}
+					continue
+				}
+				if errors.Is(claimErr, store.ErrNoReadyTickets) || errors.Is(claimErr, store.ErrCapacity) || errors.Is(claimErr, store.ErrNotReady) {
+					return nil
+				}
+				return claimErr
+			}
+		})
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
 			fmt.Fprintln(os.Stderr, err)
 			return err
@@ -343,12 +369,18 @@ func runPollGitHub(args []string) {
 		}
 		return nil
 	}
-	if err := poll(); err != nil && *once {
-		fail(err)
-	}
 	if *once {
+		pollErr := poll()
+		workers.Wait()
+		workerErrorMu.Lock()
+		pollErr = errors.Join(pollErr, workerError)
+		workerErrorMu.Unlock()
+		if pollErr != nil {
+			fail(pollErr)
+		}
 		return
 	}
+	_ = poll()
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -368,9 +400,11 @@ func runAnswerInbox(args []string) {
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	questionID := flags.String("question", "", "stable Workflow Inbox question ID")
 	answer := flags.String("answer", "", "human decision")
+	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
+	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	_ = flags.Parse(args)
-	if *repository == "" || *questionID == "" || *answer == "" {
-		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, and answer")
+	if *repository == "" || *questionID == "" || *answer == "" || *gatewayURL == "" || *gatewayControlToken == "" {
+		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, answer, Gateway URL, and control credential")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
@@ -378,7 +412,19 @@ func runAnswerInbox(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	if err := db.AnswerWorkflowQuestion(context.Background(), *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+	ctx := context.Background()
+	question, err := db.WorkflowQuestion(ctx, *repository, *questionID)
+	if err != nil {
+		fail(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+		fail(err)
+	}
+	projection, err := db.PlanProjection(ctx, question.VersionID)
+	if err != nil {
+		fail(err)
+	}
+	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectPlan(ctx, *repository, question.RootNumber, projection, ""); err != nil {
 		fail(err)
 	}
 }
@@ -388,13 +434,14 @@ func runGateway(args []string) {
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
 	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "Gateway GitHub credential")
+	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
 	gitBinary := flags.String("git", "git", "Git executable")
 	outboxInterval := flags.Duration("outbox-interval", time.Second, "durable outbox recovery interval")
 	_ = flags.Parse(args)
-	if *listen == "" || *token == "" || *outboxInterval <= 0 {
-		fmt.Fprintln(os.Stderr, "gateway requires listen address and GitHub credential")
+	if *listen == "" || *token == "" || *controlToken == "" || *outboxInterval <= 0 {
+		fmt.Fprintln(os.Stderr, "gateway requires listen address, GitHub credential, and control-plane credential")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
@@ -411,7 +458,7 @@ func runGateway(args []string) {
 			time.Sleep(*outboxInterval)
 		}
 	}()
-	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(gateway)}
+	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: *controlToken})}
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		_ = db.Close()
 		fail(err)

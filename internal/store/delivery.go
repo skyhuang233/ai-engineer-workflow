@@ -650,12 +650,16 @@ WHERE rt.version_id = s.version_id AND rt.issue_id = s.issue_id`, request.RunID)
 	if delivered != 0 {
 		return nil
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?) AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), request.RunID)
-	if err != nil {
+	var versionID string
+	var issueID int64
+	if err := tx.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?`, request.RunID).Scan(&versionID, &issueID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
 		return err
 	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrNotFound
+	if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
+		return err
 	}
 	return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)
 }
@@ -742,7 +746,7 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 				return DeliveryTarget{}, request, fmt.Errorf("%w: structured plan projection is required", ErrDeliveryRejected)
 			}
 		case DeliveryAddIssueLabel:
-			if request.Label == "" || request.Body != "" {
+			if request.Label != plan.ActiveLabel || request.Body != "" {
 				return DeliveryTarget{}, request, fmt.Errorf("%w: plan label is required", ErrDeliveryRejected)
 			}
 		}

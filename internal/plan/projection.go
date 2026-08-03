@@ -10,6 +10,12 @@ type Projection struct {
 	VersionID string             `json:"version_id"`
 	State     string             `json:"state"`
 	Tickets   []ProjectionTicket `json:"tickets"`
+	Questions []WorkflowQuestion `json:"questions,omitempty"`
+}
+
+type WorkflowQuestion struct {
+	ID     string `json:"id"`
+	Prompt string `json:"prompt"`
 }
 
 type ProjectionTicket struct {
@@ -82,6 +88,14 @@ func renderBlock(projection Projection) string {
 			} else {
 				fmt.Fprintf(&b, "| #%d %s | %s |\n", ticket.Number, escapeCell(ticket.Title), strings.Join(blockers, ", "))
 			}
+		}
+	}
+	if len(projection.Questions) > 0 {
+		questions := append([]WorkflowQuestion(nil), projection.Questions...)
+		sort.Slice(questions, func(i, j int) bool { return questions[i].ID < questions[j].ID })
+		b.WriteString("\n### Workflow Inbox\n\n")
+		for _, question := range questions {
+			fmt.Fprintf(&b, "- `%s`: %s\n", question.ID, escapeCell(question.Prompt))
 		}
 	}
 	fmt.Fprintf(&b, "%s", ProjectionEnd)

@@ -161,6 +161,9 @@ func TestClaimReadyStopsAfterConfiguredAttemptLimit(t *testing.T) {
 	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("projection tickets = %#v, want Needs Attention", projection.Tickets)
 	}
+	if len(projection.Questions) != 1 || !strings.Contains(projection.Questions[0].Prompt, "retry budget exhausted") {
+		t.Fatalf("workflow inbox = %#v", projection.Questions)
+	}
 }
 
 func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {

@@ -113,7 +113,25 @@ WHERE d.version_id = ?`, versionID)
 			projection.Tickets[index].Blockers = append(projection.Tickets[index].Blockers, blocker)
 		}
 	}
-	return projection, dependencyRows.Err()
+	if err := dependencyRows.Err(); err != nil {
+		return plan.Projection{}, err
+	}
+	questionRows, err := s.db.QueryContext(ctx, `SELECT question_id, prompt FROM workflow_questions WHERE version_id = ? AND state = 'open' ORDER BY question_id`, versionID)
+	if err != nil {
+		return plan.Projection{}, err
+	}
+	defer questionRows.Close()
+	for questionRows.Next() {
+		var question plan.WorkflowQuestion
+		if err := questionRows.Scan(&question.ID, &question.Prompt); err != nil {
+			return plan.Projection{}, err
+		}
+		projection.Questions = append(projection.Questions, question)
+	}
+	if err := questionRows.Err(); err != nil {
+		return plan.Projection{}, err
+	}
+	return projection, nil
 }
 
 func projectionState(state string) string {
