@@ -145,7 +145,7 @@ for ((i=1; i<=ITERATIONS; i++)); do
 
   codex exec \
     --cd "$PROJECT_ROOT" \
-    --model gpt-5.6-luna \
+    --model gpt-5.6-terra \
     -c 'model_reasoning_effort="high"' \
     --dangerously-bypass-approvals-and-sandbox \
     --output-last-message "$result_file" \
