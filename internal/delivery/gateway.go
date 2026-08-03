@@ -77,7 +77,17 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
 	}
+	if outbox.ReconcileOnly {
+		return g.reconcileOnly(ctx, outbox)
+	}
 	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+		if request.Operation == store.DeliveryProjectPlan {
+			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
+			if projectionErr != nil {
+				return store.DeliveryResult{}, projectionErr
+			}
+			request.PlanProjection = &projection
+		}
 		observation, observeErr := g.Remote.Observe(operationCtx, request)
 		if observeErr != nil {
 			return store.DeliveryResult{}, observeErr
@@ -120,6 +130,22 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(ctx, outbox, err)
 	}
 	return g.succeed(ctx, outbox, result)
+}
+
+func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox) error {
+	operationCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	observation, err := g.Remote.Observe(operationCtx, outbox.Request)
+	if err != nil {
+		if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
+			return finishErr
+		}
+		return err
+	}
+	if observation.Applied {
+		return g.succeed(ctx, outbox, resultFrom(observation))
+	}
+	return g.reject(ctx, outbox, fmt.Errorf("%w: uncertain delivery was not observed", store.ErrDeliveryRejected))
 }
 
 func resultFrom(observation Observation) store.DeliveryResult {

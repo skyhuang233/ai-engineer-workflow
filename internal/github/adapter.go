@@ -111,7 +111,23 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 	payload := struct {
 		Body string `json:"body"`
 	}{Body: planProjectionComment(projection)}
-	return c.requestJSON(ctx, http.MethodPost, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10)+"/comments", payload, nil)
+	comments, err := c.listIssueComments(ctx, repository, number)
+	if err != nil {
+		return err
+	}
+	var status *commentResponse
+	for index := range comments {
+		if strings.Contains(comments[index].Body, planProjectionIdentity) {
+			if status != nil {
+				return fmt.Errorf("multiple workflow control-plane comments found")
+			}
+			status = &comments[index]
+		}
+	}
+	if status == nil {
+		return c.requestJSON(ctx, http.MethodPost, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10)+"/comments", payload, nil)
+	}
+	return c.requestJSON(ctx, http.MethodPatch, "/repos/"+repository+"/issues/comments/"+strconv.FormatInt(status.ID, 10), payload, nil)
 }
 
 func (c *Client) HasPlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) (bool, error) {
@@ -135,13 +151,30 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 
 func planProjectionComment(projection plan.Projection) string {
 	content, _ := plan.RenderProjection("", projection)
-	return content + "\n\n" + planProjectionMarker(projection)
+	return content + "\n\n" + planProjectionIdentity + "\n" + planProjectionMarker(projection)
 }
+
+const planProjectionIdentity = "<!-- workflow:control-plane -->"
 
 func planProjectionMarker(projection plan.Projection) string {
 	content, _ := plan.RenderProjection("", projection)
 	digest := sha256.Sum256([]byte(content))
 	return fmt.Sprintf("<!-- workflow-projection:%x -->", digest)
+}
+
+func (c *Client) listIssueComments(ctx context.Context, repository string, number int64) ([]commentResponse, error) {
+	var all []commentResponse
+	for page := 1; ; page++ {
+		var comments []commentResponse
+		path := "/repos/" + repository + "/issues/" + strconv.FormatInt(number, 10) + "/comments?per_page=100&page=" + strconv.Itoa(page)
+		if err := c.getJSON(ctx, path, &comments); err != nil {
+			return nil, err
+		}
+		all = append(all, comments...)
+		if len(comments) < 100 {
+			return all, nil
+		}
+	}
 }
 
 func (c *Client) AddIssueLabel(ctx context.Context, repository string, number int64, label string) error {

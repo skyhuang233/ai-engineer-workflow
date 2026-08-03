@@ -97,12 +97,15 @@ func TestUpdateIssueBodyPreservesPatchPayloadAndHeaders(t *testing.T) {
 	}
 }
 
-func TestUpdatePlanProjectionAppendsAnImmutableStatusComment(t *testing.T) {
+func TestUpdatePlanProjectionCreatesOneStatusComment(t *testing.T) {
 	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
-			http.NotFound(w, r)
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
+			_ = json.NewEncoder(w).Encode([]any{})
 			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
 		var payload struct {
 			Body string `json:"body"`
@@ -118,7 +121,35 @@ func TestUpdatePlanProjectionAppendsAnImmutableStatusComment(t *testing.T) {
 	if err := client.UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(comment, plan.ProjectionStart) || !strings.Contains(comment, "workflow-projection:") {
+	if !strings.Contains(comment, plan.ProjectionStart) || !strings.Contains(comment, planProjectionIdentity) || !strings.Contains(comment, "workflow-projection:") {
+		t.Fatalf("projected comment = %q", comment)
+	}
+}
+
+func TestUpdatePlanProjectionUpdatesTheExistingStatusComment(t *testing.T) {
+	var comment string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 42, "body": planProjectionIdentity}})
+			return
+		}
+		if r.Method != http.MethodPatch || r.URL.Path != "/repos/owner/repo/issues/comments/42" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var payload struct {
+			Body string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		comment = payload.Body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	if err := NewClient(server.URL, "", server.Client()).UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(comment, "state: `Active`") {
 		t.Fatalf("projected comment = %q", comment)
 	}
 }

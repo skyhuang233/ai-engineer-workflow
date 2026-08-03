@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,6 +47,10 @@ func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
 			http.NotFound(w, r)
 			return
@@ -110,5 +115,26 @@ func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
 		if err == nil {
 			t.Fatalf("invalid mapped pull request was accepted: %#v", pull)
 		}
+	}
+}
+
+func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 7, "state": "open", "head": map[string]string{"ref": "ticket-1", "sha": "replacement"}, "base": map[string]string{"ref": "main"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	_, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
+	if err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("head-change error = %v", err)
 	}
 }

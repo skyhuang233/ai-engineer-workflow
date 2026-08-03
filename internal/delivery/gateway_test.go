@@ -457,6 +457,34 @@ func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	}
 }
 
+func TestGatewayReconcilesExpiredUncertainWriteWithoutApplying(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	}, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true, RemoteHead: "accepted"}}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC) }}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != store.OutboxSucceeded || remote.applyCalls != 0 || remote.observeCalls != 1 {
+		t.Fatalf("reconciled outbox = %#v, applies=%d observes=%d", outbox, remote.applyCalls, remote.observeCalls)
+	}
+}
+
 func TestReplacedLeaseCannotUpdateMappedPROrReplyWithEvidence(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)

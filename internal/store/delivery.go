@@ -332,10 +332,11 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 }
 
 func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, d.remote_head
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
-WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0`, repository)
+JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
+WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.accepted_commit != ''`, repository)
 	if err != nil {
 		return nil, err
 	}

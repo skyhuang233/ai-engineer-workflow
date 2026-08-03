@@ -115,6 +115,9 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 				return delivery.Observation{}, err
 			}
 		}
+		if pull.Head.SHA != request.CommitSHA {
+			return delivery.Observation{}, fmt.Errorf("%w: pull request head %q does not match accepted candidate %q", store.ErrDeliveryRejected, pull.Head.SHA, request.CommitSHA)
+		}
 		return delivery.Observation{Applied: true, RemoteHead: request.CommitSHA, PullRequestNumber: pull.Number, PullRequestNodeID: pull.NodeID}, nil
 	case store.DeliveryReplyEvidence:
 		body := fmt.Sprintf("%s\n\n<!-- workflow-idempotency:%s -->", request.Evidence, request.IdempotencyKey)
@@ -160,6 +163,7 @@ type pullRequestResponse struct {
 }
 
 type commentResponse struct {
+	ID   int64  `json:"id"`
 	Body string `json:"body"`
 }
 
@@ -205,18 +209,7 @@ func validatePullRequest(pull pullRequestResponse, request store.DeliveryRequest
 }
 
 func (r DeliveryRemote) listComments(ctx context.Context, repository string, number int64) ([]commentResponse, error) {
-	var comments []commentResponse
-	for page := 1; ; page++ {
-		var batch []commentResponse
-		path := "/repos/" + repository + "/issues/" + strconv.FormatInt(number, 10) + "/comments?per_page=100&page=" + strconv.Itoa(page)
-		if err := r.Client.getJSON(ctx, path, &batch); err != nil {
-			return nil, err
-		}
-		comments = append(comments, batch...)
-		if len(batch) < 100 {
-			return comments, nil
-		}
-	}
+	return r.Client.listIssueComments(ctx, repository, number)
 }
 
 func (c *Client) branchHead(ctx context.Context, repository, branch string) (string, bool, error) {
