@@ -187,6 +187,9 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if c.Store == nil || c.Runtime == nil {
 		return errors.New("agent controller dependencies are incomplete")
 	}
+	if err := c.Store.RequireCurrentDeliveryLease(ctx, claim, c.now()); err != nil {
+		return err
+	}
 	session, err := c.Store.TicketSession(ctx, claim.VersionID, claim.TicketID)
 	if err != nil {
 		return err
@@ -255,7 +258,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	if err := c.Store.ReserveWorkerLaunch(ctx, deliveryClaim, c.now()); err != nil {
+	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, c.now()); err != nil {
 		if errors.Is(err, store.ErrWorkerLaunched) {
 			return err
 		}

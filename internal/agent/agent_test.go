@@ -356,6 +356,23 @@ func TestControllerRequiresGatewayBeforeCandidateAcceptance(t *testing.T) {
 	}
 }
 
+func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: &fakeRuntime{}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.RetryDelivery(ctx, claim); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("retry with Agent lease = %v, want ErrInvalidClaim", err)
+	}
+	if len(controller.Runtime.(*fakeRuntime).specs) != 0 {
+		t.Fatal("Delivery Controller launched for an Agent lease")
+	}
+}
+
 func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

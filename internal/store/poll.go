@@ -236,16 +236,39 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ?
-WHERE version_id = ? AND EXISTS (
-    SELECT 1 FROM poll_failure_targets t WHERE t.poll_question_id = ? AND t.version_id = ticket_sessions.version_id AND t.issue_id = ticket_sessions.issue_id
-)`, formatTimestamp(now), versionID, questionID); err != nil {
+		rows, err := tx.QueryContext(ctx, `SELECT t.issue_id, COALESCE(s.session_id, ''), COALESCE(s.accepted_commit, '')
+FROM poll_failure_targets t
+LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
+WHERE t.poll_question_id = ? AND t.version_id = ?`, questionID, versionID)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0 AND state = ? AND EXISTS (
-    SELECT 1 FROM poll_failure_targets t WHERE t.poll_question_id = ? AND t.version_id = ticket_runtime.version_id AND t.issue_id = ticket_runtime.issue_id
-)`, plan.StateQueued, formatTimestamp(now), versionID, plan.StateNeedsAttention, questionID); err != nil {
+		type recoveryTarget struct {
+			issueID        int64
+			sessionID      string
+			acceptedCommit string
+		}
+		var targets []recoveryTarget
+		for rows.Next() {
+			var targetIssueID int64
+			var sessionID, acceptedCommit string
+			if err := rows.Scan(&targetIssueID, &sessionID, &acceptedCommit); err != nil {
+				rows.Close()
+				return err
+			}
+			targets = append(targets, recoveryTarget{issueID: targetIssueID, sessionID: sessionID, acceptedCommit: acceptedCommit})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
 			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, target := range targets {
+			if err := recoverNeedsAttentionTicketTx(ctx, tx, versionID, target.issueID, target.sessionID, target.acceptedCommit, now); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = ?, answered_at = ? WHERE state = 'open' AND question_id IN (
     SELECT ticket_question_id FROM poll_failure_targets WHERE poll_question_id = ?
@@ -253,34 +276,40 @@ WHERE version_id = ? AND EXISTS (
 			return err
 		}
 	} else if kind == "needs_attention" {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, versionID, issueID); err != nil {
-			return err
-		}
 		var sessionID, acceptedCommit string
 		err := tx.QueryRowContext(ctx, `SELECT session_id, accepted_commit FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &acceptedCommit)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			sessionID = ""
+			acceptedCommit = ""
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if acceptedCommit != "" {
-			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
-				return err
-			}
-			if _, err := claimDeliveryControllerTx(ctx, tx, sessionID, defaultDeliveryLeaseTTL, now); err != nil {
-				return err
-			}
-		} else {
-			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), versionID, issueID); err != nil {
-				return err
-			}
+		if err := recoverNeedsAttentionTicketTx(ctx, tx, versionID, issueID, sessionID, acceptedCommit, now); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, acceptedCommit string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, versionID, issueID); err != nil {
+		return err
+	}
+	if acceptedCommit != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+			return err
+		}
+		_, err := claimDeliveryControllerTx(ctx, tx, sessionID, defaultDeliveryLeaseTTL, now)
+		return err
+	}
+	if sessionID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), versionID, issueID)
+	return err
 }
 
 func ensureWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, versionID string, issueID int64, kind, prompt string, now time.Time) error {

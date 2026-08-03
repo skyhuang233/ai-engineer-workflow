@@ -310,6 +310,14 @@ AND l.state = ? AND l.expires_at > ? ORDER BY r.started_at, r.run_id`, repositor
 }
 
 func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
+	return s.reserveWorkerLaunch(ctx, claim, now, "")
+}
+
+func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
+	return s.reserveWorkerLaunch(ctx, claim, now, RunDelivery)
+}
+
+func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time, runKind string) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -323,11 +331,12 @@ func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now 
 	result, err := s.db.ExecContext(ctx, `UPDATE worker_runs
 SET launch_state = 'launched', launched_at = ?
 WHERE run_id = ? AND lease_generation = ? AND state = ? AND launch_state = 'ready'
+AND (? = '' OR run_kind = ?)
 AND EXISTS (
     SELECT 1 FROM ticket_sessions s
     JOIN run_leases l ON l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation
     WHERE s.current_run_id = worker_runs.run_id AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?
-)`, formatTimestamp(now), claim.RunID, claim.LeaseGeneration, RunRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now))
+)`, formatTimestamp(now), claim.RunID, claim.LeaseGeneration, RunRunning, runKind, runKind, claim.LeaseToken, LeaseActive, formatTimestamp(now))
 	if err != nil {
 		return err
 	}
@@ -337,6 +346,35 @@ AND EXISTS (
 	}
 	if count != 1 {
 		return ErrWorkerLaunched
+	}
+	return nil
+}
+
+func (s *Store) RequireCurrentDeliveryLease(ctx context.Context, claim TicketClaim, now time.Time) error {
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	var current bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ?
+AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ?
+)`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&current)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return ErrInvalidClaim
 	}
 	return nil
 }
@@ -447,7 +485,9 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, ErrNotReady
 	}
 	var activeRuns int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE state = ? AND run_kind = ?`, RunRunning, RunAgent).Scan(&activeRuns); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&activeRuns); err != nil {
 		return TicketClaim{}, err
 	}
 	if activeRuns >= maxParallelRuns {
@@ -637,7 +677,7 @@ WHERE t.version_id = ?`, versionID)
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND r.run_kind = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, RunAgent, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
+WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
 		return snapshot, err
 	}
 	return snapshot, nil

@@ -231,6 +231,61 @@ func TestPollFailureAnswerRestoresPausedTickets(t *testing.T) {
 	}
 }
 
+func TestPollFailureAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pollFailure WorkflowQuestion
+	for _, question := range questions {
+		if question.Kind == "poll_failure" {
+			pollFailure = question
+		}
+	}
+	if pollFailure.ID == "" {
+		t.Fatal("poll failure question was not created")
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(2*time.Hour+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, snapshot.Repository, now.Add(2*time.Hour+time.Second))
+	if err != nil || len(pending) != 1 || pending[0].TicketID != claim.TicketID {
+		t.Fatalf("recovered delivery claims = %#v, err = %v", pending, err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2*time.Hour + 2*time.Second)}); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("Agent recovery after poll failure = %v, want ErrFencingConflict", err)
+	}
+}
+
 func TestRepositoryEscalationRequeuesClaimedReviewFeedback(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
