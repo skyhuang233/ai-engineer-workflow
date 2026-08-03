@@ -28,11 +28,13 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"default_branch":"main","private":true}`))
+			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"conclusion": "success"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
 			_ = json.NewEncoder(w).Encode(map[string]string{"target_commitish": config.NoMistakes.UpstreamCommit})
 		default:
@@ -62,5 +64,32 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		if strings.Contains(path, "protection") {
 			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
 		}
+	}
+}
+
+func TestGitHubCheckRejectsContractRunFromAnOldDefaultHead(t *testing.T) {
+	config := validConfig()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
+			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "old", "status": "completed", "conclusion": "success"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	result := (GitHubCheck{
+		GitHub: config.GitHub, NoMistakes: config.NoMistakes,
+		Credentials: memoryCredential{secret: "github_pat_test"}, APIBase: server.URL,
+	}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "current default-branch revision") {
+		t.Fatalf("GitHub check = %#v, want stale-run failure", result)
 	}
 }

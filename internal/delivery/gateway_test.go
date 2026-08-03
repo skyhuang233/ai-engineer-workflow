@@ -363,7 +363,7 @@ func TestGatewayDerivesRepositoryFromLeasedTicket(t *testing.T) {
 	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
 		LeaseGeneration: claim.LeaseGeneration, Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
-	}, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC))
+	}, time.Date(2026, 7, 31, 0, 10, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}

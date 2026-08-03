@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 24
+	latestSchemaVersion = 27
 )
 
 var (
@@ -637,6 +637,7 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (23, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
+		applied = 23
 	}
 	if applied < 24 {
 		statements := []string{
@@ -664,11 +665,11 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (24, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
-		applied = 5
+		applied = 24
 	}
-	if applied < 6 {
+	if applied < 25 {
 		statements := []string{
-			`CREATE TABLE worker_releases (
+			`CREATE TABLE IF NOT EXISTS worker_releases (
     image_digest TEXT PRIMARY KEY,
     version TEXT NOT NULL,
     source_commit TEXT NOT NULL,
@@ -676,45 +677,45 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
     verified_at TEXT NOT NULL,
     activated_at TEXT NOT NULL
 )`,
-			`CREATE TABLE active_worker_image (
+			`CREATE TABLE IF NOT EXISTS active_worker_image (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     image_digest TEXT NOT NULL REFERENCES worker_releases(image_digest)
 )`,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("migration 6: %w", err)
+				return fmt.Errorf("migration 25: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (25, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
-		applied = 6
+		applied = 25
 	}
-	if applied < 7 {
-		if _, err := tx.ExecContext(ctx, `CREATE TABLE gateway_credential_verifications (
+	if applied < 26 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS gateway_credential_verifications (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     fingerprint_sha256 TEXT NOT NULL,
     owner TEXT NOT NULL,
     integration_repository TEXT NOT NULL,
     verified_at TEXT NOT NULL
 )`); err != nil {
-			return fmt.Errorf("migration 7: %w", err)
+			return fmt.Errorf("migration 26: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (26, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
-		applied = 7
+		applied = 26
 	}
-	if applied < 8 {
+	if applied < 27 {
 		statements := []string{
-			`CREATE TABLE gateway_runtime (
+			`CREATE TABLE IF NOT EXISTS gateway_runtime (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     writes_paused INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 )`,
-			`CREATE TABLE workflow_inbox (
+			`CREATE TABLE IF NOT EXISTS workflow_inbox (
     item_key TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
     title TEXT NOT NULL,
@@ -726,16 +727,17 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("migration 8: %w", err)
+				return fmt.Errorf("migration 27: %w", err)
 			}
 		}
-		timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO gateway_runtime(singleton, writes_paused, reason, updated_at) VALUES (1, 0, '', ?)`, timestamp); err != nil {
+		timestamp := formatTimestamp(time.Now())
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO gateway_runtime(singleton, writes_paused, reason, updated_at) VALUES (1, 0, '', ?)`, timestamp); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)", timestamp); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (27, ?)", timestamp); err != nil {
 			return err
 		}
+		applied = 27
 	}
 	return tx.Commit()
 }

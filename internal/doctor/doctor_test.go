@@ -182,19 +182,6 @@ func TestCodexResumeCheckUsesReturnedSessionID(t *testing.T) {
 	}
 }
 
-func TestGitHubCheckRequiresContractRunForCurrentDefaultHead(t *testing.T) {
-	config := validConfig()
-	executor := fakeExecutor{outputs: map[string]string{
-		"gh api repos/skyhuang233/workflow-integration-test":                                                                                          `{"private":true,"default_branch":"main"}`,
-		"gh api repos/skyhuang233/workflow-integration-test/branches/main":                                                                            `{"commit":{"sha":"current"}}`,
-		"gh run list -R skyhuang233/workflow-integration-test --workflow workflow-contract --branch main --limit 20 --json status,conclusion,headSha": `[{"status":"completed","conclusion":"success","headSha":"old"}]`,
-	}}
-	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Executor: executor}).Run(context.Background())
-	if result.Status != Fail || !strings.Contains(result.Summary, "current default-branch revision") {
-		t.Fatalf("GitHub check = %#v, want stale-run failure", result)
-	}
-}
-
 type checkFunc struct {
 	name   string
 	result Result
