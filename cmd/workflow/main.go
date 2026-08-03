@@ -219,9 +219,12 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 	if revisionErr == nil {
 		return revision, revisionPrompt, nil
 	}
+	if errors.Is(revisionErr, store.ErrNeedsAttention) {
+		return store.TicketClaim{}, "", revisionErr
+	}
 	owner, ownerErr := db.RecoveryOwner(ctx, versionID, ticketID)
 	if ownerErr != nil {
-		return store.TicketClaim{}, "", err
+		return store.TicketClaim{}, "", ownerErr
 	}
 	replacement, replacementErr := db.ClaimReady(ctx, store.ClaimRequest{
 		VersionID:       versionID,

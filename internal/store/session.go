@@ -281,7 +281,7 @@ func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision
 	defer tx.Rollback()
 	var sessionID, currentSessionID, existingCodexSessionID string
 	err = tx.QueryRowContext(ctx, `SELECT r.session_id, s.session_id, s.codex_session_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-	WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, candidate.LeaseToken, RunRunning, LeaseActive, formatTimestamp(candidate.Now)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID)
+	WHERE r.run_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, RunAgent, candidate.LeaseToken, RunRunning, LeaseActive, formatTimestamp(candidate.Now)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrInvalidClaim
 	}
@@ -398,7 +398,7 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 	err = tx.QueryRowContext(ctx, `SELECT s.session_id
 FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID)
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}

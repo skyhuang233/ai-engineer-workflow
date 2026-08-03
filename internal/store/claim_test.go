@@ -140,6 +140,128 @@ WHERE rt.version_id = ? AND rt.issue_id = ?`, version.ID, claim.TicketID).Scan(&
 	}
 }
 
+func TestDeliveryClaimsCannotBeReadOrAcceptedAsAgentClaims(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.currentClaimAt(ctx, version.ID, claim.TicketID, now.Add(time.Second)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delivery CurrentClaim error = %v, want ErrNotFound", err)
+	}
+	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: delivery.RunID, LeaseToken: delivery.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "replacement", StructuredOutput: []byte(`{"summary":"replacement"}`), Now: now.Add(time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("delivery candidate acceptance error = %v, want ErrInvalidClaim", err)
+	}
+}
+
+func TestExpiredDeliveryFeedbackNeedsAttentionWithoutAgentRevision(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "1", Body: "Please revise."}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNeedsAttention) {
+		t.Fatalf("expired delivery feedback recovery = %v, want ErrNeedsAttention", err)
+	}
+	var runtimeState string
+	var agentRuns int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND run_kind = ? AND state = ?`, claim.SessionID, RunAgent, RunRunning).Scan(&agentRuns); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeState != plan.StateNeedsAttention || agentRuns != 0 {
+		t.Fatalf("expired delivery feedback state = %q, running agent revisions = %d", runtimeState, agentRuns)
+	}
+}
+
+func TestDeliveryCompletionRequiresUnexpiredLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(2*time.Hour)); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("late delivery completion error = %v, want ErrInvalidClaim", err)
+	}
+	var runState, leaseState string
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&runState, &leaseState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != RunRunning || leaseState != LeaseActive {
+		t.Fatalf("late completion mutated delivery to run %q lease %q", runState, leaseState)
+	}
+}
+
 func TestReserveWorkerLaunchAllowsOnlyOneStarter(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -418,6 +540,65 @@ func TestExpiredReviewRevisionRequeuesItsFeedback(t *testing.T) {
 	}
 	if retry.Attempt != revision.Attempt+1 || !strings.Contains(prompt, "Please rename this.") {
 		t.Fatalf("retry = %#v, prompt = %q", retry, prompt)
+	}
+	var consecutiveFailures int
+	if err := db.db.QueryRowContext(ctx, `SELECT consecutive_failures FROM ticket_sessions WHERE session_id = ?`, retry.SessionID).Scan(&consecutiveFailures); err != nil {
+		t.Fatal(err)
+	}
+	if consecutiveFailures != 1 {
+		t.Fatalf("expired revision failures = %d, want 1", consecutiveFailures)
+	}
+}
+
+func TestExpiredReviewRevisionConsumesRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, now.Add(time.Second), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("expired revision retry budget error = %v, want ErrNotReady", err)
+	}
+	var runtimeState string
+	var consecutiveFailures int
+	if err := db.db.QueryRowContext(ctx, `SELECT rt.state, s.consecutive_failures FROM ticket_runtime rt JOIN ticket_sessions s ON s.version_id = rt.version_id AND s.issue_id = rt.issue_id WHERE rt.version_id = ? AND rt.issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState, &consecutiveFailures); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeState != plan.StateNeedsAttention || consecutiveFailures != 1 {
+		t.Fatalf("expired revision budget state = %q, failures = %d", runtimeState, consecutiveFailures)
 	}
 }
 

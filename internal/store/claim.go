@@ -323,7 +323,7 @@ FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, versionID, issueID, SessionRunning, RunRunning, LeaseActive, formatTimestamp(now)).
+WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, versionID, issueID, SessionRunning, RunAgent, RunRunning, LeaseActive, formatTimestamp(now)).
 		Scan(&claim.SessionID, &claim.Owner, &claim.RunID, &claim.Attempt, &claim.LeaseToken, &claim.LeaseGeneration, &expiresText, &claim.TicketNumber, &claim.TicketTitle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound

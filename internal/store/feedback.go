@@ -106,10 +106,10 @@ JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 		return TicketClaim{}, "", err
 	}
 	if currentRunID != "" {
-		var runState, leaseState, expiresText string
-		err := tx.QueryRowContext(ctx, `SELECT r.state, l.state, l.expires_at
+		var runKind, runState, leaseState, expiresText string
+		err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, l.expires_at
 FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ?`, currentRunID).Scan(&runState, &leaseState, &expiresText)
+WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expiresText)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return TicketClaim{}, "", err
 		}
@@ -121,6 +121,21 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runState, &leaseState, &expiresText)
 			if expiresAt.After(now) {
 				return TicketClaim{}, "", ErrNotReady
 			}
+			if runKind == RunDelivery {
+				if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), currentRunID, RunRunning); err != nil {
+					return TicketClaim{}, "", err
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND state = ?`, currentRunID, LeaseActive); err != nil {
+					return TicketClaim{}, "", err
+				}
+				if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "Delivery Controller lease expired before completion", now); err != nil {
+					return TicketClaim{}, "", err
+				}
+				if err := tx.Commit(); err != nil {
+					return TicketClaim{}, "", err
+				}
+				return TicketClaim{}, "", ErrNeedsAttention
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), currentRunID, RunRunning); err != nil {
 				return TicketClaim{}, "", err
 			}
@@ -130,6 +145,10 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runState, &leaseState, &expiresText)
 			if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, currentRunID); err != nil {
 				return TicketClaim{}, "", err
 			}
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+				return TicketClaim{}, "", err
+			}
+			consecutiveFailures++
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID); err != nil {
 				return TicketClaim{}, "", err
 			}
