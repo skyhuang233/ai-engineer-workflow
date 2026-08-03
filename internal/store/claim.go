@@ -303,6 +303,35 @@ AND EXISTS (
 	return nil
 }
 
+func (s *Store) WithCurrentAgentLease(ctx context.Context, claim TicketClaim, now time.Time, operation func() error) (bool, error) {
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 || operation == nil {
+		return false, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	var current bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ?
+AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ?
+)`, claim.VersionID, claim.TicketID, claim.RunID, RunAgent, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&current)
+	if err != nil {
+		return false, err
+	}
+	if !current {
+		return false, nil
+	}
+	return true, operation()
+}
+
 func (s *Store) RecoveryOwner(ctx context.Context, versionID string, issueID int64) (string, error) {
 	var owner string
 	err := s.db.QueryRowContext(ctx, `SELECT s.owner

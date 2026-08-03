@@ -30,6 +30,17 @@ type fakeRuntime struct {
 	deliveryDeadline time.Time
 }
 
+type blockingFailureRuntime struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Result, error) {
+	r.started <- struct{}{}
+	<-r.release
+	return worker.Result{Output: []byte(`{"type":"thread.started","thread_id":"expired-agent"}`), ContainerID: "expired-container"}, errors.New("worker crashed")
+}
+
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
@@ -141,6 +152,59 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	}
 	if next.SessionID != claim.SessionID || next.Attempt != claim.Attempt+1 || next.LeaseGeneration != claim.LeaseGeneration+1 {
 		t.Fatalf("replacement claim = %#v, want same session and next run", next)
+	}
+}
+
+func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	expired := agent.Controller{Store: db, Workspace: manager, Runtime: blockingFailureRuntime{started: started, release: release}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := expired.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
+		errCh <- err
+	}()
+	<-started
+
+	replacement, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(time.Second)})
+	if err != nil {
+		t.Fatalf("claim replacement: %v", err)
+	}
+	replacementRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("replacement-session", "replacement"), ContainerID: "replacement-container"}}}
+	replacementController := agent.Controller{Store: db, Workspace: manager, Runtime: replacementRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	candidate, err := replacementController.Run(ctx, candidateRequest(replacement, source, "ticket-1", "replace"))
+	if err != nil {
+		t.Fatalf("run replacement: %v", err)
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(session.WorkspacePath, "replacement.txt")
+	if err := os.WriteFile(marker, []byte("replacement work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-errCh; err == nil {
+		t.Fatal("expired worker run returned nil error")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expired worker removed replacement work: %v", err)
+	}
+	head := exec.Command("git", "rev-parse", "HEAD")
+	head.Dir = session.WorkspacePath
+	output, err := head.Output()
+	if err != nil || strings.TrimSpace(string(output)) != candidate.Commit {
+		t.Fatalf("workspace HEAD = %q, err = %v, want replacement %q", output, err, candidate.Commit)
+	}
+	if _, err := db.RunDiagnostic(ctx, claim.RunID); err != nil {
+		t.Fatalf("expired worker did not retain diagnostics: %v", err)
 	}
 }
 

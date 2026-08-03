@@ -273,7 +273,9 @@ func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspac
 	if restoreCommit == "" {
 		restoreCommit = baseCommit
 	}
-	restoreErr := c.Workspace.restore(ctx, ws, restoreCommit)
+	_, restoreErr := c.Store.WithCurrentAgentLease(ctx, request.Claim, c.now(), func() error {
+		return c.Workspace.restore(ctx, ws, restoreCommit)
+	})
 	var recordErr error
 	if diagnosticErr == nil {
 		recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: reason, Now: c.now()})
