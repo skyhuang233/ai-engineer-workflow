@@ -13,7 +13,7 @@
   },
   "worker": {
     "image": "ghcr.io/skyhuang233/workflow-worker:0.1.0@sha256:be055179fa2740356baf348ae39213858218b0b09838af278a7f0f8b7ac7f789",
-    "local_build_id": "sha256:be055179fa2740356baf348ae39213858218b0b09838af278a7f0f8b7ac7f789"
+    "local_build_id": "sha256:4c1ef26cb3a73e8ff0df8919a9df333e75b852f9e65d323baab67d16de5b773c"
   },
   "runtime": {
     "max_worker_attempts": 3

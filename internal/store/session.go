@@ -54,6 +54,8 @@ type CandidateRevision struct {
 	Publication      CandidatePublication
 }
 
+const defaultDeliveryLeaseTTL = 30 * time.Minute
+
 type CandidatePublication struct {
 	Repository         string
 	Branch             string

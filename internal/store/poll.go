@@ -256,11 +256,28 @@ WHERE version_id = ? AND EXISTS (
 		if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, versionID, issueID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE version_id = ? AND issue_id = ?`, formatTimestamp(now), versionID, issueID); err != nil {
+		var sessionID, acceptedCommit string
+		err := tx.QueryRowContext(ctx, `SELECT session_id, accepted_commit FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &acceptedCommit)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), versionID, issueID); err != nil {
-			return err
+		if acceptedCommit != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+				return err
+			}
+			if _, err := claimDeliveryControllerTx(ctx, tx, sessionID, defaultDeliveryLeaseTTL, now); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), versionID, issueID); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

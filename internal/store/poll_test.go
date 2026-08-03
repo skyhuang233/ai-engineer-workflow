@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -106,6 +107,60 @@ func TestNeedsAttentionAnswerRestoresTicketAndOpensNextGeneration(t *testing.T) 
 	questions, err = db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
 	if err != nil || len(questions) != 1 || questions[0].ID != "needs-attention-"+version.ID+"-1-g2" {
 		t.Fatalf("reopened question = %#v, %v", questions, err)
+	}
+}
+
+func TestNeedsAttentionAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryController(ctx, delivery, "Delivery Controller lease expired before completion", now.Add(2*time.Hour)); !errors.Is(err, ErrNeedsAttention) {
+		t.Fatalf("expire delivery = %v, want ErrNeedsAttention", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(2*time.Hour+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var runKind, runState, leaseState, acceptedCommit string
+	if err := db.db.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, s.accepted_commit
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ?`, version.ID, claim.TicketID).Scan(&runKind, &runState, &leaseState, &acceptedCommit); err != nil {
+		t.Fatal(err)
+	}
+	if runKind != RunDelivery || runState != RunRunning || leaseState != LeaseActive || acceptedCommit != "accepted" {
+		t.Fatalf("retried delivery = kind %q, state %q, lease %q, commit %q", runKind, runState, leaseState, acceptedCommit)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2*time.Hour + 2*time.Second)}); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("Agent recovery after delivery retry = %v, want ErrFencingConflict", err)
 	}
 }
 
