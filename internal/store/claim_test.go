@@ -138,6 +138,55 @@ func TestCapacityComparisonUsesFixedWidthLeaseTimestamps(t *testing.T) {
 	}
 }
 
+func TestNeedsAttentionTicketCannotBeClaimedAgain(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	snapshot.BlockedBy = map[int64][]plan.Issue{}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateNeedsAttention, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_sessions SET owner = '' WHERE session_id = ?`, claim.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	frontier, err := db.ReadyFrontier(ctx, version.ID, 1, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 1 || frontier[0].IssueID != 2 {
+		t.Fatalf("frontier = %#v, want only ticket 2", frontier)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now.Add(time.Hour)}); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("needs-attention claim error = %v, want ErrFencingConflict", err)
+	}
+}
+
 func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

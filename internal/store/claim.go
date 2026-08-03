@@ -315,8 +315,8 @@ WHERE t.version_id = ?`, versionID)
 			return snapshot, err
 		}
 		ticket.Delivered = delivered != 0
-		if runtimeState == plan.StateWaitingReview {
-			ticket.Owner = "waiting_review"
+		if runtimeState == plan.StateWaitingReview || runtimeState == plan.StateNeedsAttention {
+			ticket.Owner = runtimeState
 		}
 		if sessionState == SessionRunning && runState == RunRunning && leaseState == LeaseActive {
 			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)

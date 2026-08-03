@@ -16,8 +16,8 @@ func TestWorkspacePusherUsesTemporaryCredentialStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Remove(storePath)
-	if filepath.Dir(storePath) != workspace {
-		t.Fatalf("credential store directory = %q, want workspace %q", filepath.Dir(storePath), workspace)
+	if filepath.Dir(storePath) == workspace {
+		t.Fatalf("credential store must not be created in workspace %q", workspace)
 	}
 	contents, err := os.ReadFile(storePath)
 	if err != nil {

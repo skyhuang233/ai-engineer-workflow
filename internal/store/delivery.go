@@ -488,6 +488,17 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	nextAttempt := formatTimestamp(now)
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
+		if state == OutboxRejected {
+			var request DeliveryRequest
+			if err := json.Unmarshal([]byte(raw), &request); err != nil {
+				return err
+			}
+			if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
+				if err := markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
+					return err
+				}
+			}
+		}
 	} else if attempts >= maxDeliveryAttempts {
 		state = OutboxRejected
 		completed = formatTimestamp(now)
@@ -562,7 +573,21 @@ func markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request Deliv
 	if request.RunID == "" {
 		return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?)`, plan.StateNeedsAttention, formatTimestamp(now), request.RunID)
+	var delivered int
+	err := tx.QueryRowContext(ctx, `SELECT rt.delivered FROM ticket_runtime rt
+JOIN worker_runs r ON r.run_id = ?
+JOIN ticket_sessions s ON s.session_id = r.session_id
+WHERE rt.version_id = s.version_id AND rt.issue_id = s.issue_id`, request.RunID).Scan(&delivered)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if delivered != 0 {
+		return nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?) AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), request.RunID)
 	if err != nil {
 		return err
 	}

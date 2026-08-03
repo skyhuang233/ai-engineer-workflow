@@ -354,7 +354,7 @@ func TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(audits) < 2 || audits[len(audits)-1].Decision != "rejected" {
+	if len(audits) < 3 || audits[len(audits)-2].Decision != "rejected" || audits[len(audits)-1].Decision != "needs_attention" {
 		t.Fatalf("audits = %#v", audits)
 	}
 }
@@ -434,6 +434,29 @@ func TestGatewayBoundsExternalWriteByLeaseDeadline(t *testing.T) {
 	}
 	if !remote.deadlineSeen || time.Since(started) > time.Second {
 		t.Fatalf("external write was not bounded by lease deadline; deadline=%t elapsed=%s", remote.deadlineSeen, time.Since(started))
+	}
+}
+
+func TestGatewayRejectionPausesAcceptedCandidateDelivery(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "unexpected", RemoteExists: true}}}
+	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, handoff.PushOutboxKey); !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("push rejection error = %v, want delivery rejection", err)
+	}
+	projection, err := db.PlanProjectionAt(ctx, claim.VersionID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("ticket state after rejected publication = %q", projection.Tickets[0].State)
 	}
 }
 

@@ -53,7 +53,7 @@ func (p WorkspacePusher) createCredentialStore(pushURL string) (string, error) {
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
 		return "", errors.New("credential-owning push adapter requires an HTTPS push URL")
 	}
-	credentialStore, err := os.CreateTemp(p.WorkspacePath, ".workflow-git-credential-*")
+	credentialStore, err := os.CreateTemp("", ".workflow-git-credential-*")
 	if err != nil {
 		return "", fmt.Errorf("create temporary git credential store: %w", err)
 	}
