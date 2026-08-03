@@ -52,9 +52,21 @@ imported as a ticket. Activation is admitted only after every native child is
 typed and every blocked-by edge points to another child without cycles or
 duplicate edges. A closed blocker must already have a verified Delivered fact;
 the derived `workflow:delivered` label is projection only and is never authority.
+A Delivered fact is recorded only when the ticket's accepted Candidate Revision
+is tied to a merged pull request and that revision is reachable from `main`.
+Neither pull-request prose nor a closed issue or pull request establishes delivery.
 
 The control plane records its state in a hidden, replaceable block delimited by
 `<!-- workflow:status:start -->` and `<!-- workflow:status:end -->`. It leaves
 the surrounding Plan Root specification untouched. Successful activation adds
 the `workflow:active` label only after the immutable plan version is stored;
 until that final marker is written, the version remains non-dispatchable.
+If activation finds every ticket already Delivered and no live Worker Run, the
+version is projected as Completed without dispatching work.
+
+When an approved replacement targets another Plan Root, the scheduler consumes
+the source-to-target handoff durably and idempotently. It may activate and
+project the target while it is still `projecting`, but dispatches its tickets
+only after the `workflow:active` projection succeeds. It then atomically
+cancels the source and records the handoff as active; a repeated reconciliation
+observes that recorded state rather than creating another handoff.
