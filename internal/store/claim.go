@@ -309,6 +309,86 @@ AND l.state = ? AND l.expires_at > ? ORDER BY r.started_at, r.run_id`, repositor
 	return claims, rows.Err()
 }
 
+func (s *Store) ClaimPendingDeliveryClaims(ctx context.Context, repository string, maxParallelRuns int, leaseTTL time.Duration, now time.Time) ([]TicketClaim, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if repository == "" || maxParallelRuns <= 0 {
+		return nil, ErrInvalidClaim
+	}
+	if leaseTTL <= 0 {
+		leaseTTL = time.Minute
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	activeRuns, err := activeRunCountTx(ctx, tx, now)
+	if err != nil {
+		return nil, err
+	}
+	available := maxParallelRuns - activeRuns
+	if available <= 0 {
+		return nil, tx.Commit()
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT s.session_id
+FROM ticket_sessions s
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+JOIN plan_versions v ON v.version_id = s.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE p.repository = ? AND p.current_version_id = s.version_id
+AND s.state = ? AND s.accepted_commit != '' AND s.delivery_retry_pending = 1
+AND rt.state = ? AND rt.delivered = 0
+ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.StateWaitingReview, available)
+	if err != nil {
+		return nil, err
+	}
+	var sessionIDs []string
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	claims := make([]TicketClaim, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		result, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 0, updated_at = ? WHERE session_id = ? AND delivery_retry_pending = 1`, formatTimestamp(now), sessionID)
+		if err != nil {
+			return nil, err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if updated != 1 {
+			continue
+		}
+		claim, err := claimDeliveryControllerTx(ctx, tx, sessionID, leaseTTL, now)
+		if err != nil {
+			return nil, err
+		}
+		claims = append(claims, claim)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
 func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
 	return s.reserveWorkerLaunch(ctx, claim, now, "")
 }
@@ -484,10 +564,8 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
 		return TicketClaim{}, ErrNotReady
 	}
-	var activeRuns int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
-JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&activeRuns); err != nil {
+	activeRuns, err := activeRunCountTx(ctx, tx, now)
+	if err != nil {
 		return TicketClaim{}, err
 	}
 	if activeRuns >= maxParallelRuns {
@@ -675,12 +753,18 @@ WHERE t.version_id = ?`, versionID)
 	if err := dependencyRows.Err(); err != nil {
 		return snapshot, err
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
-JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
+	if snapshot.ActiveRuns, err = activeRunCountTx(ctx, tx, now); err != nil {
 		return snapshot, err
 	}
 	return snapshot, nil
+}
+
+func activeRunCountTx(ctx context.Context, tx frontierRows, now time.Time) (int, error) {
+	var activeRuns int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&activeRuns)
+	return activeRuns, err
 }
 
 func randomID(prefix string) (string, error) {

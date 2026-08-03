@@ -353,7 +353,7 @@ func runPollGitHub(args []string) {
 			if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
 				return err
 			}
-			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, time.Now().UTC(), launchDelivery); err != nil {
+			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, *maxParallelRuns, 30*time.Minute, time.Now().UTC(), launchDelivery); err != nil {
 				return err
 			}
 			for {
@@ -406,7 +406,10 @@ func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, 
 	return err
 }
 
-func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, repository string, now time.Time, launch func(context.Context, store.TicketClaim) error) error {
+func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, repository string, maxParallelRuns int, leaseTTL time.Duration, now time.Time, launch func(context.Context, store.TicketClaim) error) error {
+	if _, err := db.ClaimPendingDeliveryClaims(ctx, repository, maxParallelRuns, leaseTTL, now); err != nil {
+		return err
+	}
 	claims, err := db.PendingDeliveryClaims(ctx, repository, now)
 	if err != nil {
 		return err

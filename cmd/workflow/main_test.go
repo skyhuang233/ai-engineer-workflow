@@ -93,7 +93,7 @@ func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T
 		t.Fatal(err)
 	}
 	var launched []store.TicketClaim
-	if err := dispatchPendingDeliveryClaims(ctx, db, snapshot.Repository, now.Add(2*time.Second), func(_ context.Context, retry store.TicketClaim) error {
+	if err := dispatchPendingDeliveryClaims(ctx, db, snapshot.Repository, 1, time.Hour, now.Add(2*time.Second), func(_ context.Context, retry store.TicketClaim) error {
 		launched = append(launched, retry)
 		return nil
 	}); err != nil {

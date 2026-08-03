@@ -545,6 +545,14 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return err
 		}
 	}
+	if applied < 18 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE ticket_sessions ADD COLUMN delivery_retry_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migration 18: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

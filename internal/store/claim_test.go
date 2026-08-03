@@ -982,6 +982,48 @@ func TestDeliveryControllerCountsTowardClaimCapacity(t *testing.T) {
 	}
 }
 
+func TestDeliveryControllerCountsTowardReviewRevisionCapacity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	snapshot.BlockedBy = map[int64][]plan.Issue{}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	deliveryAgent, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: deliveryAgent.RunID, LeaseToken: deliveryAgent.LeaseToken, CodexSessionID: "codex-1", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket-1"}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO ticket_sessions(session_id, version_id, issue_id, owner, state, current_run_id, current_lease_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', 0, ?, ?)`, "review-session", version.ID, int64(2), "agent-2", SessionRunning, formatTimestamp(now), formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, int64(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, 2, []ReviewFeedback{{Source: "review", EventID: "1", Body: "Please revise."}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, 2, time.Hour, now.Add(time.Second), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("review revision while delivery is running = %v, want ErrCapacity", err)
+	}
+}
+
 func TestNeedsAttentionTicketCannotBeClaimedAgain(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

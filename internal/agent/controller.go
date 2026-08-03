@@ -313,7 +313,7 @@ func parseDeliveryTOON(output []byte) error {
 	if status, ok := run["status"].(string); !ok || strings.TrimSpace(status) != "completed" {
 		return errors.New("Delivery Controller TOON did not complete")
 	}
-	if outcome, ok := document["outcome"].(string); !ok || strings.TrimSpace(outcome) != "passed" {
+	if outcome, ok := document["outcome"].(string); !ok || (strings.TrimSpace(outcome) != "passed" && strings.TrimSpace(outcome) != "checks-passed") {
 		return errors.New("Delivery Controller TOON did not pass")
 	}
 	return nil

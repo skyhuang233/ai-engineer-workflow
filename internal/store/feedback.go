@@ -161,8 +161,8 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 	if err := tx.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE session_id = ?`, sessionID).Scan(&recoveryEpoch); err != nil {
 		return TicketClaim{}, "", err
 	}
-	var activeRuns int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE state = ? AND run_kind = ?`, RunRunning, RunAgent).Scan(&activeRuns); err != nil {
+	activeRuns, err := activeRunCountTx(ctx, tx, now)
+	if err != nil {
 		return TicketClaim{}, "", err
 	}
 	if activeRuns >= maxParallelRuns {

@@ -44,7 +44,7 @@ func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Re
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
-		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: passed\n")
+		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: checks-passed\n")
 		if len(r.deliveryOutput) > 0 {
 			output = r.deliveryOutput
 		}
@@ -395,6 +395,9 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 		t.Fatalf("review claim after failed delivery = %v, want not ready", err)
 	}
 	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "retry", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())

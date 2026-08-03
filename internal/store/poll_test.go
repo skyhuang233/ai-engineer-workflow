@@ -149,6 +149,9 @@ func TestNeedsAttentionAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testin
 	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(2*time.Hour+time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if claims, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(2*time.Hour+time.Second)); err != nil || len(claims) != 1 {
+		t.Fatalf("claimed recovered delivery = %#v, %v", claims, err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -277,12 +280,74 @@ func TestPollFailureAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T
 	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(2*time.Hour+time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if claims, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(2*time.Hour+time.Second)); err != nil || len(claims) != 1 {
+		t.Fatalf("claimed recovered delivery = %#v, %v", claims, err)
+	}
 	pending, err := db.PendingDeliveryClaims(ctx, snapshot.Repository, now.Add(2*time.Hour+time.Second))
 	if err != nil || len(pending) != 1 || pending[0].TicketID != claim.TicketID {
 		t.Fatalf("recovered delivery claims = %#v, err = %v", pending, err)
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2*time.Hour + 2*time.Second)}); !errors.Is(err, ErrFencingConflict) {
 		t.Fatalf("Agent recovery after poll failure = %v, want ErrFencingConflict", err)
+	}
+}
+
+func TestRecoveredDeliveryWaitsForGlobalCapacity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	snapshot.BlockedBy = map[int64][]plan.Issue{}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	first, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDelivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: first.RunID, LeaseToken: first.LeaseToken, CodexSessionID: "codex-1", CommitSHA: "accepted-1", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket-1"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryController(ctx, firstDelivery, "delivery failed", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: second.RunID, LeaseToken: second.LeaseToken, CodexSessionID: "codex-2", CommitSHA: "accepted-2", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now.Add(2 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-2", ExpectRemoteAbsent: true, Title: "ticket-2"}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Second))
+	if err != nil || len(claims) != 0 {
+		t.Fatalf("recovered claims while delivery is live = %#v, %v", claims, err)
+	}
+	var pending int
+	if err := db.db.QueryRowContext(ctx, `SELECT delivery_retry_pending FROM ticket_sessions WHERE session_id = ?`, first.SessionID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("delivery retry pending = %d, want 1", pending)
 	}
 }
 

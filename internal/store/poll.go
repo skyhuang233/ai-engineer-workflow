@@ -297,10 +297,10 @@ func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID st
 		return err
 	}
 	if acceptedCommit != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
 			return err
 		}
-		_, err := claimDeliveryControllerTx(ctx, tx, sessionID, defaultDeliveryLeaseTTL, now)
+		_, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID)
 		return err
 	}
 	if sessionID != "" {
@@ -346,6 +346,9 @@ WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 0, updated_at = ? WHERE version_id = ? AND issue_id = ?`, formatTimestamp(now), versionID, issueID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id IN (
