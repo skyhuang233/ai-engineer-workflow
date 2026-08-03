@@ -377,6 +377,25 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
 		t.Fatalf("review claim after failed delivery = %v, want not ready", err)
 	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "retry", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending delivery claims = %#v, %v", pending, err)
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("retry delivery: %v", err)
+	}
+	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
+		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
+	}
+	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
+	}
 }
 
 func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T) {

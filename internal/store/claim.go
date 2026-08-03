@@ -271,6 +271,44 @@ func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int6
 	return s.currentClaimAt(ctx, versionID, issueID, time.Now().UTC())
 }
 
+func (s *Store) PendingDeliveryClaims(ctx context.Context, repository string, now time.Time) ([]TicketClaim, error) {
+	if repository == "" {
+		return nil, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id, r.run_id, r.attempt, l.lease_token, l.generation, l.expires_at
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN plan_versions v ON v.version_id = s.version_id
+JOIN plans p ON p.id = v.plan_id
+JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+WHERE p.repository = ? AND s.state = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'ready'
+AND l.state = ? AND l.expires_at > ? ORDER BY r.started_at, r.run_id`, repository, SessionRunning, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var claims []TicketClaim
+	for rows.Next() {
+		var claim TicketClaim
+		var expiresText string
+		if err := rows.Scan(&claim.VersionID, &claim.TicketID, &claim.TicketNumber, &claim.TicketTitle, &claim.Owner, &claim.SessionID, &claim.RunID, &claim.Attempt, &claim.LeaseToken, &claim.LeaseGeneration, &expiresText); err != nil {
+			return nil, err
+		}
+		claim.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, expiresText)
+		if err != nil {
+			return nil, err
+		}
+		claims = append(claims, claim)
+	}
+	return claims, rows.Err()
+}
+
 func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()

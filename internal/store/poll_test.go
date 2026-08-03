@@ -112,7 +112,8 @@ func TestNeedsAttentionAnswerRestoresTicketAndOpensNextGeneration(t *testing.T) 
 
 func TestNeedsAttentionAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +148,18 @@ func TestNeedsAttentionAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testin
 	}
 	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(2*time.Hour+time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pending, err := db.PendingDeliveryClaims(ctx, snapshot.Repository, now.Add(2*time.Hour+time.Second))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("persisted delivery claims = %#v, %v", pending, err)
 	}
 	var runKind, runState, leaseState, acceptedCommit string
 	if err := db.db.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, s.accepted_commit

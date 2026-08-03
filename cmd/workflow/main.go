@@ -334,6 +334,10 @@ func runPollGitHub(args []string) {
 		}
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
+	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
+		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: *gatewayURL}
+		return controller.RetryDelivery(ctx, claim)
+	}
 	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -347,6 +351,9 @@ func runPollGitHub(args []string) {
 			}
 			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute}
 			if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
+				return err
+			}
+			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, time.Now().UTC(), launchDelivery); err != nil {
 				return err
 			}
 			for {
@@ -397,6 +404,19 @@ func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, 
 	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: workspaceRoot, CodexStateRoot: stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: gatewayURL}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: repository, Branch: branch, ExpectedRemoteHead: expectedHead, ExpectRemoteAbsent: expectAbsent, Title: claim.TicketTitle}})
 	return err
+}
+
+func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, repository string, now time.Time, launch func(context.Context, store.TicketClaim) error) error {
+	claims, err := db.PendingDeliveryClaims(ctx, repository, now)
+	if err != nil {
+		return err
+	}
+	for _, claim := range claims {
+		if err := launch(ctx, claim); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runAnswerInbox(args []string) {

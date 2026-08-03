@@ -108,11 +108,19 @@ type TicketDelivery struct {
 }
 
 func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
+	delivery, err := s.CandidateDelivery(ctx, versionID, issueID)
+	if errors.Is(err, ErrNotFound) || (err == nil && delivery.PullRequestNumber == 0) {
+		return TicketDelivery{}, ErrNotFound
+	}
+	return delivery, err
+}
+
+func (s *Store) CandidateDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
 	var delivery TicketDelivery
 	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.checks_etag
 FROM ticket_deliveries d
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
-WHERE d.version_id = ? AND d.issue_id = ? AND d.pull_request_number > 0 AND s.accepted_commit != ''`, versionID, issueID).
+WHERE d.version_id = ? AND d.issue_id = ? AND s.accepted_commit != ''`, versionID, issueID).
 		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.ChecksETag)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketDelivery{}, ErrNotFound

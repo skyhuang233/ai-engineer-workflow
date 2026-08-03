@@ -175,7 +175,57 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
+	session.AcceptedCommit = commit
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
+	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt); err != nil {
+		return candidate, err
+	}
+	return candidate, nil
+}
+
+func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) error {
+	if c.Store == nil || c.Runtime == nil {
+		return errors.New("agent controller dependencies are incomplete")
+	}
+	session, err := c.Store.TicketSession(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return err
+	}
+	delivery, err := c.Store.CandidateDelivery(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return c.failDeliveryController(ctx, claim, err)
+	}
+	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" {
+		return c.failDeliveryController(ctx, claim, errors.New("accepted Candidate workspace is incomplete"))
+	}
+	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, Branch: session.Branch}
+	commit, branch, clean, err := c.Workspace.status(ctx, ws)
+	if err != nil {
+		return c.failDeliveryController(ctx, claim, err)
+	}
+	if branch != ws.Branch || !clean || commit != session.AcceptedCommit {
+		return c.failDeliveryController(ctx, claim, errors.New("accepted Candidate workspace no longer matches its delivery revision"))
+	}
+	if err := validateLocalRemotes(ctx, ws.Path); err != nil {
+		return c.failDeliveryController(ctx, claim, err)
+	}
+	publication := store.CandidatePublication{
+		Repository:         delivery.Repository,
+		Branch:             delivery.Branch,
+		ExpectedRemoteHead: delivery.RemoteHead,
+		ExpectRemoteAbsent: delivery.RemoteHead == "",
+		Title:              claim.TicketTitle,
+		Body:               "Retry delivery of the accepted Candidate Revision.",
+	}
+	intent := fmt.Sprintf("Retry delivery of accepted Candidate Revision %s for ticket #%d.", delivery.CandidateCommit, claim.TicketNumber)
+	return c.runDeliveryController(ctx, claim, session, ws, publication, intent)
+}
+
+func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {
+	gatewayURL := strings.TrimSpace(c.GatewayURL)
+	if gatewayURL == "" {
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
+	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
@@ -188,35 +238,42 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(deliveryClaim.LeaseGeneration),
 		"NO_MISTAKES_REPOSITORY":           publication.Repository,
 		"NO_MISTAKES_BRANCH":               publication.Branch,
-		"NO_MISTAKES_COMMIT_SHA":           commit,
+		"NO_MISTAKES_COMMIT_SHA":           session.AcceptedCommit,
 		"NO_MISTAKES_EXPECTED_REMOTE_HEAD": publication.ExpectedRemoteHead,
 		"NO_MISTAKES_EXPECT_REMOTE_ABSENT": fmt.Sprint(publication.ExpectRemoteAbsent),
 		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
 		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
-	deliverySpec := spec
-	deliverySpec.Command = []string{noMistakes, "axi", "run", "--intent", request.Prompt}
-	deliverySpec.Environment = deliveryEnvironment
-	if err := deliverySpec.Validate(); err != nil {
-		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
+	deliverySpec := worker.Spec{
+		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
+		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
+		Environment: deliveryEnvironment,
+		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
+		ExtraHosts:  []string{worker.GatewayHostMapping},
 	}
-	if err := c.Store.ReserveWorkerLaunch(handoffCtx, deliveryClaim, c.now()); err != nil {
-		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
+	if err := deliverySpec.Validate(); err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
+	}
+	if err := c.Store.ReserveWorkerLaunch(ctx, deliveryClaim, c.now()); err != nil {
+		if errors.Is(err, store.ErrWorkerLaunched) {
+			return err
+		}
+		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.WithoutCancel(ctx), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
 	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
-		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
 	}
 	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
-		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
+		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	if err := c.Store.CompleteDeliveryController(handoffCtx, deliveryClaim, c.now()); err != nil {
-		return candidate, err
+	if err := c.Store.CompleteDeliveryController(ctx, deliveryClaim, c.now()); err != nil {
+		return err
 	}
-	return candidate, nil
+	return nil
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
