@@ -103,3 +103,33 @@ func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T
 		t.Fatalf("launched delivery claims = %#v", launched)
 	}
 }
+
+func TestLaunchDeliveryClaimsConcurrently(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	claims := []store.TicketClaim{{RunID: "delivery-1"}, {RunID: "delivery-2"}}
+	go func() {
+		finished <- launchDeliveryClaims(context.Background(), claims, func(_ context.Context, claim store.TicketClaim) error {
+			started <- claim.RunID
+			<-release
+			return nil
+		})
+	}()
+	for range claims {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("delivery claims did not launch concurrently")
+		}
+	}
+	close(release)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delivery claim dispatch did not finish")
+	}
+}
