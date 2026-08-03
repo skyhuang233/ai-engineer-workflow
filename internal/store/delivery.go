@@ -70,6 +70,7 @@ type DeliveryTarget struct {
 	PullRequestNodeID string
 	RemoteHead        string
 	LeaseExpiresAt    time.Time
+	AcceptedHandoff   bool
 }
 
 type DeliveryOutbox struct {
@@ -215,6 +216,9 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 	if !errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, err
 	}
+	if target.AcceptedHandoff {
+		return DeliveryOutbox{}, fmt.Errorf("%w: accepted handoff requires its original outbox command", ErrDeliveryRejected)
+	}
 	if target.TicketID != 0 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_deliveries(version_id, issue_id, repository, branch, pull_request_number, pull_request_node_id, remote_head, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, '', '', ?, ?)
@@ -262,6 +266,9 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 		}
 		return DeliveryTarget{}, err
 	}
+	if err := requireAcceptedHandoffOutboxTx(ctx, tx, target, request); err != nil {
+		return DeliveryTarget{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryTarget{}, err
 	}
@@ -287,6 +294,9 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 	if err != nil {
 		return DeliveryResult{}, err
 	}
+	if err := requireAcceptedHandoffOutboxTx(ctx, tx, target, request); err != nil {
+		return DeliveryResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryResult{}, err
 	}
@@ -304,6 +314,26 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, fmt.Errorf("%w: delivery lease expired during external write: %v", ErrDeliveryUncertain, err)
 	}
 	return deliveryResult, nil
+}
+
+func requireAcceptedHandoffOutboxTx(ctx context.Context, tx *sql.Tx, target DeliveryTarget, request DeliveryRequest) error {
+	if !target.AcceptedHandoff {
+		return nil
+	}
+	keyRequest := request
+	if (request.Operation == DeliveryUpsertPR || request.Operation == DeliveryReplyEvidence) && request.PullRequestNumber == 0 {
+		keyRequest.PullRequestNumber = 0
+	}
+	key, err := deliveryKey(keyRequest)
+	if err != nil {
+		return err
+	}
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: accepted handoff requires its original outbox command", ErrDeliveryRejected)
+	} else {
+		return err
+	}
 }
 
 func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox, error) {
@@ -791,6 +821,9 @@ AND ((r.state = ? AND l.state = ?) OR (r.state = 'succeeded' AND l.state = 'revo
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
 	target.LeaseExpiresAt = expiresAt
+	if acceptedHandoff {
+		target.AcceptedHandoff = true
+	}
 	if request.Repository != target.Repository {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: repository does not belong to ticket", ErrDeliveryRejected)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
@@ -300,6 +301,34 @@ func TestValidateRepository(t *testing.T) {
 	}
 	if err := ValidateRepository("owner/repo/extra"); err == nil {
 		t.Fatal("accepted repository with too many path components")
+	}
+}
+
+func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored"}})
+	}))
+	defer server.Close()
+	answers, err := NewClient(server.URL, "", server.Client()).WorkflowInboxAnswers(context.Background(), "owner/repo", 10, []string{"needs-attention-pv-1-1-g1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answers["needs-attention-pv-1-1-g1"] != "retry after restoring access" || len(answers) != 1 {
+		t.Fatalf("answers = %#v", answers)
+	}
+}
+
+func TestRateLimitRetryAtUsesGitHubReset(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("X-RateLimit-Remaining", "0")
+	headers.Set("X-RateLimit-Reset", "1785715260")
+	response := &http.Response{StatusCode: http.StatusForbidden, Header: headers}
+	got := rateLimitRetryAt(response, time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC))
+	if !got.Equal(time.Unix(1785715260, 0).UTC()) {
+		t.Fatalf("retry at = %s", got)
 	}
 }
 

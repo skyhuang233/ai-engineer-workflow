@@ -190,6 +190,10 @@ type pullRequestResponse struct {
 type commentResponse struct {
 	ID   int64  `json:"id"`
 	Body string `json:"body"`
+	User struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"user"`
 }
 
 func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.DeliveryRequest) (pullRequestResponse, bool, error) {

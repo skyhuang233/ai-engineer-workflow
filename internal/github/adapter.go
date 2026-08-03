@@ -167,6 +167,7 @@ type apiError struct {
 	Path       string
 	StatusCode int
 	Message    string
+	RetryAt    time.Time
 }
 
 func (e *apiError) Error() string {
@@ -175,9 +176,54 @@ func (e *apiError) Error() string {
 
 func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
+}
+
+func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, rootNumber int64, questionIDs []string) (map[string]string, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return nil, err
+	}
+	if rootNumber <= 0 || len(questionIDs) == 0 {
+		return nil, fmt.Errorf("workflow inbox location is incomplete")
+	}
+	known := make(map[string]struct{}, len(questionIDs))
+	for _, questionID := range questionIDs {
+		known[questionID] = struct{}{}
+	}
+	comments, err := c.listIssueComments(ctx, repository, rootNumber)
+	if err != nil {
+		return nil, err
+	}
+	answers := make(map[string]string)
+	for _, comment := range comments {
+		if !actionableAuthor(comment.User.Login, comment.User.Type) {
+			continue
+		}
+		for questionID, answer := range parseWorkflowInboxAnswers(comment.Body) {
+			if _, ok := known[questionID]; ok {
+				answers[questionID] = answer
+			}
+		}
+	}
+	return answers, nil
+}
+
+func parseWorkflowInboxAnswers(body string) map[string]string {
+	answers := make(map[string]string)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "workflow-answer:") {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(line, "workflow-answer:")), ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			continue
+		}
+		answers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	return answers
 }
 
 // ReadPlan uses GitHub's native sub-issue and blocked-by endpoints. It reads
@@ -461,12 +507,29 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
-		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message))}
+		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message)), RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
 	}
 	if destination == nil {
 		return nil
 	}
 	return json.NewDecoder(response.Body).Decode(destination)
+}
+
+func rateLimitRetryAt(response *http.Response, now time.Time) time.Time {
+	if response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusForbidden {
+		return time.Time{}
+	}
+	if retryAfter, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && retryAfter > 0 {
+		return now.Add(time.Duration(retryAfter) * time.Second)
+	}
+	if response.Header.Get("X-RateLimit-Remaining") != "0" {
+		return time.Time{}
+	}
+	reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64)
+	if err != nil || reset <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(reset, 0).UTC()
 }
 
 type issueResponse struct {

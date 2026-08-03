@@ -23,6 +23,27 @@ type WorkflowQuestion struct {
 	RootNumber int64
 }
 
+func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number
+FROM workflow_questions q
+JOIN plan_versions v ON v.version_id = q.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE q.repository = ? AND (? = 0 OR p.root_issue_number = ?) AND q.state = 'open' ORDER BY q.created_at, q.question_id`, repository, rootNumber, rootNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var questions []WorkflowQuestion
+	for rows.Next() {
+		var question WorkflowQuestion
+		if err := rows.Scan(&question.ID, &question.Repository, &question.VersionID, &question.IssueID, &question.Kind, &question.Prompt, &question.State, &question.Answer, &question.RootNumber); err != nil {
+			return nil, err
+		}
+		questions = append(questions, question)
+	}
+	return questions, rows.Err()
+}
+
 type GitHubPollCursor struct {
 	Repository          string
 	LastSuccessAt       time.Time
@@ -82,6 +103,21 @@ consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at
 	return err
 }
 
+func (s *Store) DeferGitHubPoll(ctx context.Context, repository string, retryAt, now time.Time) error {
+	if retryAt.IsZero() {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, next_attempt_at, updated_at)
+VALUES (?, 0, ?, ?)
+ON CONFLICT(repository) DO UPDATE SET next_attempt_at = CASE WHEN github_poll_cursors.next_attempt_at > excluded.next_attempt_at THEN github_poll_cursors.next_attempt_at ELSE excluded.next_attempt_at END, updated_at = excluded.updated_at`, repository, formatTimestamp(retryAt), formatTimestamp(now))
+	return err
+}
+
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -93,28 +129,33 @@ func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository str
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
-WHERE delivered = 0 AND version_id IN (
-  SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL
-)`, plan.StateNeedsAttention, formatTimestamp(now), repository); err != nil {
-		return err
-	}
 	rows, err := tx.QueryContext(ctx, `SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL`, repository)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	var versionIDs []string
 	for rows.Next() {
 		var versionID string
 		if err := rows.Scan(&versionID); err != nil {
+			rows.Close()
+			return err
+		}
+		versionIDs = append(versionIDs, versionID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, versionID := range versionIDs {
+		if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "GitHub polling exhausted its retry budget", now); err != nil {
 			return err
 		}
 		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
 			return err
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	return tx.Commit()
 }
@@ -161,6 +202,12 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 			return err
 		}
 	} else if kind == "needs_attention" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = (SELECT version_id FROM workflow_questions WHERE question_id = ? AND repository = ?)`, questionID, repository); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE version_id = (SELECT version_id FROM workflow_questions WHERE question_id = ?) AND issue_id = (SELECT issue_id FROM workflow_questions WHERE question_id = ?)`, formatTimestamp(now), questionID, questionID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM workflow_questions WHERE question_id = ?) AND issue_id = (SELECT issue_id FROM workflow_questions WHERE question_id = ?) AND delivered = 0`, plan.StateQueued, formatTimestamp(now), questionID, questionID); err != nil {
 			return err
 		}
@@ -169,10 +216,21 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 }
 
 func ensureWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, versionID string, issueID int64, kind, prompt string, now time.Time) error {
-	questionID := fmt.Sprintf("%s-%s-%d", strings.ReplaceAll(kind, "_", "-"), versionID, issueID)
-	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, prompt, state, created_at)
-VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
-ON CONFLICT(repository, version_id, issue_id, kind) DO NOTHING`, questionID, repository, versionID, issueID, kind, prompt, formatTimestamp(now))
+	var open int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = ? AND kind = ? AND state = 'open'`, repository, versionID, issueID, kind).Scan(&open); err != nil {
+		return err
+	}
+	if open != 0 {
+		return nil
+	}
+	var generation int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) + 1 FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = ? AND kind = ?`, repository, versionID, issueID, kind).Scan(&generation); err != nil {
+		return err
+	}
+	questionID := fmt.Sprintf("%s-%s-%d-g%d", strings.ReplaceAll(kind, "_", "-"), versionID, issueID, generation)
+	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, generation, prompt, state, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+ON CONFLICT(repository, version_id, issue_id, kind, generation) DO NOTHING`, questionID, repository, versionID, issueID, kind, generation, prompt, formatTimestamp(now))
 	return err
 }
 
@@ -191,6 +249,12 @@ WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, formatTimestamp(now), RunRunning, versionID, issueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, LeaseActive, versionID, issueID); err != nil {
 		return err
 	}
 	prompt := fmt.Sprintf("Ticket #%d needs attention: %s Reply with an id-addressed retry decision after resolving the cause.", number, reason)

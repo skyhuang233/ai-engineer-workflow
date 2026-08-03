@@ -95,7 +95,7 @@ func renderBlock(projection Projection) string {
 		sort.Slice(questions, func(i, j int) bool { return questions[i].ID < questions[j].ID })
 		b.WriteString("\n### Workflow Inbox\n\n")
 		for _, question := range questions {
-			fmt.Fprintf(&b, "- `%s`: %s\n", question.ID, escapeCell(question.Prompt))
+			fmt.Fprintf(&b, "- `%s`: %s Reply with `workflow-answer:%s: <answer>`.\n", question.ID, escapeCell(question.Prompt), question.ID)
 		}
 	}
 	fmt.Fprintf(&b, "%s", ProjectionEnd)

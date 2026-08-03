@@ -366,6 +366,16 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 }
 
 func enqueueAcceptedDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now string) (string, error) {
+	if request.RootNumber == 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT p.root_issue_number
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN plan_versions v ON v.version_id = s.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE r.run_id = ?`, request.RunID).Scan(&request.RootNumber); err != nil {
+			return "", err
+		}
+	}
 	key, err := deliveryKey(request)
 	if err != nil {
 		return "", err

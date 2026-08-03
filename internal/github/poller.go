@@ -25,6 +25,7 @@ type Poller struct {
 	LaunchReview          ReviewLauncher
 	MaxFailures           int
 	MaxWorkerAttempts     int
+	MaxParallelRuns       int
 	FullReconcileInterval time.Duration
 }
 
@@ -64,6 +65,9 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 			return p.recordFailure(ctx, repository, now, err)
 		}
 	}
+	if err := p.routeInboxAnswers(ctx, repository); err != nil {
+		return p.recordFailure(ctx, repository, now, err)
+	}
 	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
 		return p.recordFailure(ctx, repository, now, err)
@@ -75,6 +79,13 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 }
 
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
+	var githubError *apiError
+	if errors.As(cause, &githubError) && githubError.RetryAt.After(now) {
+		if err := p.Store.DeferGitHubPoll(ctx, repository, githubError.RetryAt, now); err != nil {
+			return PollResult{}, errors.Join(cause, err)
+		}
+		return PollResult{}, cause
+	}
 	if recordErr := p.Store.RecordGitHubPollFailure(ctx, repository, now); recordErr != nil {
 		return PollResult{}, errors.Join(cause, recordErr)
 	}
@@ -134,7 +145,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 				}
 				result.Feedback += inserted
 				if p.LaunchReview != nil {
-					claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.MaxWorkerAttempts)
+					claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
 					if claimErr == nil {
 						if err := p.LaunchReview(ctx, claim, prompt); err != nil {
 							return PollResult{}, err
@@ -161,6 +172,32 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		}
 	}
 	return result, nil
+}
+
+func (p Poller) maxParallelRuns() int {
+	if p.MaxParallelRuns > 0 {
+		return p.MaxParallelRuns
+	}
+	return 1
+}
+
+func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error {
+	questions, err := p.Store.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		return err
+	}
+	for _, question := range questions {
+		answers, err := p.Client.WorkflowInboxAnswers(ctx, repository, question.RootNumber, []string{question.ID})
+		if err != nil {
+			return err
+		}
+		if answer, ok := answers[question.ID]; ok {
+			if err := p.Store.AnswerWorkflowQuestion(ctx, repository, question.ID, answer, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func hasPullRequestUpdate(updated map[int64]struct{}, number int64) bool {

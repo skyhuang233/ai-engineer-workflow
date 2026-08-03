@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -55,7 +56,7 @@ func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryReques
 	request.Header.Set(controlPlaneTokenHeader, p.ControlPlaneToken)
 	client := p.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	response, err := client.Do(request)
 	if err != nil {

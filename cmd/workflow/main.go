@@ -215,7 +215,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 	if !errors.Is(err, store.ErrNotFound) {
 		return store.TicketClaim{}, "", err
 	}
-	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now, maxAttempts)
+	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now, 1, maxAttempts)
 	if revisionErr == nil {
 		return revision, revisionPrompt, nil
 	}
@@ -297,8 +297,9 @@ func runPollGitHub(args []string) {
 	var workerError error
 	var workerErrorMu sync.Mutex
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
-			err := runClaimWorker(ctx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
+			err := runClaimWorker(workerCtx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
 				if *once {
@@ -330,9 +331,10 @@ func runPollGitHub(args []string) {
 		}
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	poll := func() error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
 		client := github.NewClient(*githubURL, *token, nil)
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {

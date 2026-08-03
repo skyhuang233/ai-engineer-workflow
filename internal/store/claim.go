@@ -134,7 +134,7 @@ func (s *Store) ClaimReady(ctx context.Context, request ClaimRequest) (TicketCla
 	}
 
 	var sessionID, currentOwner, sessionState, currentRunID string
-	var currentGeneration int64
+	var currentGeneration, recoveryEpoch int64
 	err = tx.QueryRowContext(ctx, `SELECT session_id, owner, state, COALESCE(current_run_id, ''), current_lease_generation
 FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, request.VersionID, selected.IssueID).
 		Scan(&sessionID, &currentOwner, &sessionState, &currentRunID, &currentGeneration)
@@ -183,11 +183,18 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 			return TicketClaim{}, err
 		}
 	}
+	if err := tx.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE session_id = ?`, sessionID).Scan(&recoveryEpoch); err != nil {
+		return TicketClaim{}, err
+	}
 	var attempt int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
 		return TicketClaim{}, err
 	}
-	if attempt > maxWorkerAttempts(request.MaxAttempts) {
+	var attemptsInEpoch int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ?`, sessionID, recoveryEpoch).Scan(&attemptsInEpoch); err != nil {
+		return TicketClaim{}, err
+	}
+	if attemptsInEpoch >= maxWorkerAttempts(request.MaxAttempts) {
 		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, "worker retry budget exhausted", request.Now); err != nil {
 			return TicketClaim{}, err
 		}
@@ -205,8 +212,8 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 		return TicketClaim{}, err
 	}
 	expiresAt := request.Now.Add(request.LeaseTTL)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, lease_generation, state, started_at)
-VALUES (?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, currentGeneration, RunRunning, formatTimestamp(request.Now)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, recoveryEpoch, currentGeneration, RunRunning, formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at)
@@ -297,10 +304,10 @@ WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ? AND l.
 	return claim, err
 }
 
-func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxAttempts ...int) (TicketClaim, error) {
+func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxParallelRuns int, maxAttempts ...int) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if versionID == "" || issueID == 0 {
+	if versionID == "" || issueID == 0 || maxParallelRuns <= 0 {
 		return TicketClaim{}, ErrInvalidClaim
 	}
 	if leaseTTL <= 0 {
@@ -324,7 +331,7 @@ func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issue
 	var sessionID, owner, sessionState, runtimeState string
 	var ticketNumber int64
 	var ticketTitle string
-	var generation int64
+	var generation, recoveryEpoch int64
 	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
@@ -339,6 +346,16 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
 		return TicketClaim{}, ErrNotReady
 	}
+	var activeRuns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE state = ?`, RunRunning).Scan(&activeRuns); err != nil {
+		return TicketClaim{}, err
+	}
+	if activeRuns >= maxParallelRuns {
+		return TicketClaim{}, ErrCapacity
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE session_id = ?`, sessionID).Scan(&recoveryEpoch); err != nil {
+		return TicketClaim{}, err
+	}
 	generation++
 	attempt := 0
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
@@ -348,7 +365,11 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 	if len(maxAttempts) > 0 {
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
-	if attempt > limit {
+	var attemptsInEpoch int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ?`, sessionID, recoveryEpoch).Scan(&attemptsInEpoch); err != nil {
+		return TicketClaim{}, err
+	}
+	if attemptsInEpoch >= limit {
 		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "worker retry budget exhausted", now); err != nil {
 			return TicketClaim{}, err
 		}
@@ -366,7 +387,7 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, err
 	}
 	expiresAt := now.Add(leaseTTL)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, lease_generation, state, started_at) VALUES (?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, generation, RunRunning, formatTimestamp(now)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, recoveryEpoch, generation, RunRunning, formatTimestamp(now)); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, generation, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(now)); err != nil {

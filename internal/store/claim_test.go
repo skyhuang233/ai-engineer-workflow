@@ -206,7 +206,7 @@ func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	if inserted != 1 {
 		t.Fatalf("inserted = %d, want 1", inserted)
 	}
-	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second))
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second), 1, DefaultMaxWorkerAttempts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestReviewRevisionsDoNotConsumeFailureRecoveryBudget(t *testing.T) {
 		if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: fmt.Sprint(round), Author: "human", Body: "Please revise."}}, now.Add(time.Duration(round)*time.Second)); err != nil {
 			t.Fatal(err)
 		}
-		claim, _, err = db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Duration(round)*time.Second), 1)
+		claim, _, err = db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Duration(round)*time.Second), 1, 1)
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
@@ -305,14 +305,14 @@ func TestFailedReviewRevisionRequeuesItsFeedback(t *testing.T) {
 	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}}, now); err != nil {
 		t.Fatal(err)
 	}
-	revision, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second))
+	revision, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second), 1, DefaultMaxWorkerAttempts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := db.RecordRunFailure(ctx, RunFailure{RunID: revision.RunID, LeaseToken: revision.LeaseToken, DiagnosticsPath: "diagnostics", Error: "worker failed", Now: now.Add(2 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	retry, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(3*time.Second))
+	retry, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(3*time.Second), 1, DefaultMaxWorkerAttempts)
 	if err != nil {
 		t.Fatal(err)
 	}

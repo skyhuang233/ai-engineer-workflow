@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 12
+	latestSchemaVersion = 14
 )
 
 var (
@@ -468,6 +468,39 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 14 {
+		statements := []string{
+			`ALTER TABLE ticket_sessions ADD COLUMN recovery_epoch INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE worker_runs ADD COLUMN recovery_epoch INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE workflow_questions RENAME TO workflow_questions_old`,
+			`CREATE TABLE workflow_questions (
+    question_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'answered')),
+    answer TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    answered_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(repository, version_id, issue_id, kind, generation),
+    FOREIGN KEY (version_id) REFERENCES plan_versions(version_id)
+)`,
+			`INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, generation, prompt, state, answer, created_at, answered_at)
+SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, answer, created_at, answered_at FROM workflow_questions_old`,
+			`DROP TABLE workflow_questions_old`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 14: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
