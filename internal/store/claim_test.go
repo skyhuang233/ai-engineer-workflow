@@ -250,15 +250,108 @@ func TestDeliveryCompletionRequiresUnexpiredLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(2*time.Hour)); !errors.Is(err, ErrInvalidClaim) {
-		t.Fatalf("late delivery completion error = %v, want ErrInvalidClaim", err)
+	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(2*time.Hour)); !errors.Is(err, ErrNeedsAttention) {
+		t.Fatalf("late delivery completion error = %v, want ErrNeedsAttention", err)
 	}
 	var runState, leaseState string
 	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&runState, &leaseState); err != nil {
 		t.Fatal(err)
 	}
-	if runState != RunRunning || leaseState != LeaseActive {
-		t.Fatalf("late completion mutated delivery to run %q lease %q", runState, leaseState)
+	if runState != "failed" || leaseState != "expired" {
+		t.Fatalf("late completion state = run %q lease %q", runState, leaseState)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("late completion projection = %#v", projection)
+	}
+}
+
+func TestExpiredAgentFailureRecordsDiagnosticsWithoutMutatingWorkflow(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics/late", Error: "late failure", Now: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic != "diagnostics/late" {
+		t.Fatalf("diagnostics path = %q", diagnostic)
+	}
+	var runState, leaseState string
+	var failures int
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state, s.consecutive_failures
+FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_sessions s ON s.session_id = r.session_id
+WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures); err != nil {
+		t.Fatal(err)
+	}
+	if runState != RunRunning || leaseState != LeaseActive || failures != 0 {
+		t.Fatalf("late agent failure mutated run=%q lease=%q failures=%d", runState, leaseState, failures)
+	}
+}
+
+func TestExpiredAgentOutputCannotBindCodexSession(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET expires_at = ? WHERE run_id = ?`, formatTimestamp(now.Add(-time.Minute)), claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordCodexSession(ctx, claim.RunID, claim.LeaseToken, "late-session"); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("late Codex session error = %v, want ErrInvalidClaim", err)
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.CodexSessionID != "" {
+		t.Fatalf("late Codex session mutated ticket session = %q", session.CodexSessionID)
 	}
 }
 
@@ -602,7 +695,7 @@ func TestExpiredReviewRevisionConsumesRetryBudget(t *testing.T) {
 	}
 }
 
-func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
+func TestAgentRevisionCannotSubmitEvidenceBeforeDeliveryHandoff(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -629,13 +722,17 @@ func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
 	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now.Add(time.Second)); err != nil {
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: delivery.RunID, LeaseToken: delivery.LeaseToken, LeaseGeneration: delivery.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.RecordReviewFeedback(ctx, version.ID, 1, []ReviewFeedback{{Source: "review", EventID: "1", Author: "human", Body: "Please revise."}}, now.Add(time.Second)); err != nil {
@@ -645,16 +742,8 @@ func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryReplyEvidence, RunID: revision.RunID, LeaseToken: revision.LeaseToken, LeaseGeneration: revision.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", PullRequestNumber: 42, Evidence: "mutable evidence"}, now.Add(3*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: revision.RunID, LeaseToken: revision.LeaseToken, CodexSessionID: "codex", CommitSHA: "revised", StructuredOutput: []byte(`{"summary":"revision"}`), Now: now.Add(4 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectedRemoteHead: "accepted", Title: "ticket"}}); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := db.DeliveryOutbox(ctx, evidence.IdempotencyKey)
-	if err != nil || stored.State != OutboxRejected {
-		t.Fatalf("preexisting evidence outbox = %#v, err=%v", stored, err)
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryReplyEvidence, RunID: revision.RunID, LeaseToken: revision.LeaseToken, LeaseGeneration: revision.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", PullRequestNumber: 42, Evidence: "mutable evidence"}, now.Add(3*time.Second)); !errors.Is(err, ErrDeliveryRejected) {
+		t.Fatalf("Agent revision evidence error = %v, want ErrDeliveryRejected", err)
 	}
 }
 
@@ -967,10 +1056,11 @@ func TestPlanProjectionDoesNotTreatPRPublicationAsAGateResult(t *testing.T) {
 	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryUpsertPR, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"}, now.Add(time.Second)); err != nil {
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryUpsertPR, RunID: delivery.RunID, LeaseToken: delivery.LeaseToken, LeaseGeneration: delivery.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, "UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?", version.ID, int64(1)); err != nil {

@@ -310,21 +310,17 @@ func TestGatewayAllowsFirstCandidatePushToExpectAbsentBranch(t *testing.T) {
 	}
 }
 
-func TestGatewayAllowsAcceptedCandidateDeliveryBeforeLeaseDeadline(t *testing.T) {
+func TestGatewayRejectsAgentPhasePublicationBeforeDeliveryController(t *testing.T) {
 	ctx := context.Background()
-	db, claim := newPublishedCandidate(t, ctx)
+	db, claim := newAgentCandidate(t, ctx)
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 1, 30, 0, time.UTC) }}
-	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
-	if err != nil {
-		t.Fatal(err)
+	if _, err := gateway.Submit(ctx, candidatePush(claim, "base", false)); !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("Agent publication error = %v, want delivery rejection", err)
 	}
-	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
-		t.Fatal(err)
-	}
-	if remote.applyCalls != 1 {
-		t.Fatalf("accepted candidate was not delivered: applies=%d", remote.applyCalls)
+	if remote.applyCalls != 0 {
+		t.Fatalf("Agent publication reached remote: applies=%d", remote.applyCalls)
 	}
 }
 
@@ -650,6 +646,15 @@ func newPublishedCandidate(t *testing.T, ctx context.Context) (*store.Store, sto
 	return newCandidateClaim(t, ctx)
 }
 
+func newAgentCandidate(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
+	t.Helper()
+	db, claim := newAgentClaim(t, ctx)
+	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectedRemoteHead: "base", Title: "ticket", Body: "evidence"}}); err != nil {
+		t.Fatal(err)
+	}
+	return db, claim
+}
+
 func candidatePush(claim store.TicketClaim, expectedRemoteHead string, expectRemoteAbsent bool) store.DeliveryRequest {
 	return store.DeliveryRequest{Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: expectedRemoteHead, ExpectRemoteAbsent: expectRemoteAbsent}
 }
@@ -663,6 +668,17 @@ func newCandidateClaim(t *testing.T, ctx context.Context) (*store.Store, store.T
 }
 
 func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publication store.CandidatePublication) (*store.Store, store.TicketClaim) {
+	t.Helper()
+	db, claim := newAgentClaim(t, ctx)
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: publication}, time.Hour)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	return db, delivery
+}
+
+func newAgentClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
 	t.Helper()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -685,9 +701,6 @@ func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publica
 		t.Fatal(err)
 	}
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: publication}); err != nil {
 		t.Fatal(err)
 	}
 	return db, claim

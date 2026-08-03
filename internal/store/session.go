@@ -204,6 +204,7 @@ func (s *Store) RecordCodexSession(ctx context.Context, runID, leaseToken, codex
 	if runID == "" || leaseToken == "" || codexSessionID == "" {
 		return ErrInvalidClaim
 	}
+	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -211,7 +212,7 @@ func (s *Store) RecordCodexSession(ctx context.Context, runID, leaseToken, codex
 	defer tx.Rollback()
 	var sessionID, existing string
 	err = tx.QueryRowContext(ctx, `SELECT r.session_id, s.codex_session_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, runID, leaseToken, RunRunning, LeaseActive).Scan(&sessionID, &existing)
+WHERE r.run_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, runID, RunAgent, leaseToken, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&sessionID, &existing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -221,7 +222,7 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, runID
 	if existing != "" && existing != codexSessionID {
 		return ErrSessionConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = ?, updated_at = ? WHERE session_id = ?`, codexSessionID, formatTimestamp(time.Now()), sessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = ?, updated_at = ? WHERE session_id = ?`, codexSessionID, formatTimestamp(now), sessionID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -394,16 +395,36 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
-	var sessionID string
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id
+	var sessionID, expiresText string
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, l.expires_at
 FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID)
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
 	if err != nil {
 		return err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(now) {
+		nowText := formatTimestamp(now)
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
+			return err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller lease expired before completion", now); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return ErrNeedsAttention
 	}
 	state := "succeeded"
 	if reason != "" {
@@ -441,8 +462,11 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 		return err
 	}
 	defer tx.Rollback()
-	var exists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, failure.RunID, failure.LeaseToken, RunRunning, LeaseActive).Scan(&exists)
+	var currentRunID, runState, leaseState, expiresText string
+	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id, r.state, l.state, l.expires_at
+FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, failure.LeaseToken, RunAgent).Scan(&currentRunID, &runState, &leaseState, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -450,8 +474,15 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 		return err
 	}
 	now := formatTimestamp(failure.Now)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?)`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
 		return err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return err
+	}
+	if currentRunID != failure.RunID || runState != RunRunning || leaseState != LeaseActive || !expiresAt.After(failure.Now) {
+		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, now, failure.RunID, RunRunning); err != nil {
 		return err
