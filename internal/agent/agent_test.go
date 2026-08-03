@@ -607,7 +607,7 @@ func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
 }
 
 func codexOutput(sessionID, summary string) []byte {
-	message, _ := json.Marshal(map[string]any{"summary": summary, "tests": []string{"go test ./..."}})
+	message, _ := json.Marshal(map[string]any{"summary": summary, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
 }

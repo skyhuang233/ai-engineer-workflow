@@ -191,27 +191,29 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err := c.Store.RequireCurrentDeliveryLease(ctx, claim, c.now()); err != nil {
 		return err
 	}
-	session, err := c.Store.TicketSession(ctx, claim.VersionID, claim.TicketID)
+	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), claim.LeaseExpiresAt.Add(10*time.Second))
+	defer cancelFinalization()
+	session, err := c.Store.TicketSession(finalizationCtx, claim.VersionID, claim.TicketID)
 	if err != nil {
-		return err
+		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	delivery, err := c.Store.CandidateDelivery(ctx, claim.VersionID, claim.TicketID)
+	delivery, err := c.Store.CandidateDelivery(finalizationCtx, claim.VersionID, claim.TicketID)
 	if err != nil {
-		return c.failDeliveryController(ctx, claim, err)
+		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" {
-		return c.failDeliveryController(ctx, claim, errors.New("accepted Candidate workspace is incomplete"))
+		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
 	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, Branch: session.Branch}
-	commit, branch, clean, err := c.Workspace.status(ctx, ws)
+	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
 	if err != nil {
-		return c.failDeliveryController(ctx, claim, err)
+		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
 	if branch != ws.Branch || !clean || commit != session.AcceptedCommit {
-		return c.failDeliveryController(ctx, claim, errors.New("accepted Candidate workspace no longer matches its delivery revision"))
+		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace no longer matches its delivery revision"))
 	}
-	if err := validateLocalRemotes(ctx, ws.Path); err != nil {
-		return c.failDeliveryController(ctx, claim, err)
+	if err := validateLocalRemotes(finalizationCtx, ws.Path); err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
 	publication := store.CandidatePublication{
 		Repository:         delivery.Repository,
@@ -222,7 +224,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		Body:               "Retry delivery of the accepted Candidate Revision.",
 	}
 	intent := fmt.Sprintf("Retry delivery of accepted Candidate Revision %s for ticket #%d.", delivery.CandidateCommit, claim.TicketNumber)
-	return c.runDeliveryController(ctx, claim, session, ws, publication, intent)
+	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent)
 }
 
 func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {

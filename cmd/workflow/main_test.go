@@ -78,7 +78,7 @@ func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,30 +92,34 @@ func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T
 	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	var launched []store.TicketClaim
+	launched := make(chan store.TicketClaim, 1)
 	if err := dispatchPendingDeliveryClaims(ctx, db, snapshot.Repository, 1, time.Hour, now.Add(2*time.Second), func(_ context.Context, retry store.TicketClaim) error {
-		launched = append(launched, retry)
+		launched <- retry
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(launched) != 1 || launched[0].RunID == claim.RunID || launched[0].RunID == "" {
-		t.Fatalf("launched delivery claims = %#v", launched)
+	select {
+	case retry := <-launched:
+		if retry.RunID == claim.RunID || retry.RunID == "" {
+			t.Fatalf("launched delivery claim = %#v", retry)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovered delivery was not launched")
 	}
 }
 
-func TestLaunchDeliveryClaimsConcurrently(t *testing.T) {
+func TestLaunchDeliveryClaimsDoesNotBlockControlLoop(t *testing.T) {
 	started := make(chan string, 2)
 	release := make(chan struct{})
-	finished := make(chan error, 1)
 	claims := []store.TicketClaim{{RunID: "delivery-1"}, {RunID: "delivery-2"}}
-	go func() {
-		finished <- launchDeliveryClaims(context.Background(), claims, func(_ context.Context, claim store.TicketClaim) error {
-			started <- claim.RunID
-			<-release
-			return nil
-		})
-	}()
+	if err := launchDeliveryClaims(context.Background(), claims, func(_ context.Context, claim store.TicketClaim) error {
+		started <- claim.RunID
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatalf("launch delivery claims: %v", err)
+	}
 	for range claims {
 		select {
 		case <-started:
@@ -124,12 +128,4 @@ func TestLaunchDeliveryClaimsConcurrently(t *testing.T) {
 		}
 	}
 	close(release)
-	select {
-	case err := <-finished:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("delivery claim dispatch did not finish")
-	}
 }

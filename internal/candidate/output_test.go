@@ -8,15 +8,19 @@ func TestValidateMatchesCandidateSchema(t *testing.T) {
 		output string
 		valid  bool
 	}{
-		{name: "complete", output: `{"summary":"implemented","commit":"abc","tests":["go test"]}`, valid: true},
+		{name: "complete", output: `{"summary":"implemented","commit":"abc","checks":[{"command":"go test ./...","outcome":"passed"}]}`, valid: true},
 		{name: "additional property", output: `{"summary":"implemented","unexpected":"value"}`},
-		{name: "missing summary", output: `{"tests":[]}`},
+		{name: "missing summary", output: `{"checks":[]}`},
 		{name: "missing verification evidence", output: `{"summary":"implemented"}`},
-		{name: "empty verification evidence", output: `{"summary":"implemented","tests":[]}`},
+		{name: "empty verification evidence", output: `{"summary":"implemented","checks":[]}`},
 		{name: "null commit", output: `{"summary":"implemented","commit":null}`},
-		{name: "non-string test", output: `{"summary":"implemented","tests":[1]}`},
-		{name: "null test", output: `{"summary":"implemented","tests":[null]}`},
-		{name: "empty test", output: `{"summary":"implemented","tests":[" "]}`},
+		{name: "test label", output: `{"summary":"implemented","tests":["not run"]}`},
+		{name: "unknown check property", output: `{"summary":"implemented","checks":[{"command":"go test","outcome":"passed","detail":"ok"}]}`},
+		{name: "missing check command", output: `{"summary":"implemented","checks":[{"outcome":"passed"}]}`},
+		{name: "empty check command", output: `{"summary":"implemented","checks":[{"command":" ","outcome":"passed"}]}`},
+		{name: "null check", output: `{"summary":"implemented","checks":[null]}`},
+		{name: "failed check", output: `{"summary":"implemented","checks":[{"command":"go test","outcome":"failed"}]}`},
+		{name: "not run check", output: `{"summary":"implemented","checks":[{"command":"go test","outcome":"not run"}]}`},
 		{name: "trailing JSON", output: `{"summary":"implemented"} {}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

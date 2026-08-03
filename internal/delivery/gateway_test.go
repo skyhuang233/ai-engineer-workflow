@@ -649,7 +649,7 @@ func newPublishedCandidate(t *testing.T, ctx context.Context) (*store.Store, sto
 func newAgentCandidate(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
 	t.Helper()
 	db, claim := newAgentClaim(t, ctx)
-	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectedRemoteHead: "base", Title: "ticket", Body: "evidence"}}); err != nil {
+	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectedRemoteHead: "base", Title: "ticket", Body: "evidence"}}); err != nil {
 		t.Fatal(err)
 	}
 	return db, claim
@@ -670,7 +670,7 @@ func newCandidateClaim(t *testing.T, ctx context.Context) (*store.Store, store.T
 func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publication store.CandidatePublication) (*store.Store, store.TicketClaim) {
 	t.Helper()
 	db, claim := newAgentClaim(t, ctx)
-	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), Publication: publication}, time.Hour)
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), Publication: publication}, time.Hour)
 	if err != nil {
 		db.Close()
 		t.Fatal(err)

@@ -10,11 +10,23 @@ import (
 
 const Schema = `{
   "type": "object",
-  "required": ["summary", "tests"],
+  "required": ["summary", "checks"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
     "commit": {"type": "string"},
-    "tests": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["command", "outcome"],
+        "properties": {
+          "command": {"type": "string", "minLength": 1},
+          "outcome": {"type": "string", "enum": ["passed"]}
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false
 }`
@@ -31,7 +43,7 @@ func Validate(output []byte) error {
 	}
 	for name := range fields {
 		switch name {
-		case "summary", "commit", "tests":
+		case "summary", "commit", "checks":
 		default:
 			return errors.New("structured result contains an unsupported property")
 		}
@@ -50,18 +62,28 @@ func Validate(output []byte) error {
 			return errors.New("structured result commit must be a string")
 		}
 	}
-	tests, ok := fields["tests"]
+	checks, ok := fields["checks"]
 	if !ok {
 		return errors.New("structured result requires verification evidence")
 	}
-	var testNames []json.RawMessage
-	if err := json.Unmarshal(tests, &testNames); err != nil || jsonNull(tests) || len(testNames) == 0 {
+	var records []json.RawMessage
+	if err := json.Unmarshal(checks, &records); err != nil || jsonNull(checks) || len(records) == 0 {
 		return errors.New("structured result requires verification evidence")
 	}
-	for _, testName := range testNames {
-		var name string
-		if err := json.Unmarshal(testName, &name); err != nil || jsonNull(testName) || strings.TrimSpace(name) == "" {
-			return errors.New("structured result tests must be nonempty strings")
+	for _, record := range records {
+		var check map[string]json.RawMessage
+		if err := json.Unmarshal(record, &check); err != nil || check == nil || jsonNull(record) {
+			return errors.New("structured result checks must be objects")
+		}
+		if len(check) != 2 || check["command"] == nil || check["outcome"] == nil {
+			return errors.New("structured result checks must include only command and outcome")
+		}
+		var command, outcome string
+		if err := json.Unmarshal(check["command"], &command); err != nil || jsonNull(check["command"]) || strings.TrimSpace(command) == "" {
+			return errors.New("structured result checks require a nonempty command")
+		}
+		if err := json.Unmarshal(check["outcome"], &outcome); err != nil || jsonNull(check["outcome"]) || outcome != "passed" {
+			return errors.New("structured result checks require a passed outcome")
 		}
 	}
 	return nil

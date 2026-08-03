@@ -423,24 +423,15 @@ func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, reposit
 }
 
 func launchDeliveryClaims(ctx context.Context, claims []store.TicketClaim, launch func(context.Context, store.TicketClaim) error) error {
-	errs := make(chan error, len(claims))
-	var workers sync.WaitGroup
 	for _, claim := range claims {
-		workers.Add(1)
+		claim := claim
 		go func() {
-			defer workers.Done()
-			if err := launch(ctx, claim); err != nil {
-				errs <- err
+			if err := launch(context.WithoutCancel(ctx), claim); err != nil {
+				fmt.Fprintln(os.Stderr, "workflow recovered delivery:", err)
 			}
 		}()
 	}
-	workers.Wait()
-	close(errs)
-	var joined error
-	for err := range errs {
-		joined = errors.Join(joined, err)
-	}
-	return joined
+	return nil
 }
 
 func runAnswerInbox(args []string) {

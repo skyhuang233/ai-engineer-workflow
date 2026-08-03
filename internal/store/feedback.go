@@ -318,12 +318,12 @@ FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, v
 	}
 	var report strings.Builder
 	fmt.Fprintf(&report, "Pull request for ticket issue %d closed without merge. Plan #%d is frozen pending a human decision.\n\nTickets:\n", issueID, rootNumber)
-	tickets, err := tx.QueryContext(ctx, `SELECT t.issue_number, t.title, rt.state, rt.delivered, COALESCE(s.agent_identity, ''), COALESCE(td.pull_request_number, 0)
+	tickets, err := tx.QueryContext(ctx, `SELECT t.issue_number, t.title, COALESCE(rt.state, ?), COALESCE(rt.delivered, 0), COALESCE(s.agent_identity, ''), COALESCE(td.pull_request_number, 0)
 FROM plan_tickets t
-JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id
+LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id
 LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
 LEFT JOIN ticket_deliveries td ON td.version_id = t.version_id AND td.issue_id = t.issue_id
-WHERE t.version_id = ? ORDER BY t.issue_number`, versionID)
+WHERE t.version_id = ? ORDER BY t.issue_number`, plan.StateQueued, versionID)
 	if err != nil {
 		return "", "", err
 	}
