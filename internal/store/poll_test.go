@@ -127,7 +127,7 @@ func TestPollFailureAnswerRestoresPausedTickets(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now}); err != nil {
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, MaxAttempts: 1, LeaseTTL: time.Hour, Now: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now); err != nil {
@@ -149,7 +149,14 @@ func TestPollFailureAnswerRestoresPausedTickets(t *testing.T) {
 	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Second)}); err != nil {
+	var recoveryEpoch int
+	if err := db.db.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)).Scan(&recoveryEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryEpoch != 1 {
+		t.Fatalf("recovery epoch = %d, want 1", recoveryEpoch)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, MaxAttempts: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Second)}); err != nil {
 		t.Fatalf("reclaimed ticket after poll failure: %v", err)
 	}
 }

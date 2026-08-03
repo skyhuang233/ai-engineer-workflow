@@ -54,19 +54,24 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 		return PollResult{}, err
 	}
 	now := p.now()
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if err == nil {
+		if cursor.NextAttemptAt.After(now) {
+			return PollResult{}, store.ErrNotReady
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return PollResult{}, err
+	}
 	if err := p.routeInboxAnswers(ctx, repository); err != nil {
 		return p.recordFailure(ctx, repository, now, err)
 	}
 	if err := p.projectWorkflowInbox(ctx, repository); err != nil {
 		return p.recordFailure(ctx, repository, now, err)
 	}
-	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	cursor, err = p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
 			return PollResult{}, store.ErrNeedsAttention
-		}
-		if cursor.NextAttemptAt.After(now) {
-			return PollResult{}, store.ErrNotReady
 		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, err

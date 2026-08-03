@@ -236,6 +236,12 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ?
+WHERE version_id = ? AND EXISTS (
+    SELECT 1 FROM poll_failure_targets t WHERE t.poll_question_id = ? AND t.version_id = ticket_sessions.version_id AND t.issue_id = ticket_sessions.issue_id
+)`, formatTimestamp(now), versionID, questionID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0 AND state = ? AND EXISTS (
     SELECT 1 FROM poll_failure_targets t WHERE t.poll_question_id = ? AND t.version_id = ticket_runtime.version_id AND t.issue_id = ticket_runtime.issue_id
 )`, plan.StateQueued, formatTimestamp(now), versionID, plan.StateNeedsAttention, questionID); err != nil {

@@ -331,7 +331,7 @@ func requireAcceptedHandoffOutboxTx(ctx context.Context, tx *sql.Tx, target Deli
 		return err
 	}
 	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM accepted_candidate_outbox WHERE outbox_key = ? AND run_id = ?`, key, request.RunID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: accepted handoff requires its original outbox command", ErrDeliveryRejected)
 	} else {
 		return err

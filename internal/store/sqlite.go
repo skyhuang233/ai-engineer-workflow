@@ -523,6 +523,18 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return err
 		}
 	}
+	if applied < 16 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE accepted_candidate_outbox (
+    outbox_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
+    run_id TEXT NOT NULL REFERENCES worker_runs(run_id),
+    created_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 16: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

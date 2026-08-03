@@ -270,7 +270,10 @@ WHERE s.version_id = ? AND s.issue_id = ? AND rt.state = ? AND r.state = 'succee
 		return CandidateRecord{}, CandidateHandoff{}, err
 	}
 	candidate.StructuredOutput = []byte(structured)
-	rows, err := s.db.QueryContext(ctx, `SELECT operation, idempotency_key FROM delivery_outbox WHERE json_extract(request_json, '$.run_id') = ? AND operation IN (?, ?)`, candidate.RunID, DeliveryPushCandidate, DeliveryUpsertPR)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.operation, o.idempotency_key
+FROM accepted_candidate_outbox a
+JOIN delivery_outbox o ON o.idempotency_key = a.outbox_key
+WHERE a.run_id = ? AND o.operation IN (?, ?)`, candidate.RunID, DeliveryPushCandidate, DeliveryUpsertPR)
 	if err != nil {
 		return CandidateRecord{}, CandidateHandoff{}, err
 	}
@@ -392,6 +395,9 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET repository = excluded.repository
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_outbox(idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, next_attempt_at)
 VALUES (?, ?, ?, ?, 0, '', ?, ?, ?)`, key, request.Operation, string(raw), OutboxPending, now, now, now); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO accepted_candidate_outbox(outbox_key, run_id, created_at) VALUES (?, ?, ?)`, key, request.RunID, now); err != nil {
 		return "", err
 	}
 	if err := insertDeliveryAuditTx(ctx, tx, request, "accepted", "queued with accepted candidate", time.Now().UTC()); err != nil {
