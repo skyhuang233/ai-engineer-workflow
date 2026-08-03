@@ -34,6 +34,7 @@ type RunRequest struct {
 	SourceRepository string
 	Branch           string
 	Prompt           string
+	Publication      store.CandidatePublication
 }
 
 type Candidate struct {
@@ -42,6 +43,8 @@ type Candidate struct {
 	CodexSessionID   string
 	Commit           string
 	StructuredOutput []byte
+	PushOutboxKey    string
+	PROutboxKey      string
 }
 
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
@@ -136,10 +139,15 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(result.Output))
 	}
-	if err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now()}); err != nil {
+	publication := request.Publication
+	if publication.Body == "" {
+		publication.Body = candidateSummary(structured)
+	}
+	handoff, err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication})
+	if err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
 	}
-	return Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}, nil
+	return Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured, PushOutboxKey: handoff.PushOutboxKey, PROutboxKey: handoff.PROutboxKey}, nil
 }
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {
@@ -220,6 +228,16 @@ func validateStructuredOutput(output []byte) error {
 		}
 	}
 	return nil
+}
+
+func candidateSummary(output []byte) string {
+	var result struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil || strings.TrimSpace(result.Summary) == "" {
+		return "Worker completed candidate delivery."
+	}
+	return result.Summary
 }
 
 func parseSessionID(output []byte, existing string) (string, error) {

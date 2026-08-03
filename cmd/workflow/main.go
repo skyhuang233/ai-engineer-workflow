@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
@@ -136,31 +135,33 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	claim, err := db.CurrentClaim(ctx, version.ID, *ticketID)
-	if err != nil {
-		fail(err)
-	}
-	if *branch == "" {
-		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
-	}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"codex": config.Codex.Version}}
-	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: *branch, Prompt: *prompt})
-	if err != nil {
-		fail(err)
-	}
 	session, err := db.TicketSession(ctx, version.ID, *ticketID)
 	if err != nil {
 		fail(err)
 	}
 	remote := github.DeliveryRemote{Client: client, Pusher: github.WorkspacePusher{WorkspacePath: session.WorkspacePath, Token: *token}}
 	gateway := delivery.Gateway{Store: db, Remote: remote}
-	baseRequest := store.DeliveryRequest{RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: *repository, Branch: *branch, CommitSHA: candidate.Commit}
-	push := baseRequest
-	push.Operation, push.ExpectedRemoteHead, push.ExpectRemoteAbsent = store.DeliveryPushCandidate, *expectedHead, *expectAbsent
-	dispatchDelivery(ctx, gateway, push)
-	pr := baseRequest
-	pr.Operation, pr.ExpectedRemoteHead, pr.Title, pr.Body = store.DeliveryUpsertPR, candidate.Commit, claim.TicketTitle, candidateSummary(candidate.StructuredOutput)
-	dispatchDelivery(ctx, gateway, pr)
+	claim, claimErr := db.CurrentClaim(ctx, version.ID, *ticketID)
+	if claimErr != nil {
+		accepted, handoff, handoffErr := db.AcceptedCandidateHandoff(ctx, version.ID, *ticketID)
+		if handoffErr != nil {
+			fail(claimErr)
+		}
+		dispatchStoredDelivery(ctx, gateway, handoff.PushOutboxKey)
+		dispatchStoredDelivery(ctx, gateway, handoff.PROutboxKey)
+		fmt.Println(string(accepted.StructuredOutput))
+		return
+	}
+	if *branch == "" {
+		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
+	}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"codex": config.Codex.Version}}
+	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: *branch, Prompt: *prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: *branch, ExpectedRemoteHead: *expectedHead, ExpectRemoteAbsent: *expectAbsent, Title: claim.TicketTitle}})
+	if err != nil {
+		fail(err)
+	}
+	dispatchStoredDelivery(ctx, gateway, candidate.PushOutboxKey)
+	dispatchStoredDelivery(ctx, gateway, candidate.PROutboxKey)
 	encoded, _ := json.MarshalIndent(candidate, "", "  ")
 	fmt.Println(string(encoded))
 }
@@ -190,24 +191,10 @@ func runReconcileDelivered(args []string) {
 	fmt.Println(marked)
 }
 
-func dispatchDelivery(ctx context.Context, gateway delivery.Gateway, request store.DeliveryRequest) {
-	outbox, err := gateway.Submit(ctx, request)
-	if err != nil {
+func dispatchStoredDelivery(ctx context.Context, gateway delivery.Gateway, key string) {
+	if err := gateway.Dispatch(ctx, key); err != nil {
 		fail(err)
 	}
-	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); err != nil {
-		fail(err)
-	}
-}
-
-func candidateSummary(output []byte) string {
-	var result struct {
-		Summary string `json:"summary"`
-	}
-	if err := json.Unmarshal(output, &result); err != nil || strings.TrimSpace(result.Summary) == "" {
-		return "Worker completed candidate delivery."
-	}
-	return result.Summary
 }
 
 func fail(err error) {

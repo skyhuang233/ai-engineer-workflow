@@ -132,6 +132,8 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 
 func (c *Client) HasPlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) (bool, error) {
 	marker := planProjectionMarker(projection)
+	statusComments := 0
+	matched := false
 	for page := 1; ; page++ {
 		var comments []commentResponse
 		path := "/repos/" + repository + "/issues/" + strconv.FormatInt(number, 10) + "/comments?per_page=100&page=" + strconv.Itoa(page)
@@ -139,12 +141,22 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 			return false, err
 		}
 		for _, comment := range comments {
+			if strings.Contains(comment.Body, planProjectionIdentity) {
+				statusComments++
+				if statusComments > 1 {
+					return false, fmt.Errorf("multiple workflow control-plane comments found")
+				}
+				if strings.Contains(comment.Body, marker) {
+					matched = true
+				}
+				continue
+			}
 			if strings.Contains(comment.Body, marker) {
-				return true, nil
+				return false, fmt.Errorf("legacy workflow projection comment found")
 			}
 		}
 		if len(comments) < 100 {
-			return false, nil
+			return matched, nil
 		}
 	}
 }

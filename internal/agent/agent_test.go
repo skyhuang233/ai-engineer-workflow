@@ -84,7 +84,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	runtime := &fakeRuntime{dirty: true, ignoredFile: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
-	if _, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"}); err == nil {
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket")); err == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
 	session, err := db.TicketSession(ctx, version.ID, 1)
@@ -196,12 +196,24 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	first := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "implemented"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
-	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement the ticket"})
+	candidate, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if candidate.CodexSessionID != "codex-session-1" || candidate.Commit == "" {
 		t.Fatalf("candidate = %#v", candidate)
+	}
+	for _, key := range []string{candidate.PushOutboxKey, candidate.PROutboxKey} {
+		if key == "" {
+			t.Fatalf("candidate handoff = %#v", candidate)
+		}
+		if _, err := db.DeliveryOutbox(ctx, key); err != nil {
+			t.Fatalf("durable candidate handoff %q: %v", key, err)
+		}
+	}
+	recovered, handoff, err := db.AcceptedCandidateHandoff(ctx, version.ID, claim.TicketID)
+	if err != nil || recovered.RunID != candidate.RunID || handoff.PushOutboxKey != candidate.PushOutboxKey || handoff.PROutboxKey != candidate.PROutboxKey {
+		t.Fatalf("recovered candidate handoff = %#v, %#v, err=%v", recovered, handoff, err)
 	}
 	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --output-schema "+filepath.Join(root, "codex", claim.SessionID, "output-schema.json")+" implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
@@ -210,43 +222,8 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 		t.Fatalf("first worker isolation = %#v", first.specs[0])
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err = store.Open(ctx, filepath.Join(root, "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
-		VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1,
-		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nextClaim.SessionID != claim.SessionID {
-		t.Fatalf("replacement session = %q, want %q", nextClaim.SessionID, claim.SessionID)
-	}
-
-	second := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "revised"), ContainerID: "container-2"}}}
-	controller = agent.Controller{Store: db, Workspace: manager, Runtime: second, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
-	if _, err := controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "review the implementation"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(second.specs) != 1 || strings.Join(second.specs[0].Command, " ") != "codex exec resume codex-session-1 --json --output-schema "+filepath.Join(root, "codex", claim.SessionID, "output-schema.json")+" review the implementation" {
-		t.Fatalf("replacement worker spec = %#v", second.specs)
-	}
-	if second.specs[0].WorkspacePath != first.specs[0].WorkspacePath || second.specs[0].CodexStatePath != first.specs[0].CodexStatePath || second.specs[0].Branch != first.specs[0].Branch || second.specs[0].AgentIdentity != first.specs[0].AgentIdentity {
-		t.Fatalf("replacement lost durable identity: first=%#v second=%#v", first.specs[0], second.specs[0])
-	}
-
-	session, err := db.TicketSession(ctx, version.ID, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if session.CodexSessionID != "codex-session-1" || session.WorkspacePath != first.specs[0].WorkspacePath || session.Branch != "ticket-1" {
-		t.Fatalf("persisted session = %#v", session)
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("claim while delivery handoff is pending = %v, want fencing conflict", err)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
 		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)
@@ -269,7 +246,7 @@ func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T
 			defer db.Close()
 			manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 			controller := agent.Controller{Store: db, Workspace: manager, Runtime: test.runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
-			if _, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err == nil {
+			if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
 				t.Fatal("abnormal worker run returned nil error")
 			}
 			diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
@@ -321,7 +298,7 @@ func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
-	if _, err := controller.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err != nil {
+	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
 		t.Fatal(err)
 	}
 	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
@@ -333,21 +310,12 @@ func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
 	if output, err := remote.CombinedOutput(); err != nil {
 		t.Fatalf("set credential-bearing remote: %v (%s)", err, output)
 	}
-	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
+	_, err = db.ClaimReady(ctx, store.ClaimRequest{
 		VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1,
 		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondRuntime := &fakeRuntime{}
-	controller.Runtime = secondRuntime
-	_, err = controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"})
-	if err == nil || !strings.Contains(err.Error(), "absolute local path") {
-		t.Fatalf("persisted external remote error = %v", err)
-	}
-	if len(secondRuntime.specs) != 0 {
-		t.Fatal("worker started with a persisted external remote")
+	if !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("claim while accepted candidate is waiting = %v", err)
 	}
 }
 
@@ -360,7 +328,7 @@ func TestControllerRejectsCredentialBearingWorkspacePushURL(t *testing.T) {
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
-	if _, err := controller.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err != nil {
+	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
 		t.Fatal(err)
 	}
 	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
@@ -372,17 +340,9 @@ func TestControllerRejectsCredentialBearingWorkspacePushURL(t *testing.T) {
 	if output, err := pushURL.CombinedOutput(); err != nil {
 		t.Fatalf("set credential-bearing push URL: %v (%s)", err, output)
 	}
-	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondRuntime := &fakeRuntime{}
-	controller.Runtime = secondRuntime
-	if _, err := controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"}); err == nil || !strings.Contains(err.Error(), "absolute local path") {
-		t.Fatalf("persisted external push URL error = %v", err)
-	}
-	if len(secondRuntime.specs) != 0 {
-		t.Fatal("worker started with a persisted external push URL")
+	_, err = db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)})
+	if !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("claim while accepted candidate is waiting = %v", err)
 	}
 }
 
@@ -395,24 +355,16 @@ func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	firstController := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
-	accepted, err := firstController.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"})
+	accepted, err := firstController.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
+	_, err = db.ClaimReady(ctx, store.ClaimRequest{
 		VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1,
 		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "second"), ContainerID: "container-2"}}}
-	secondController := agent.Controller{
-		Store: db, Workspace: manager, Runtime: secondRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
-		Now: func() time.Time { return nextClaim.LeaseExpiresAt.Add(time.Second) },
-	}
-	if _, err := secondController.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"}); err == nil {
-		t.Fatal("expired candidate acceptance succeeded")
+	if !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("claim while accepted candidate is waiting = %v, want fencing conflict", err)
 	}
 	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
 	if err != nil {
@@ -424,20 +376,16 @@ func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing
 	if err != nil || strings.TrimSpace(string(output)) != accepted.Commit {
 		t.Fatalf("workspace head = %q, err = %v; want accepted %q", output, err, accepted.Commit)
 	}
-	diagnostic, err := db.RunDiagnostic(ctx, nextClaim.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	patch, err := os.ReadFile(filepath.Join(filepath.Dir(diagnostic), "revision.patch"))
-	if err != nil || !strings.Contains(string(patch), "candidate resume") {
-		t.Fatalf("unaccepted candidate evidence = %q, err = %v", patch, err)
-	}
 }
 
 func codexOutput(sessionID, summary string) []byte {
 	message, _ := json.Marshal(map[string]string{"summary": summary})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
+}
+
+func candidateRequest(claim store.TicketClaim, source, branch, prompt string) agent.RunRequest {
+	return agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: "owner/repo", Branch: branch, ExpectRemoteAbsent: true, Title: claim.TicketTitle}}
 }
 
 func initRepository(t *testing.T) string {

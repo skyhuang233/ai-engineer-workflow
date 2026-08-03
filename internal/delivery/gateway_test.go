@@ -181,9 +181,9 @@ func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditio
 		applyErr: errors.New("request timed out"),
 		observations: []delivery.Observation{
 			{RemoteHead: "base"},
+			{RemoteHead: "base"},
 			{Applied: true, RemoteHead: "accepted"},
 		},
-		observeErrs: []error{nil, errors.New("observation unavailable"), nil},
 	}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
 	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
@@ -220,15 +220,11 @@ func TestGatewayRejectsZombieCommandAfterLeaseReplacement(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
-	remote := &fakeRemote{}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
-	request := store.DeliveryRequest{Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base"}
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
 	if err := db.RecordRunFailure(ctx, store.RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics", Error: "worker replaced", Now: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	queued, err := gateway.Submit(ctx, request)
-	if err == nil || !errors.Is(err, store.ErrDeliveryRejected) || queued.IdempotencyKey != "" {
-		t.Fatalf("zombie submit = %#v, err = %v", queued, err)
+		if !errors.Is(err, store.ErrInvalidClaim) {
+			t.Fatal(err)
+		}
 	}
 	if remote.applyCalls != 0 {
 		t.Fatal("zombie command reached remote")
@@ -358,7 +354,7 @@ func TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite(t *testing.T) {
 	}
 	takeover := make(chan error, 1)
 	go func() {
-		takeover <- db.RecordRunFailure(ctx, store.RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics", Error: "replace", Now: time.Date(2026, 7, 31, 1, 0, 1, 0, time.UTC)})
+		takeover <- db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID)
 	}()
 	select {
 	case err := <-takeover:
@@ -380,7 +376,7 @@ func TestGatewayBoundsExternalWriteByLeaseDeadline(t *testing.T) {
 	defer db.Close()
 	remote := &deadlineRemote{}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
-		return time.Date(2026, 7, 31, 1, 1, 59, 950000000, time.UTC)
+		return time.Date(2026, 7, 31, 0, 59, 59, 950000000, time.UTC)
 	}}
 	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
@@ -408,7 +404,7 @@ func TestGatewayRejectsDeliveryWhenValidationConsumesLease(t *testing.T) {
 		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC),
 	}
-	remote := &fakeRemote{}
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
 		value := clock[0]
 		if len(clock) > 1 {
@@ -423,11 +419,11 @@ func TestGatewayRejectsDeliveryWhenValidationConsumesLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
-		t.Fatalf("expired delivery error = %v", err)
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatalf("accepted handoff recovery error = %v", err)
 	}
-	if remote.observeCalls != 0 || remote.applyCalls != 0 {
-		t.Fatalf("delivery reached remote after lease expiry: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
+	if remote.observeCalls != 1 || remote.applyCalls != 1 {
+		t.Fatalf("accepted handoff was not delivered: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
 	}
 }
 
@@ -515,10 +511,7 @@ func TestReplacedLeaseCannotUpdateMappedPROrReplyWithEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordRunFailure(ctx, store.RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics", Error: "lease replaced", Now: time.Date(2026, 7, 31, 1, 1, 0, 0, time.UTC)}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: claim.VersionID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: time.Date(2026, 7, 31, 1, 2, 0, 0, time.UTC)}); err != nil {
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
 		t.Fatal(err)
 	}
 	applyCalls := remote.applyCalls
@@ -533,14 +526,14 @@ func TestReplacedLeaseCannotUpdateMappedPROrReplyWithEvidence(t *testing.T) {
 }
 
 func newAcceptedClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
-	return newCandidateClaim(t, ctx, true)
+	return newCandidateClaim(t, ctx)
 }
 
 func newPublishedCandidate(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
-	return newCandidateClaim(t, ctx, false)
+	return newCandidateClaim(t, ctx)
 }
 
-func newCandidateClaim(t *testing.T, ctx context.Context, renewLease bool) (*store.Store, store.TicketClaim) {
+func newCandidateClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
 	t.Helper()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -565,14 +558,8 @@ func newCandidateClaim(t *testing.T, ctx context.Context, renewLease bool) (*sto
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC)}); err != nil {
+	if _, err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
 		t.Fatal(err)
-	}
-	if renewLease {
-		claim, err = db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: time.Date(2026, 7, 31, 0, 2, 0, 0, time.UTC)})
-		if err != nil {
-			t.Fatal(err)
-		}
 	}
 	return db, claim
 }

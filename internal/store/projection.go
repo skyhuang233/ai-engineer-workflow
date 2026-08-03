@@ -59,6 +59,11 @@ WHERE t.version_id = ?`, versionID)
 			ticket.Owner = ""
 			ticket.RunID = ""
 			ticket.LeaseGeneration = 0
+		} else if runtimeState == plan.StateWaitingReview {
+			ticket.State = "Waiting Review"
+			ticket.Owner = ""
+			ticket.RunID = ""
+			ticket.LeaseGeneration = 0
 		} else if runtimeState == plan.StateRunning && runState == RunRunning && leaseState == LeaseActive {
 			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
 			if parseErr == nil && expiresAt.After(now) {

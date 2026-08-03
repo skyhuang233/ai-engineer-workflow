@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/plan"
 )
 
 var ErrSessionConflict = errors.New("ticket session identity conflict")
@@ -48,6 +50,21 @@ type CandidateRevision struct {
 	CommitSHA        string
 	StructuredOutput []byte
 	Now              time.Time
+	Publication      CandidatePublication
+}
+
+type CandidatePublication struct {
+	Repository         string
+	Branch             string
+	ExpectedRemoteHead string
+	ExpectRemoteAbsent bool
+	Title              string
+	Body               string
+}
+
+type CandidateHandoff struct {
+	PushOutboxKey string
+	PROutboxKey   string
 }
 
 type RunFailure struct {
@@ -220,14 +237,59 @@ func (s *Store) CandidateRevision(ctx context.Context, runID string) (CandidateR
 	return record, err
 }
 
-func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision) error {
+func (s *Store) AcceptedCandidateHandoff(ctx context.Context, versionID string, ticketID int64) (CandidateRecord, CandidateHandoff, error) {
+	var candidate CandidateRecord
+	var structured string
+	err := s.db.QueryRowContext(ctx, `SELECT c.run_id, c.session_id, c.codex_session_id, c.commit_sha, c.structured_output
+FROM candidate_revisions c
+JOIN ticket_sessions s ON s.session_id = c.session_id
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+JOIN worker_runs r ON r.run_id = c.run_id
+WHERE s.version_id = ? AND s.issue_id = ? AND rt.state = ? AND r.state = 'succeeded'`, versionID, ticketID, plan.StateWaitingReview).
+		Scan(&candidate.RunID, &candidate.SessionID, &candidate.CodexSessionID, &candidate.CommitSHA, &structured)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CandidateRecord{}, CandidateHandoff{}, ErrNotFound
+	}
+	if err != nil {
+		return CandidateRecord{}, CandidateHandoff{}, err
+	}
+	candidate.StructuredOutput = []byte(structured)
+	rows, err := s.db.QueryContext(ctx, `SELECT operation, idempotency_key FROM delivery_outbox WHERE json_extract(request_json, '$.run_id') = ? AND operation IN (?, ?)`, candidate.RunID, DeliveryPushCandidate, DeliveryUpsertPR)
+	if err != nil {
+		return CandidateRecord{}, CandidateHandoff{}, err
+	}
+	defer rows.Close()
+	var handoff CandidateHandoff
+	for rows.Next() {
+		var operation DeliveryOperation
+		var key string
+		if err := rows.Scan(&operation, &key); err != nil {
+			return CandidateRecord{}, CandidateHandoff{}, err
+		}
+		switch operation {
+		case DeliveryPushCandidate:
+			handoff.PushOutboxKey = key
+		case DeliveryUpsertPR:
+			handoff.PROutboxKey = key
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return CandidateRecord{}, CandidateHandoff{}, err
+	}
+	if handoff.PushOutboxKey == "" || handoff.PROutboxKey == "" {
+		return CandidateRecord{}, CandidateHandoff{}, ErrNotFound
+	}
+	return candidate, handoff, nil
+}
+
+func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision) (CandidateHandoff, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if candidate.RunID == "" || candidate.LeaseToken == "" || candidate.CodexSessionID == "" || candidate.CommitSHA == "" || len(candidate.StructuredOutput) == 0 {
-		return ErrInvalidClaim
+	if candidate.RunID == "" || candidate.LeaseToken == "" || candidate.CodexSessionID == "" || candidate.CommitSHA == "" || len(candidate.StructuredOutput) == 0 || candidate.Publication.Repository == "" || candidate.Publication.Branch == "" || candidate.Publication.Title == "" || (candidate.Publication.ExpectedRemoteHead == "") == !candidate.Publication.ExpectRemoteAbsent {
+		return CandidateHandoff{}, ErrInvalidClaim
 	}
 	if !json.Valid(candidate.StructuredOutput) {
-		return ErrInvalidClaim
+		return CandidateHandoff{}, ErrInvalidClaim
 	}
 	if candidate.Now.IsZero() {
 		candidate.Now = time.Now().UTC()
@@ -236,7 +298,7 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
 	defer tx.Rollback()
 	var sessionID, currentSessionID, existingCodexSessionID string
@@ -244,31 +306,72 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 	err = tx.QueryRowContext(ctx, `SELECT r.session_id, s.session_id, s.codex_session_id, l.generation FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 	WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, candidate.LeaseToken, RunRunning, LeaseActive, formatTimestamp(candidate.Now)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrInvalidClaim
+		return CandidateHandoff{}, ErrInvalidClaim
 	}
 	if err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
 	if sessionID != currentSessionID || generation <= 0 {
-		return ErrInvalidClaim
+		return CandidateHandoff{}, ErrInvalidClaim
 	}
 	if existingCodexSessionID != "" && existingCodexSessionID != candidate.CodexSessionID {
-		return ErrSessionConflict
+		return CandidateHandoff{}, ErrSessionConflict
 	}
 	now := formatTimestamp(candidate.Now)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, created_at) VALUES (?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), now); err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded', finished_at = ? WHERE run_id = ? AND state = ?`, now, candidate.RunID, RunRunning); err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, candidate.RunID, candidate.LeaseToken, LeaseActive); err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, now, sessionID, candidate.CodexSessionID); err != nil {
-		return err
+		return CandidateHandoff{}, err
 	}
-	return tx.Commit()
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM ticket_sessions WHERE session_id = ?) AND issue_id = (SELECT issue_id FROM ticket_sessions WHERE session_id = ?) AND delivered = 0`, plan.StateWaitingReview, now, sessionID, sessionID); err != nil {
+		return CandidateHandoff{}, err
+	}
+	push := DeliveryRequest{Operation: DeliveryPushCandidate, RunID: candidate.RunID, LeaseToken: candidate.LeaseToken, LeaseGeneration: generation, Repository: candidate.Publication.Repository, Branch: candidate.Publication.Branch, CommitSHA: candidate.CommitSHA, ExpectedRemoteHead: candidate.Publication.ExpectedRemoteHead, ExpectRemoteAbsent: candidate.Publication.ExpectRemoteAbsent}
+	pr := DeliveryRequest{Operation: DeliveryUpsertPR, RunID: candidate.RunID, LeaseToken: candidate.LeaseToken, LeaseGeneration: generation, Repository: candidate.Publication.Repository, Branch: candidate.Publication.Branch, CommitSHA: candidate.CommitSHA, ExpectedRemoteHead: candidate.CommitSHA, Title: candidate.Publication.Title, Body: candidate.Publication.Body}
+	pushKey, err := enqueueAcceptedDeliveryTx(ctx, tx, push, now)
+	if err != nil {
+		return CandidateHandoff{}, err
+	}
+	prKey, err := enqueueAcceptedDeliveryTx(ctx, tx, pr, now)
+	if err != nil {
+		return CandidateHandoff{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CandidateHandoff{}, err
+	}
+	return CandidateHandoff{PushOutboxKey: pushKey, PROutboxKey: prKey}, nil
+}
+
+func enqueueAcceptedDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now string) (string, error) {
+	key, err := deliveryKey(request)
+	if err != nil {
+		return "", err
+	}
+	request.IdempotencyKey = key
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_deliveries(version_id, issue_id, repository, branch, pull_request_number, pull_request_node_id, remote_head, created_at, updated_at)
+SELECT s.version_id, s.issue_id, ?, ?, 0, '', '', ?, ? FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?
+ON CONFLICT(version_id, issue_id) DO UPDATE SET repository = excluded.repository, branch = excluded.branch, updated_at = excluded.updated_at`, request.Repository, request.Branch, now, now, request.RunID); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_outbox(idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, next_attempt_at)
+VALUES (?, ?, ?, ?, 0, '', ?, ?, ?)`, key, request.Operation, string(raw), OutboxPending, now, now, now); err != nil {
+		return "", err
+	}
+	if err := insertDeliveryAuditTx(ctx, tx, request, "accepted", "queued with accepted candidate", time.Now().UTC()); err != nil {
+		return "", err
+	}
+	return key, nil
 }
 
 func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error {

@@ -154,6 +154,22 @@ func TestUpdatePlanProjectionUpdatesTheExistingStatusComment(t *testing.T) {
 	}
 }
 
+func TestHasPlanProjectionRejectsLegacyAndDuplicateStatusComments(t *testing.T) {
+	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
+	marker := planProjectionMarker(projection)
+	for _, comments := range [][]map[string]any{
+		{{"id": 1, "body": marker}},
+		{{"id": 1, "body": planProjectionIdentity + marker}, {"id": 2, "body": planProjectionIdentity}},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(comments) }))
+		_, err := NewClient(server.URL, "", server.Client()).HasPlanProjection(context.Background(), "owner/repo", 10, projection)
+		server.Close()
+		if err == nil {
+			t.Fatalf("invalid status comments were accepted: %#v", comments)
+		}
+	}
+}
+
 func TestDeliveredLabelIsProjectionOnly(t *testing.T) {
 	issue := issueResponse{ID: 1, Number: 11, State: "closed", Labels: []labelResponse{{Name: "workflow:ticket"}, {Name: "workflow:delivered"}}}.issue()
 	if issue.IsDelivered() {

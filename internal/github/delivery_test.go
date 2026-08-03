@@ -138,3 +138,27 @@ func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.
 		t.Fatalf("head-change error = %v", err)
 	}
 }
+
+func TestDeliveryRemoteRejectsInvalidPullRequestReturnedByApply(t *testing.T) {
+	for _, pull := range []map[string]any{
+		{"number": 7, "state": "closed", "head": map[string]string{"ref": "ticket-1", "sha": "accepted"}, "base": map[string]string{"ref": "main"}},
+		{"number": 7, "state": "open", "head": map[string]string{"ref": "other", "sha": "accepted"}, "base": map[string]string{"ref": "main"}},
+		{"number": 7, "state": "open", "head": map[string]string{"ref": "ticket-1", "sha": "accepted"}, "base": map[string]string{"ref": "release"}},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				_ = json.NewEncoder(w).Encode([]any{})
+			case http.MethodPost:
+				_ = json.NewEncoder(w).Encode(pull)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		_, err := (DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}).Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
+		server.Close()
+		if !errors.Is(err, store.ErrDeliveryRejected) {
+			t.Fatalf("invalid response error = %v", err)
+		}
+	}
+}

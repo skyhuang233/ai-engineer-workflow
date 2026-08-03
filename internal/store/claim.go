@@ -295,7 +295,7 @@ func loadFrontierTx(ctx context.Context, tx frontierRows, versionID string, now 
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT t.issue_id, t.issue_number, t.title, COALESCE(rt.delivered, t.delivered),
+	rows, err := tx.QueryContext(ctx, `SELECT t.issue_id, t.issue_number, t.title, COALESCE(rt.delivered, t.delivered), COALESCE(rt.state, ''),
 COALESCE(s.owner, ''), COALESCE(s.state, ''), COALESCE(r.state, ''), COALESCE(l.state, ''), COALESCE(l.expires_at, '')
 FROM plan_tickets t
 LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id
@@ -310,11 +310,14 @@ WHERE t.version_id = ?`, versionID)
 	for rows.Next() {
 		var ticket plan.FrontierTicket
 		var delivered int
-		var owner, sessionState, runState, leaseState, expiresText string
-		if err := rows.Scan(&ticket.IssueID, &ticket.Number, &ticket.Title, &delivered, &owner, &sessionState, &runState, &leaseState, &expiresText); err != nil {
+		var runtimeState, owner, sessionState, runState, leaseState, expiresText string
+		if err := rows.Scan(&ticket.IssueID, &ticket.Number, &ticket.Title, &delivered, &runtimeState, &owner, &sessionState, &runState, &leaseState, &expiresText); err != nil {
 			return snapshot, err
 		}
 		ticket.Delivered = delivered != 0
+		if runtimeState == plan.StateWaitingReview {
+			ticket.Owner = "waiting_review"
+		}
 		if sessionState == SessionRunning && runState == RunRunning && leaseState == LeaseActive {
 			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
 			if parseErr == nil && expiresAt.After(now) {

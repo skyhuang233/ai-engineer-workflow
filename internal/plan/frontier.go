@@ -5,6 +5,7 @@ import "sort"
 const (
 	StateQueued         = "queued"
 	StateRunning        = "running"
+	StateWaitingReview  = "waiting_review"
 	StateActive         = "active"
 	StateDelivered      = "delivered"
 	StateNeedsAttention = "needs_attention"

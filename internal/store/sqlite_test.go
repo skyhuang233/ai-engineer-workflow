@@ -88,6 +88,33 @@ func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	}
 }
 
+func TestMigrationBackupCanBeRestored(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(dbPath + ".migration.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredPath := filepath.Join(filepath.Dir(dbPath), "restored.db")
+	if err := os.WriteFile(restoredPath, backup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(ctx, restoredPath)
+	if err != nil {
+		t.Fatalf("open restored migration backup: %v", err)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBeginActivationRejectsChangedImmutablePlan(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

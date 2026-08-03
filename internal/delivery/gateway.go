@@ -62,7 +62,7 @@ func (g Gateway) Submit(ctx context.Context, request store.DeliveryRequest) (sto
 
 // Dispatch claims one outbox item and executes it. An external error remains
 // retryable unless an observation proves that the requested mutation already
-// happened. This is the important timeout rule: observe first, then retry.
+// happened.
 func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
@@ -107,7 +107,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 			if observeErr == nil && observed.Applied {
 				observation = observed
 				applyErr = nil
-			} else if observeErr != nil {
+			} else {
 				applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
 			}
 		}

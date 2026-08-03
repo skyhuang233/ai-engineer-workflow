@@ -272,11 +272,8 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, err
 	}
 	remaining := target.LeaseExpiresAt.Sub(now().UTC())
-	if target.LeaseExpiresAt.IsZero() {
-		remaining = time.Minute
-	}
 	if remaining <= 0 {
-		return DeliveryResult{}, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
+		remaining = time.Minute
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
@@ -676,18 +673,21 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 	var expiresText string
 	var mappedNumber int64
 	var mappedNode, mappedHead string
+	var runState, leaseState, runtimeState string
 	err := tx.QueryRowContext(ctx, `SELECT p.current_version_id, s.issue_id, s.session_id, r.run_id, l.generation, p.repository, p.root_issue_number, s.branch, s.accepted_commit,
 	COALESCE(td.pull_request_number, 0), COALESCE(td.pull_request_node_id, ''), COALESCE(td.remote_head, ''), l.expires_at
+	, r.state, l.state, rt.state
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN plan_versions v ON v.version_id = s.version_id
 JOIN plans p ON p.id = v.plan_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 LEFT JOIN ticket_deliveries td ON td.version_id = s.version_id AND td.issue_id = s.issue_id
 WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id = r.run_id AND l.lease_token = ? AND l.generation = ?
 AND ((r.state = ? AND l.state = ?) OR (r.state = 'succeeded' AND l.state = 'revoked' AND EXISTS (SELECT 1 FROM candidate_revisions c WHERE c.run_id = r.run_id AND c.commit_sha = s.accepted_commit)))`,
 		request.RunID, request.LeaseToken, request.LeaseGeneration, RunRunning, LeaseActive).
-		Scan(&target.VersionID, &target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.Repository, &target.RootNumber, &target.Branch, &target.AcceptedCommit, &mappedNumber, &mappedNode, &mappedHead, &expiresText)
+		Scan(&target.VersionID, &target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.Repository, &target.RootNumber, &target.Branch, &target.AcceptedCommit, &mappedNumber, &mappedNode, &mappedHead, &expiresText, &runState, &leaseState, &runtimeState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is not current", ErrDeliveryRejected)
 	}
@@ -695,7 +695,8 @@ AND ((r.state = ? AND l.state = ?) OR (r.state = 'succeeded' AND l.state = 'revo
 		return DeliveryTarget{}, request, err
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
-	if err != nil || !expiresAt.After(now) {
+	acceptedHandoff := runState == "succeeded" && leaseState == "revoked" && runtimeState == plan.StateWaitingReview
+	if err != nil || (!acceptedHandoff && !expiresAt.After(now)) {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
 	target.LeaseExpiresAt = expiresAt

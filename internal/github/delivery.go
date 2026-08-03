@@ -115,6 +115,9 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 				return delivery.Observation{}, err
 			}
 		}
+		if err := validatePullRequest(pull, request); err != nil {
+			return delivery.Observation{}, fmt.Errorf("%w: %v", store.ErrDeliveryRejected, err)
+		}
 		if pull.Head.SHA != request.CommitSHA {
 			return delivery.Observation{}, fmt.Errorf("%w: pull request head %q does not match accepted candidate %q", store.ErrDeliveryRejected, pull.Head.SHA, request.CommitSHA)
 		}
