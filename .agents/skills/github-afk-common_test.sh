@@ -222,6 +222,47 @@ test_claim_retries_comment_after_label_succeeds() (
   fi
 )
 
+test_render_context_excludes_free_form_comments() (
+  gh() {
+    if [ "$1 $2 $3" = "issue view 7" ]; then
+      printf '%s' $'## What to build\n\nBuild it.\n\n## Acceptance criteria\n\n- [ ] It works.\n\n## Blocked by\n\nNone\n'
+      return 0
+    fi
+    echo "unexpected gh invocation: $*" >&2
+    return 1
+  }
+
+  local output
+  output="$(gh_afk_render_issue_context 7)"
+  if grep -Fq "comments" <<<"$output" || grep -Fq "unexpected" <<<"$output"; then
+    printf '%s\n' "$output" >&2
+    echo "free-form discussion reached the AFK prompt" >&2
+    return 1
+  fi
+  if ! grep -Fq "# Selected issue contract" <<<"$output"; then
+    printf '%s\n' "$output" >&2
+    echo "structured issue contract was omitted" >&2
+    return 1
+  fi
+)
+
+test_render_context_fails_when_issue_read_fails() (
+  gh() {
+    echo 'HTTP 401: Bad credentials' >&2
+    return 1
+  }
+
+  local status
+  set +e
+  gh_afk_render_issue_context 7 >/dev/null 2>&1
+  status="$?"
+  set -e
+  if [ "$status" -eq 0 ]; then
+    echo "context rendering accepted a failed issue read" >&2
+    return 1
+  fi
+)
+
 failures=0
 
 for test_case in \
@@ -229,7 +270,9 @@ for test_case in \
   test_label_lookup_retries_without_create \
   test_exhausted_transport_error_is_not_malformed \
   test_non_transient_error_is_not_retried \
-  test_claim_retries_comment_after_label_succeeds
+  test_claim_retries_comment_after_label_succeeds \
+  test_render_context_excludes_free_form_comments \
+  test_render_context_fails_when_issue_read_fails
 do
   if "$test_case"; then
     echo "ok - $test_case"

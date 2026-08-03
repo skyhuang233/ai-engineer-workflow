@@ -97,36 +97,29 @@ func TestUpdateIssueBodyPreservesPatchPayloadAndHeaders(t *testing.T) {
 	}
 }
 
-func TestUpdatePlanProjectionReadsTheCurrentHumanBodyAtWriteTime(t *testing.T) {
-	var patched string
+func TestUpdatePlanProjectionAppendsAnImmutableStatusComment(t *testing.T) {
+	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet:
-			w.Header().Set("ETag", `"v1"`)
-			json.NewEncoder(w).Encode(issueResponse{ID: 100, Number: 10, Body: "fresh human edit"})
-		case r.Method == http.MethodPatch:
-			if r.Header.Get("If-Match") != `"v1"` {
-				t.Errorf("If-Match = %q", r.Header.Get("If-Match"))
-			}
-			var payload struct {
-				Body string `json:"body"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatal(err)
-			}
-			patched = payload.Body
-			w.WriteHeader(http.StatusOK)
-		default:
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
 			http.NotFound(w, r)
+			return
 		}
+		var payload struct {
+			Body string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		comment = payload.Body
+		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
 	client := NewClient(server.URL, "", server.Client())
 	if err := client.UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(patched, "fresh human edit") || !strings.Contains(patched, plan.ProjectionStart) {
-		t.Fatalf("projected body = %q", patched)
+	if !strings.Contains(comment, plan.ProjectionStart) || !strings.Contains(comment, "workflow-projection:") {
+		t.Fatalf("projected comment = %q", comment)
 	}
 }
 

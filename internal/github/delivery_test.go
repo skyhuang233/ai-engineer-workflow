@@ -3,7 +3,6 @@ package github
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,26 +43,21 @@ func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 	}
 }
 
-func TestDeliveryRemoteRendersPlanProjectionAgainstFreshHumanBody(t *testing.T) {
-	var patched string
+func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
+	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet:
-			w.Header().Set("ETag", `"v1"`)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "body": "fresh human specification"})
-		case r.Method == http.MethodPatch:
-			body, _ := io.ReadAll(r.Body)
-			var payload struct {
-				Body string `json:"body"`
-			}
-			if err := json.Unmarshal(body, &payload); err != nil {
-				t.Errorf("decode patch payload: %v", err)
-			}
-			patched = payload.Body
-			w.WriteHeader(http.StatusOK)
-		default:
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
 			http.NotFound(w, r)
+			return
 		}
+		var payload struct {
+			Body string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode comment payload: %v", err)
+		}
+		comment = payload.Body
+		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
 	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
@@ -71,8 +65,8 @@ func TestDeliveryRemoteRendersPlanProjectionAgainstFreshHumanBody(t *testing.T) 
 	if _, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryProjectPlan, Repository: "owner/repo", RootNumber: 10, PlanProjection: &projection}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(patched, "fresh human specification") || !strings.Contains(patched, plan.ProjectionStart) {
-		t.Fatalf("projected payload = %s", patched)
+	if !strings.Contains(comment, plan.ProjectionStart) || !strings.Contains(comment, "workflow-projection:") {
+		t.Fatalf("projected comment = %s", comment)
 	}
 }
 

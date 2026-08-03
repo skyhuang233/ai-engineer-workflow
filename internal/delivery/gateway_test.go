@@ -256,6 +256,27 @@ func TestGatewayAllowsFirstCandidatePushToExpectAbsentBranch(t *testing.T) {
 	}
 }
 
+func TestGatewayAllowsAcceptedCandidateDeliveryBeforeLeaseDeadline(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newPublishedCandidate(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 1, 30, 0, time.UTC) }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("accepted candidate was not delivered: applies=%d", remote.applyCalls)
+	}
+}
+
 func TestGatewayRejectsUnstructuredPlanBodyReplacement(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
@@ -377,6 +398,39 @@ func TestGatewayBoundsExternalWriteByLeaseDeadline(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsDeliveryWhenValidationConsumesLease(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	clock := []time.Time{
+		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC),
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		value := clock[0]
+		if len(clock) > 1 {
+			clock = clock[1:]
+		}
+		return value
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("expired delivery error = %v", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("delivery reached remote after lease expiry: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
 func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
@@ -451,6 +505,14 @@ func TestReplacedLeaseCannotUpdateMappedPROrReplyWithEvidence(t *testing.T) {
 }
 
 func newAcceptedClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
+	return newCandidateClaim(t, ctx, true)
+}
+
+func newPublishedCandidate(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
+	return newCandidateClaim(t, ctx, false)
+}
+
+func newCandidateClaim(t *testing.T, ctx context.Context, renewLease bool) (*store.Store, store.TicketClaim) {
 	t.Helper()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -478,11 +540,11 @@ func newAcceptedClaim(t *testing.T, ctx context.Context) (*store.Store, store.Ti
 	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC)}); err != nil {
 		t.Fatal(err)
 	}
-	// A published candidate is accepted before the delivery command is sent;
-	// create a fresh run to model the delivery controller's active lease.
-	claim, err = db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: time.Date(2026, 7, 31, 0, 2, 0, 0, time.UTC)})
-	if err != nil {
-		t.Fatal(err)
+	if renewLease {
+		claim, err = db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: time.Date(2026, 7, 31, 0, 2, 0, 0, time.UTC)})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	return db, claim
 }

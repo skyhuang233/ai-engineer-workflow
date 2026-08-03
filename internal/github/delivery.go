@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
-	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -34,11 +33,11 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 		if request.PlanProjection == nil {
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
-		issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
-		if err != nil {
-			return delivery.Observation{}, err
-		}
 		if request.Operation == store.DeliveryAddIssueLabel {
+			issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
+			if err != nil {
+				return delivery.Observation{}, err
+			}
 			for _, label := range issue.Labels {
 				if label == request.Label {
 					return delivery.Observation{Applied: true}, nil
@@ -46,11 +45,11 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 			}
 			return delivery.Observation{}, nil
 		}
-		expected, err := plan.RenderProjection(issue.Body, *request.PlanProjection)
+		applied, err := r.Client.HasPlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection)
 		if err != nil {
 			return delivery.Observation{}, err
 		}
-		return delivery.Observation{Applied: issue.Body == expected}, nil
+		return delivery.Observation{Applied: applied}, nil
 	}
 	head, exists, err := r.Client.branchHead(ctx, request.Repository, request.Branch)
 	if err != nil {

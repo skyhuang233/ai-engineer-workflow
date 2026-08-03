@@ -798,28 +798,37 @@ gh_afk_render_issue_context() {
   local contract_body
   local parent_number
 
-  body="$(gh_afk_retry_read gh issue view "$number" --json body --jq '.body // ""')"
-  if contract_body="$(gh_afk_resolve_issue_contract_body "$number" "$body")"; then
-    body="$contract_body"
+  if ! body="$(gh_afk_retry_read gh issue view "$number" --json body --jq '.body // ""')"; then
+    echo "Cannot read issue #$number while constructing the AFK prompt." >&2
+    return 1
   fi
+  body="$(gh_afk_strip_cr "$body")"
+
+  if ! contract_body="$(gh_afk_resolve_issue_contract_body "$number" "$body")"; then
+    echo "Cannot resolve the structured contract for issue #$number." >&2
+    return 1
+  fi
+  body="$contract_body"
   parent_number="$(gh_afk_parent_issue_number "$body")"
 
-  echo "# Selected GitHub issue"
+  echo "# Selected issue contract"
   echo ""
-  gh_afk_retry_read gh issue view "$number" --comments
+  printf '%s\n' "$body"
   echo ""
-
-  if printf '%s' "$body" | gh_afk_has_text; then
-    echo "# Resolved issue contract"
-    echo ""
-    printf '%s\n' "$body"
-    echo ""
-  fi
 
   if [ -n "$parent_number" ]; then
+    if ! body="$(gh_afk_retry_read gh issue view "$parent_number" --json body --jq '.body // ""')"; then
+      echo "Cannot read parent issue #$parent_number while constructing the AFK prompt." >&2
+      return 1
+    fi
+    body="$(gh_afk_strip_cr "$body")"
+    if ! contract_body="$(gh_afk_resolve_issue_contract_body "$parent_number" "$body")"; then
+      echo "Cannot resolve the structured contract for parent issue #$parent_number." >&2
+      return 1
+    fi
     echo "# Parent issue context"
     echo ""
-    gh_afk_retry_read gh issue view "$parent_number" --comments
+    printf '%s\n' "$contract_body"
     echo ""
   fi
 }

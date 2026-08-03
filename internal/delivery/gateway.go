@@ -77,7 +77,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
 	}
-	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now(), func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
 		observation, observeErr := g.Remote.Observe(operationCtx, request)
 		if observeErr != nil {
 			return store.DeliveryResult{}, observeErr

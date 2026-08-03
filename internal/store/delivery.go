@@ -96,6 +96,7 @@ type TicketDelivery struct {
 	IssueID           int64
 	Repository        string
 	PullRequestNumber int64
+	CandidateCommit   string
 }
 
 const maxDeliveryAttempts = 3
@@ -248,15 +249,14 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 	return target, nil
 }
 
-func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, now time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
+func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, now func() time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
 	if apply == nil {
 		return DeliveryResult{}, ErrInvalidClaim
 	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	} else {
-		now = now.UTC()
+	if now == nil {
+		now = time.Now
 	}
+	validatedAt := now().UTC()
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -264,14 +264,14 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, err
 	}
 	defer tx.Rollback()
-	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now)
+	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, validatedAt)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryResult{}, err
 	}
-	remaining := target.LeaseExpiresAt.Sub(now)
+	remaining := target.LeaseExpiresAt.Sub(now().UTC())
 	if target.LeaseExpiresAt.IsZero() {
 		remaining = time.Minute
 	}
@@ -332,7 +332,7 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 }
 
 func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, d.remote_head
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0`, repository)
@@ -343,7 +343,7 @@ WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0`, repos
 	var deliveries []TicketDelivery
 	for rows.Next() {
 		var delivery TicketDelivery
-		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber); err != nil {
+		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit); err != nil {
 			return nil, err
 		}
 		deliveries = append(deliveries, delivery)
@@ -562,6 +562,9 @@ AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryRe
 }
 
 func markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, reason string, now time.Time) error {
+	if request.RunID == "" {
+		return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?)`, plan.StateNeedsAttention, formatTimestamp(now), request.RunID)
 	if err != nil {
 		return err
@@ -680,8 +683,9 @@ JOIN plan_versions v ON v.version_id = s.version_id
 JOIN plans p ON p.id = v.plan_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 LEFT JOIN ticket_deliveries td ON td.version_id = s.version_id AND td.issue_id = s.issue_id
-WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id = r.run_id AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`,
-		request.RunID, RunRunning, request.LeaseToken, request.LeaseGeneration, LeaseActive).
+WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id = r.run_id AND l.lease_token = ? AND l.generation = ?
+AND ((r.state = ? AND l.state = ?) OR (r.state = 'succeeded' AND l.state = 'revoked' AND EXISTS (SELECT 1 FROM candidate_revisions c WHERE c.run_id = r.run_id AND c.commit_sha = s.accepted_commit)))`,
+		request.RunID, request.LeaseToken, request.LeaseGeneration, RunRunning, LeaseActive).
 		Scan(&target.VersionID, &target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.Repository, &target.RootNumber, &target.Branch, &target.AcceptedCommit, &mappedNumber, &mappedNode, &mappedHead, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is not current", ErrDeliveryRejected)

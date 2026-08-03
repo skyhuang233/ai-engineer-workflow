@@ -27,7 +27,7 @@ func (r DeliveredReconciler) Reconcile(ctx context.Context, repository string) (
 	}
 	marked := 0
 	for _, delivery := range deliveries {
-		delivered, err := r.Client.pullRequestReachedMain(ctx, repository, delivery.PullRequestNumber)
+		delivered, err := r.Client.pullRequestReachedMain(ctx, repository, delivery.PullRequestNumber, delivery.CandidateCommit)
 		if err != nil {
 			return marked, err
 		}
@@ -42,7 +42,7 @@ func (r DeliveredReconciler) Reconcile(ctx context.Context, repository string) (
 	return marked, nil
 }
 
-func (c *Client) pullRequestReachedMain(ctx context.Context, repository string, number int64) (bool, error) {
+func (c *Client) pullRequestReachedMain(ctx context.Context, repository string, number int64, candidateCommit string) (bool, error) {
 	var pull struct {
 		State          string `json:"state"`
 		MergedAt       string `json:"merged_at"`
@@ -54,15 +54,15 @@ func (c *Client) pullRequestReachedMain(ctx context.Context, repository string, 
 	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10), &pull); err != nil {
 		return false, err
 	}
-	if pull.State != "closed" || pull.MergedAt == "" || pull.MergeCommitSHA == "" || pull.Base.Ref != "main" {
+	if pull.State != "closed" || pull.MergedAt == "" || pull.MergeCommitSHA == "" || pull.Base.Ref != "main" || candidateCommit == "" {
 		return false, nil
 	}
 	var comparison struct {
 		Status string `json:"status"`
 	}
-	path := "/repos/" + repository + "/compare/" + url.PathEscape(pull.MergeCommitSHA) + "...main"
+	path := "/repos/" + repository + "/compare/" + url.PathEscape(candidateCommit) + "...main"
 	if err := c.getJSON(ctx, path, &comparison); err != nil {
 		return false, err
 	}
-	return comparison.Status == "behind" || comparison.Status == "identical", nil
+	return comparison.Status == "ahead" || comparison.Status == "identical", nil
 }
