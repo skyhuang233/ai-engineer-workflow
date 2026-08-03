@@ -824,7 +824,7 @@ AND ((r.state = ? AND l.state = ?) OR (r.state = 'succeeded' AND l.state = 'revo
 		return DeliveryTarget{}, request, err
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
-	acceptedHandoff := runState == "succeeded" && leaseState == "revoked" && runtimeState == plan.StateWaitingReview
+	acceptedHandoff := runState == "succeeded" && leaseState == "revoked"
 	if err != nil || (!acceptedHandoff && !expiresAt.After(now)) {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
