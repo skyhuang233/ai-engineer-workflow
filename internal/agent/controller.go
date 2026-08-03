@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -19,6 +18,8 @@ type Controller struct {
 	Runtime      worker.Runtime
 	ImageDigest  string
 	ToolVersions map[string]string
+	NoMistakes   string
+	GatewayURL   string
 	Now          func() time.Time
 }
 
@@ -70,9 +71,6 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return Candidate{}, err
 	}
-	if err := os.WriteFile(c.Workspace.schemaPath(ws.CodexState), []byte(outputSchema), 0o600); err != nil {
-		return Candidate{}, err
-	}
 	baseCommit, currentBranch, clean, err := c.Workspace.status(ctx, ws)
 	if err != nil {
 		return Candidate{}, err
@@ -83,15 +81,22 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
-	command := []string{"codex", "exec", "--json", "--output-schema", c.Workspace.schemaPath(ws.CodexState)}
-	if session.CodexSessionID != "" {
-		command = []string{"codex", "exec", "resume", session.CodexSessionID, "--json", "--output-schema", c.Workspace.schemaPath(ws.CodexState)}
+	noMistakes := c.NoMistakes
+	if noMistakes == "" {
+		noMistakes = "no-mistakes"
 	}
-	command = append(command, request.Prompt)
+	command := []string{noMistakes, "axi", "run", "--intent", request.Prompt}
+	environment := map[string]string{
+		"CODEX_HOME":                 ws.CodexState,
+		"NO_MISTAKES_DELIVERY_CYCLE": session.SessionID,
+	}
+	if c.GatewayURL != "" {
+		environment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL
+	}
 	spec := worker.Spec{
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
-		Environment: map[string]string{"CODEX_HOME": ws.CodexState},
+		Environment: environment,
 		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
 		ExtraHosts:  []string{worker.GatewayHostMapping},
 	}
@@ -261,5 +266,3 @@ func parseSessionID(output []byte, existing string) (string, error) {
 	}
 	return sessionID, nil
 }
-
-const outputSchema = `{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"},"commit":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}}},"additionalProperties":true}`

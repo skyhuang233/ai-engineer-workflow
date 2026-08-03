@@ -101,13 +101,25 @@ gh_afk_retry_read() {
   return 1
 }
 
+gh_afk_gateway_write() {
+  local gateway="${WORKFLOW_GITHUB_GATEWAY_COMMAND:-}"
+
+  if [ -z "$gateway" ]; then
+    echo "GitHub writes require WORKFLOW_GITHUB_GATEWAY_COMMAND." >&2
+    return 1
+  fi
+  if ! command -v "$gateway" >/dev/null 2>&1; then
+    echo "GitHub Write Gateway command is not available: $gateway" >&2
+    return 1
+  fi
+  "$gateway" "$@"
+}
+
 gh_afk_ensure_label() {
   local name="$1"
   local color="$2"
   local description="$3"
   local labels
-  local create_error_file
-  local create_status
 
   if ! labels="$(gh_afk_retry_read gh label list --limit 1000 --json name --jq '.[].name')"; then
     echo "Cannot ensure label '$name': unable to list repository labels." >&2
@@ -118,26 +130,17 @@ gh_afk_ensure_label() {
     return 0
   fi
 
-  create_error_file="$(mktemp)"
-  if gh label create "$name" --color "$color" --description "$description" \
-    >/dev/null 2>"$create_error_file"; then
-    rm -f "$create_error_file"
-    return 0
-  else
-    create_status="$?"
+  if ! gh_afk_gateway_write ensure-label "$name" "$color" "$description"; then
+    echo "Cannot ensure label '$name' through the GitHub Write Gateway." >&2
+    return 1
   fi
 
-  # A create request may have reached GitHub even when its response was lost.
-  # Re-read before reporting failure so an existing label remains idempotent.
   if labels="$(gh_afk_retry_read gh label list --limit 1000 --json name --jq '.[].name')" \
     && grep -Fxq "$name" <<<"$labels"; then
-    rm -f "$create_error_file"
     return 0
   fi
-
-  cat "$create_error_file" >&2
-  rm -f "$create_error_file"
-  return "$create_status"
+  echo "Gateway did not provision label '$name'." >&2
+  return 1
 }
 
 gh_afk_ensure_labels() {
@@ -838,25 +841,18 @@ gh_afk_rollback_claim_label() {
   local attempts="$2"
   local delay="$3"
   local attempt
-  local error_file
-
-  error_file="$(mktemp)"
   for ((attempt=1; attempt<=attempts; attempt++)); do
-    if gh issue edit "$number" --remove-label "in-progress" >/dev/null 2>"$error_file"; then
-      rm -f "$error_file"
+    if gh_afk_gateway_write remove-issue-label "$number" "in-progress"; then
       return 0
     fi
     if gh_afk_retry_read gh issue view "$number" --json labels --jq '([.labels[].name] // []) | index("in-progress") == null' 2>/dev/null | grep -Fxq true; then
-      rm -f "$error_file"
       return 0
     fi
-    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
+    if [ "$attempt" -ge "$attempts" ]; then
       break
     fi
     [ "$delay" -eq 0 ] || sleep "$delay"
   done
-  cat "$error_file" >&2
-  rm -f "$error_file"
   return 1
 }
 
@@ -868,7 +864,6 @@ gh_afk_claim_issue() {
   local attempts="${GH_AFK_RETRY_ATTEMPTS:-5}"
   local delay="${GH_AFK_RETRY_BASE_DELAY_SECONDS:-2}"
   local attempt
-  local error_file
   local status
 
   timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -880,9 +875,8 @@ gh_afk_claim_issue() {
     delay=2
   fi
 
-  error_file="$(mktemp)"
   for ((attempt=1; attempt<=attempts; attempt++)); do
-    if gh issue edit "$number" --add-label "in-progress" >/dev/null 2>"$error_file"; then
+    if gh_afk_gateway_write add-issue-label "$number" "in-progress"; then
       break
     else
       status="$?"
@@ -890,9 +884,7 @@ gh_afk_claim_issue() {
     if gh_afk_retry_read gh issue view "$number" --json labels --jq '([.labels[].name] // []) | index("in-progress") != null' 2>/dev/null | grep -Fxq true; then
       break
     fi
-    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
-      cat "$error_file" >&2
-      rm -f "$error_file"
+    if [ "$attempt" -ge "$attempts" ]; then
       if ! gh_afk_rollback_claim_label "$number" "$attempts" "$delay"; then
         echo "Failed to roll back incomplete claim for issue #$number." >&2
       fi
@@ -903,28 +895,22 @@ gh_afk_claim_issue() {
 
   for ((attempt=1; attempt<=attempts; attempt++)); do
     if gh_afk_retry_read gh issue view "$number" --json comments 2>/dev/null | jq -e --arg body "$body" 'any(.comments[]?; .body == $body)' >/dev/null; then
-      rm -f "$error_file"
       return 0
     fi
-    : >"$error_file"
-    if gh issue comment "$number" --body "$body" >/dev/null 2>"$error_file"; then
-      rm -f "$error_file"
+    if gh_afk_gateway_write add-issue-comment "$number" "$body"; then
       return 0
     else
       status="$?"
     fi
     if gh_afk_retry_read gh issue view "$number" --json comments 2>/dev/null | jq -e --arg body "$body" 'any(.comments[]?; .body == $body)' >/dev/null; then
-      rm -f "$error_file"
       return 0
     fi
-    if [ "$attempt" -ge "$attempts" ] || ! gh_afk_is_transient_github_error "$error_file"; then
+    if [ "$attempt" -ge "$attempts" ]; then
       break
     fi
     [ "$delay" -eq 0 ] || sleep "$delay"
   done
 
-  cat "$error_file" >&2
-  rm -f "$error_file"
   if ! gh_afk_rollback_claim_label "$number" "$attempts" "$delay"; then
     echo "Failed to roll back incomplete claim for issue #$number." >&2
   fi
@@ -934,5 +920,5 @@ gh_afk_claim_issue() {
 gh_afk_release_issue_claim() {
   local number="$1"
 
-  gh issue edit "$number" --remove-label "in-progress" >/dev/null
+  gh_afk_gateway_write remove-issue-label "$number" "in-progress"
 }

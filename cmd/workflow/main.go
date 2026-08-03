@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
-	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -105,14 +104,16 @@ func runTicket(args []string) {
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	prompt := flags.String("prompt", "", "Worker prompt")
+	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback for the next revision round")
 	branch := flags.String("branch", "", "ticket branch")
-	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "Gateway GitHub credential")
+	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
+	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	expectedHead := flags.String("expected-remote-head", "", "current remote ticket branch head")
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *prompt == "" || *token == "" || (*expectedHead != "") == *expectAbsent {
-		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, prompt, credential, and exactly one remote-head expectation")
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *prompt == "" || *token == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
+		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, prompt, read credential, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -137,37 +138,25 @@ func runTicket(args []string) {
 	}
 	claim, claimErr := db.CurrentClaim(ctx, version.ID, *ticketID)
 	if claimErr != nil {
-		accepted, handoff, handoffErr := db.AcceptedCandidateHandoff(ctx, version.ID, *ticketID)
-		if handoffErr != nil {
+		if *reviewFeedback == "" {
 			fail(claimErr)
 		}
-		gateway := ticketGateway(ctx, db, client, version.ID, *ticketID, *token)
-		dispatchStoredDelivery(ctx, gateway, handoff.PushOutboxKey)
-		dispatchStoredDelivery(ctx, gateway, handoff.PROutboxKey)
-		fmt.Println(string(accepted.StructuredOutput))
-		return
+		claim, claimErr = db.ClaimReviewRevision(ctx, version.ID, *ticketID, 30*time.Minute, time.Now().UTC())
+		if claimErr != nil {
+			fail(claimErr)
+		}
+		*prompt = *reviewFeedback
 	}
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 	}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"codex": config.Codex.Version}}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: *gatewayURL}
 	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: *branch, Prompt: *prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: *branch, ExpectedRemoteHead: *expectedHead, ExpectRemoteAbsent: *expectAbsent, Title: claim.TicketTitle}})
 	if err != nil {
 		fail(err)
 	}
-	gateway := ticketGateway(ctx, db, client, version.ID, *ticketID, *token)
-	dispatchStoredDelivery(ctx, gateway, candidate.PushOutboxKey)
-	dispatchStoredDelivery(ctx, gateway, candidate.PROutboxKey)
 	encoded, _ := json.MarshalIndent(candidate, "", "  ")
 	fmt.Println(string(encoded))
-}
-
-func ticketGateway(ctx context.Context, db *store.Store, client *github.Client, versionID string, ticketID int64, token string) delivery.Gateway {
-	session, err := db.TicketSession(ctx, versionID, ticketID)
-	if err != nil {
-		fail(err)
-	}
-	return delivery.Gateway{Store: db, Remote: github.DeliveryRemote{Client: client, Pusher: github.WorkspacePusher{WorkspacePath: session.WorkspacePath, Token: token}}}
 }
 
 func runReconcileDelivered(args []string) {
@@ -193,12 +182,6 @@ func runReconcileDelivered(args []string) {
 		fail(err)
 	}
 	fmt.Println(marked)
-}
-
-func dispatchStoredDelivery(ctx context.Context, gateway delivery.Gateway, key string) {
-	if err := gateway.Dispatch(ctx, key); err != nil {
-		fail(err)
-	}
 }
 
 func fail(err error) {

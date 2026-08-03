@@ -215,7 +215,7 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	if err != nil || recovered.RunID != candidate.RunID || handoff.PushOutboxKey != candidate.PushOutboxKey || handoff.PROutboxKey != candidate.PROutboxKey {
 		t.Fatalf("recovered candidate handoff = %#v, %#v, err=%v", recovered, handoff, err)
 	}
-	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --output-schema "+filepath.Join(root, "codex", claim.SessionID, "output-schema.json")+" implement the ticket" {
+	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
 	}
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
@@ -224,6 +224,13 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
 		t.Fatalf("claim while delivery handoff is pending = %v, want fencing conflict", err)
+	}
+	revision, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC().Add(time.Second))
+	if err != nil {
+		t.Fatalf("claim review revision: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || revision.LeaseGeneration != claim.LeaseGeneration+1 {
+		t.Fatalf("review revision claim = %#v", revision)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
 		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)

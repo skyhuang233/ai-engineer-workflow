@@ -230,6 +230,75 @@ WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ?`, vers
 	return claim, err
 }
 
+func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time) (TicketClaim, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if versionID == "" || issueID == 0 {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	if leaseTTL <= 0 {
+		leaseTTL = time.Minute
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	defer tx.Rollback()
+	var sessionID, owner, sessionState, runtimeState string
+	var ticketNumber int64
+	var ticketTitle string
+	var generation int64
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title
+FROM ticket_sessions s
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, ErrNotFound
+	}
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
+		return TicketClaim{}, ErrNotReady
+	}
+	generation++
+	attempt := 0
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
+		return TicketClaim{}, err
+	}
+	runID, err := randomID("run-")
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	leaseToken, err := randomID("lease-")
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	expiresAt := now.Add(leaseTTL)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, lease_generation, state, started_at) VALUES (?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, generation, RunRunning, formatTimestamp(now)); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, generation, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(now)); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_run_id = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, runID, generation, formatTimestamp(now), sessionID); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateRunning, formatTimestamp(now), versionID, issueID); err != nil {
+		return TicketClaim{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TicketClaim{}, err
+	}
+	return TicketClaim{VersionID: versionID, TicketID: issueID, TicketNumber: ticketNumber, TicketTitle: ticketTitle, Owner: owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: generation, LeaseExpiresAt: expiresAt}, nil
+}
+
 // MarkTicketDelivered records the durable delivery fact that unlocks dependent
 // tickets. The caller is expected to have already verified the merged revision
 // and reachability at the GitHub boundary.

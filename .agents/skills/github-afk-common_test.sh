@@ -194,14 +194,18 @@ test_claim_retries_comment_after_label_succeeds() (
   }
 
   gh() {
-    if [ "$1 $2 $3" = "issue edit 7" ]; then
-      return 0
-    fi
     if [ "$1 $2 $3" = "issue view 7" ]; then
       printf '{"comments":[]}'
       return 0
     fi
-    if [ "$1 $2 $3" = "issue comment 7" ]; then
+    return 1
+  }
+
+  gh_afk_gateway_write() {
+    if [ "$1 $2" = "add-issue-label 7" ]; then
+      return 0
+    fi
+    if [ "$1 $2" = "add-issue-comment 7" ]; then
       printf 'call\n' >> "$comment_calls"
       if [ "$(wc -l < "$comment_calls" | tr -d ' ')" -eq 1 ]; then
         echo 'HTTP 503: Service Unavailable' >&2
