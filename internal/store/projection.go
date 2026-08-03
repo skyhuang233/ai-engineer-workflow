@@ -29,7 +29,7 @@ func (s *Store) PlanProjectionAt(ctx context.Context, versionID string, now time
 COALESCE(s.owner, ''), COALESCE(s.session_id, ''), COALESCE(r.run_id, ''),
 COALESCE(r.state, ''), COALESCE(l.generation, 0), COALESCE(l.state, ''), COALESCE(l.expires_at, ''),
 COALESCE(td.pull_request_number, 0), COALESCE(s.accepted_commit, ''),
-COALESCE((SELECT o.state FROM delivery_outbox o WHERE json_extract(o.request_json, '$.run_id') = r.run_id AND o.operation = 'upsert_pull_request' ORDER BY o.updated_at DESC LIMIT 1), ''),
+CASE WHEN td.pull_request_number > 0 THEN 'not run' ELSE '' END,
 MAX(COALESCE(rt.updated_at, ''), COALESCE(s.updated_at, ''), COALESCE(r.started_at, ''), COALESCE(r.finished_at, ''), COALESCE(td.updated_at, ''))
 FROM plan_tickets t
 LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id

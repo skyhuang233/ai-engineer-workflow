@@ -205,3 +205,48 @@ func TestPlanProjectionUsesBlockerIssueNumbers(t *testing.T) {
 		t.Fatalf("projection blockers = %#v, want issue number 11", projection.Tickets)
 	}
 }
+
+func TestPlanProjectionDoesNotTreatPRPublicationAsAGateResult(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?", version.ID, int64(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE delivery_outbox SET state = ? WHERE operation = ?", OutboxSucceeded, DeliveryUpsertPR); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].GateResult != "not run" {
+		t.Fatalf("gate result = %q, want not run", projection.Tickets[0].GateResult)
+	}
+}

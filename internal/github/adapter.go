@@ -115,14 +115,9 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 	if err != nil {
 		return err
 	}
-	var status *commentResponse
-	for index := range comments {
-		if strings.Contains(comments[index].Body, planProjectionIdentity) {
-			if status != nil {
-				return fmt.Errorf("multiple workflow control-plane comments found")
-			}
-			status = &comments[index]
-		}
+	status, err := planProjectionStatusComment(comments)
+	if err != nil {
+		return err
 	}
 	if status == nil {
 		return c.requestJSON(ctx, http.MethodPost, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10)+"/comments", payload, nil)
@@ -141,6 +136,9 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 			return false, err
 		}
 		for _, comment := range comments {
+			if isLegacyPlanProjectionComment(comment) {
+				return false, fmt.Errorf("legacy workflow projection comment found")
+			}
 			if strings.Contains(comment.Body, planProjectionIdentity) {
 				statusComments++
 				if statusComments > 1 {
@@ -149,10 +147,6 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 				if strings.Contains(comment.Body, marker) {
 					matched = true
 				}
-				continue
-			}
-			if strings.Contains(comment.Body, marker) {
-				return false, fmt.Errorf("legacy workflow projection comment found")
 			}
 		}
 		if len(comments) < 100 {
@@ -167,6 +161,28 @@ func planProjectionComment(projection plan.Projection) string {
 }
 
 const planProjectionIdentity = "<!-- workflow:control-plane -->"
+
+const planProjectionMarkerPrefix = "workflow-projection:"
+
+func planProjectionStatusComment(comments []commentResponse) (*commentResponse, error) {
+	var status *commentResponse
+	for index := range comments {
+		if isLegacyPlanProjectionComment(comments[index]) {
+			return nil, fmt.Errorf("legacy workflow projection comment found")
+		}
+		if strings.Contains(comments[index].Body, planProjectionIdentity) {
+			if status != nil {
+				return nil, fmt.Errorf("multiple workflow control-plane comments found")
+			}
+			status = &comments[index]
+		}
+	}
+	return status, nil
+}
+
+func isLegacyPlanProjectionComment(comment commentResponse) bool {
+	return strings.Contains(comment.Body, planProjectionMarkerPrefix) && !strings.Contains(comment.Body, planProjectionIdentity)
+}
 
 func planProjectionMarker(projection plan.Projection) string {
 	content, _ := plan.RenderProjection("", projection)

@@ -170,6 +170,33 @@ func TestHasPlanProjectionRejectsLegacyAndDuplicateStatusComments(t *testing.T) 
 	}
 }
 
+func TestUpdatePlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("legacy projection comment allowed mutation: %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->"}})
+	}))
+	defer server.Close()
+
+	err := NewClient(server.URL, "", server.Client()).UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
+	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+		t.Fatalf("UpdatePlanProjection error = %v", err)
+	}
+}
+
+func TestHasPlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->"}})
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, "", server.Client()).HasPlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
+	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+		t.Fatalf("HasPlanProjection error = %v", err)
+	}
+}
+
 func TestDeliveredLabelIsProjectionOnly(t *testing.T) {
 	issue := issueResponse{ID: 1, Number: 11, State: "closed", Labels: []labelResponse{{Name: "workflow:ticket"}, {Name: "workflow:delivered"}}}.issue()
 	if issue.IsDelivered() {
