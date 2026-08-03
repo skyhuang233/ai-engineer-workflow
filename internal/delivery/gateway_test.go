@@ -19,10 +19,12 @@ type fakeRemote struct {
 	applyErr     error
 	applyCalls   int
 	observeCalls int
+	requests     []store.DeliveryRequest
 }
 
-func (f *fakeRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+func (f *fakeRemote) Observe(_ context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	f.observeCalls++
+	f.requests = append(f.requests, request)
 	if len(f.observeErrs) > 0 {
 		err := f.observeErrs[0]
 		f.observeErrs = f.observeErrs[1:]
@@ -39,6 +41,53 @@ func (f *fakeRemote) Observe(context.Context, store.DeliveryRequest) (delivery.O
 		observation.RemoteExists = true
 	}
 	return observation, nil
+}
+
+func TestGatewayPreservesWorkflowQuestionContext(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, claim.VersionID, claim.TicketID, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 0)
+	if err != nil {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	var closedQuestion store.WorkflowQuestion
+	for _, candidate := range questions {
+		if candidate.Kind == "closed_unmerged_impact" {
+			closedQuestion = candidate
+			break
+		}
+	}
+	if closedQuestion.ID == "" {
+		t.Fatalf("closed question missing from %#v", questions)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	outbox, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) == 0 || len(remote.requests[0].WorkflowQuestions) != len(questions) {
+		t.Fatalf("published requests = %#v", remote.requests)
+	}
+	var got plan.WorkflowQuestion
+	for _, candidate := range remote.requests[0].WorkflowQuestions {
+		if candidate.ID == closedQuestion.ID {
+			got = candidate
+			break
+		}
+	}
+	want := closedQuestion
+	if got.ID != want.ID || got.Prompt != want.Prompt || got.Repository != want.Repository || got.PlanNumber != want.RootNumber || got.TicketNumber != want.TicketNumber || got.PullRequest != want.PullRequest || got.Commit != want.Commit || got.Diagnostics != want.Diagnostics || got.Evidence != want.Evidence {
+		t.Fatalf("published question = %#v, want %#v", got, want)
+	}
 }
 
 type deadlineRemote struct {

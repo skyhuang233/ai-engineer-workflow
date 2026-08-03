@@ -613,8 +613,50 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (22, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
+		applied = 22
+	}
+	if applied < 23 {
+		columns := []struct {
+			name       string
+			definition string
+		}{
+			{name: "replacement_version_id", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "replacement_issue_id", definition: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "replacement_tickets", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 23: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE replacement_tickets ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 23: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (23, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+func tableHasColumnTx(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) schemaVersion(ctx context.Context) (int, error) {

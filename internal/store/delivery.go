@@ -300,11 +300,15 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 	if err := tx.Commit(); err != nil {
 		return DeliveryResult{}, err
 	}
-	remaining := target.LeaseExpiresAt.Sub(now().UTC())
-	if remaining <= 0 {
-		return DeliveryResult{}, fmt.Errorf("%w: delivery lease expired before external write", ErrDeliveryRejected)
+	operationCtx := ctx
+	cancel := func() {}
+	if !target.LeaseExpiresAt.IsZero() {
+		remaining := target.LeaseExpiresAt.Sub(now().UTC())
+		if remaining <= 0 {
+			return DeliveryResult{}, fmt.Errorf("%w: delivery lease expired before external write", ErrDeliveryRejected)
+		}
+		operationCtx, cancel = context.WithTimeout(ctx, remaining)
 	}
-	operationCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	deliveryResult, err := apply(operationCtx, normalized)
 	if err != nil {
@@ -397,8 +401,8 @@ JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
 JOIN plan_versions v ON v.version_id = d.version_id
 JOIN plans p ON p.id = v.plan_id
-WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.accepted_commit != ''
-AND `+currentActiveUnfrozenPlanPredicate, repository)
+WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND r.state != ? AND s.accepted_commit != ''
+AND `+currentActiveUnfrozenPlanPredicate, repository, plan.StateCancelled)
 	if err != nil {
 		return nil, err
 	}

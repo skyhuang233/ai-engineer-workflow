@@ -30,8 +30,14 @@ type WorkflowQuestion struct {
 }
 
 type closedPlanDecision struct {
-	Action      string `json:"action"`
-	Replacement string `json:"replacement,omitempty"`
+	Action      string                `json:"action"`
+	Replacement *replacementReference `json:"replacement,omitempty"`
+}
+
+type replacementReference struct {
+	VersionID       string `json:"version_id,omitempty"`
+	TicketID        int64  `json:"ticket_id,omitempty"`
+	PlanRootIssueID int64  `json:"plan_root_issue_id,omitempty"`
 }
 
 func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
@@ -245,14 +251,20 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		return err
 	}
 	defer tx.Rollback()
-	var kind, versionID string
+	var kind, versionID, state, priorAnswer string
 	var issueID int64
-	err = tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id FROM workflow_questions WHERE question_id = ? AND repository = ? AND state = 'open'`, questionID, repository).Scan(&kind, &versionID, &issueID)
+	err = tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
+	}
+	if state != "open" {
+		if kind == "closed_unmerged_impact" && state == "answered" && priorAnswer == answer {
+			return tx.Commit()
+		}
+		return ErrNotFound
 	}
 	if kind == "closed_unmerged_impact" {
 		var decision closedPlanDecision
@@ -261,17 +273,17 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		}
 		switch decision.Action {
 		case "cancel-plan":
-			if decision.Replacement != "" {
+			if decision.Replacement != nil {
 				return ErrInvalidClaim
 			}
 			if err := cancelPlanTx(ctx, tx, versionID, now); err != nil {
 				return err
 			}
 		case "replace":
-			if strings.TrimSpace(decision.Replacement) == "" {
+			if decision.Replacement == nil {
 				return ErrInvalidClaim
 			}
-			if err := replaceFrozenPlanTx(ctx, tx, questionID, versionID, issueID, decision.Replacement, now); err != nil {
+			if err := replaceFrozenPlanTx(ctx, tx, repository, questionID, versionID, issueID, *decision.Replacement, now); err != nil {
 				return err
 			}
 		default:
@@ -362,7 +374,7 @@ func cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Ti
 	return err
 }
 
-func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, questionID, versionID string, questionIssueID int64, replacement string, now time.Time) error {
+func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, repository, questionID, versionID string, questionIssueID int64, replacement replacementReference, now time.Time) error {
 	var frozenIssueID int64
 	if err := tx.QueryRowContext(ctx, `SELECT issue_id FROM plan_freezes WHERE version_id = ?`, versionID).Scan(&frozenIssueID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -373,25 +385,51 @@ func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, questionID, versionID 
 	if questionIssueID != frozenIssueID {
 		return ErrNotReady
 	}
+	if (replacement.VersionID == "" || replacement.TicketID == 0) == (replacement.PlanRootIssueID == 0) {
+		return ErrInvalidClaim
+	}
+	var replacementVersionID string
+	var replacementIssueID int64
+	if replacement.PlanRootIssueID != 0 {
+		err := tx.QueryRowContext(ctx, `SELECT v.version_id
+FROM plans p
+JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND p.root_issue_id = ? AND `+currentActiveUnfrozenPlanPredicate, repository, replacement.PlanRootIssueID).Scan(&replacementVersionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotReady
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		err := tx.QueryRowContext(ctx, `SELECT v.version_id
+FROM plan_tickets t
+JOIN ticket_runtime r ON r.version_id = t.version_id AND r.issue_id = t.issue_id
+JOIN plan_versions v ON v.version_id = t.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE t.version_id = ? AND t.issue_id = ? AND p.repository = ? AND r.delivered = 0 AND r.state != ? AND `+currentActiveUnfrozenPlanPredicate,
+			replacement.VersionID, replacement.TicketID, repository, plan.StateCancelled).Scan(&replacementVersionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotReady
+		}
+		if err != nil {
+			return err
+		}
+		replacementIssueID = replacement.TicketID
+	}
+	if replacementVersionID == versionID {
+		return ErrInvalidClaim
+	}
+	replacementJSON, err := json.Marshal(replacement)
+	if err != nil {
+		return err
+	}
 	stamp := formatTimestamp(now)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO replacement_tickets(question_id, version_id, retired_issue_id, replacement, state, approved_at)
-VALUES (?, ?, ?, ?, 'active', ?)`, questionID, versionID, frozenIssueID, strings.TrimSpace(replacement), stamp); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO replacement_tickets(question_id, version_id, retired_issue_id, replacement, replacement_version_id, replacement_issue_id, state, approved_at)
+VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`, questionID, versionID, frozenIssueID, string(replacementJSON), replacementVersionID, replacementIssueID, stamp); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateCancelled, stamp, versionID, frozenIssueID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, stamp, RunRunning, versionID, frozenIssueID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, LeaseActive, versionID, frozenIssueID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE version_id = ? AND issue_id = ?`, SessionClosed, stamp, versionID, frozenIssueID); err != nil {
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ?`, versionID)
-	return err
+	return cancelPlanTx(ctx, tx, versionID, now)
 }
 
 func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, acceptedCommit string, now time.Time) error {
