@@ -55,6 +55,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if request.Claim.SessionID == "" || request.Claim.RunID == "" || request.Prompt == "" {
 		return Candidate{}, store.ErrInvalidClaim
 	}
+	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, c.now()); err != nil {
+		return Candidate{}, err
+	}
 	session, err := c.Store.TicketSession(ctx, request.Claim.VersionID, request.Claim.TicketID)
 	if err != nil {
 		return Candidate{}, err
@@ -87,8 +90,11 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	command := []string{noMistakes, "axi", "run", "--intent", request.Prompt}
 	environment := map[string]string{
-		"CODEX_HOME":                 ws.CodexState,
-		"NO_MISTAKES_DELIVERY_CYCLE": session.SessionID,
+		"CODEX_HOME":                   ws.CodexState,
+		"NO_MISTAKES_DELIVERY_CYCLE":   session.SessionID,
+		"NO_MISTAKES_RUN_ID":           request.Claim.RunID,
+		"NO_MISTAKES_LEASE_TOKEN":      request.Claim.LeaseToken,
+		"NO_MISTAKES_LEASE_GENERATION": fmt.Sprint(request.Claim.LeaseGeneration),
 	}
 	if c.GatewayURL != "" {
 		environment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL

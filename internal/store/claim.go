@@ -17,8 +17,18 @@ type ClaimRequest struct {
 	TicketID        int64
 	Owner           string
 	MaxParallelRuns int
+	MaxAttempts     int
 	LeaseTTL        time.Duration
 	Now             time.Time
+}
+
+const DefaultMaxWorkerAttempts = 3
+
+func maxWorkerAttempts(value int) int {
+	if value <= 0 {
+		return DefaultMaxWorkerAttempts
+	}
+	return value
 }
 
 type TicketClaim struct {
@@ -177,6 +187,15 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
 		return TicketClaim{}, err
 	}
+	if attempt > maxWorkerAttempts(request.MaxAttempts) {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(request.Now), request.VersionID, selected.IssueID); err != nil {
+			return TicketClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return TicketClaim{}, err
+		}
+		return TicketClaim{}, ErrNotReady
+	}
 	runID, err := randomID("run-")
 	if err != nil {
 		return TicketClaim{}, err
@@ -210,6 +229,38 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_
 
 func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int64) (TicketClaim, error) {
 	return s.currentClaimAt(ctx, versionID, issueID, time.Now().UTC())
+}
+
+func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE worker_runs
+SET launch_state = 'launched', launched_at = ?
+WHERE run_id = ? AND lease_generation = ? AND state = ? AND launch_state = 'ready'
+AND EXISTS (
+    SELECT 1 FROM ticket_sessions s
+    JOIN run_leases l ON l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation
+    WHERE s.current_run_id = worker_runs.run_id AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?
+)`, formatTimestamp(now), claim.RunID, claim.LeaseGeneration, RunRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrWorkerLaunched
+	}
+	return nil
 }
 
 func (s *Store) RecoveryOwner(ctx context.Context, versionID string, issueID int64) (string, error) {
@@ -246,7 +297,7 @@ WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ? AND l.
 	return claim, err
 }
 
-func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time) (TicketClaim, error) {
+func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxAttempts ...int) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if versionID == "" || issueID == 0 {
@@ -292,6 +343,19 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 	attempt := 0
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
 		return TicketClaim{}, err
+	}
+	limit := DefaultMaxWorkerAttempts
+	if len(maxAttempts) > 0 {
+		limit = maxWorkerAttempts(maxAttempts[0])
+	}
+	if attempt > limit {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+			return TicketClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return TicketClaim{}, err
+		}
+		return TicketClaim{}, ErrNotReady
 	}
 	runID, err := randomID("run-")
 	if err != nil {

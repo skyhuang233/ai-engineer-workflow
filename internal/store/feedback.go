@@ -65,7 +65,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(version_id, issue_id, source, event_id)
 	return inserted, nil
 }
 
-func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time) (TicketClaim, string, error) {
+func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxAttempts ...int) (TicketClaim, string, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if versionID == "" || issueID == 0 {
@@ -143,6 +143,19 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 	var attempt int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
 		return TicketClaim{}, "", err
+	}
+	limit := DefaultMaxWorkerAttempts
+	if len(maxAttempts) > 0 {
+		limit = maxWorkerAttempts(maxAttempts[0])
+	}
+	if attempt > limit {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
+			return TicketClaim{}, "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return TicketClaim{}, "", err
+		}
+		return TicketClaim{}, "", ErrNotReady
 	}
 	runID, err := randomID("run-")
 	if err != nil {

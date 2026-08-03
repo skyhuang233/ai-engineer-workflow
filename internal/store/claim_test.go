@@ -88,6 +88,80 @@ func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestReserveWorkerLaunchAllowsOnlyOneStarter(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerLaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerLaunch(ctx, claim, now); !errors.Is(err, ErrWorkerLaunched) {
+		t.Fatalf("second launch reservation = %v, want ErrWorkerLaunched", err)
+	}
+}
+
+func TestClaimReadyStopsAfterConfiguredAttemptLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	var claim TicketClaim
+	for attempt := 0; attempt < 2; attempt++ {
+		claim, err = db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, MaxAttempts: 2, LeaseTTL: time.Hour, Now: now.Add(time.Duration(attempt) * time.Minute)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, DiagnosticsPath: "diagnostics", Error: "failed", Now: now.Add(time.Duration(attempt)*time.Minute + time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, MaxAttempts: 2, LeaseTTL: time.Hour, Now: now.Add(3 * time.Minute)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("attempt beyond limit = %v, want ErrNotReady", err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("projection tickets = %#v, want Needs Attention", projection.Tickets)
+	}
+}
+
 func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

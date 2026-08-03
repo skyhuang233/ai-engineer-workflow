@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 8
+	latestSchemaVersion = 10
 )
 
 var (
@@ -30,6 +30,7 @@ var (
 	ErrNotReady           = errors.New("ticket is not ready")
 	ErrInvalidClaim       = errors.New("invalid ticket claim")
 	ErrDeliveryInProgress = errors.New("delivery outbox item is already being processed")
+	ErrWorkerLaunched     = errors.New("worker run has already been launched")
 )
 
 const (
@@ -383,6 +384,35 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 9 {
+		statements := []string{
+			`ALTER TABLE worker_runs ADD COLUMN launch_state TEXT NOT NULL DEFAULT 'ready' CHECK (launch_state IN ('ready', 'launched'))`,
+			`ALTER TABLE worker_runs ADD COLUMN launched_at TEXT`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 9: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 10 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE github_poll_cursors (
+    repository TEXT PRIMARY KEY,
+    last_success_at TEXT NOT NULL DEFAULT '',
+    last_full_reconcile_at TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 10: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

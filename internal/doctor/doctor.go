@@ -43,6 +43,10 @@ type WorkerPin struct {
 	LocalBuildID string `json:"local_build_id"`
 }
 
+type RuntimePolicy struct {
+	MaxWorkerAttempts int `json:"max_worker_attempts"`
+}
+
 type GitHubPin struct {
 	TestRepository      string              `json:"test_repository"`
 	DefaultBranch       string              `json:"default_branch"`
@@ -69,6 +73,7 @@ type Config struct {
 	Codex         ToolPin       `json:"codex"`
 	NoMistakes    NoMistakesPin `json:"no_mistakes"`
 	Worker        WorkerPin     `json:"worker"`
+	Runtime       RuntimePolicy `json:"runtime"`
 	GitHub        GitHubPin     `json:"github"`
 	Upgrade       UpgradePolicy `json:"upgrade"`
 }
@@ -119,6 +124,8 @@ func (c Config) Validate() error {
 		return errors.New("worker image must use an immutable sha256 digest")
 	case !strings.HasPrefix(c.Worker.LocalBuildID, "sha256:") || !sha256Pattern.MatchString(strings.TrimPrefix(c.Worker.LocalBuildID, "sha256:")):
 		return errors.New("worker local build ID must be SHA-256")
+	case c.Runtime.MaxWorkerAttempts < 1:
+		return errors.New("runtime max worker attempts must be positive")
 	case !repoPattern.MatchString(c.GitHub.TestRepository):
 		return errors.New("GitHub test repository must be owner/name")
 	case strings.TrimSpace(c.GitHub.DefaultBranch) == "":

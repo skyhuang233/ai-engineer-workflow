@@ -106,6 +106,22 @@ FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, ticketID
 	return session, err
 }
 
+func (s *Store) WorkspaceForRun(ctx context.Context, runID string) (string, error) {
+	var workspace string
+	err := s.db.QueryRowContext(ctx, `SELECT s.workspace_path FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?`, runID).Scan(&workspace)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if workspace == "" {
+		return "", ErrNotFound
+	}
+	return workspace, nil
+}
+
 func (s *Store) BindAgent(ctx context.Context, binding AgentBinding) (TicketSession, error) {
 	if binding.SessionID == "" || binding.AgentIdentity == "" || binding.WorkspacePath == "" || binding.CodexStatePath == "" || binding.Branch == "" {
 		return TicketSession{}, ErrInvalidClaim

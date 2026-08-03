@@ -221,6 +221,9 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
 		t.Fatalf("first worker isolation = %#v", first.specs[0])
 	}
+	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[0].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[0].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) {
+		t.Fatalf("worker Gateway fence environment = %#v", first.specs[0].Environment)
+	}
 
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
 		t.Fatalf("claim while delivery handoff is pending = %v, want fencing conflict", err)

@@ -7,12 +7,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -21,7 +23,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|reconcile-delivered>")
+		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -29,10 +31,14 @@ func main() {
 		runDoctor(os.Args[2:])
 	case "run-ticket":
 		runTicket(os.Args[2:])
+	case "gateway":
+		runGateway(os.Args[2:])
+	case "poll-github":
+		runPollGitHub(os.Args[2:])
 	case "reconcile-delivered":
 		runReconcileDelivered(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|reconcile-delivered>")
+		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered>")
 		os.Exit(2)
 	}
 }
@@ -142,7 +148,7 @@ func runTicket(args []string) {
 	if err := syncReviewFeedback(ctx, db, client, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
 		fail(err)
 	}
-	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, time.Now().UTC())
+	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, config.Runtime.MaxWorkerAttempts, time.Now().UTC())
 	if err != nil {
 		fail(err)
 	}
@@ -196,7 +202,7 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 	return err
 }
 
-func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, now time.Time) (store.TicketClaim, string, error) {
+func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, maxAttempts int, now time.Time) (store.TicketClaim, string, error) {
 	claim, err := db.CurrentClaim(ctx, versionID, ticketID)
 	if err == nil {
 		return claim, "", nil
@@ -204,7 +210,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 	if !errors.Is(err, store.ErrNotFound) {
 		return store.TicketClaim{}, "", err
 	}
-	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now)
+	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now, maxAttempts)
 	if revisionErr == nil {
 		return revision, revisionPrompt, nil
 	}
@@ -217,6 +223,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 		TicketID:        ticketID,
 		Owner:           owner,
 		MaxParallelRuns: 1,
+		MaxAttempts:     maxAttempts,
 		LeaseTTL:        30 * time.Minute,
 		Now:             now,
 	})
@@ -249,6 +256,76 @@ func runReconcileDelivered(args []string) {
 		fail(err)
 	}
 	fmt.Println(marked)
+}
+
+func runPollGitHub(args []string) {
+	flags := flag.NewFlagSet("poll-github", flag.ExitOnError)
+	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	repository := flags.String("repository", "", "GitHub owner/repository")
+	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
+	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
+	once := flags.Bool("once", false, "perform one durable reconciliation pass")
+	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
+	_ = flags.Parse(args)
+	if *repository == "" || *token == "" || *interval <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, read credential, and positive interval")
+		os.Exit(2)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil)}
+	poll := func() error {
+		result, err := poller.Poll(context.Background(), *repository)
+		if err != nil && !errors.Is(err, store.ErrNotReady) {
+			fmt.Fprintln(os.Stderr, err)
+			return err
+		}
+		if err == nil {
+			encoded, _ := json.Marshal(result)
+			fmt.Println(string(encoded))
+		}
+		return nil
+	}
+	if err := poll(); err != nil && *once {
+		fail(err)
+	}
+	if *once {
+		return
+	}
+	ticker := time.NewTicker(*interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		_ = poll()
+	}
+}
+
+func runGateway(args []string) {
+	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
+	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	listen := flags.String("listen", "", "Gateway listen address")
+	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "Gateway GitHub credential")
+	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
+	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
+	gitBinary := flags.String("git", "git", "Git executable")
+	_ = flags.Parse(args)
+	if *listen == "" || *token == "" {
+		fmt.Fprintln(os.Stderr, "gateway requires listen address and GitHub credential")
+		os.Exit(2)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	remote := github.DeliveryRemote{Client: github.NewClient(*githubURL, *token, nil), Store: db, Token: *token, PushURL: *pushURL, GitBinary: *gitBinary}
+	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: remote})}
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		_ = db.Close()
+		fail(err)
+	}
+	_ = db.Close()
 }
 
 func fail(err error) {

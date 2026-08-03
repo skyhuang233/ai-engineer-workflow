@@ -145,6 +145,7 @@ func validConfig() Config {
 			Image:        "workflow-worker:0.1.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			LocalBuildID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
+		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
 			TestRepository:      "skyhuang233/workflow-integration-test",
 			DefaultBranch:       "main",

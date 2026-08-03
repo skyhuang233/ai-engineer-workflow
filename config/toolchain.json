@@ -15,6 +15,9 @@
     "image": "ghcr.io/skyhuang233/workflow-worker:0.1.0@sha256:be055179fa2740356baf348ae39213858218b0b09838af278a7f0f8b7ac7f789",
     "local_build_id": "sha256:be055179fa2740356baf348ae39213858218b0b09838af278a7f0f8b7ac7f789"
   },
+  "runtime": {
+    "max_worker_attempts": 3
+  },
   "github": {
     "test_repository": "skyhuang233/workflow-integration-test",
     "default_branch": "main",

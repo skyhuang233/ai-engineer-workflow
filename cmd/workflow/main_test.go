@@ -41,7 +41,7 @@ func TestAcquireTicketClaimReplacesExpiredWorker(t *testing.T) {
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: expired.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	replacement, prompt, err := acquireTicketClaim(ctx, db, version.ID, expired.TicketID, now)
+	replacement, prompt, err := acquireTicketClaim(ctx, db, version.ID, expired.TicketID, store.DefaultMaxWorkerAttempts, now)
 	if err != nil {
 		t.Fatal(err)
 	}

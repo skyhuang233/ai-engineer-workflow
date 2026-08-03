@@ -21,8 +21,12 @@ type GitPusher interface {
 }
 
 type DeliveryRemote struct {
-	Client *Client
-	Pusher GitPusher
+	Client    *Client
+	Pusher    GitPusher
+	Store     *store.Store
+	Token     string
+	PushURL   string
+	GitBinary string
 }
 
 func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
@@ -92,10 +96,14 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 	}
 	switch request.Operation {
 	case store.DeliveryPushCandidate:
-		if r.Pusher == nil {
+		pusher, err := r.pusher(ctx, request)
+		if err != nil {
+			return delivery.Observation{}, err
+		}
+		if pusher == nil {
 			return delivery.Observation{}, fmt.Errorf("candidate push adapter is missing")
 		}
-		if err := r.Pusher.Push(ctx, request.Repository, request.Branch, request.CommitSHA, request.ExpectedRemoteHead, request.ExpectRemoteAbsent); err != nil {
+		if err := pusher.Push(ctx, request.Repository, request.Branch, request.CommitSHA, request.ExpectedRemoteHead, request.ExpectRemoteAbsent); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true, RemoteHead: request.CommitSHA, RemoteExists: true}, nil
@@ -148,6 +156,20 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 	default:
 		return delivery.Observation{}, fmt.Errorf("unsupported delivery operation %q", request.Operation)
 	}
+}
+
+func (r DeliveryRemote) pusher(ctx context.Context, request store.DeliveryRequest) (GitPusher, error) {
+	if r.Pusher != nil {
+		return r.Pusher, nil
+	}
+	if r.Store == nil || r.Token == "" {
+		return nil, nil
+	}
+	workspace, err := r.Store.WorkspaceForRun(ctx, request.RunID)
+	if err != nil {
+		return nil, err
+	}
+	return WorkspacePusher{WorkspacePath: workspace, Token: r.Token, PushURL: r.PushURL, Binary: r.GitBinary}, nil
 }
 
 type pullRequestResponse struct {

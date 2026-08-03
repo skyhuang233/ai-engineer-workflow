@@ -33,11 +33,12 @@ Docker Worker without GitHub credentials. The controller owns rebase, review,
 tests, documentation checks, lint, Gateway-backed push and pull-request
 updates, CI, and the review-driven revision cycle. `run-ticket` never
 dispatches GitHub mutations itself; it requires the credential-isolated Gateway
-URL and passes it only to the pinned controller. Each invocation polls the
-ticket's pull-request reviews, inline comments, and conversation comments,
-persists and deduplicates human feedback, and batches it into the same Ticket
-Session's next revision round; `--review-feedback` uses that same durable queue
-for manual routing. `workflow reconcile-delivered` checks merged pull requests
+URL and passes it only to the pinned controller. Run `workflow poll-github` as
+the persistent control-plane process; it records durable polling cursors,
+applies retry backoff, reconciles every active ticket pull request, and
+deduplicates newly observed reviews and comments before the owning Ticket
+Session is resumed. `--review-feedback` uses that same durable queue for manual
+routing. `workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 
