@@ -55,9 +55,6 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if request.Claim.SessionID == "" || request.Claim.RunID == "" || request.Prompt == "" {
 		return Candidate{}, store.ErrInvalidClaim
 	}
-	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, c.now()); err != nil {
-		return Candidate{}, err
-	}
 	session, err := c.Store.TicketSession(ctx, request.Claim.VersionID, request.Claim.TicketID)
 	if err != nil {
 		return Candidate{}, err
@@ -107,6 +104,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		ExtraHosts:  []string{worker.GatewayHostMapping},
 	}
 	if err := spec.Validate(); err != nil {
+		return Candidate{}, err
+	}
+	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, c.now()); err != nil {
 		return Candidate{}, err
 	}
 	result, runErr := c.Runtime.Run(ctx, spec)

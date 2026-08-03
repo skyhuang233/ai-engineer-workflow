@@ -82,7 +82,7 @@ func TestActionablePullRequestFeedbackIncludesHumanEventsOnly(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/owner/repo/pulls/7/reviews":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "Please change this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 2, "body": "bot message", "state": "COMMENTED", "user": map[string]string{"login": "ci[bot]", "type": "Bot"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "Please change this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 2, "body": "bot message", "state": "COMMENTED", "user": map[string]string{"login": "ci[bot]", "type": "Bot"}}, {"id": 6, "body": "", "state": "APPROVED", "user": map[string]string{"login": "approver", "type": "User"}}})
 		case "/repos/owner/repo/pulls/7/comments":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 3, "body": "Inline concern.", "user": map[string]string{"login": "reviewer", "type": "User"}}})
 		case "/repos/owner/repo/issues/7/comments":
@@ -96,8 +96,26 @@ func TestActionablePullRequestFeedbackIncludesHumanEventsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 3 || events[0].Source != "review" || events[1].Source != "inline-comment" || events[2].Source != "conversation-comment" {
+	if len(events) != 4 || events[0].Source != "review" || events[1].Source != "review" || events[1].Author != "approver" || events[1].Body != "Review submitted with state: APPROVED" || events[2].Source != "inline-comment" || events[3].Source != "conversation-comment" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestPullRequestChecksReadsCurrentCandidateChecks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo/commits/candidate/check-runs" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"id": 42, "name": "workflow-contract", "status": "completed", "conclusion": "success", "head_sha": "candidate"}}})
+	}))
+	defer server.Close()
+	checks, err := NewClient(server.URL, "", server.Client()).PullRequestChecks(context.Background(), "owner/repo", "candidate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 1 || checks[0].CheckRunID != 42 || checks[0].Conclusion != "success" || checks[0].HeadSHA != "candidate" {
+		t.Fatalf("checks = %#v", checks)
 	}
 }
 

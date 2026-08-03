@@ -93,11 +93,12 @@ func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string,
 	var ticketNumber int64
 	var ticketTitle string
 	var generation int64
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title
+	var consecutiveFailures int
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title, s.consecutive_failures
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle)
+WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle, &consecutiveFailures)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, "", ErrNotFound
 	}
@@ -148,7 +149,7 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 	if len(maxAttempts) > 0 {
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
-	if attempt > limit {
+	if consecutiveFailures >= limit {
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
 			return TicketClaim{}, "", err
 		}

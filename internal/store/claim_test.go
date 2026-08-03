@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -215,6 +216,53 @@ func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	}
 	if inserted != 0 {
 		t.Fatalf("repeated event inserted = %d, want 0", inserted)
+	}
+}
+
+func TestReviewRevisionsDoNotConsumeFailureRecoveryBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := 1; round <= 3; round++ {
+		if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: fmt.Sprint(round), Author: "human", Body: "Please revise."}}, now.Add(time.Duration(round)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		claim, _, err = db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Duration(round)*time.Second), 1)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+	if claim.Attempt != 4 {
+		t.Fatalf("review claim = %#v, want fourth run", claim)
 	}
 }
 

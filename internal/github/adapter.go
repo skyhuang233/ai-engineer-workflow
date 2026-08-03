@@ -59,8 +59,8 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableHuman(value.User.Login, value.User.Type, value.Body) {
-				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
+			if value.State != "PENDING" && actionableReview(value.User.Login, value.User.Type, value.Body) {
+				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
 			}
 		}
 		if len(reviews) < 100 {
@@ -81,7 +81,7 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 				return nil, err
 			}
 			for _, value := range comments {
-				if actionableHuman(value.User.Login, value.User.Type, value.Body) {
+				if actionableComment(value.User.Login, value.User.Type, value.Body) {
 					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
 				}
 			}
@@ -93,11 +93,26 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 	return result, nil
 }
 
-func actionableHuman(login, accountType, body string) bool {
-	if strings.TrimSpace(body) == "" || strings.EqualFold(accountType, "bot") || strings.HasSuffix(strings.ToLower(login), "[bot]") {
+func actionableReview(login, accountType, body string) bool {
+	return actionableAuthor(login, accountType) && !strings.Contains(body, "<!-- workflow-idempotency:")
+}
+
+func actionableComment(login, accountType, body string) bool {
+	return strings.TrimSpace(body) != "" && actionableReview(login, accountType, body)
+}
+
+func actionableAuthor(login, accountType string) bool {
+	if strings.EqualFold(accountType, "bot") || strings.HasSuffix(strings.ToLower(login), "[bot]") {
 		return false
 	}
-	return !strings.Contains(body, "<!-- workflow-idempotency:")
+	return true
+}
+
+func reviewFeedbackBody(state, body string) string {
+	if strings.TrimSpace(body) != "" {
+		return body
+	}
+	return "Review submitted with state: " + state
 }
 
 type apiError struct {

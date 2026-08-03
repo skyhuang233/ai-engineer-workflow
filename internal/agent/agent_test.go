@@ -297,6 +297,9 @@ func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
 	if len(runtime.specs) != 0 {
 		t.Fatal("worker started with a credential-bearing workspace source")
 	}
+	if err := db.ReserveWorkerLaunch(ctx, claim, time.Now().UTC()); err != nil {
+		t.Fatalf("preflight failure reserved worker launch: %v", err)
+	}
 }
 
 func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {

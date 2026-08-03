@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 10
+	latestSchemaVersion = 12
 )
 
 var (
@@ -413,6 +413,33 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return fmt.Errorf("migration 10: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 11 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE pull_request_checks (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    check_run_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    conclusion TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (version_id, issue_id, check_run_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 11: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 12 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE ticket_sessions ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migration 12: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

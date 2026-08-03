@@ -12,6 +12,7 @@ import (
 type PollResult struct {
 	Deliveries int
 	Feedback   int
+	Checks     int
 }
 
 type Poller struct {
@@ -81,6 +82,15 @@ func (p Poller) poll(ctx context.Context, repository string, now time.Time) (Pol
 			return PollResult{}, err
 		}
 		result.Feedback += inserted
+		checks, err := p.Client.PullRequestChecks(ctx, repository, delivery.CandidateCommit)
+		if err != nil {
+			return PollResult{}, err
+		}
+		updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
+		if err != nil {
+			return PollResult{}, err
+		}
+		result.Checks += updated
 	}
 	return result, nil
 }
