@@ -207,17 +207,12 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if candidate.CodexSessionID != "codex-session-1" || candidate.Commit == "" {
 		t.Fatalf("candidate = %#v", candidate)
 	}
-	for _, key := range []string{candidate.PushOutboxKey, candidate.PROutboxKey} {
-		if key == "" {
-			t.Fatalf("candidate handoff = %#v", candidate)
-		}
-		if _, err := db.DeliveryOutbox(ctx, key); err != nil {
-			t.Fatalf("durable candidate handoff %q: %v", key, err)
-		}
+	recovered, err := db.CandidateRevision(ctx, candidate.RunID)
+	if err != nil || recovered.CommitSHA != candidate.Commit {
+		t.Fatalf("recovered candidate = %#v, err=%v", recovered, err)
 	}
-	recovered, handoff, err := db.AcceptedCandidateHandoff(ctx, version.ID, claim.TicketID)
-	if err != nil || recovered.RunID != candidate.RunID || handoff.PushOutboxKey != candidate.PushOutboxKey || handoff.PROutboxKey != candidate.PROutboxKey {
-		t.Fatalf("recovered candidate handoff = %#v, %#v, err=%v", recovered, handoff, err)
+	if keys, err := db.DueDeliveryOutboxKeys(ctx, time.Now().UTC(), 8); err != nil || len(keys) != 0 {
+		t.Fatalf("candidate acceptance queued delivery commands: keys=%#v, err=%v", keys, err)
 	}
 	if len(first.specs) != 2 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --skip-git-repo-check implement the ticket" || strings.Join(first.specs[1].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
@@ -228,7 +223,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != "" {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
 	}
-	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) {
+	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
 	}
 

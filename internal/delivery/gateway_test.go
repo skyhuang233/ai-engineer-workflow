@@ -137,12 +137,8 @@ func TestGatewayUsesDurableOutboxAndReconcilesAnUncertainWrite(t *testing.T) {
 			{Applied: true, RemoteHead: "accepted", PullRequestNumber: 17},
 		},
 	}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	queued, err := db.DeliveryOutbox(ctx, handoff.PushOutboxKey)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,16 +166,20 @@ func TestGatewayDispatchPendingPublishesAcceptedCandidateInOrder(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newPublishedCandidate(t, ctx)
 	defer db.Close()
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}, {RemoteHead: "accepted", RemoteExists: true}}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
+	push, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}, {RemoteHead: "accepted", RemoteExists: true}}}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	pr, err := gateway.Submit(ctx, candidatePR(claim))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := gateway.DispatchPending(ctx, 8); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{handoff.PushOutboxKey, handoff.PROutboxKey} {
+	for _, key := range []string{push.IdempotencyKey, pr.IdempotencyKey} {
 		outbox, err := db.DeliveryOutbox(ctx, key)
 		if err != nil || outbox.State != store.OutboxSucceeded {
 			t.Fatalf("outbox %q = %#v, %v", key, outbox, err)
@@ -194,7 +194,7 @@ func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditio
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
-	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
 	remote := &fakeRemote{
 		applyErr: errors.New("request timed out"),
 		observations: []delivery.Observation{
@@ -238,7 +238,7 @@ func TestGatewayBoundsUncertainReconciliation(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
-	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
 	remote := &fakeRemote{
 		applyErr:     errors.New("request timed out"),
 		observations: []delivery.Observation{{RemoteHead: "base"}},
@@ -297,12 +297,12 @@ func TestGatewayAllowsFirstCandidatePushToExpectAbsentBranch(t *testing.T) {
 	db, claim := newCandidateClaimWithPublication(t, ctx, store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket", Body: "evidence"})
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{}}}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "", true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, handoff.PushOutboxKey); err != nil {
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
 	if remote.applyCalls != 1 {
@@ -316,11 +316,11 @@ func TestGatewayAllowsAcceptedCandidateDeliveryBeforeLeaseDeadline(t *testing.T)
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 1, 30, 0, time.UTC) }}
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, handoff.PushOutboxKey); err != nil {
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
 	if remote.applyCalls != 1 {
@@ -328,16 +328,16 @@ func TestGatewayAllowsAcceptedCandidateDeliveryBeforeLeaseDeadline(t *testing.T)
 	}
 }
 
-func TestGatewayRejectsNewCommandFromRevokedAcceptedLease(t *testing.T) {
+func TestGatewayAllowsDeliveryControllerCommandFromAcceptedCandidate(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newPublishedCandidate(t, ctx)
 	defer db.Close()
-	_, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryUpsertPR, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
 		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "mutated title", Body: "mutable body",
 	}, time.Date(2026, 7, 31, 0, 2, 0, 0, time.UTC))
-	if !errors.Is(err, store.ErrDeliveryRejected) {
-		t.Fatalf("enqueue error = %v, want rejected", err)
+	if err != nil || queued.Request.Operation != store.DeliveryUpsertPR {
+		t.Fatalf("delivery controller command = %#v, err = %v", queued, err)
 	}
 }
 
@@ -360,7 +360,7 @@ func TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite(t *testing.T) {
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "someone-else"}}}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
 	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
 		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
@@ -396,7 +396,7 @@ func TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite(t *testing.T) {
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
 	remote := &blockingRemote{entered: make(chan struct{}), release: make(chan struct{})}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
 	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
 		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
@@ -474,13 +474,13 @@ func TestGatewayRejectionPausesAcceptedCandidateDelivery(t *testing.T) {
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "unexpected", RemoteExists: true}}}
-	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, handoff.PushOutboxKey); !errors.Is(err, store.ErrDeliveryRejected) {
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, store.ErrDeliveryRejected) {
 		t.Fatalf("push rejection error = %v, want delivery rejection", err)
 	}
 	projection, err := db.PlanProjectionAt(ctx, claim.VersionID, now)
@@ -529,9 +529,9 @@ func TestGatewayRejectsDeliveryWhenValidationConsumesLease(t *testing.T) {
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
 	clock := []time.Time{
-		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
-		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
-		time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 59, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 59, 0, 0, time.UTC),
+		time.Date(2026, 7, 31, 0, 59, 0, 0, time.UTC),
 		time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC),
 	}
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}
@@ -549,11 +549,11 @@ func TestGatewayRejectsDeliveryWhenValidationConsumesLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
-		t.Fatalf("accepted handoff recovery error = %v", err)
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("expired delivery error = %v, want delivery rejection", err)
 	}
-	if remote.observeCalls != 1 || remote.applyCalls != 1 {
-		t.Fatalf("accepted handoff was not delivered: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("expired delivery reached remote: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
 	}
 }
 
@@ -590,11 +590,11 @@ func TestGatewayReconcilesExpiredUncertainWriteWithoutApplying(t *testing.T) {
 	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
 		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
 		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
-	}, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC))
+	}, time.Date(2026, 7, 31, 0, 3, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)); err != nil {
+	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 3, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
 	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true, RemoteHead: "accepted"}}}
@@ -616,19 +616,23 @@ func TestReplacedLeaseCannotUpdateMappedPROrReplyWithEvidence(t *testing.T) {
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
 	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}}}
-	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
-	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
+	push, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, handoff.PushOutboxKey); err != nil {
+	pr, err := gateway.Submit(ctx, candidatePR(claim))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, push.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
 		t.Fatal(err)
 	}
 	applyCalls := remote.applyCalls
-	for _, key := range []string{handoff.PROutboxKey} {
+	for _, key := range []string{pr.IdempotencyKey} {
 		if err := gateway.Dispatch(ctx, key); err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
 			t.Fatalf("zombie dispatch %q error = %v", key, err)
 		}
@@ -644,6 +648,14 @@ func newAcceptedClaim(t *testing.T, ctx context.Context) (*store.Store, store.Ti
 
 func newPublishedCandidate(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
 	return newCandidateClaim(t, ctx)
+}
+
+func candidatePush(claim store.TicketClaim, expectedRemoteHead string, expectRemoteAbsent bool) store.DeliveryRequest {
+	return store.DeliveryRequest{Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: expectedRemoteHead, ExpectRemoteAbsent: expectRemoteAbsent}
+}
+
+func candidatePR(claim store.TicketClaim) store.DeliveryRequest {
+	return store.DeliveryRequest{Operation: store.DeliveryUpsertPR, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket", Body: "evidence"}
 }
 
 func newCandidateClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
@@ -675,7 +687,7 @@ func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publica
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: publication}); err != nil {
+	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"result":"ok"}`), Now: time.Date(2026, 7, 31, 0, 1, 0, 0, time.UTC), Publication: publication}); err != nil {
 		t.Fatal(err)
 	}
 	return db, claim

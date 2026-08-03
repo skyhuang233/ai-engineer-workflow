@@ -45,8 +45,6 @@ type Candidate struct {
 	CodexSessionID   string
 	Commit           string
 	StructuredOutput []byte
-	PushOutboxKey    string
-	PROutboxKey      string
 }
 
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
@@ -155,21 +153,27 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
 	}
-	handoff, err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication})
-	if err != nil {
+	if err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication}); err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
-	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured, PushOutboxKey: handoff.PushOutboxKey, PROutboxKey: handoff.PROutboxKey}
+	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
 	deliveryEnvironment := map[string]string{
-		"CODEX_HOME":                   ws.CodexState,
-		"NO_MISTAKES_DELIVERY_CYCLE":   session.SessionID,
-		"NO_MISTAKES_RUN_ID":           request.Claim.RunID,
-		"NO_MISTAKES_LEASE_TOKEN":      request.Claim.LeaseToken,
-		"NO_MISTAKES_LEASE_GENERATION": fmt.Sprint(request.Claim.LeaseGeneration),
+		"CODEX_HOME":                       ws.CodexState,
+		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
+		"NO_MISTAKES_RUN_ID":               request.Claim.RunID,
+		"NO_MISTAKES_LEASE_TOKEN":          request.Claim.LeaseToken,
+		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(request.Claim.LeaseGeneration),
+		"NO_MISTAKES_REPOSITORY":           publication.Repository,
+		"NO_MISTAKES_BRANCH":               publication.Branch,
+		"NO_MISTAKES_COMMIT_SHA":           commit,
+		"NO_MISTAKES_EXPECTED_REMOTE_HEAD": publication.ExpectedRemoteHead,
+		"NO_MISTAKES_EXPECT_REMOTE_ABSENT": fmt.Sprint(publication.ExpectRemoteAbsent),
+		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
+		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
 	}
 	if c.GatewayURL != "" {
 		deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL

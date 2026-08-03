@@ -397,7 +397,10 @@ func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
 	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)); err != nil {
@@ -414,11 +417,12 @@ func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidate(ctx, CandidateRevision{RunID: revision.RunID, LeaseToken: revision.LeaseToken, CodexSessionID: "codex", CommitSHA: "revised", StructuredOutput: []byte(`{"summary":"revision"}`), Now: now.Add(4 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectedRemoteHead: "accepted", Title: "ticket"}}); err != nil {
+	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: revision.RunID, LeaseToken: revision.LeaseToken, CodexSessionID: "codex", CommitSHA: "revised", StructuredOutput: []byte(`{"summary":"revision"}`), Now: now.Add(4 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectedRemoteHead: "accepted", Title: "ticket"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ValidateDelivery(ctx, evidence.Request, now.Add(5*time.Second)); !errors.Is(err, ErrDeliveryRejected) {
-		t.Fatalf("preexisting evidence validation error = %v, want rejected", err)
+	stored, err := db.DeliveryOutbox(ctx, evidence.IdempotencyKey)
+	if err != nil || stored.State != OutboxRejected {
+		t.Fatalf("preexisting evidence outbox = %#v, err=%v", stored, err)
 	}
 }
 
@@ -449,7 +453,7 @@ func TestAcceptedHandoffRejectsMutableDeliveryAfterNeedsAttention(t *testing.T) 
 	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)); err != nil {
@@ -731,7 +735,10 @@ func TestPlanProjectionDoesNotTreatPRPublicationAsAGateResult(t *testing.T) {
 	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+	if err := db.AcceptCandidate(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryUpsertPR, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.db.ExecContext(ctx, "UPDATE ticket_deliveries SET pull_request_number = 42 WHERE version_id = ? AND issue_id = ?", version.ID, int64(1)); err != nil {
