@@ -77,31 +77,23 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
 	}
-	observation, observeErr := g.Remote.Observe(ctx, outbox.Request)
-	if observeErr != nil {
-		if outbox.ReconcileOnly || outbox.Uncertain {
-			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, observeErr.Error(), g.now()); finishErr != nil {
-				return finishErr
-			}
-			return observeErr
-		}
-		return g.retry(ctx, outbox, observeErr)
-	}
-	if observation.Applied {
-		return g.succeed(ctx, outbox, resultFrom(observation))
-	}
-	if outbox.Request.ExpectRemoteAbsent && observation.RemoteExists {
-		err := fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
-		return g.reject(ctx, outbox, err)
-	}
-	if outbox.Request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != outbox.Request.ExpectedRemoteHead) {
-		err := fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, outbox.Request.ExpectedRemoteHead)
-		return g.reject(ctx, outbox, err)
-	}
 	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now(), func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+		observation, observeErr := g.Remote.Observe(operationCtx, request)
+		if observeErr != nil {
+			return store.DeliveryResult{}, observeErr
+		}
+		if observation.Applied {
+			return resultFrom(observation), nil
+		}
+		if request.ExpectRemoteAbsent && observation.RemoteExists {
+			return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
+		}
+		if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
+			return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
+		}
 		observation, applyErr := g.Remote.Apply(operationCtx, request)
 		if applyErr != nil {
-			observed, observeErr := g.Remote.Observe(ctx, request)
+			observed, observeErr := g.Remote.Observe(operationCtx, request)
 			if observeErr == nil && observed.Applied {
 				observation = observed
 				applyErr = nil

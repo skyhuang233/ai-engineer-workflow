@@ -75,17 +75,24 @@ func validateLocalRemotes(ctx context.Context, path string) error {
 		return err
 	}
 	for _, remote := range strings.Fields(remotes) {
-		urls, err := gitOutput(ctx, path, "remote", "get-url", "--all", remote)
-		if err != nil {
-			return err
-		}
-		for _, remoteURL := range strings.Split(strings.TrimSpace(urls), "\n") {
-			remoteURL = strings.TrimSpace(remoteURL)
-			if remoteURL == "" {
-				continue
+		for _, push := range []bool{false, true} {
+			args := []string{"remote", "get-url", "--all"}
+			if push {
+				args = append(args, "--push")
 			}
-			if !filepath.IsAbs(remoteURL) {
-				return fmt.Errorf("workspace remote %q must use an absolute local path", remote)
+			args = append(args, remote)
+			urls, err := gitOutput(ctx, path, args...)
+			if err != nil {
+				return err
+			}
+			for _, remoteURL := range strings.Split(strings.TrimSpace(urls), "\n") {
+				remoteURL = strings.TrimSpace(remoteURL)
+				if remoteURL == "" {
+					continue
+				}
+				if !filepath.IsAbs(remoteURL) {
+					return fmt.Errorf("workspace remote %q must use an absolute local path", remote)
+				}
 			}
 		}
 	}

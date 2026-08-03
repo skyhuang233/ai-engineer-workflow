@@ -28,6 +28,13 @@ go run ./cmd/workflow doctor `
   --report docs/operations/doctor-report.md
 ```
 
+`workflow run-ticket` is the production Worker-to-Gateway path. It runs the
+pinned Docker Worker without the GitHub credential, accepts its candidate
+commit, then submits and dispatches the candidate push and pull-request
+commands through the credential-owning Gateway. `workflow reconcile-delivered`
+checks merged pull requests for reachability from `main` before marking their
+tickets Delivered.
+
 The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
 registry. The report must be reviewed before filling the credential

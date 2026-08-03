@@ -12,8 +12,7 @@ type SnapshotReader interface {
 }
 
 type RootProjector interface {
-	UpdatePlanProjection(context.Context, string, int64, Projection) error
-	AddIssueLabel(context.Context, string, int64, string) error
+	ProjectPlan(context.Context, string, int64, Projection, string) error
 }
 
 type VersionStore interface {
@@ -66,11 +65,8 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 		return Version{}, err
 	}
 	if version.State != "active" {
-		if err := a.Projector.UpdatePlanProjection(ctx, repository, rootNumber, projection); err != nil {
+		if err := a.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ActiveLabel); err != nil {
 			return Version{}, fmt.Errorf("project plan root: %w", err)
-		}
-		if err := a.Projector.AddIssueLabel(ctx, repository, rootNumber, ActiveLabel); err != nil {
-			return Version{}, fmt.Errorf("activate plan root: %w", err)
 		}
 		if err := a.Store.MarkActive(ctx, version.ID); err != nil {
 			return Version{}, err
@@ -78,7 +74,7 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 		version.State = "active"
 	}
 	projection.State = "Active"
-	if err := a.Projector.UpdatePlanProjection(ctx, repository, rootNumber, projection); err != nil {
+	if err := a.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ""); err != nil {
 		return Version{}, fmt.Errorf("reconcile active plan root: %w", err)
 	}
 	return version, nil

@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,15 +105,32 @@ func (c *Client) UpdateIssueBody(ctx context.Context, repository string, number 
 }
 
 func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) error {
-	issue, err := c.getIssue(ctx, repository, number)
-	if err != nil {
+	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
-	body, err := plan.RenderProjection(issue.Body, projection)
-	if err != nil {
+	for attempt := 0; attempt < 3; attempt++ {
+		issue, etag, err := c.getIssueWithETag(ctx, repository, number)
+		if err != nil {
+			return err
+		}
+		if etag == "" {
+			return fmt.Errorf("GitHub did not provide an issue version for projection")
+		}
+		body, err := plan.RenderProjection(issue.Body, projection)
+		if err != nil {
+			return err
+		}
+		payload := struct {
+			Body string `json:"body"`
+		}{Body: body}
+		err = c.requestJSONWithHeaders(ctx, http.MethodPatch, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10), payload, nil, http.Header{"If-Match": []string{etag}})
+		var apiErr *apiError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusConflict || apiErr.StatusCode == http.StatusPreconditionFailed) {
+			continue
+		}
 		return err
 	}
-	return c.UpdateIssueBody(ctx, repository, number, body)
+	return fmt.Errorf("GitHub issue projection changed concurrently")
 }
 
 func (c *Client) AddIssueLabel(ctx context.Context, repository string, number int64, label string) error {
@@ -129,7 +147,20 @@ func (c *Client) getJSON(ctx context.Context, path string, destination any) erro
 	return c.requestJSON(ctx, http.MethodGet, path, nil, destination)
 }
 
+func (c *Client) getIssueWithETag(ctx context.Context, repository string, number int64) (plan.Issue, string, error) {
+	var raw issueResponse
+	var header http.Header
+	if err := c.requestJSONWithHeaders(ctx, http.MethodGet, "/repos/"+repository+"/issues/"+strconv.FormatInt(number, 10), nil, &raw, nil, &header); err != nil {
+		return plan.Issue{}, "", err
+	}
+	return raw.issue(), header.Get("ETag"), nil
+}
+
 func (c *Client) requestJSON(ctx context.Context, method, path string, body any, destination any) error {
+	return c.requestJSONWithHeaders(ctx, method, path, body, destination, nil)
+}
+
+func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string, body any, destination any, requestHeaders http.Header, responseHeaders ...*http.Header) error {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -144,6 +175,11 @@ func (c *Client) requestJSON(ctx context.Context, method, path string, body any,
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	for name, values := range requestHeaders {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -155,6 +191,9 @@ func (c *Client) requestJSON(ctx context.Context, method, path string, body any,
 		return err
 	}
 	defer response.Body.Close()
+	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
+		*responseHeaders[0] = response.Header.Clone()
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
 		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message))}

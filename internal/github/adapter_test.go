@@ -102,8 +102,12 @@ func TestUpdatePlanProjectionReadsTheCurrentHumanBodyAtWriteTime(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
+			w.Header().Set("ETag", `"v1"`)
 			json.NewEncoder(w).Encode(issueResponse{ID: 100, Number: 10, Body: "fresh human edit"})
 		case r.Method == http.MethodPatch:
+			if r.Header.Get("If-Match") != `"v1"` {
+				t.Errorf("If-Match = %q", r.Header.Get("If-Match"))
+			}
 			var payload struct {
 				Body string `json:"body"`
 			}

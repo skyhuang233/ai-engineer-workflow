@@ -30,13 +30,21 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 	if r.Client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
-	if request.Operation == store.DeliveryProjectPlan {
+	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryAddIssueLabel {
 		if request.PlanProjection == nil {
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
 		issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
 		if err != nil {
 			return delivery.Observation{}, err
+		}
+		if request.Operation == store.DeliveryAddIssueLabel {
+			for _, label := range issue.Labels {
+				if label == request.Label {
+					return delivery.Observation{Applied: true}, nil
+				}
+			}
+			return delivery.Observation{}, nil
 		}
 		expected, err := plan.RenderProjection(issue.Body, *request.PlanProjection)
 		if err != nil {
@@ -124,6 +132,14 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
+	case store.DeliveryAddIssueLabel:
+		if request.PlanProjection == nil || request.Label == "" {
+			return delivery.Observation{}, fmt.Errorf("plan label is incomplete")
+		}
+		if err := r.Client.AddIssueLabel(ctx, request.Repository, request.RootNumber, request.Label); err != nil {
+			return delivery.Observation{}, err
+		}
+		return delivery.Observation{Applied: true}, nil
 	default:
 		return delivery.Observation{}, fmt.Errorf("unsupported delivery operation %q", request.Operation)
 	}
@@ -139,6 +155,9 @@ type pullRequestResponse struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 
 type commentResponse struct {
@@ -152,8 +171,8 @@ func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.Deliv
 		if err != nil {
 			return pullRequestResponse{}, false, err
 		}
-		if pull.Head.Ref != request.Branch {
-			return pullRequestResponse{}, false, fmt.Errorf("mapped pull request head does not match ticket branch")
+		if err := validatePullRequest(pull, request); err != nil {
+			return pullRequestResponse{}, false, err
 		}
 		return pull, true, nil
 	}
@@ -164,10 +183,26 @@ func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.Deliv
 	}
 	for _, pull := range pulls {
 		if pull.Head.Ref == request.Branch {
+			if err := validatePullRequest(pull, request); err != nil {
+				return pullRequestResponse{}, false, err
+			}
 			return pull, true, nil
 		}
 	}
 	return pullRequestResponse{}, false, nil
+}
+
+func validatePullRequest(pull pullRequestResponse, request store.DeliveryRequest) error {
+	if pull.Head.Ref != request.Branch {
+		return fmt.Errorf("mapped pull request head does not match ticket branch")
+	}
+	if pull.State != "open" {
+		return fmt.Errorf("mapped pull request is not open")
+	}
+	if pull.Base.Ref != "main" {
+		return fmt.Errorf("mapped pull request does not target main")
+	}
+	return nil
 }
 
 func (r DeliveryRemote) listComments(ctx context.Context, repository string, number int64) ([]commentResponse, error) {

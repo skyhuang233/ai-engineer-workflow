@@ -103,10 +103,28 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if name == "" {
 		name = "docker"
 	}
+	cidfile, err := os.CreateTemp("", "workflow-worker-cid-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("create worker container id file: %w", err)
+	}
+	cidfilePath := cidfile.Name()
+	if err := cidfile.Close(); err != nil {
+		_ = os.Remove(cidfilePath)
+		return Result{}, fmt.Errorf("close worker container id file: %w", err)
+	}
+	if err := os.Remove(cidfilePath); err != nil {
+		return Result{}, fmt.Errorf("prepare worker container id file: %w", err)
+	}
+	defer os.Remove(cidfilePath)
 	args := dockerArgs(spec)
+	args = append(args[:2], append([]string{"--cidfile", cidfilePath}, args[2:]...)...)
 	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
-	result := Result{Output: output}
+	containerID, readErr := os.ReadFile(cidfilePath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return Result{Output: output}, fmt.Errorf("read worker container id: %w", readErr)
+	}
+	result := Result{Output: output, ContainerID: strings.TrimSpace(string(containerID))}
 	if err != nil {
 		result.ExitCode = 1
 		var exitErr *exec.ExitError

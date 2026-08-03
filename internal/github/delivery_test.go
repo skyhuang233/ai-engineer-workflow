@@ -49,6 +49,7 @@ func TestDeliveryRemoteRendersPlanProjectionAgainstFreshHumanBody(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
+			w.Header().Set("ETag", `"v1"`)
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "body": "fresh human specification"})
 		case r.Method == http.MethodPatch:
 			body, _ := io.ReadAll(r.Body)
@@ -100,5 +101,20 @@ func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 	}
 	if !observation.Applied || pages != 2 {
 		t.Fatalf("observation = %#v, pages = %d", observation, pages)
+	}
+}
+
+func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
+	for _, pull := range []map[string]any{
+		{"number": 7, "state": "closed", "head": map[string]string{"ref": "ticket-1", "sha": "candidate"}, "base": map[string]string{"ref": "main"}},
+		{"number": 7, "state": "open", "head": map[string]string{"ref": "ticket-1", "sha": "candidate"}, "base": map[string]string{"ref": "release"}},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(pull) }))
+		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+		_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, CommitSHA: "candidate"})
+		server.Close()
+		if err == nil {
+			t.Fatalf("invalid mapped pull request was accepted: %#v", pull)
+		}
 	}
 }

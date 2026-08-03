@@ -85,28 +85,28 @@ func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 0, 0, time.UTC))
+	second, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, second.ClaimToken, store.OutboxPending, "second failure", time.Date(2026, 7, 31, 0, 5, 0, 0, time.UTC)); err != nil {
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, second.ClaimToken, store.OutboxPending, "second failure", time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, first.ClaimToken, store.OutboxSucceeded, "", time.Date(2026, 7, 31, 0, 5, 1, 0, time.UTC)); !errors.Is(err, store.ErrFencingConflict) {
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, first.ClaimToken, store.OutboxSucceeded, "", time.Date(2026, 7, 31, 1, 3, 1, 0, time.UTC)); !errors.Is(err, store.ErrFencingConflict) {
 		t.Fatalf("stale completion error = %v, want fencing conflict", err)
 	}
-	third, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 2, 0, time.UTC))
+	third, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 3, 2, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, third.ClaimToken, store.OutboxPending, "third failure", time.Date(2026, 7, 31, 0, 5, 2, 0, time.UTC)); err != nil {
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, third.ClaimToken, store.OutboxPending, "third failure", time.Date(2026, 7, 31, 1, 3, 2, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	fourth, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 4, 0, time.UTC))
+	fourth, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 3, 4, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, fourth.ClaimToken, store.OutboxPending, "fourth failure", time.Date(2026, 7, 31, 0, 5, 4, 0, time.UTC)); err != nil {
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, fourth.ClaimToken, store.OutboxPending, "fourth failure", time.Date(2026, 7, 31, 1, 3, 4, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
 	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
@@ -394,7 +394,7 @@ func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 3, 30, 0, time.UTC)); !errors.Is(err, store.ErrDeliveryInProgress) {
 		t.Fatalf("concurrent claim error = %v, want ErrDeliveryInProgress", err)
 	}
-	reclaimed, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 0, 5, 0, 0, time.UTC))
+	reclaimed, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 3, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}

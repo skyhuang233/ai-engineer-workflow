@@ -56,7 +56,7 @@ func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ti
 	if err != nil {
 		return claim, err
 	}
-	if err := d.Projector.UpdatePlanProjection(ctx, repository, rootNumber, projection); err != nil {
+	if err := d.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ""); err != nil {
 		return claim, fmt.Errorf("project ticket claim: %w", err)
 	}
 	return claim, nil
@@ -84,5 +84,5 @@ func (d Dispatcher) Recover(ctx context.Context, repository string, rootNumber i
 	if err != nil {
 		return err
 	}
-	return d.Projector.UpdatePlanProjection(ctx, repository, rootNumber, projection)
+	return d.Projector.ProjectPlan(ctx, repository, rootNumber, projection, "")
 }

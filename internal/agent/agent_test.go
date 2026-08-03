@@ -351,6 +351,41 @@ func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
 	}
 }
 
+func TestControllerRejectsCredentialBearingWorkspacePushURL(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, firstClaim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	if _, err := controller.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushURL := exec.Command("git", "remote", "set-url", "--push", "origin", "https://user:token@github.com/owner/repo.git")
+	pushURL.Dir = session.WorkspacePath
+	if output, err := pushURL.CombinedOutput(); err != nil {
+		t.Fatalf("set credential-bearing push URL: %v (%s)", err, output)
+	}
+	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRuntime := &fakeRuntime{}
+	controller.Runtime = secondRuntime
+	if _, err := controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"}); err == nil || !strings.Contains(err.Error(), "absolute local path") {
+		t.Fatalf("persisted external push URL error = %v", err)
+	}
+	if len(secondRuntime.specs) != 0 {
+		t.Fatal("worker started with a persisted external push URL")
+	}
+}
+
 func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

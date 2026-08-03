@@ -20,6 +20,7 @@ const (
 	DeliveryUpsertPR      DeliveryOperation = "upsert_pull_request"
 	DeliveryReplyEvidence DeliveryOperation = "reply_evidence"
 	DeliveryProjectPlan   DeliveryOperation = "project_plan"
+	DeliveryAddIssueLabel DeliveryOperation = "add_issue_label"
 
 	OutboxPending    = "pending"
 	OutboxProcessing = "processing"
@@ -48,6 +49,7 @@ type DeliveryRequest struct {
 	Body               string            `json:"body,omitempty"`
 	Evidence           string            `json:"evidence,omitempty"`
 	PlanProjection     *plan.Projection  `json:"plan_projection,omitempty"`
+	Label              string            `json:"label,omitempty"`
 	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
 }
 
@@ -87,6 +89,13 @@ type DeliveryResult struct {
 	RemoteHead        string
 	PullRequestNumber int64
 	PullRequestNodeID string
+}
+
+type TicketDelivery struct {
+	VersionID         string
+	IssueID           int64
+	Repository        string
+	PullRequestNumber int64
 }
 
 const maxDeliveryAttempts = 3
@@ -186,11 +195,13 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 	if !errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_deliveries(version_id, issue_id, repository, branch, pull_request_number, pull_request_node_id, remote_head, created_at, updated_at)
+	if target.TicketID != 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_deliveries(version_id, issue_id, repository, branch, pull_request_number, pull_request_node_id, remote_head, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, '', '', ?, ?)
 ON CONFLICT(version_id, issue_id) DO UPDATE SET repository = excluded.repository, branch = excluded.branch, updated_at = excluded.updated_at`,
-		target.VersionID, target.TicketID, target.Repository, target.Branch, target.PullRequestNumber, nowText, nowText); err != nil {
-		return DeliveryOutbox{}, err
+			target.VersionID, target.TicketID, target.Repository, target.Branch, target.PullRequestNumber, nowText, nowText); err != nil {
+			return DeliveryOutbox{}, err
+		}
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO delivery_outbox(idempotency_key, operation, request_json, state, attempts, last_error, created_at, updated_at, next_attempt_at)
 VALUES (?, ?, ?, ?, 0, '', ?, ?, ?)`, key, normalized.Operation, string(encoded), OutboxPending, nowText, nowText, nowText)
@@ -261,6 +272,9 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, err
 	}
 	remaining := target.LeaseExpiresAt.Sub(now)
+	if target.LeaseExpiresAt.IsZero() {
+		remaining = time.Minute
+	}
 	if remaining <= 0 {
 		return DeliveryResult{}, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
@@ -317,7 +331,29 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 	return result, nil
 }
 
+func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number
+FROM ticket_deliveries d
+JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
+WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0`, repository)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var deliveries []TicketDelivery
+	for rows.Next() {
+		var delivery TicketDelivery
+		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber); err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	return deliveries, rows.Err()
+}
+
 func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Time) (DeliveryOutbox, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -328,10 +364,10 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
-	var state, updatedText, nextAttemptText, raw string
+	var state, updatedText, nextAttemptText, raw, previousClaimToken string
 	var attempts int
 	var uncertain int
-	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw, &uncertain); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json, claim_token, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw, &previousClaimToken, &uncertain); errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, ErrNotFound
 	} else if err != nil {
 		return DeliveryOutbox{}, err
@@ -343,12 +379,31 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return s.DeliveryOutbox(ctx, key)
 	}
 	if state == OutboxProcessing {
-		updatedAt, parseErr := time.Parse(time.RFC3339Nano, updatedText)
-		if parseErr != nil {
-			return DeliveryOutbox{}, parseErr
+		var request DeliveryRequest
+		if err := json.Unmarshal([]byte(raw), &request); err != nil {
+			return DeliveryOutbox{}, err
 		}
-		if updatedAt.After(now.Add(-time.Minute)) {
-			return DeliveryOutbox{}, ErrDeliveryInProgress
+		if request.RunID == "" {
+			updatedAt, parseErr := time.Parse(time.RFC3339Nano, updatedText)
+			if parseErr != nil {
+				return DeliveryOutbox{}, parseErr
+			}
+			if updatedAt.After(now.Add(-time.Minute)) {
+				return DeliveryOutbox{}, ErrDeliveryInProgress
+			}
+		} else {
+			var expiresText string
+			err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
+			if err != nil {
+				return DeliveryOutbox{}, ErrDeliveryInProgress
+			}
+			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+			if parseErr != nil {
+				return DeliveryOutbox{}, parseErr
+			}
+			if expiresAt.After(now) {
+				return DeliveryOutbox{}, ErrDeliveryInProgress
+			}
 		}
 	}
 	if state == OutboxPending && nextAttemptText != "" {
@@ -385,7 +440,7 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	if reconcileOnly {
 		attemptIncrement = 0
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + ?, claim_token = ?, updated_at = ? WHERE idempotency_key = ? AND (state = ? OR (state = ? AND updated_at <= ?))`, OutboxProcessing, attemptIncrement, claimToken, formatTimestamp(now), key, OutboxPending, OutboxProcessing, formatTimestamp(now.Add(-time.Minute)))
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + ?, claim_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ?) OR (state = ? AND claim_token = ?))`, OutboxProcessing, attemptIncrement, claimToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, OutboxProcessing, previousClaimToken)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -578,11 +633,38 @@ func (s *Store) RecordDeliveryAudit(ctx context.Context, request DeliveryRequest
 }
 
 func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryTarget, DeliveryRequest, error) {
+	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
+		if request.Repository == "" || request.RootNumber <= 0 || request.PlanProjection == nil || request.PlanProjection.VersionID == "" {
+			return DeliveryTarget{}, request, fmt.Errorf("%w: control-plane projection is incomplete", ErrDeliveryRejected)
+		}
+		var versionID string
+		err := tx.QueryRowContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND p.root_issue_number = ?`, request.Repository, request.RootNumber).Scan(&versionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryTarget{}, request, fmt.Errorf("%w: current plan version is missing", ErrDeliveryRejected)
+		}
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
+		if versionID != request.PlanProjection.VersionID {
+			return DeliveryTarget{}, request, fmt.Errorf("%w: projection does not match the current plan version", ErrDeliveryRejected)
+		}
+		switch request.Operation {
+		case DeliveryProjectPlan:
+			if request.Body != "" || request.Label != "" {
+				return DeliveryTarget{}, request, fmt.Errorf("%w: structured plan projection is required", ErrDeliveryRejected)
+			}
+		case DeliveryAddIssueLabel:
+			if request.Label == "" || request.Body != "" {
+				return DeliveryTarget{}, request, fmt.Errorf("%w: plan label is required", ErrDeliveryRejected)
+			}
+		}
+		return DeliveryTarget{VersionID: versionID, Repository: request.Repository, RootNumber: request.RootNumber}, request, nil
+	}
 	if request.RunID == "" || request.LeaseToken == "" || request.LeaseGeneration <= 0 || request.Repository == "" {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: run lease and repository are required", ErrDeliveryRejected)
 	}
 	switch request.Operation {
-	case DeliveryPushCandidate, DeliveryUpsertPR, DeliveryReplyEvidence, DeliveryProjectPlan:
+	case DeliveryPushCandidate, DeliveryUpsertPR, DeliveryReplyEvidence, DeliveryProjectPlan, DeliveryAddIssueLabel:
 	default:
 		return DeliveryTarget{}, request, fmt.Errorf("%w: unsupported operation %q", ErrDeliveryRejected, request.Operation)
 	}
@@ -673,6 +755,8 @@ WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id 
 		if request.PlanProjection == nil || request.PlanProjection.VersionID != target.VersionID || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: matching structured plan projection is required", ErrDeliveryRejected)
 		}
+	case DeliveryAddIssueLabel:
+		return DeliveryTarget{}, request, fmt.Errorf("%w: labels require the control-plane gateway", ErrDeliveryRejected)
 	}
 	if request.CommitSHA != "" && request.CommitSHA != target.AcceptedCommit {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: commit does not match accepted Candidate Revision", ErrDeliveryRejected)

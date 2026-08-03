@@ -20,17 +20,15 @@ type integrationProjector struct {
 	label string
 }
 
-func (p *integrationProjector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection plan.Projection) error {
+func (p *integrationProjector) ProjectPlan(_ context.Context, _ string, _ int64, projection plan.Projection, label string) error {
 	body, err := plan.RenderProjection(p.body, projection)
 	if err == nil {
 		p.body = body
 	}
+	if label != "" {
+		p.label = label
+	}
 	return err
-}
-
-func (p *integrationProjector) AddIssueLabel(_ context.Context, _ string, _ int64, label string) error {
-	p.label = label
-	return nil
 }
 
 func TestActivationPathPersistsOneVersionAcrossRestart(t *testing.T) {

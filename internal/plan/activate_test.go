@@ -22,7 +22,7 @@ type fakeProjector struct {
 	beforeProject func(*fakeProjector)
 }
 
-func (f *fakeProjector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection Projection) error {
+func (f *fakeProjector) ProjectPlan(_ context.Context, _ string, _ int64, projection Projection, label string) error {
 	if f.beforeProject != nil {
 		f.beforeProject(f)
 	}
@@ -32,12 +32,10 @@ func (f *fakeProjector) UpdatePlanProjection(_ context.Context, _ string, _ int6
 	}
 	f.body = body
 	f.bodies = append(f.bodies, body)
+	if label != "" {
+		f.label = label
+	}
 	return errors.Join(err, f.err)
-}
-
-func (f *fakeProjector) AddIssueLabel(_ context.Context, _ string, _ int64, label string) error {
-	f.label = label
-	return f.err
 }
 
 type fakeStore struct {

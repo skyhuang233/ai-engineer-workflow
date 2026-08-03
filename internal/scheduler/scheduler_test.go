@@ -20,15 +20,13 @@ func (r *reader) ReadPlan(context.Context, string, int64) (plan.Snapshot, error)
 
 type projector struct{ body string }
 
-func (p *projector) UpdatePlanProjection(_ context.Context, _ string, _ int64, projection plan.Projection) error {
+func (p *projector) ProjectPlan(_ context.Context, _ string, _ int64, projection plan.Projection, _ string) error {
 	body, err := plan.RenderProjection(p.body, projection)
 	if err == nil {
 		p.body = body
 	}
 	return err
 }
-
-func (p *projector) AddIssueLabel(context.Context, string, int64, string) error { return nil }
 
 func TestDispatcherClaimsAndProjectsRunningTicket(t *testing.T) {
 	ctx := context.Background()
