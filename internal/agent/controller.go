@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -14,14 +15,15 @@ import (
 )
 
 type Controller struct {
-	Store        *store.Store
-	Workspace    WorkspaceManager
-	Runtime      worker.Runtime
-	ImageDigest  string
-	ToolVersions map[string]string
-	NoMistakes   string
-	GatewayURL   string
-	Now          func() time.Time
+	Store            *store.Store
+	Workspace        WorkspaceManager
+	Runtime          worker.Runtime
+	ImageDigest      string
+	ToolVersions     map[string]string
+	NoMistakes       string
+	GatewayURL       string
+	DeliveryLeaseTTL time.Duration
+	Now              func() time.Time
 }
 
 func (c Controller) now() time.Time {
@@ -29,6 +31,13 @@ func (c Controller) now() time.Time {
 		return c.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (c Controller) deliveryLeaseTTL() time.Duration {
+	if c.DeliveryLeaseTTL > 0 {
+		return c.DeliveryLeaseTTL
+	}
+	return 30 * time.Minute
 }
 
 type RunRequest struct {
@@ -80,9 +89,13 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
-	command := []string{"codex", "exec", "--json", "--skip-git-repo-check", request.Prompt}
+	schemaPath := c.Workspace.schemaPath(ws.CodexState)
+	if err := os.WriteFile(schemaPath, []byte(candidateOutputSchema), 0o600); err != nil {
+		return Candidate{}, fmt.Errorf("write Candidate output schema: %w", err)
+	}
+	command := []string{"codex", "exec", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", request.Prompt}
 	if session.CodexSessionID != "" {
-		command = []string{"codex", "exec", "resume", "--json", "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
+		command = []string{"codex", "exec", "resume", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
 	}
 	environment := map[string]string{
 		"CODEX_HOME": ws.CodexState,
@@ -153,7 +166,8 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
 	}
-	if err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication}); err != nil {
+	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
+	if err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
@@ -164,9 +178,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
 		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
-		"NO_MISTAKES_RUN_ID":               request.Claim.RunID,
-		"NO_MISTAKES_LEASE_TOKEN":          request.Claim.LeaseToken,
-		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(request.Claim.LeaseGeneration),
+		"NO_MISTAKES_RUN_ID":               deliveryClaim.RunID,
+		"NO_MISTAKES_LEASE_TOKEN":          deliveryClaim.LeaseToken,
+		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(deliveryClaim.LeaseGeneration),
 		"NO_MISTAKES_REPOSITORY":           publication.Repository,
 		"NO_MISTAKES_BRANCH":               publication.Branch,
 		"NO_MISTAKES_COMMIT_SHA":           commit,
@@ -182,16 +196,28 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	deliverySpec.Command = []string{noMistakes, "axi", "run", "--intent", request.Prompt}
 	deliverySpec.Environment = deliveryEnvironment
 	if err := deliverySpec.Validate(); err != nil {
-		return candidate, err
+		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
 	}
-	deliveryResult, deliveryErr := c.Runtime.Run(runCtx, deliverySpec)
+	if err := c.Store.ReserveWorkerLaunch(handoffCtx, deliveryClaim, c.now()); err != nil {
+		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
+	}
+	deliveryCtx, cancelDelivery := context.WithDeadline(context.WithoutCancel(ctx), deliveryClaim.LeaseExpiresAt)
+	defer cancelDelivery()
+	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
 	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
-		return candidate, errors.New(errorText(deliveryErr, deliveryResult.ExitCode))
+		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
 	}
 	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
+		return candidate, c.failDeliveryController(handoffCtx, deliveryClaim, err)
+	}
+	if err := c.Store.CompleteDeliveryController(handoffCtx, deliveryClaim, c.now()); err != nil {
 		return candidate, err
 	}
 	return candidate, nil
+}
+
+func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
+	return errors.Join(cause, c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now()))
 }
 
 func runtimeStdout(result worker.Result) []byte {
@@ -221,11 +247,25 @@ func parseDeliveryTOON(output []byte) error {
 	if !ok {
 		return errors.New("Delivery Controller TOON did not contain a run")
 	}
-	if status, ok := run["status"].(string); !ok || strings.TrimSpace(status) == "" {
-		return errors.New("Delivery Controller TOON did not contain a run status")
+	if status, ok := run["status"].(string); !ok || strings.TrimSpace(status) != "completed" {
+		return errors.New("Delivery Controller TOON did not complete")
+	}
+	if outcome, ok := document["outcome"].(string); !ok || strings.TrimSpace(outcome) != "passed" {
+		return errors.New("Delivery Controller TOON did not pass")
 	}
 	return nil
 }
+
+const candidateOutputSchema = `{
+  "type": "object",
+  "required": ["summary"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "commit": {"type": "string"},
+    "tests": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}`
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {
 	diagnostic, diagnosticErr := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, baseCommit, output, reason)

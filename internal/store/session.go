@@ -249,13 +249,25 @@ func (s *Store) CandidateRevision(ctx context.Context, runID string) (CandidateR
 }
 
 func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision) error {
+	_, err := s.acceptCandidate(ctx, candidate, 0)
+	return err
+}
+
+func (s *Store) AcceptCandidateForDelivery(ctx context.Context, candidate CandidateRevision, deliveryLeaseTTL time.Duration) (TicketClaim, error) {
+	if deliveryLeaseTTL <= 0 {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	return s.acceptCandidate(ctx, candidate, deliveryLeaseTTL)
+}
+
+func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision, deliveryLeaseTTL time.Duration) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if candidate.RunID == "" || candidate.LeaseToken == "" || candidate.CodexSessionID == "" || candidate.CommitSHA == "" || len(candidate.StructuredOutput) == 0 || candidate.Publication.Repository == "" || candidate.Publication.Branch == "" || candidate.Publication.Title == "" || (candidate.Publication.ExpectedRemoteHead == "") == !candidate.Publication.ExpectRemoteAbsent {
-		return ErrInvalidClaim
+		return TicketClaim{}, ErrInvalidClaim
 	}
 	if !json.Valid(candidate.StructuredOutput) {
-		return ErrInvalidClaim
+		return TicketClaim{}, ErrInvalidClaim
 	}
 	if candidate.Now.IsZero() {
 		candidate.Now = time.Now().UTC()
@@ -264,49 +276,153 @@ func (s *Store) AcceptCandidate(ctx context.Context, candidate CandidateRevision
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return TicketClaim{}, err
 	}
 	defer tx.Rollback()
 	var sessionID, currentSessionID, existingCodexSessionID string
 	err = tx.QueryRowContext(ctx, `SELECT r.session_id, s.session_id, s.codex_session_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 	WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, candidate.RunID, candidate.LeaseToken, RunRunning, LeaseActive, formatTimestamp(candidate.Now)).Scan(&sessionID, &currentSessionID, &existingCodexSessionID)
 	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	if sessionID != currentSessionID {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	if existingCodexSessionID != "" && existingCodexSessionID != candidate.CodexSessionID {
+		return TicketClaim{}, ErrSessionConflict
+	}
+	now := formatTimestamp(candidate.Now)
+	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox
+SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ?
+	WHERE json_extract(request_json, '$.run_id') = ? AND state IN (?, ?)`, OutboxRejected, "candidate accepted before delivery controller admission", now, now, candidate.RunID, OutboxPending, OutboxProcessing); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, created_at) VALUES (?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), now); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded', finished_at = ? WHERE run_id = ? AND state = ?`, now, candidate.RunID, RunRunning); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, candidate.RunID, candidate.LeaseToken, LeaseActive); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, consecutive_failures = 0, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, now, sessionID, candidate.CodexSessionID); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM ticket_sessions WHERE session_id = ?) AND issue_id = (SELECT issue_id FROM ticket_sessions WHERE session_id = ?) AND delivered = 0`, plan.StateWaitingReview, now, sessionID, sessionID); err != nil {
+		return TicketClaim{}, err
+	}
+	var delivery TicketClaim
+	if deliveryLeaseTTL > 0 {
+		if delivery, err = claimDeliveryControllerTx(ctx, tx, sessionID, deliveryLeaseTTL, candidate.Now); err != nil {
+			return TicketClaim{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return TicketClaim{}, err
+	}
+	return delivery, nil
+}
+
+func claimDeliveryControllerTx(ctx context.Context, tx *sql.Tx, sessionID string, leaseTTL time.Duration, now time.Time) (TicketClaim, error) {
+	var claim TicketClaim
+	var generation, recoveryEpoch int64
+	err := tx.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id, s.owner, s.current_lease_generation, s.recovery_epoch, t.issue_number, t.title
+FROM ticket_sessions s JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.VersionID, &claim.TicketID, &claim.Owner, &generation, &recoveryEpoch, &claim.TicketNumber, &claim.TicketTitle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	claim.SessionID = sessionID
+	generation++
+	runID, err := randomID("run-")
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	leaseToken, err := randomID("lease-")
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	expiresAt := now.Add(leaseTTL)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at, run_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, -int(generation), recoveryEpoch, generation, RunRunning, formatTimestamp(now), RunDelivery); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, generation, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(now)); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_run_id = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, runID, generation, formatTimestamp(now), sessionID); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateRunning, formatTimestamp(now), claim.VersionID, claim.TicketID); err != nil {
+		return TicketClaim{}, err
+	}
+	claim.RunID = runID
+	claim.Attempt = -int(generation)
+	claim.LeaseToken = leaseToken
+	claim.LeaseGeneration = generation
+	claim.LeaseExpiresAt = expiresAt
+	return claim, nil
+}
+
+func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClaim, now time.Time) error {
+	return s.finishDeliveryController(ctx, claim, "", now)
+}
+
+func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
+	return s.finishDeliveryController(ctx, claim, reason, now)
+}
+
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var sessionID string
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id
+FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
 	if err != nil {
 		return err
 	}
-	if sessionID != currentSessionID {
-		return ErrInvalidClaim
+	state := "succeeded"
+	if reason != "" {
+		state = "failed"
 	}
-	if existingCodexSessionID != "" && existingCodexSessionID != candidate.CodexSessionID {
-		return ErrSessionConflict
-	}
-	now := formatTimestamp(candidate.Now)
-	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox
-SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ?
-WHERE json_extract(request_json, '$.run_id') = ? AND state IN (?, ?)`, OutboxRejected, "candidate accepted before delivery controller admission", now, now, candidate.RunID, OutboxPending, OutboxProcessing); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, state, formatTimestamp(now), claim.RunID, RunRunning); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, created_at) VALUES (?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded', finished_at = ? WHERE run_id = ? AND state = ?`, now, candidate.RunID, RunRunning); err != nil {
+	if reason == "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), claim.VersionID, claim.TicketID); err != nil {
+			return err
+		}
+	} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller failed: "+reason, now); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, candidate.RunID, candidate.LeaseToken, LeaseActive); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, consecutive_failures = 0, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, now, sessionID, candidate.CodexSessionID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM ticket_sessions WHERE session_id = ?) AND issue_id = (SELECT issue_id FROM ticket_sessions WHERE session_id = ?) AND delivered = 0`, plan.StateWaitingReview, now, sessionID, sessionID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error {

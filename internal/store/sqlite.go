@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 16
+	latestSchemaVersion = 17
 )
 
 var (
@@ -39,6 +39,8 @@ const (
 	SessionClosed  = "closed"
 	RunRunning     = "running"
 	LeaseActive    = "active"
+	RunAgent       = "agent"
+	RunDelivery    = "delivery_controller"
 )
 
 type Store struct {
@@ -532,6 +534,14 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return fmt.Errorf("migration 16: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (16, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 17 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE worker_runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'agent' CHECK (run_kind IN ('agent', 'delivery_controller'))`); err != nil {
+			return fmt.Errorf("migration 17: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (17, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

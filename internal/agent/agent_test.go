@@ -19,19 +19,25 @@ import (
 )
 
 type fakeRuntime struct {
-	results         []worker.Result
-	specs           []worker.Spec
-	err             error
-	dirty           bool
-	failAfterCommit bool
-	switchBranch    bool
-	ignoredFile     bool
+	results          []worker.Result
+	specs            []worker.Spec
+	err              error
+	dirty            bool
+	failAfterCommit  bool
+	switchBranch     bool
+	ignoredFile      bool
+	deliveryOutput   []byte
+	deliveryDeadline time.Time
 }
 
-func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, error) {
+func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
 		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: passed\n")
+		if len(r.deliveryOutput) > 0 {
+			output = r.deliveryOutput
+		}
+		r.deliveryDeadline, _ = ctx.Deadline()
 		return worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}, nil
 	}
 	marker := "initial"
@@ -214,8 +220,13 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if keys, err := db.DueDeliveryOutboxKeys(ctx, time.Now().UTC(), 8); err != nil || len(keys) != 0 {
 		t.Fatalf("candidate acceptance queued delivery commands: keys=%#v, err=%v", keys, err)
 	}
-	if len(first.specs) != 2 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --skip-git-repo-check implement the ticket" || strings.Join(first.specs[1].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
+	if len(first.specs) != 2 || strings.Join(first.specs[1].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
+	}
+	if command := first.specs[0].Command; len(command) != 7 || command[0] != "codex" || command[1] != "exec" || command[2] != "--json" || command[3] != "--output-schema" || command[5] != "--skip-git-repo-check" || command[6] != "implement the ticket" {
+		t.Fatalf("Codex command = %#v", command)
+	} else if schema, err := os.ReadFile(command[4]); err != nil || !strings.Contains(string(schema), `"summary"`) {
+		t.Fatalf("Candidate output schema = %q, err = %v", schema, err)
 	}
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
 		t.Fatalf("first worker isolation = %#v", first.specs[0])
@@ -223,8 +234,11 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != "" {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
 	}
-	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
+	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
+	}
+	if !first.deliveryDeadline.After(claim.LeaseExpiresAt) {
+		t.Fatalf("Delivery Controller deadline = %s, want after Agent deadline %s", first.deliveryDeadline, claim.LeaseExpiresAt)
 	}
 
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
@@ -234,7 +248,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim review revision: %v", err)
 	}
-	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || revision.LeaseGeneration != claim.LeaseGeneration+1 {
+	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || revision.LeaseGeneration != claim.LeaseGeneration+2 {
 		t.Fatalf("review revision claim = %#v", revision)
 	}
 	second := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "revised"), ContainerID: "container-2"}}}
@@ -242,11 +256,37 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if _, err := controller.Run(ctx, candidateRequest(revision, source, "ticket-1", "address the review feedback")); err != nil {
 		t.Fatalf("run review revision: %v", err)
 	}
-	if len(second.specs) != 2 || strings.Join(second.specs[0].Command, " ") != "codex exec resume --json --skip-git-repo-check codex-session-1 address the review feedback" || strings.Join(second.specs[1].Command, " ") != "no-mistakes axi run --intent address the review feedback" {
+	if len(second.specs) != 2 || strings.Join(second.specs[1].Command, " ") != "no-mistakes axi run --intent address the review feedback" {
 		t.Fatalf("review worker specs = %#v", second.specs)
+	}
+	if command := second.specs[0].Command; len(command) != 9 || command[0] != "codex" || command[1] != "exec" || command[2] != "resume" || command[3] != "--json" || command[4] != "--output-schema" || command[6] != "--skip-git-repo-check" || command[7] != "codex-session-1" || command[8] != "address the review feedback" {
+		t.Fatalf("resumed Codex command = %#v", command)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
 		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)
+	}
+}
+
+func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: []byte("run:\n  status: completed\noutcome: failed\n")}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "did not pass") {
+		t.Fatalf("failed Delivery Controller error = %v", err)
+	}
+	if _, err := db.CandidateRevision(ctx, claim.RunID); err != nil {
+		t.Fatalf("Candidate acceptance was not durable: %v", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 || !strings.Contains(questions[0].Prompt, "Delivery Controller failed") {
+		t.Fatalf("Delivery Controller recovery question = %#v, err = %v", questions, err)
+	}
+	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("review claim after failed delivery = %v, want not ready", err)
 	}
 }
 

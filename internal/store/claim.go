@@ -208,7 +208,7 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 		return TicketClaim{}, err
 	}
 	var attemptsInEpoch int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ?`, sessionID, recoveryEpoch).Scan(&attemptsInEpoch); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ? AND run_kind = ?`, sessionID, recoveryEpoch, RunAgent).Scan(&attemptsInEpoch); err != nil {
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= maxWorkerAttempts(request.MaxAttempts) {
@@ -364,7 +364,7 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, ErrNotReady
 	}
 	var activeRuns int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE state = ?`, RunRunning).Scan(&activeRuns); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE state = ? AND run_kind = ?`, RunRunning, RunAgent).Scan(&activeRuns); err != nil {
 		return TicketClaim{}, err
 	}
 	if activeRuns >= maxParallelRuns {
@@ -383,7 +383,7 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
 	var attemptsInEpoch int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ?`, sessionID, recoveryEpoch).Scan(&attemptsInEpoch); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ? AND run_kind = ?`, sessionID, recoveryEpoch, RunAgent).Scan(&attemptsInEpoch); err != nil {
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= limit {
@@ -554,7 +554,7 @@ WHERE t.version_id = ?`, versionID)
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
+WHERE r.state = ? AND r.run_kind = ? AND l.state = ? AND l.expires_at > ?`, RunRunning, RunAgent, LeaseActive, formatTimestamp(now)).Scan(&snapshot.ActiveRuns); err != nil {
 		return snapshot, err
 	}
 	return snapshot, nil
