@@ -131,6 +131,17 @@ func TestFingerprintIgnoresMutableDeliveryFacts(t *testing.T) {
 	}
 }
 
+func TestDeliveredLabelDoesNotAuthorizeDelivery(t *testing.T) {
+	issue := Issue{Labels: []string{TicketLabel, "workflow:delivered"}}
+	if issue.IsDelivered() {
+		t.Fatal("delivery projection label was treated as an authoritative fact")
+	}
+	issue.Delivered = true
+	if !issue.IsDelivered() {
+		t.Fatal("verified delivery fact was ignored")
+	}
+}
+
 func TestRenderProjectionPreservesHumanSpec(t *testing.T) {
 	body := "# Approved spec\n\nKeep this text.\n\n" + ProjectionStart + "\nold\n" + ProjectionEnd + "\n\nHuman notes."
 	updated, err := RenderProjection(body, Projection{VersionID: "pv-1", State: "Active", Tickets: []ProjectionTicket{{Number: 11, Title: "A | B", Blockers: []int64{12}}}})

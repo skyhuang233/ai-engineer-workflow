@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -14,8 +16,9 @@ import (
 )
 
 const (
-	StateProjecting = "projecting"
-	StateActive     = "active"
+	StateProjecting     = "projecting"
+	StateActive         = "active"
+	latestSchemaVersion = 7
 )
 
 var (
@@ -39,6 +42,7 @@ const (
 type Store struct {
 	db           *sql.DB
 	databasePath string
+	leaseMu      sync.Mutex
 }
 
 type PlanVersion = plan.Version
@@ -90,8 +94,14 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	if err := s.backupDatabase(ctx); err != nil {
+	applied, err := s.schemaVersion(ctx)
+	if err != nil {
 		return err
+	}
+	if applied < latestSchemaVersion {
+		if err := s.backupDatabase(ctx); err != nil {
+			return err
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -105,7 +115,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 )`); err != nil {
 		return err
 	}
-	var applied int
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
 		return err
 	}
@@ -331,7 +340,36 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return err
 		}
 	}
+	if applied < 7 {
+		statements := []string{
+			`ALTER TABLE worker_audits ADD COLUMN extra_hosts_json TEXT NOT NULL DEFAULT '[]'`,
+			`ALTER TABLE delivery_outbox ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 7: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+func (s *Store) schemaVersion(ctx context.Context) (int, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if exists == 0 {
+		return 0, nil
+	}
+	var applied int
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
+		return 0, err
+	}
+	return applied, nil
 }
 
 func (s *Store) backupDatabase(ctx context.Context) error {
@@ -350,21 +388,58 @@ func (s *Store) backupDatabase(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read sqlite migration backup: %w", err)
 	}
-	backupPath := s.databasePath + ".migration.bak"
-	if err := os.WriteFile(backupPath, data, 0o600); err != nil {
+	temporary, err := os.CreateTemp(filepath.Dir(s.databasePath), filepath.Base(s.databasePath)+".migration-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create sqlite migration backup: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return fmt.Errorf("secure sqlite migration backup: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
 		return fmt.Errorf("write sqlite migration backup: %w", err)
 	}
-	backup, err := sql.Open("sqlite", backupPath)
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return fmt.Errorf("sync sqlite migration backup: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close sqlite migration backup: %w", err)
+	}
+	backup, err := sql.Open("sqlite", temporaryPath)
 	if err != nil {
 		return fmt.Errorf("open sqlite migration backup: %w", err)
 	}
-	defer backup.Close()
 	var result string
 	if err := backup.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		backup.Close()
 		return fmt.Errorf("verify sqlite migration backup: %w", err)
 	}
 	if result != "ok" {
+		backup.Close()
 		return fmt.Errorf("verify sqlite migration backup: integrity check = %q", result)
+	}
+	if err := backup.Close(); err != nil {
+		return fmt.Errorf("close verified sqlite migration backup: %w", err)
+	}
+	backupPath := s.databasePath + ".migration.bak"
+	archivedPath := ""
+	if _, err := os.Stat(backupPath); err == nil {
+		archivedPath = fmt.Sprintf("%s.migration.%d.bak", s.databasePath, time.Now().UTC().UnixNano())
+		if err := os.Rename(backupPath, archivedPath); err != nil {
+			return fmt.Errorf("preserve previous sqlite migration backup: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(temporaryPath, backupPath); err != nil {
+		if archivedPath != "" {
+			_ = os.Rename(archivedPath, backupPath)
+		}
+		return fmt.Errorf("publish sqlite migration backup: %w", err)
 	}
 	return nil
 }

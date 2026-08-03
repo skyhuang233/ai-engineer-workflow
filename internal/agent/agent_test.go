@@ -122,7 +122,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if audit.ContainerID != "container-failed" || audit.GitHubWriteCredentials {
+	if audit.ContainerID != "container-failed" || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) {
 		t.Fatalf("audit = %#v", audit)
 	}
 	next, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)})
@@ -290,6 +290,112 @@ func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T
 				t.Fatalf("restored branch = %q, err = %v", output, err)
 			}
 		})
+	}
+}
+
+func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
+	}
+	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: "https://user:token@github.com/owner/repo.git", Branch: "ticket-1", Prompt: "implement"})
+	if err == nil || !strings.Contains(err.Error(), "absolute local path") {
+		t.Fatalf("credential-bearing source error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatal("worker started with a credential-bearing workspace source")
+	}
+}
+
+func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, firstClaim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	if _, err := controller.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := exec.Command("git", "remote", "set-url", "origin", "https://user:token@github.com/owner/repo.git")
+	remote.Dir = session.WorkspacePath
+	if output, err := remote.CombinedOutput(); err != nil {
+		t.Fatalf("set credential-bearing remote: %v (%s)", err, output)
+	}
+	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRuntime := &fakeRuntime{}
+	controller.Runtime = secondRuntime
+	_, err = controller.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"})
+	if err == nil || !strings.Contains(err.Error(), "absolute local path") {
+		t.Fatalf("persisted external remote error = %v", err)
+	}
+	if len(secondRuntime.specs) != 0 {
+		t.Fatal("worker started with a persisted external remote")
+	}
+}
+
+func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, firstClaim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
+	firstController := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	accepted, err := firstController.Run(ctx, agent.RunRequest{Claim: firstClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "implement"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextClaim, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: firstClaim.TicketID, Owner: "agent-owner", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "second"), ContainerID: "container-2"}}}
+	secondController := agent.Controller{
+		Store: db, Workspace: manager, Runtime: secondRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
+		Now: func() time.Time { return nextClaim.LeaseExpiresAt.Add(time.Second) },
+	}
+	if _, err := secondController.Run(ctx, agent.RunRequest{Claim: nextClaim, SourceRepository: source, Branch: "ticket-1", Prompt: "revise"}); err == nil {
+		t.Fatal("expired candidate acceptance succeeded")
+	}
+	session, err := db.TicketSession(ctx, version.ID, firstClaim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := exec.Command("git", "rev-parse", "HEAD")
+	head.Dir = session.WorkspacePath
+	output, err := head.Output()
+	if err != nil || strings.TrimSpace(string(output)) != accepted.Commit {
+		t.Fatalf("workspace head = %q, err = %v; want accepted %q", output, err, accepted.Commit)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, nextClaim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := os.ReadFile(filepath.Join(filepath.Dir(diagnostic), "revision.patch"))
+	if err != nil || !strings.Contains(string(patch), "candidate resume") {
+		t.Fatalf("unaccepted candidate evidence = %q, err = %v", patch, err)
 	}
 }
 

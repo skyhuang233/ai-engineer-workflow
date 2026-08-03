@@ -12,6 +12,8 @@ import (
 
 var ErrGitHubCredential = errors.New("worker spec contains a GitHub write credential")
 
+const GatewayHostMapping = "host.docker.internal:host-gateway"
+
 type Mount struct {
 	Source   string
 	Target   string
@@ -28,6 +30,7 @@ type Spec struct {
 	ToolVersions   map[string]string
 	Environment    map[string]string
 	Mounts         []Mount
+	ExtraHosts     []string
 }
 
 type Result struct {
@@ -49,6 +52,9 @@ func (s Spec) Validate() error {
 	}
 	if len(s.ToolVersions) == 0 {
 		return errors.New("worker tool versions are required")
+	}
+	if !contains(s.ExtraHosts, GatewayHostMapping) {
+		return errors.New("worker Gateway host mapping is required")
 	}
 	for name := range s.Environment {
 		if IsGitHubCredentialName(name) {
@@ -97,7 +103,25 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if name == "" {
 		name = "docker"
 	}
+	args := dockerArgs(spec)
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	result := Result{Output: output}
+	if err != nil {
+		result.ExitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			result.ExitCode = exitErr.ExitCode()
+		}
+	}
+	return result, err
+}
+
+func dockerArgs(spec Spec) []string {
 	args := []string{"run", "--rm", "--workdir", "/workspace"}
+	for _, host := range spec.ExtraHosts {
+		args = append(args, "--add-host", host)
+	}
 	for _, mount := range spec.Mounts {
 		value := "type=bind,source=" + mount.Source + ",target=" + mount.Target
 		if mount.ReadOnly {
@@ -123,17 +147,16 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	for _, value := range spec.Command {
 		args = append(args, containerPath(value, spec.Mounts))
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
-	result := Result{Output: output}
-	if err != nil {
-		result.ExitCode = 1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			result.ExitCode = exitErr.ExitCode()
+	return args
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
 		}
 	}
-	return result, err
+	return false
 }
 
 func containerPath(value string, mounts []Mount) string {

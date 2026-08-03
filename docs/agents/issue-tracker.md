@@ -50,8 +50,8 @@ The Plan Root carries the `workflow:plan` label. Only native sub-issues with
 the `workflow:ticket` label are Executable Tickets; the root itself is never
 imported as a ticket. Activation is admitted only after every native child is
 typed and every blocked-by edge points to another child without cycles or
-duplicate edges. A closed blocker must already carry the derived
-`workflow:delivered` label.
+duplicate edges. A closed blocker must already have a verified Delivered fact;
+the derived `workflow:delivered` label is projection only and is never authority.
 
 The control plane records its state in a hidden, replaceable block delimited by
 `<!-- workflow:status:start -->` and `<!-- workflow:status:end -->`. It leaves

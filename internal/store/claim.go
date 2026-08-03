@@ -57,6 +57,8 @@ func (s *Store) ReadyFrontier(ctx context.Context, versionID string, maxParallel
 // ClaimReady is the execution boundary: eligibility, capacity, ownership,
 // session reuse, run numbering, and lease generation are committed together.
 func (s *Store) ClaimReady(ctx context.Context, request ClaimRequest) (TicketClaim, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	if request.VersionID == "" || request.Owner == "" || request.MaxParallelRuns <= 0 {
 		return TicketClaim{}, ErrInvalidClaim
 	}
@@ -232,6 +234,8 @@ WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ?`, vers
 // tickets. The caller is expected to have already verified the merged revision
 // and reachability at the GitHub boundary.
 func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issueID int64) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/skyhuang233/workflow/internal/plan"
 )
 
 func TestReadPlanUsesNativeSubIssuesAndBlockedByEndpoints(t *testing.T) {
@@ -92,6 +94,42 @@ func TestUpdateIssueBodyPreservesPatchPayloadAndHeaders(t *testing.T) {
 	defer server.Close()
 	if err := NewClient(server.URL, "", server.Client()).UpdateIssueBody(context.Background(), "owner/repo", 10, "human spec"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUpdatePlanProjectionReadsTheCurrentHumanBodyAtWriteTime(t *testing.T) {
+	var patched string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(issueResponse{ID: 100, Number: 10, Body: "fresh human edit"})
+		case r.Method == http.MethodPatch:
+			var payload struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			patched = payload.Body
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "", server.Client())
+	if err := client.UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(patched, "fresh human edit") || !strings.Contains(patched, plan.ProjectionStart) {
+		t.Fatalf("projected body = %q", patched)
+	}
+}
+
+func TestDeliveredLabelIsProjectionOnly(t *testing.T) {
+	issue := issueResponse{ID: 1, Number: 11, State: "closed", Labels: []labelResponse{{Name: "workflow:ticket"}, {Name: "workflow:delivered"}}}.issue()
+	if issue.IsDelivered() {
+		t.Fatal("workflow:delivered label became authoritative delivery state")
 	}
 }
 

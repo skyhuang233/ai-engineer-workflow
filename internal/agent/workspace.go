@@ -26,6 +26,10 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 	if m.RootDir == "" || m.CodexStateRoot == "" || sessionID == "" || sourceRepository == "" || branch == "" {
 		return workspace{}, errors.New("workspace configuration is incomplete")
 	}
+	sourceRepository, err := localSourceRepository(sourceRepository)
+	if err != nil {
+		return workspace{}, err
+	}
 	path := filepath.Join(m.RootDir, sessionID)
 	state := filepath.Join(m.CodexStateRoot, sessionID)
 	if err := os.MkdirAll(m.RootDir, 0o755); err != nil {
@@ -52,6 +56,9 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 			return workspace{}, fmt.Errorf("workspace branch is %q, want %q", strings.TrimSpace(current), branch)
 		}
 	}
+	if err := validateLocalRemotes(ctx, path); err != nil {
+		return workspace{}, err
+	}
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		return workspace{}, err
 	}
@@ -60,6 +67,47 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 		return workspace{}, err
 	}
 	return workspace{Path: path, CodexState: state, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
+}
+
+func validateLocalRemotes(ctx context.Context, path string) error {
+	remotes, err := gitOutput(ctx, path, "remote")
+	if err != nil {
+		return err
+	}
+	for _, remote := range strings.Fields(remotes) {
+		urls, err := gitOutput(ctx, path, "remote", "get-url", "--all", remote)
+		if err != nil {
+			return err
+		}
+		for _, remoteURL := range strings.Split(strings.TrimSpace(urls), "\n") {
+			remoteURL = strings.TrimSpace(remoteURL)
+			if remoteURL == "" {
+				continue
+			}
+			if !filepath.IsAbs(remoteURL) {
+				return fmt.Errorf("workspace remote %q must use an absolute local path", remote)
+			}
+		}
+	}
+	return nil
+}
+
+func localSourceRepository(source string) (string, error) {
+	if !filepath.IsAbs(source) {
+		return "", errors.New("workspace source repository must be an absolute local path")
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(source))
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace source repository: %w", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect workspace source repository: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("workspace source repository must be a local directory")
+	}
+	return resolved, nil
 }
 
 func (m WorkspaceManager) schemaPath(state string) string {
