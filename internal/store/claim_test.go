@@ -321,6 +321,71 @@ func TestFailedReviewRevisionRequeuesItsFeedback(t *testing.T) {
 	}
 }
 
+func TestExpiredReviewRevisionRequeuesItsFeedback(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}}, now); err != nil {
+		t.Fatal(err)
+	}
+	revision, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, now.Add(time.Second), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Hour)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("stale review claim error = %v, want ErrNotReady", err)
+	}
+	var claimedRunID, runtimeState string
+	if err := db.db.QueryRowContext(ctx, `SELECT claimed_run_id FROM review_feedback_events WHERE version_id = ? AND issue_id = ? AND source = ? AND event_id = ?`, version.ID, claim.TicketID, "review", "100").Scan(&claimedRunID); err != nil {
+		t.Fatal(err)
+	}
+	if claimedRunID != "" {
+		t.Fatalf("claimed run after expiry = %q, want empty", claimedRunID)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeState != plan.StateWaitingReview {
+		t.Fatalf("runtime state after expiry = %q, want %q", runtimeState, plan.StateWaitingReview)
+	}
+	retry, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour+time.Second), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Attempt != revision.Attempt+1 || !strings.Contains(prompt, "Please rename this.") {
+		t.Fatalf("retry = %#v, prompt = %q", retry, prompt)
+	}
+}
+
 func TestAcceptedHandoffRejectsPreexistingReviewEvidence(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

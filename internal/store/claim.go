@@ -170,6 +170,23 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 			if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND state = ?`, "expired", currentRunID, LeaseActive); err != nil {
 				return TicketClaim{}, err
 			}
+			result, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, currentRunID)
+			if err != nil {
+				return TicketClaim{}, err
+			}
+			claimedFeedback, err := result.RowsAffected()
+			if err != nil {
+				return TicketClaim{}, err
+			}
+			if claimedFeedback > 0 {
+				if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(request.Now), request.VersionID, selected.IssueID); err != nil {
+					return TicketClaim{}, err
+				}
+				if err := tx.Commit(); err != nil {
+					return TicketClaim{}, err
+				}
+				return TicketClaim{}, ErrNotReady
+			}
 		}
 		currentGeneration++
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, request.Owner, SessionRunning, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
