@@ -331,7 +331,7 @@ func runPollGitHub(args []string) {
 		}
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -415,18 +415,18 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	question, err := db.WorkflowQuestion(ctx, *repository, *questionID)
-	if err != nil {
-		fail(err)
-	}
 	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
-	projection, err := db.PlanProjection(ctx, question.VersionID)
+	questions, err := db.OpenWorkflowQuestions(ctx, *repository, 0)
 	if err != nil {
 		fail(err)
 	}
-	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectPlan(ctx, *repository, question.RootNumber, projection, ""); err != nil {
+	projected := make([]plan.WorkflowQuestion, 0, len(questions))
+	for _, open := range questions {
+		projected = append(projected, plan.WorkflowQuestion{ID: open.ID, Prompt: open.Prompt})
+	}
+	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectWorkflowInbox(ctx, *repository, projected); err != nil {
 		fail(err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -18,11 +19,16 @@ type PollResult struct {
 type ReviewLauncher func(context.Context, store.TicketClaim, string) error
 type ControlPass func(context.Context) error
 
+type WorkflowInboxProjector interface {
+	ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error
+}
+
 type Poller struct {
 	Store                 *store.Store
 	Client                *Client
 	Now                   func() time.Time
 	LaunchReview          ReviewLauncher
+	InboxProjector        WorkflowInboxProjector
 	MaxFailures           int
 	MaxWorkerAttempts     int
 	MaxParallelRuns       int
@@ -48,6 +54,12 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 		return PollResult{}, err
 	}
 	now := p.now()
+	if err := p.routeInboxAnswers(ctx, repository); err != nil {
+		return p.recordFailure(ctx, repository, now, err)
+	}
+	if err := p.projectWorkflowInbox(ctx, repository); err != nil {
+		return p.recordFailure(ctx, repository, now, err)
+	}
 	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
@@ -65,9 +77,6 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 			return p.recordFailure(ctx, repository, now, err)
 		}
 	}
-	if err := p.routeInboxAnswers(ctx, repository); err != nil {
-		return p.recordFailure(ctx, repository, now, err)
-	}
 	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
 		return p.recordFailure(ctx, repository, now, err)
@@ -79,20 +88,25 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 }
 
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
+	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	var githubError *apiError
 	if errors.As(cause, &githubError) && githubError.RetryAt.After(now) {
-		if err := p.Store.DeferGitHubPoll(ctx, repository, githubError.RetryAt, now); err != nil {
+		if err := p.Store.DeferGitHubPoll(persistenceCtx, repository, githubError.RetryAt, now); err != nil {
 			return PollResult{}, errors.Join(cause, err)
 		}
 		return PollResult{}, cause
 	}
-	if recordErr := p.Store.RecordGitHubPollFailure(ctx, repository, now); recordErr != nil {
+	if recordErr := p.Store.RecordGitHubPollFailure(persistenceCtx, repository, now); recordErr != nil {
 		return PollResult{}, errors.Join(cause, recordErr)
 	}
-	updated, cursorErr := p.Store.GitHubPollCursor(ctx, repository)
+	updated, cursorErr := p.Store.GitHubPollCursor(persistenceCtx, repository)
 	if cursorErr == nil && updated.ConsecutiveFailures >= p.maxFailures() {
-		if attentionErr := p.Store.MarkRepositoryNeedsAttention(ctx, repository, now); attentionErr != nil {
+		if attentionErr := p.Store.MarkRepositoryNeedsAttention(persistenceCtx, repository, now); attentionErr != nil {
 			return PollResult{}, errors.Join(cause, attentionErr)
+		}
+		if inboxErr := p.projectWorkflowInbox(persistenceCtx, repository); inboxErr != nil {
+			return PollResult{}, errors.Join(cause, inboxErr)
 		}
 		return PollResult{}, store.ErrNeedsAttention
 	}
@@ -186,11 +200,15 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 	if err != nil {
 		return err
 	}
+	questionIDs := make([]string, 0, len(questions))
 	for _, question := range questions {
-		answers, err := p.Client.WorkflowInboxAnswers(ctx, repository, question.RootNumber, []string{question.ID})
-		if err != nil {
-			return err
-		}
+		questionIDs = append(questionIDs, question.ID)
+	}
+	answers, err := p.Client.WorkflowInboxAnswers(ctx, repository, questionIDs)
+	if err != nil {
+		return err
+	}
+	for _, question := range questions {
 		if answer, ok := answers[question.ID]; ok {
 			if err := p.Store.AnswerWorkflowQuestion(ctx, repository, question.ID, answer, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
@@ -198,6 +216,21 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 		}
 	}
 	return nil
+}
+
+func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) error {
+	if p.InboxProjector == nil {
+		return nil
+	}
+	questions, err := p.Store.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		return err
+	}
+	projected := make([]plan.WorkflowQuestion, 0, len(questions))
+	for _, question := range questions {
+		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt})
+	}
+	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
 func hasPullRequestUpdate(updated map[int64]struct{}, number int64) bool {

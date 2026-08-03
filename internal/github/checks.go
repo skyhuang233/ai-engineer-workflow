@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -80,7 +81,7 @@ func (c *Client) getJSONIfChanged(ctx context.Context, path string, destination 
 		return false, etag, nil
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return false, "", &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Message: response.Status}
+		return false, "", &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Message: response.Status, RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
 	}
 	if err := json.NewDecoder(response.Body).Decode(destination); err != nil {
 		return false, "", err

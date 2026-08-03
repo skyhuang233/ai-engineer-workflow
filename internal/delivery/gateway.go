@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -87,6 +88,15 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				return store.DeliveryResult{}, projectionErr
 			}
 			request.PlanProjection = &projection
+		} else if request.Operation == store.DeliveryProjectInbox {
+			questions, questionsErr := g.Store.OpenWorkflowQuestions(operationCtx, request.Repository, 0)
+			if questionsErr != nil {
+				return store.DeliveryResult{}, questionsErr
+			}
+			request.WorkflowQuestions = make([]plan.WorkflowQuestion, 0, len(questions))
+			for _, question := range questions {
+				request.WorkflowQuestions = append(request.WorkflowQuestions, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt})
+			}
 		}
 		observation, observeErr := g.Remote.Observe(operationCtx, request)
 		if observeErr != nil {

@@ -28,3 +28,12 @@ func (p PlanProjector) ProjectPlan(ctx context.Context, repository string, rootN
 	}
 	return p.Gateway.Dispatch(ctx, outbox.IdempotencyKey)
 }
+
+func (p PlanProjector) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	request := store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: questions}
+	outbox, err := p.Gateway.Submit(ctx, request)
+	if err != nil {
+		return err
+	}
+	return p.Gateway.Dispatch(ctx, outbox.IdempotencyKey)
+}

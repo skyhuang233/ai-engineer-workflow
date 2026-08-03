@@ -306,13 +306,23 @@ func TestValidateRepository(t *testing.T) {
 
 func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/issues/10/comments" {
-			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/owner/repo/issues":
+			if r.Method != http.MethodGet || r.URL.Query().Get("labels") != workflowInboxLabel {
+				t.Fatalf("request = %s %s", r.Method, r.URL.String())
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 10, "number": 10, "title": "Workflow Inbox", "body": "", "labels": []map[string]string{{"name": workflowInboxLabel}}}})
+		case "/repos/owner/repo/issues/10/comments":
+			if r.Method != http.MethodGet {
+				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored"}})
+		default:
+			t.Fatalf("request = %s %s", r.Method, r.URL.String())
 		}
-		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored"}})
 	}))
 	defer server.Close()
-	answers, err := NewClient(server.URL, "", server.Client()).WorkflowInboxAnswers(context.Background(), "owner/repo", 10, []string{"needs-attention-pv-1-1-g1"})
+	answers, err := NewClient(server.URL, "", server.Client()).WorkflowInboxAnswers(context.Background(), "owner/repo", []string{"needs-attention-pv-1-1-g1"})
 	if err != nil {
 		t.Fatal(err)
 	}

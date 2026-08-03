@@ -20,6 +20,7 @@ const (
 	DeliveryUpsertPR      DeliveryOperation = "upsert_pull_request"
 	DeliveryReplyEvidence DeliveryOperation = "reply_evidence"
 	DeliveryProjectPlan   DeliveryOperation = "project_plan"
+	DeliveryProjectInbox  DeliveryOperation = "project_workflow_inbox"
 	DeliveryAddIssueLabel DeliveryOperation = "add_issue_label"
 
 	OutboxPending    = "pending"
@@ -37,23 +38,24 @@ var (
 // The gateway derives all authoritative ownership fields from RunID and the
 // current Run Lease before this request can reach an external writer.
 type DeliveryRequest struct {
-	Operation          DeliveryOperation `json:"operation"`
-	RunID              string            `json:"run_id"`
-	LeaseToken         string            `json:"lease_token"`
-	LeaseGeneration    int64             `json:"lease_generation"`
-	Repository         string            `json:"repository"`
-	RootNumber         int64             `json:"root_number,omitempty"`
-	Branch             string            `json:"branch,omitempty"`
-	PullRequestNumber  int64             `json:"pull_request_number,omitempty"`
-	CommitSHA          string            `json:"commit_sha,omitempty"`
-	ExpectedRemoteHead string            `json:"expected_remote_head,omitempty"`
-	ExpectRemoteAbsent bool              `json:"expect_remote_absent,omitempty"`
-	Title              string            `json:"title,omitempty"`
-	Body               string            `json:"body,omitempty"`
-	Evidence           string            `json:"evidence,omitempty"`
-	PlanProjection     *plan.Projection  `json:"plan_projection,omitempty"`
-	Label              string            `json:"label,omitempty"`
-	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
+	Operation          DeliveryOperation       `json:"operation"`
+	RunID              string                  `json:"run_id"`
+	LeaseToken         string                  `json:"lease_token"`
+	LeaseGeneration    int64                   `json:"lease_generation"`
+	Repository         string                  `json:"repository"`
+	RootNumber         int64                   `json:"root_number,omitempty"`
+	Branch             string                  `json:"branch,omitempty"`
+	PullRequestNumber  int64                   `json:"pull_request_number,omitempty"`
+	CommitSHA          string                  `json:"commit_sha,omitempty"`
+	ExpectedRemoteHead string                  `json:"expected_remote_head,omitempty"`
+	ExpectRemoteAbsent bool                    `json:"expect_remote_absent,omitempty"`
+	Title              string                  `json:"title,omitempty"`
+	Body               string                  `json:"body,omitempty"`
+	Evidence           string                  `json:"evidence,omitempty"`
+	PlanProjection     *plan.Projection        `json:"plan_projection,omitempty"`
+	WorkflowQuestions  []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
+	Label              string                  `json:"label,omitempty"`
+	IdempotencyKey     string                  `json:"idempotency_key,omitempty"`
 }
 
 type DeliveryTarget struct {
@@ -755,6 +757,12 @@ func (s *Store) RecordDeliveryAudit(ctx context.Context, request DeliveryRequest
 }
 
 func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryTarget, DeliveryRequest, error) {
+	if request.Operation == DeliveryProjectInbox && request.RunID == "" {
+		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
+			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
+		}
+		return DeliveryTarget{Repository: request.Repository}, request, nil
+	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber <= 0 || request.PlanProjection == nil || request.PlanProjection.VersionID == "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: control-plane projection is incomplete", ErrDeliveryRejected)

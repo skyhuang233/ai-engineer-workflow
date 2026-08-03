@@ -91,14 +91,25 @@ func renderBlock(projection Projection) string {
 		}
 	}
 	if len(projection.Questions) > 0 {
-		questions := append([]WorkflowQuestion(nil), projection.Questions...)
-		sort.Slice(questions, func(i, j int) bool { return questions[i].ID < questions[j].ID })
-		b.WriteString("\n### Workflow Inbox\n\n")
-		for _, question := range questions {
-			fmt.Fprintf(&b, "- `%s`: %s Reply with `workflow-answer:%s: <answer>`.\n", question.ID, escapeCell(question.Prompt), question.ID)
-		}
+		b.WriteString("\n### Workflow Inbox\n\nPending human decisions are listed in the repository Workflow Inbox.\n")
 	}
 	fmt.Fprintf(&b, "%s", ProjectionEnd)
+	return b.String()
+}
+
+func RenderWorkflowInbox(questions []WorkflowQuestion) string {
+	questions = append([]WorkflowQuestion(nil), questions...)
+	sort.Slice(questions, func(i, j int) bool { return questions[i].ID < questions[j].ID })
+	var b strings.Builder
+	b.WriteString("# Workflow Inbox\n\nReply with `workflow-answer:<question-id>: <answer>`.\n")
+	if len(questions) == 0 {
+		b.WriteString("\nNo open workflow questions.\n")
+		return b.String()
+	}
+	b.WriteString("\n## Open questions\n\n")
+	for _, question := range questions {
+		fmt.Fprintf(&b, "- `%s`: %s\n", question.ID, escapeCell(question.Prompt))
+	}
 	return b.String()
 }
 

@@ -181,18 +181,27 @@ func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
 }
 
-func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, rootNumber int64, questionIDs []string) (map[string]string, error) {
+const workflowInboxLabel = "workflow:inbox"
+
+func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, questionIDs []string) (map[string]string, error) {
 	if err := ValidateRepository(repository); err != nil {
 		return nil, err
 	}
-	if rootNumber <= 0 || len(questionIDs) == 0 {
-		return nil, fmt.Errorf("workflow inbox location is incomplete")
+	if len(questionIDs) == 0 {
+		return map[string]string{}, nil
 	}
 	known := make(map[string]struct{}, len(questionIDs))
 	for _, questionID := range questionIDs {
 		known[questionID] = struct{}{}
 	}
-	comments, err := c.listIssueComments(ctx, repository, rootNumber)
+	inbox, found, err := c.workflowInbox(ctx, repository)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return map[string]string{}, nil
+	}
+	comments, err := c.listIssueComments(ctx, repository, inbox.Number)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +217,57 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, ro
 		}
 	}
 	return answers, nil
+}
+
+func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	if err := ValidateRepository(repository); err != nil {
+		return err
+	}
+	inbox, found, err := c.workflowInbox(ctx, repository)
+	if err != nil {
+		return err
+	}
+	body := plan.RenderWorkflowInbox(questions)
+	if found {
+		return c.requestJSON(ctx, http.MethodPatch, "/repos/"+repository+"/issues/"+strconv.FormatInt(inbox.Number, 10), map[string]string{"title": "Workflow Inbox", "body": body, "state": "open"}, nil)
+	}
+	payload := struct {
+		Title  string   `json:"title"`
+		Body   string   `json:"body"`
+		Labels []string `json:"labels"`
+	}{Title: "Workflow Inbox", Body: body, Labels: []string{workflowInboxLabel}}
+	return c.requestJSON(ctx, http.MethodPost, "/repos/"+repository+"/issues", payload, nil)
+}
+
+func (c *Client) HasWorkflowInboxProjection(ctx context.Context, repository string, questions []plan.WorkflowQuestion) (bool, error) {
+	inbox, found, err := c.workflowInbox(ctx, repository)
+	if err != nil || !found {
+		return false, err
+	}
+	return inbox.Body == plan.RenderWorkflowInbox(questions), nil
+}
+
+func (c *Client) workflowInbox(ctx context.Context, repository string) (plan.Issue, bool, error) {
+	issues, err := c.listIssues(ctx, "/repos/"+repository+"/issues?state=all&labels="+url.QueryEscape(workflowInboxLabel)+"&per_page=100")
+	if err != nil {
+		return plan.Issue{}, false, err
+	}
+	var inboxes []plan.Issue
+	for _, issue := range issues {
+		for _, label := range issue.Labels {
+			if label == workflowInboxLabel {
+				inboxes = append(inboxes, issue)
+				break
+			}
+		}
+	}
+	if len(inboxes) > 1 {
+		return plan.Issue{}, false, fmt.Errorf("multiple repository Workflow Inbox issues found")
+	}
+	if len(inboxes) == 0 {
+		return plan.Issue{}, false, nil
+	}
+	return inboxes[0], true, nil
 }
 
 func parseWorkflowInboxAnswers(body string) map[string]string {

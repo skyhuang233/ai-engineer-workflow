@@ -40,6 +40,10 @@ func (p HTTPProjector) ProjectPlan(ctx context.Context, repository string, rootN
 	return p.deliver(ctx, command)
 }
 
+func (p HTTPProjector) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	return p.deliver(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: questions})
+}
+
 func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryRequest) error {
 	if strings.TrimSpace(p.URL) == "" || strings.TrimSpace(p.ControlPlaneToken) == "" {
 		return errors.New("control-plane gateway credentials are missing")
@@ -88,7 +92,7 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 			return
 		}
 		if command.RunID == "" {
-			if command.Operation != store.DeliveryProjectPlan && command.Operation != store.DeliveryAddIssueLabel {
+			if command.Operation != store.DeliveryProjectPlan && command.Operation != store.DeliveryProjectInbox && command.Operation != store.DeliveryAddIssueLabel {
 				http.Error(writer, "unsupported control-plane delivery command", http.StatusForbidden)
 				return
 			}

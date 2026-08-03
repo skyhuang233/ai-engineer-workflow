@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 14
+	latestSchemaVersion = 15
 )
 
 var (
@@ -501,6 +501,25 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (14, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 15 {
+		statements := []string{
+			`CREATE TABLE poll_failure_targets (
+    poll_question_id TEXT NOT NULL REFERENCES workflow_questions(question_id),
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    ticket_question_id TEXT NOT NULL REFERENCES workflow_questions(question_id),
+    PRIMARY KEY (poll_question_id, version_id, issue_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 15: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (15, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

@@ -33,7 +33,14 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 	if r.Client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
-	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryAddIssueLabel {
+	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryProjectInbox || request.Operation == store.DeliveryAddIssueLabel {
+		if request.Operation == store.DeliveryProjectInbox {
+			applied, err := r.Client.HasWorkflowInboxProjection(ctx, request.Repository, request.WorkflowQuestions)
+			if err != nil {
+				return delivery.Observation{}, err
+			}
+			return delivery.Observation{Applied: applied}, nil
+		}
 		if request.PlanProjection == nil {
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
@@ -142,6 +149,11 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
 		if err := r.Client.UpdatePlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection); err != nil {
+			return delivery.Observation{}, err
+		}
+		return delivery.Observation{Applied: true}, nil
+	case store.DeliveryProjectInbox:
+		if err := r.Client.ProjectWorkflowInbox(ctx, request.Repository, request.WorkflowQuestions); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
