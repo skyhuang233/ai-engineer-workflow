@@ -215,7 +215,7 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	if err != nil || recovered.RunID != candidate.RunID || handoff.PushOutboxKey != candidate.PushOutboxKey || handoff.PROutboxKey != candidate.PROutboxKey {
 		t.Fatalf("recovered candidate handoff = %#v, %#v, err=%v", recovered, handoff, err)
 	}
-	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
+	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --skip-git-repo-check implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
 	}
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
@@ -228,12 +228,20 @@ func TestControllerPersistsCodexSessionAcrossReplacementRuns(t *testing.T) {
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
 		t.Fatalf("claim while delivery handoff is pending = %v, want fencing conflict", err)
 	}
-	revision, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC().Add(time.Second))
+	revision, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC().Add(time.Second), 1)
 	if err != nil {
 		t.Fatalf("claim review revision: %v", err)
 	}
 	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || revision.LeaseGeneration != claim.LeaseGeneration+1 {
 		t.Fatalf("review revision claim = %#v", revision)
+	}
+	second := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "revised"), ContainerID: "container-2"}}}
+	controller.Runtime = second
+	if _, err := controller.Run(ctx, candidateRequest(revision, source, "ticket-1", "address the review feedback")); err != nil {
+		t.Fatalf("run review revision: %v", err)
+	}
+	if len(second.specs) != 1 || strings.Join(second.specs[0].Command, " ") != "codex exec resume --json --skip-git-repo-check codex-session-1 address the review feedback" {
+		t.Fatalf("review worker spec = %#v", second.specs)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
 		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)

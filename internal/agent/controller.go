@@ -18,7 +18,6 @@ type Controller struct {
 	Runtime      worker.Runtime
 	ImageDigest  string
 	ToolVersions map[string]string
-	NoMistakes   string
 	GatewayURL   string
 	Now          func() time.Time
 }
@@ -81,11 +80,10 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
-	noMistakes := c.NoMistakes
-	if noMistakes == "" {
-		noMistakes = "no-mistakes"
+	command := []string{"codex", "exec", "--json", "--skip-git-repo-check", request.Prompt}
+	if session.CodexSessionID != "" {
+		command = []string{"codex", "exec", "resume", "--json", "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
 	}
-	command := []string{noMistakes, "axi", "run", "--intent", request.Prompt}
 	environment := map[string]string{
 		"CODEX_HOME":                   ws.CodexState,
 		"NO_MISTAKES_DELIVERY_CYCLE":   session.SessionID,

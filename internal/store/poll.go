@@ -302,6 +302,11 @@ WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateNeedsAttention, formatTimestamp(now), versionID, issueID); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id IN (
+    SELECT run_id FROM worker_runs WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)
+)`, RunRunning, versionID, issueID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, formatTimestamp(now), RunRunning, versionID, issueID); err != nil {
 		return err
 	}
