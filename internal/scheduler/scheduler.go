@@ -16,6 +16,12 @@ type Dispatcher struct {
 	MaxParallelRuns int
 	LeaseTTL        time.Duration
 	Now             func() time.Time
+	Recovery        RecoveryInspector
+}
+
+type RecoveryInspector interface {
+	ContainerRunning(context.Context, string) (bool, error)
+	WorkspaceAvailable(context.Context, store.TicketSession) (bool, error)
 }
 
 // Claim reads the Plan Root only for the current human body and repository
@@ -79,6 +85,32 @@ func (d Dispatcher) Recover(ctx context.Context, repository string, rootNumber i
 	now := time.Now().UTC()
 	if d.Now != nil {
 		now = d.Now().UTC()
+	}
+	if d.Recovery != nil {
+		runs, err := d.Store.ActiveRecoveryRuns(ctx, version.ID, now)
+		if err != nil {
+			return err
+		}
+		for _, run := range runs {
+			containerRunning, err := d.Recovery.ContainerRunning(ctx, run.Claim.RunID)
+			if err != nil {
+				return fmt.Errorf("recover worker container %s: %w", run.Claim.RunID, err)
+			}
+			workspaceAvailable, err := d.Recovery.WorkspaceAvailable(ctx, run.Session)
+			if err != nil {
+				return fmt.Errorf("recover ticket workspace %s: %w", run.Claim.SessionID, err)
+			}
+			if containerRunning && workspaceAvailable {
+				continue
+			}
+			reason := "worker container is not running"
+			if !workspaceAvailable {
+				reason = "ticket workspace is unavailable"
+			}
+			if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now); err != nil {
+				return err
+			}
+		}
 	}
 	projection, err := d.Store.PlanProjectionAt(ctx, version.ID, now)
 	if err != nil {

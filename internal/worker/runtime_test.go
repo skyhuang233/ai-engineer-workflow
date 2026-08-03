@@ -20,7 +20,7 @@ func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
 
 func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	spec := Spec{
-		Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		RunID: "run-1", Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
 		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"},
 		ExtraHosts: []string{GatewayHostMapping},
 	}
@@ -34,6 +34,18 @@ func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	if !found {
 		t.Fatalf("docker args omit Gateway host mapping: %#v", args)
 	}
+	if !containsArgs(args, "--label", "workflow.run_id=run-1") {
+		t.Fatalf("docker args omit run label: %#v", args)
+	}
+}
+
+func containsArgs(args []string, first, second string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == first && args[i+1] == second {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGitHubCredentialClassifierCoversTokenAliases(t *testing.T) {

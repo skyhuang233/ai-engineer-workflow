@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 18
+	latestSchemaVersion = 19
 )
 
 var (
@@ -550,6 +550,14 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return fmt.Errorf("migration 18: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (18, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 19 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE ticket_sessions ADD COLUMN workspace_reclaimed_at TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migration 19: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (19, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

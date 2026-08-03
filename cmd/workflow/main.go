@@ -277,13 +277,14 @@ func runPollGitHub(args []string) {
 	source := flags.String("source", "", "absolute local repository path for review revisions")
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
+	workspaceRetention := flags.Duration("workspace-retention", 7*24*time.Hour, "retention period before closed Ticket Workspaces are reclaimed")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 {
+	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
 		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, read credential, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
@@ -349,8 +350,12 @@ func runPollGitHub(args []string) {
 			if _, err := activator.Activate(ctx, *repository, *rootNumber); err != nil {
 				return err
 			}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute}
+			workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}}
 			if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
+				return err
+			}
+			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
 				return err
 			}
 			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, *maxParallelRuns, 30*time.Minute, time.Now().UTC(), launchDelivery); err != nil {

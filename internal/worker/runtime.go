@@ -22,6 +22,7 @@ type Mount struct {
 }
 
 type Spec struct {
+	RunID          string
 	Command        []string
 	WorkspacePath  string
 	CodexStatePath string
@@ -44,6 +45,10 @@ type Result struct {
 
 type Runtime interface {
 	Run(context.Context, Spec) (Result, error)
+}
+
+type ContainerInspector interface {
+	ContainerRunning(context.Context, string) (bool, error)
 }
 
 func (s Spec) Validate() error {
@@ -144,6 +149,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 
 func dockerArgs(spec Spec) []string {
 	args := []string{"run", "--rm", "--workdir", "/workspace"}
+	if spec.RunID != "" {
+		args = append(args, "--label", "workflow.run_id="+spec.RunID)
+	}
 	for _, host := range spec.ExtraHosts {
 		args = append(args, "--add-host", host)
 	}
@@ -173,6 +181,21 @@ func dockerArgs(spec Spec) []string {
 		args = append(args, containerPath(value, spec.Mounts))
 	}
 	return args
+}
+
+func (r DockerRuntime) ContainerRunning(ctx context.Context, runID string) (bool, error) {
+	if strings.TrimSpace(runID) == "" {
+		return false, errors.New("worker run ID is required")
+	}
+	name := r.Binary
+	if name == "" {
+		name = "docker"
+	}
+	output, err := exec.CommandContext(ctx, name, "container", "ls", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
+	if err != nil {
+		return false, fmt.Errorf("inspect worker container: %w", err)
+	}
+	return strings.TrimSpace(string(output)) != "", nil
 }
 
 func contains(values []string, target string) bool {

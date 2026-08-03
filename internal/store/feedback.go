@@ -284,6 +284,13 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 	if inserted == 0 {
 		return false, tx.Commit()
 	}
+	repository, report, err := closedUnmergedImpactReportTx(ctx, tx, versionID, issueID)
+	if err != nil {
+		return false, err
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "closed_unmerged_impact", report, now); err != nil {
+		return false, err
+	}
 	if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "pull request closed without merge", now); err != nil {
 		return false, err
 	}
@@ -300,4 +307,83 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 		return false, err
 	}
 	return true, nil
+}
+
+func closedUnmergedImpactReportTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64) (string, string, error) {
+	var repository string
+	var rootNumber int64
+	if err := tx.QueryRowContext(ctx, `SELECT p.repository, p.root_issue_number
+FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, versionID).Scan(&repository, &rootNumber); err != nil {
+		return "", "", err
+	}
+	var report strings.Builder
+	fmt.Fprintf(&report, "Pull request for ticket issue %d closed without merge. Plan #%d is frozen pending a human decision.\n\nTickets:\n", issueID, rootNumber)
+	tickets, err := tx.QueryContext(ctx, `SELECT t.issue_number, t.title, rt.state, rt.delivered, COALESCE(s.agent_identity, ''), COALESCE(td.pull_request_number, 0)
+FROM plan_tickets t
+JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id
+LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
+LEFT JOIN ticket_deliveries td ON td.version_id = t.version_id AND td.issue_id = t.issue_id
+WHERE t.version_id = ? ORDER BY t.issue_number`, versionID)
+	if err != nil {
+		return "", "", err
+	}
+	defer tickets.Close()
+	var merged []string
+	for tickets.Next() {
+		var number, pullRequest int64
+		var title, state, agentIdentity string
+		var delivered int
+		if err := tickets.Scan(&number, &title, &state, &delivered, &agentIdentity, &pullRequest); err != nil {
+			return "", "", err
+		}
+		if agentIdentity == "" {
+			agentIdentity = "unassigned"
+		}
+		if pullRequest == 0 {
+			fmt.Fprintf(&report, "- ticket #%d (%s): %s; agent %s; pull request none\n", number, title, state, agentIdentity)
+		} else {
+			fmt.Fprintf(&report, "- ticket #%d (%s): %s; agent %s; pull request #%d\n", number, title, state, agentIdentity, pullRequest)
+		}
+		if delivered != 0 {
+			merged = append(merged, fmt.Sprintf("ticket #%d", number))
+		}
+	}
+	if err := tickets.Err(); err != nil {
+		return "", "", err
+	}
+	if len(merged) == 0 {
+		report.WriteString("\nMerged work: none.\n")
+	} else {
+		fmt.Fprintf(&report, "\nMerged work: %s.\n", strings.Join(merged, ", "))
+	}
+	report.WriteString("\nCross-plan dependencies:\n")
+	dependencies, err := tx.QueryContext(ctx, `SELECT p.repository, p.root_issue_number, t.issue_number
+FROM plan_dependencies d
+JOIN plan_tickets t ON t.version_id = d.version_id AND t.issue_id = d.blocked_issue_id
+JOIN plan_versions v ON v.version_id = d.version_id
+JOIN plans p ON p.id = v.plan_id AND p.current_version_id = v.version_id
+WHERE d.blocker_issue_id = ? AND d.version_id <> ?
+ORDER BY p.repository, p.root_issue_number, t.issue_number`, issueID, versionID)
+	if err != nil {
+		return "", "", err
+	}
+	defer dependencies.Close()
+	foundDependency := false
+	for dependencies.Next() {
+		var dependentRepository string
+		var dependentRoot, dependentTicket int64
+		if err := dependencies.Scan(&dependentRepository, &dependentRoot, &dependentTicket); err != nil {
+			return "", "", err
+		}
+		fmt.Fprintf(&report, "- %s plan #%d ticket #%d remains blocked for replanning\n", dependentRepository, dependentRoot, dependentTicket)
+		foundDependency = true
+	}
+	if err := dependencies.Err(); err != nil {
+		return "", "", err
+	}
+	if !foundDependency {
+		report.WriteString("- none recorded\n")
+	}
+	report.WriteString("Reply with an id-addressed replacement or cancellation decision.")
+	return repository, report.String(), nil
 }

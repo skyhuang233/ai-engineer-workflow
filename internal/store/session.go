@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
@@ -14,15 +15,67 @@ import (
 var ErrSessionConflict = errors.New("ticket session identity conflict")
 
 type TicketSession struct {
-	SessionID      string
-	VersionID      string
-	TicketID       int64
-	AgentIdentity  string
-	CodexSessionID string
-	WorkspacePath  string
-	CodexStatePath string
-	Branch         string
-	AcceptedCommit string
+	SessionID            string
+	VersionID            string
+	TicketID             int64
+	AgentIdentity        string
+	CodexSessionID       string
+	WorkspacePath        string
+	CodexStatePath       string
+	Branch               string
+	AcceptedCommit       string
+	WorkspaceReclaimedAt time.Time
+}
+
+func (s *Store) ClosedSessionsForWorkspaceCleanup(ctx context.Context, retention time.Duration, now time.Time) ([]TicketSession, error) {
+	if retention <= 0 {
+		return nil, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT session_id, version_id, issue_id, workspace_path, codex_state_path
+FROM ticket_sessions
+WHERE state = ? AND workspace_reclaimed_at = '' AND updated_at <= ?
+ORDER BY updated_at, session_id`, SessionClosed, formatTimestamp(now.Add(-retention)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sessions []TicketSession
+	for rows.Next() {
+		var session TicketSession
+		if err := rows.Scan(&session.SessionID, &session.VersionID, &session.TicketID, &session.WorkspacePath, &session.CodexStatePath); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+func (s *Store) MarkWorkspaceReclaimed(ctx context.Context, sessionID string, now time.Time) error {
+	if sessionID == "" {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE ticket_sessions
+SET workspace_reclaimed_at = ?
+WHERE session_id = ? AND state = ? AND workspace_reclaimed_at = ''`, formatTimestamp(now), sessionID, SessionClosed)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 type AgentBinding struct {
@@ -89,6 +142,104 @@ type CandidateRecord struct {
 	CodexSessionID   string
 	CommitSHA        string
 	StructuredOutput []byte
+}
+
+type RecoveryRun struct {
+	Claim   TicketClaim
+	Kind    string
+	Session TicketSession
+}
+
+func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
+	if versionID == "" {
+		return nil, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
+s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit,
+l.lease_token, l.generation, l.expires_at
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.state = ? AND l.state = ? AND l.expires_at > ?
+ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var runs []RecoveryRun
+	for rows.Next() {
+		var run RecoveryRun
+		var expiresAt string
+		if err := rows.Scan(&run.Claim.RunID, &run.Kind, &run.Claim.VersionID, &run.Claim.TicketID, &run.Claim.TicketNumber, &run.Claim.TicketTitle, &run.Claim.Owner, &run.Claim.SessionID,
+			&run.Session.AgentIdentity, &run.Session.CodexSessionID, &run.Session.WorkspacePath, &run.Session.CodexStatePath, &run.Session.Branch, &run.Session.AcceptedCommit,
+			&run.Claim.LeaseToken, &run.Claim.LeaseGeneration, &expiresAt); err != nil {
+			return nil, err
+		}
+		run.Session.SessionID = run.Claim.SessionID
+		run.Session.VersionID = run.Claim.VersionID
+		run.Session.TicketID = run.Claim.TicketID
+		var parseErr error
+		run.Claim.LeaseExpiresAt, parseErr = time.Parse(time.RFC3339Nano, expiresAt)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if run.Claim.RunID == "" || run.Claim.LeaseToken == "" || run.Claim.LeaseGeneration <= 0 || strings.TrimSpace(reason) == "" {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var kind string
+	err = tx.QueryRowContext(ctx, `SELECT r.run_kind FROM worker_runs r
+JOIN ticket_sessions s ON s.current_run_id = r.run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AND l.state = ?`, run.Claim.RunID, run.Claim.LeaseToken, run.Claim.LeaseGeneration, RunRunning, LeaseActive).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidClaim
+	}
+	if err != nil {
+		return err
+	}
+	if kind == RunDelivery {
+		if err := markTicketNeedsAttentionTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, "Delivery Controller was not recoverable after restart: "+reason, now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), run.Claim.RunID, RunRunning); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, run.Claim.RunID, run.Claim.LeaseToken, LeaseActive); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, run.Claim.RunID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), run.Claim.VersionID, run.Claim.TicketID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) TicketSession(ctx context.Context, versionID string, ticketID int64) (TicketSession, error) {

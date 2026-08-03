@@ -8,6 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/worker"
 )
 
 type WorkspaceManager struct {
@@ -20,6 +24,92 @@ type workspace struct {
 	CodexState string
 	Branch     string
 	BaseCommit string
+}
+
+type RecoveryInspector struct {
+	Containers worker.ContainerInspector
+	Workspace  WorkspaceManager
+}
+
+func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (bool, error) {
+	if r.Containers == nil {
+		return false, errors.New("container recovery inspector is incomplete")
+	}
+	return r.Containers.ContainerRunning(ctx, runID)
+}
+
+func (r RecoveryInspector) WorkspaceAvailable(_ context.Context, session store.TicketSession) (bool, error) {
+	for _, path := range []string{session.WorkspacePath, session.CodexStatePath} {
+		if strings.TrimSpace(path) == "" {
+			return false, nil
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.IsDir() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (m WorkspaceManager) ReclaimClosed(ctx context.Context, db *store.Store, retention time.Duration, now time.Time) (int, error) {
+	if db == nil || retention <= 0 {
+		return 0, errors.New("workspace cleanup configuration is incomplete")
+	}
+	sessions, err := db.ClosedSessionsForWorkspaceCleanup(ctx, retention, now)
+	if err != nil {
+		return 0, err
+	}
+	reclaimed := 0
+	var cleanupErr error
+	for _, session := range sessions {
+		workspacePath, err := managedPath(m.RootDir, session.WorkspacePath)
+		if err == nil {
+			err = os.RemoveAll(workspacePath)
+		}
+		if err == nil {
+			statePath, stateErr := managedPath(m.CodexStateRoot, session.CodexStatePath)
+			if stateErr != nil {
+				err = stateErr
+			} else {
+				err = os.RemoveAll(statePath)
+			}
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		if err := db.MarkWorkspaceReclaimed(ctx, session.SessionID, now); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		reclaimed++
+	}
+	return reclaimed, cleanupErr
+}
+
+func managedPath(root, target string) (string, error) {
+	if strings.TrimSpace(root) == "" || strings.TrimSpace(target) == "" {
+		return "", errors.New("managed workspace path is incomplete")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("workspace path is outside its managed root")
+	}
+	return target, nil
 }
 
 func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepository, branch string) (workspace, error) {

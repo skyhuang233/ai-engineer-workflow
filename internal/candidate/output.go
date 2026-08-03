@@ -10,11 +10,11 @@ import (
 
 const Schema = `{
   "type": "object",
-  "required": ["summary"],
+  "required": ["summary", "tests"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
     "commit": {"type": "string"},
-    "tests": {"type": "array", "items": {"type": "string"}}
+    "tests": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
   },
   "additionalProperties": false
 }`
@@ -50,16 +50,18 @@ func Validate(output []byte) error {
 			return errors.New("structured result commit must be a string")
 		}
 	}
-	if tests, ok := fields["tests"]; ok {
-		var testNames []json.RawMessage
-		if err := json.Unmarshal(tests, &testNames); err != nil || jsonNull(tests) {
-			return errors.New("structured result tests must be strings")
-		}
-		for _, testName := range testNames {
-			var name string
-			if err := json.Unmarshal(testName, &name); err != nil || jsonNull(testName) {
-				return errors.New("structured result tests must be strings")
-			}
+	tests, ok := fields["tests"]
+	if !ok {
+		return errors.New("structured result requires verification evidence")
+	}
+	var testNames []json.RawMessage
+	if err := json.Unmarshal(tests, &testNames); err != nil || jsonNull(tests) || len(testNames) == 0 {
+		return errors.New("structured result requires verification evidence")
+	}
+	for _, testName := range testNames {
+		var name string
+		if err := json.Unmarshal(testName, &name); err != nil || jsonNull(testName) || strings.TrimSpace(name) == "" {
+			return errors.New("structured result tests must be nonempty strings")
 		}
 	}
 	return nil

@@ -135,7 +135,7 @@ func TestNeedsAttentionAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestPollFailureAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now.Add(2*time.Hour)); err != nil {
@@ -317,7 +317,7 @@ func TestRecoveredDeliveryWaitsForGlobalCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstDelivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: first.RunID, LeaseToken: first.LeaseToken, CodexSessionID: "codex-1", CommitSHA: "accepted-1", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket-1"}}, time.Hour)
+	firstDelivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: first.RunID, LeaseToken: first.LeaseToken, CodexSessionID: "codex-1", CommitSHA: "accepted-1", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket-1"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestRecoveredDeliveryWaitsForGlobalCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: second.RunID, LeaseToken: second.LeaseToken, CodexSessionID: "codex-2", CommitSHA: "accepted-2", StructuredOutput: []byte(`{"summary":"candidate"}`), Now: now.Add(2 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-2", ExpectRemoteAbsent: true, Title: "ticket-2"}}, time.Hour); err != nil {
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: second.RunID, LeaseToken: second.LeaseToken, CodexSessionID: "codex-2", CommitSHA: "accepted-2", StructuredOutput: []byte(`{"summary":"candidate","tests":["go test"]}`), Now: now.Add(2 * time.Second), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-2", ExpectRemoteAbsent: true, Title: "ticket-2"}}, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	claims, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Second))

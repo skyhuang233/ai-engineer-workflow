@@ -569,8 +569,45 @@ func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing
 	}
 }
 
+func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
+	statePath := filepath.Join(manager.CodexStateRoot, claim.SessionID)
+	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: workspacePath, CodexStatePath: statePath, Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC()); err != nil || reclaimed != 0 {
+		t.Fatalf("early reclaim = %d, %v", reclaimed, err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(2*time.Hour)); err != nil || reclaimed != 1 {
+		t.Fatalf("reclaim = %d, %v", reclaimed, err)
+	}
+	if _, err := os.Stat(workspacePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace still exists: %v", err)
+	}
+	if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Codex state still exists: %v", err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(3*time.Hour)); err != nil || reclaimed != 0 {
+		t.Fatalf("idempotent reclaim = %d, %v", reclaimed, err)
+	}
+}
+
 func codexOutput(sessionID, summary string) []byte {
-	message, _ := json.Marshal(map[string]string{"summary": summary})
+	message, _ := json.Marshal(map[string]any{"summary": summary, "tests": []string{"go test ./..."}})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
 }

@@ -116,7 +116,7 @@ func TestMigrationBackupCanBeRestored(t *testing.T) {
 	}
 }
 
-func TestMigrationFromV17BacksUpBeforeAddingDeliveryRetryPending(t *testing.T) {
+func TestMigrationFromV17BacksUpBeforeAddingRuntimeRetentionColumns(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	store, err := Open(ctx, dbPath)
@@ -131,7 +131,11 @@ func TestMigrationFromV17BacksUpBeforeAddingDeliveryRetryPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = 18"); err != nil {
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 18"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_sessions DROP COLUMN workspace_reclaimed_at"); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -157,8 +161,14 @@ func TestMigrationFromV17BacksUpBeforeAddingDeliveryRetryPending(t *testing.T) {
 	if hasColumn(t, ctx, backup, "ticket_sessions", "delivery_retry_pending") {
 		t.Fatal("migration backup includes the v18 delivery retry column")
 	}
+	if hasColumn(t, ctx, backup, "ticket_sessions", "workspace_reclaimed_at") {
+		t.Fatal("migration backup includes the v19 workspace retention column")
+	}
 	if !hasColumn(t, ctx, migrated.db, "ticket_sessions", "delivery_retry_pending") {
 		t.Fatal("migration did not add the delivery retry column")
+	}
+	if !hasColumn(t, ctx, migrated.db, "ticket_sessions", "workspace_reclaimed_at") {
+		t.Fatal("migration did not add the workspace retention column")
 	}
 }
 

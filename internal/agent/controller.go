@@ -102,6 +102,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		"CODEX_HOME": ws.CodexState,
 	}
 	spec := worker.Spec{
+		RunID:   request.Claim.RunID,
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
 		Environment: environment,
@@ -249,6 +250,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	deliverySpec := worker.Spec{
+		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
 		Environment: deliveryEnvironment,
@@ -264,16 +266,18 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		}
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	deliveryCtx, cancelDelivery := context.WithDeadline(context.WithoutCancel(ctx), deliveryClaim.LeaseExpiresAt)
+	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
+	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
+	defer cancelFinalization()
 	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
-		return c.failDeliveryController(ctx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
 	}
 	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, err)
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
 	}
-	if err := c.Store.CompleteDeliveryController(ctx, deliveryClaim, c.now()); err != nil {
+	if err := c.Store.CompleteDeliveryController(finalizationCtx, deliveryClaim, c.now()); err != nil {
 		return err
 	}
 	return nil
