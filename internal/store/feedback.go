@@ -89,21 +89,52 @@ func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string,
 	} else if frozen {
 		return TicketClaim{}, "", ErrNotReady
 	}
-	var sessionID, owner, sessionState, runtimeState string
+	var sessionID, owner, sessionState, runtimeState, currentRunID string
 	var ticketNumber int64
 	var ticketTitle string
 	var generation, recoveryEpoch int64
 	var consecutiveFailures int
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title, s.consecutive_failures
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_run_id, s.current_lease_generation, rt.state, t.issue_number, t.title, s.consecutive_failures
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-	WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle, &consecutiveFailures)
+	WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &currentRunID, &generation, &runtimeState, &ticketNumber, &ticketTitle, &consecutiveFailures)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, "", ErrNotFound
 	}
 	if err != nil {
 		return TicketClaim{}, "", err
+	}
+	if currentRunID != "" {
+		var runState, leaseState, expiresText string
+		err := tx.QueryRowContext(ctx, `SELECT r.state, l.state, l.expires_at
+FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ?`, currentRunID).Scan(&runState, &leaseState, &expiresText)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return TicketClaim{}, "", err
+		}
+		if err == nil && runState == RunRunning && leaseState == LeaseActive {
+			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+			if parseErr != nil {
+				return TicketClaim{}, "", parseErr
+			}
+			if expiresAt.After(now) {
+				return TicketClaim{}, "", ErrNotReady
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), currentRunID, RunRunning); err != nil {
+				return TicketClaim{}, "", err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND state = ?`, currentRunID, LeaseActive); err != nil {
+				return TicketClaim{}, "", err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, currentRunID); err != nil {
+				return TicketClaim{}, "", err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID); err != nil {
+				return TicketClaim{}, "", err
+			}
+			runtimeState = plan.StateWaitingReview
+		}
 	}
 	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
 		return TicketClaim{}, "", ErrNotReady

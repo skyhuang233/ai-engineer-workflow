@@ -30,6 +30,10 @@ type fakeRuntime struct {
 
 func (r *fakeRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
+	if spec.Command[0] == "no-mistakes" {
+		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: passed\n")
+		return worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}, nil
+	}
 	marker := "initial"
 	if len(spec.Command) > 2 && spec.Command[2] == "resume" {
 		marker = "resume"
@@ -215,14 +219,17 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if err != nil || recovered.RunID != candidate.RunID || handoff.PushOutboxKey != candidate.PushOutboxKey || handoff.PROutboxKey != candidate.PROutboxKey {
 		t.Fatalf("recovered candidate handoff = %#v, %#v, err=%v", recovered, handoff, err)
 	}
-	if len(first.specs) != 1 || strings.Join(first.specs[0].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
+	if len(first.specs) != 2 || strings.Join(first.specs[0].Command, " ") != "codex exec --json --skip-git-repo-check implement the ticket" || strings.Join(first.specs[1].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
 	}
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
 		t.Fatalf("first worker isolation = %#v", first.specs[0])
 	}
-	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[0].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[0].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) {
-		t.Fatalf("worker Gateway fence environment = %#v", first.specs[0].Environment)
+	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != "" {
+		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
+	}
+	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] != claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] != claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration) {
+		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
 	}
 
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(time.Second)}); !errors.Is(err, store.ErrFencingConflict) {
@@ -234,6 +241,14 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	}
 	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || revision.LeaseGeneration != claim.LeaseGeneration+1 {
 		t.Fatalf("review revision claim = %#v", revision)
+	}
+	second := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "revised"), ContainerID: "container-2"}}}
+	controller.Runtime = second
+	if _, err := controller.Run(ctx, candidateRequest(revision, source, "ticket-1", "address the review feedback")); err != nil {
+		t.Fatalf("run review revision: %v", err)
+	}
+	if len(second.specs) != 2 || strings.Join(second.specs[0].Command, " ") != "codex exec resume --json --skip-git-repo-check codex-session-1 address the review feedback" || strings.Join(second.specs[1].Command, " ") != "no-mistakes axi run --intent address the review feedback" {
+		t.Fatalf("review worker specs = %#v", second.specs)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
 		t.Fatalf("structured output is not JSON: %s", candidate.StructuredOutput)

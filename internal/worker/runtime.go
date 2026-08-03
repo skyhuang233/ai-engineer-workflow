@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +36,8 @@ type Spec struct {
 
 type Result struct {
 	Output      []byte
+	Stdout      []byte
+	Stderr      []byte
 	ContainerID string
 	ExitCode    int
 }
@@ -119,12 +122,16 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	args := dockerArgs(spec)
 	args = append(args[:2], append([]string{"--cidfile", cidfilePath}, args[2:]...)...)
 	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	output := append(append([]byte(nil), stdout.Bytes()...), stderr.Bytes()...)
 	containerID, readErr := os.ReadFile(cidfilePath)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		return Result{Output: output}, fmt.Errorf("read worker container id: %w", readErr)
 	}
-	result := Result{Output: output, ContainerID: strings.TrimSpace(string(containerID))}
+	result := Result{Output: output, Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ContainerID: strings.TrimSpace(string(containerID))}
 	if err != nil {
 		result.ExitCode = 1
 		var exitErr *exec.ExitError
@@ -204,8 +211,12 @@ func (r ProcessRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	cmd := exec.CommandContext(ctx, name, spec.Command[1:]...)
 	cmd.Dir = spec.WorkspacePath
 	cmd.Env = explicitEnvironment(spec.Environment)
-	output, err := cmd.CombinedOutput()
-	result := Result{Output: output, ExitCode: 0}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	output := append(append([]byte(nil), stdout.Bytes()...), stderr.Bytes()...)
+	result := Result{Output: output, Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ExitCode: 0}
 	if err != nil {
 		result.ExitCode = 1
 		var exitErr *exec.ExitError

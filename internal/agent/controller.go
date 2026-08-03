@@ -10,6 +10,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	toon "github.com/toon-format/toon-go"
 )
 
 type Controller struct {
@@ -81,20 +82,12 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
-	noMistakes := c.NoMistakes
-	if noMistakes == "" {
-		noMistakes = "no-mistakes"
+	command := []string{"codex", "exec", "--json", "--skip-git-repo-check", request.Prompt}
+	if session.CodexSessionID != "" {
+		command = []string{"codex", "exec", "resume", "--json", "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
 	}
-	command := []string{noMistakes, "axi", "run", "--intent", request.Prompt}
 	environment := map[string]string{
-		"CODEX_HOME":                   ws.CodexState,
-		"NO_MISTAKES_DELIVERY_CYCLE":   session.SessionID,
-		"NO_MISTAKES_RUN_ID":           request.Claim.RunID,
-		"NO_MISTAKES_LEASE_TOKEN":      request.Claim.LeaseToken,
-		"NO_MISTAKES_LEASE_GENERATION": fmt.Sprint(request.Claim.LeaseGeneration),
-	}
-	if c.GatewayURL != "" {
-		environment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL
+		"CODEX_HOME": ws.CodexState,
 	}
 	spec := worker.Spec{
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
@@ -115,46 +108,48 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		runCtx, cancelRun = context.WithDeadline(ctx, request.Claim.LeaseExpiresAt)
 	}
 	result, runErr := c.Runtime.Run(runCtx, spec)
-	cancelRun()
+	defer cancelRun()
 	handoffCtx := context.WithoutCancel(ctx)
+	output := runtimeOutput(result)
 	if err := c.Store.RecordWorkerAudit(handoffCtx, store.WorkerAudit{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, ContainerID: result.ContainerID, ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions}); err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
-	codexSessionID, _ := parseSessionID(result.Output, session.CodexSessionID)
+	codexOutput := runtimeStdout(result)
+	codexSessionID, _ := parseSessionID(codexOutput, session.CodexSessionID)
 	if codexSessionID != "" && codexSessionID != session.CodexSessionID {
 		if err := c.Store.RecordCodexSession(handoffCtx, request.Claim.RunID, request.Claim.LeaseToken, codexSessionID); err != nil {
-			return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
+			return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 		}
 		session.CodexSessionID = codexSessionID
 	}
 	if runErr != nil || result.ExitCode != 0 {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(output))
 	}
 	commit, currentBranch, clean, err := c.Workspace.status(handoffCtx, ws)
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	if currentBranch != ws.Branch {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, fmt.Sprintf("worker changed workspace branch to %q", currentBranch), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, fmt.Sprintf("worker changed workspace branch to %q", currentBranch), string(output))
 	}
 	if !clean {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker completed with a dirty workspace", string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker completed with a dirty workspace", string(output))
 	}
-	codexSessionID, structured, err := parseOutput(result.Output, session.CodexSessionID)
+	codexSessionID, structured, err := parseOutput(codexOutput, session.CodexSessionID)
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	if commit == baseCommit {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output))
 	}
 	var candidateOutput struct {
 		Commit string `json:"commit"`
 	}
 	if err := json.Unmarshal(structured, &candidateOutput); err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(output))
 	}
 	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output))
 	}
 	publication := request.Publication
 	if publication.Body == "" {
@@ -162,9 +157,70 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	handoff, err := c.Store.AcceptCandidate(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication})
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
-	return Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured, PushOutboxKey: handoff.PushOutboxKey, PROutboxKey: handoff.PROutboxKey}, nil
+	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured, PushOutboxKey: handoff.PushOutboxKey, PROutboxKey: handoff.PROutboxKey}
+	noMistakes := c.NoMistakes
+	if noMistakes == "" {
+		noMistakes = "no-mistakes"
+	}
+	deliveryEnvironment := map[string]string{
+		"CODEX_HOME":                   ws.CodexState,
+		"NO_MISTAKES_DELIVERY_CYCLE":   session.SessionID,
+		"NO_MISTAKES_RUN_ID":           request.Claim.RunID,
+		"NO_MISTAKES_LEASE_TOKEN":      request.Claim.LeaseToken,
+		"NO_MISTAKES_LEASE_GENERATION": fmt.Sprint(request.Claim.LeaseGeneration),
+	}
+	if c.GatewayURL != "" {
+		deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL
+	}
+	deliverySpec := spec
+	deliverySpec.Command = []string{noMistakes, "axi", "run", "--intent", request.Prompt}
+	deliverySpec.Environment = deliveryEnvironment
+	if err := deliverySpec.Validate(); err != nil {
+		return candidate, err
+	}
+	deliveryResult, deliveryErr := c.Runtime.Run(runCtx, deliverySpec)
+	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
+		return candidate, errors.New(errorText(deliveryErr, deliveryResult.ExitCode))
+	}
+	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
+		return candidate, err
+	}
+	return candidate, nil
+}
+
+func runtimeStdout(result worker.Result) []byte {
+	if len(result.Stdout) > 0 {
+		return result.Stdout
+	}
+	return result.Output
+}
+
+func runtimeOutput(result worker.Result) []byte {
+	if len(result.Output) > 0 {
+		return result.Output
+	}
+	return append(append([]byte(nil), result.Stdout...), result.Stderr...)
+}
+
+func parseDeliveryTOON(output []byte) error {
+	value, err := toon.Decode(output)
+	if err != nil {
+		return fmt.Errorf("Delivery Controller returned invalid TOON: %w", err)
+	}
+	document, ok := value.(map[string]any)
+	if !ok {
+		return errors.New("Delivery Controller TOON must be an object")
+	}
+	run, ok := document["run"].(map[string]any)
+	if !ok {
+		return errors.New("Delivery Controller TOON did not contain a run")
+	}
+	if status, ok := run["status"].(string); !ok || strings.TrimSpace(status) == "" {
+		return errors.New("Delivery Controller TOON did not contain a run status")
+	}
+	return nil
 }
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {

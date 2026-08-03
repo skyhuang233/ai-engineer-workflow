@@ -361,23 +361,7 @@ func TestExpiredReviewRevisionRequeuesItsFeedback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Hour)}); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("stale review claim error = %v, want ErrNotReady", err)
-	}
-	var claimedRunID, runtimeState string
-	if err := db.db.QueryRowContext(ctx, `SELECT claimed_run_id FROM review_feedback_events WHERE version_id = ? AND issue_id = ? AND source = ? AND event_id = ?`, version.ID, claim.TicketID, "review", "100").Scan(&claimedRunID); err != nil {
-		t.Fatal(err)
-	}
-	if claimedRunID != "" {
-		t.Fatalf("claimed run after expiry = %q, want empty", claimedRunID)
-	}
-	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState); err != nil {
-		t.Fatal(err)
-	}
-	if runtimeState != plan.StateWaitingReview {
-		t.Fatalf("runtime state after expiry = %q, want %q", runtimeState, plan.StateWaitingReview)
-	}
-	retry, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour+time.Second), 1, DefaultMaxWorkerAttempts)
+	retry, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, DefaultMaxWorkerAttempts)
 	if err != nil {
 		t.Fatal(err)
 	}
