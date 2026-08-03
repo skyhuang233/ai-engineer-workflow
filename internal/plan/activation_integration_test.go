@@ -83,3 +83,51 @@ func TestActivationPathPersistsOneVersionAcrossRestart(t *testing.T) {
 		t.Fatalf("recovered = %#v", recovered)
 	}
 }
+
+func TestActivationPreservesCompletedProjection(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "approved spec", Labels: []string{plan.PlanLabel}, UpdatedAt: "source-1"},
+		Children: []plan.Issue{
+			{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"},
+		},
+		BlockedBy: map[int64][]plan.Issue{},
+	}
+	runtimeStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+	projector := &integrationProjector{body: snapshot.Root.Body}
+	reader := &integrationReader{snapshot: snapshot}
+	activator := plan.Activator{Reader: reader, Projector: projector, Store: runtimeStore}
+	version, err := activator.Activate(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeStore.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	reader.snapshot.Root.Body = projector.body
+	completed, err := activator.Activate(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != store.StateCompleted || !contains(projector.body, "`Completed`") {
+		t.Fatalf("completed activation = %#v, body = %q", completed, projector.body)
+	}
+}
+
+func contains(value, target string) bool {
+	return len(target) == 0 || (len(value) >= len(target) && index(value, target) >= 0)
+}
+
+func index(value, target string) int {
+	for i := 0; i+len(target) <= len(value); i++ {
+		if value[i:i+len(target)] == target {
+			return i
+		}
+	}
+	return -1
+}

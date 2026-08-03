@@ -395,7 +395,10 @@ func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) 
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
-WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.accepted_commit != ''`, repository)
+JOIN plan_versions v ON v.version_id = d.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.accepted_commit != ''
+AND `+currentActiveUnfrozenPlanPredicate, repository)
 	if err != nil {
 		return nil, err
 	}
@@ -789,7 +792,8 @@ JOIN plans p ON p.id = v.plan_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 LEFT JOIN ticket_deliveries td ON td.version_id = s.version_id AND td.issue_id = s.issue_id
-WHERE r.run_id = ? AND p.current_version_id = v.version_id AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`,
+WHERE r.run_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?
+AND `+currentActiveUnfrozenPlanPredicate,
 		request.RunID, RunDelivery, RunRunning, request.LeaseToken, request.LeaseGeneration, LeaseActive).
 		Scan(&target.VersionID, &target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.Repository, &target.RootNumber, &target.Branch, &target.AcceptedCommit, &mappedNumber, &mappedNode, &mappedHead, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {

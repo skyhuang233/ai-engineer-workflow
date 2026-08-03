@@ -60,11 +60,15 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 	if err != nil {
 		return Version{}, err
 	}
-	projection, err := projectionFor(snapshot, version, "Building")
+	projectionState := "Building"
+	if version.State != "projecting" {
+		projectionState = displayState(version.State)
+	}
+	projection, err := projectionFor(snapshot, version, projectionState)
 	if err != nil {
 		return Version{}, err
 	}
-	if version.State != "active" {
+	if version.State == "projecting" {
 		if err := a.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ActiveLabel); err != nil {
 			return Version{}, fmt.Errorf("project plan root: %w", err)
 		}
@@ -73,11 +77,24 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 		}
 		version.State = "active"
 	}
-	projection.State = "Active"
+	projection.State = displayState(version.State)
 	if err := a.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ""); err != nil {
 		return Version{}, fmt.Errorf("reconcile active plan root: %w", err)
 	}
 	return version, nil
+}
+
+func displayState(state string) string {
+	switch state {
+	case "completed":
+		return "Completed"
+	case "cancelled":
+		return "Cancelled"
+	case "active":
+		return "Active"
+	default:
+		return "Building"
+	}
 }
 
 func projectionFor(snapshot Snapshot, version Version, state string) (Projection, error) {

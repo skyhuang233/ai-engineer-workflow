@@ -36,10 +36,11 @@ type closedPlanDecision struct {
 
 func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
-COALESCE(t.issue_number, 0), COALESCE(d.pull_request_number, 0), COALESCE(s.accepted_commit, ''), COALESCE(rd.diagnostics_path, ''), COALESCE(c.structured_output, '')
+COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
 FROM workflow_questions q
 JOIN plan_versions v ON v.version_id = q.version_id
 JOIN plans p ON p.id = v.plan_id
+LEFT JOIN workflow_question_contexts qc ON qc.question_id = q.question_id
 LEFT JOIN plan_tickets t ON t.version_id = q.version_id AND t.issue_id = q.issue_id
 LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.issue_id
 LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
@@ -146,7 +147,7 @@ func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository str
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL`, repository)
+	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND `+currentActiveUnfrozenPlanPredicate, repository)
 	if err != nil {
 		return err
 	}
@@ -214,10 +215,11 @@ ON CONFLICT(poll_question_id, version_id, issue_id) DO NOTHING`, pollQuestionID,
 func (s *Store) WorkflowQuestion(ctx context.Context, repository, questionID string) (WorkflowQuestion, error) {
 	var question WorkflowQuestion
 	err := s.db.QueryRowContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
-COALESCE(t.issue_number, 0), COALESCE(d.pull_request_number, 0), COALESCE(s.accepted_commit, ''), COALESCE(rd.diagnostics_path, ''), COALESCE(c.structured_output, '')
+COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
 FROM workflow_questions q
 JOIN plan_versions v ON v.version_id = q.version_id
 JOIN plans p ON p.id = v.plan_id
+LEFT JOIN workflow_question_contexts qc ON qc.question_id = q.question_id
 LEFT JOIN plan_tickets t ON t.version_id = q.version_id AND t.issue_id = q.issue_id
 LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.issue_id
 LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
@@ -269,7 +271,7 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 			if strings.TrimSpace(decision.Replacement) == "" {
 				return ErrInvalidClaim
 			}
-			if err := replaceFrozenPlanTx(ctx, tx, versionID, now); err != nil {
+			if err := replaceFrozenPlanTx(ctx, tx, questionID, versionID, issueID, decision.Replacement, now); err != nil {
 				return err
 			}
 		default:
@@ -360,18 +362,35 @@ func cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Ti
 	return err
 }
 
-func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
-	var frozen int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM plan_freezes WHERE version_id = ?`, versionID).Scan(&frozen); err != nil {
+func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, questionID, versionID string, questionIssueID int64, replacement string, now time.Time) error {
+	var frozenIssueID int64
+	if err := tx.QueryRowContext(ctx, `SELECT issue_id FROM plan_freezes WHERE version_id = ?`, versionID).Scan(&frozenIssueID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotReady
+		}
 		return err
 	}
-	if frozen != 1 {
+	if questionIssueID != frozenIssueID {
 		return ErrNotReady
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ?`, versionID); err != nil {
+	stamp := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO replacement_tickets(question_id, version_id, retired_issue_id, replacement, state, approved_at)
+VALUES (?, ?, ?, ?, 'active', ?)`, questionID, versionID, frozenIssueID, strings.TrimSpace(replacement), stamp); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), versionID)
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateCancelled, stamp, versionID, frozenIssueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, stamp, RunRunning, versionID, frozenIssueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, LeaseActive, versionID, frozenIssueID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE version_id = ? AND issue_id = ?`, SessionClosed, stamp, versionID, frozenIssueID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ?`, versionID)
 	return err
 }
 

@@ -706,7 +706,7 @@ type frontierRows interface {
 func loadFrontierTx(ctx context.Context, tx frontierRows, versionID string, now time.Time) (plan.FrontierSnapshot, error) {
 	var snapshot plan.FrontierSnapshot
 	var versionState, planState string
-	err := tx.QueryRowContext(ctx, `SELECT CASE WHEN EXISTS (SELECT 1 FROM plan_terminal_states t WHERE t.version_id = v.version_id) THEN 'cancelled' ELSE v.state END, p.state FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, versionID).Scan(&versionState, &planState)
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT t.state FROM plan_terminal_states t WHERE t.version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions c WHERE c.version_id = v.version_id) THEN ? ELSE v.state END), p.state FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, StateCompleted, versionID).Scan(&versionState, &planState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return snapshot, ErrNotFound
 	}
@@ -748,7 +748,7 @@ WHERE t.version_id = ?`, versionID)
 			return snapshot, err
 		}
 		ticket.Delivered = delivered != 0
-		if runtimeState == plan.StateWaitingReview || runtimeState == plan.StateNeedsAttention {
+		if runtimeState != "" && runtimeState != plan.StateQueued && runtimeState != plan.StateRunning && delivered == 0 {
 			ticket.Owner = runtimeState
 		}
 		if sessionState == SessionRunning && runState == RunRunning && leaseState == LeaseActive {

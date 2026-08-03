@@ -159,7 +159,53 @@ func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now ti
 	} else {
 		now = now.UTC()
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, r.run_id, l.lease_token
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at <= ?`, versionID, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return nil, err
+	}
+	type expiredDelivery struct {
+		issueID           int64
+		runID, leaseToken string
+	}
+	var expired []expiredDelivery
+	for rows.Next() {
+		var delivery expiredDelivery
+		if err := rows.Scan(&delivery.issueID, &delivery.runID, &delivery.leaseToken); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		expired = append(expired, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, delivery := range expired {
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), delivery.runID, RunRunning); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, delivery.runID, delivery.leaseToken, LeaseActive); err != nil {
+			return nil, err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, delivery.issueID, "Delivery Controller lease expired during restart recovery", now); err != nil {
+			return nil, err
+		}
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
 s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit,
 l.lease_token, l.generation, l.expires_at
 FROM worker_runs r
@@ -191,7 +237,16 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 		}
 		runs = append(runs, run)
 	}
-	return runs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return runs, nil
 }
 
 func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time) error {

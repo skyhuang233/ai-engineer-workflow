@@ -99,6 +99,105 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	}
 }
 
+func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) == 0 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	var question WorkflowQuestion
+	for _, candidate := range questions {
+		if candidate.Kind == "closed_unmerged_impact" {
+			question = candidate
+			break
+		}
+	}
+	if question.ID == "" || question.IssueID != 1 {
+		t.Fatalf("closed question = %#v", question)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, question.ID, `{"action":"replace","replacement":"ticket #99"}`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var replacement, state string
+	var retiredID int64
+	if err := db.db.QueryRowContext(ctx, `SELECT replacement, state, retired_issue_id FROM replacement_tickets WHERE question_id = ?`, question.ID).Scan(&replacement, &state, &retiredID); err != nil {
+		t.Fatal(err)
+	}
+	if replacement != "ticket #99" || state != "active" || retiredID != 1 {
+		t.Fatalf("replacement = %q, %q, %d", replacement, state, retiredID)
+	}
+	frontier, err := db.ReadyFrontier(ctx, version.ID, 2, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 0 {
+		t.Fatalf("retired ticket was dispatched: %#v", frontier)
+	}
+	var runtime string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)).Scan(&runtime); err != nil {
+		t.Fatal(err)
+	}
+	if runtime != plan.StateCancelled {
+		t.Fatalf("retired runtime = %q", runtime)
+	}
+}
+
+func TestPollFailureSkipsTerminalAndFrozenPlans(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if _, err := db.db.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?)`, version.ID, "cancelled", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 0 {
+		t.Fatalf("terminal poll questions = %#v", questions)
+	}
+}
+
 func TestNeedsAttentionAnswerRestoresTicketAndOpensNextGeneration(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

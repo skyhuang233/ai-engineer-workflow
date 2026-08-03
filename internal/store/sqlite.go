@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 21
+	latestSchemaVersion = 22
 )
 
 var (
@@ -585,6 +585,35 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return err
 		}
 	}
+	if applied < 22 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS workflow_question_contexts (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    ticket_number INTEGER NOT NULL,
+    pull_request_number INTEGER NOT NULL DEFAULT 0,
+    accepted_commit TEXT NOT NULL DEFAULT '',
+    diagnostics_path TEXT NOT NULL DEFAULT '',
+    candidate_evidence TEXT NOT NULL DEFAULT ''
+)`,
+			`CREATE TABLE IF NOT EXISTS replacement_tickets (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    retired_issue_id INTEGER NOT NULL,
+    replacement TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active')),
+    approved_at TEXT NOT NULL,
+    FOREIGN KEY (version_id, retired_issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 22: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (22, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -703,7 +732,9 @@ ON CONFLICT(repository, root_issue_id) DO NOTHING`, snapshot.Repository, snapsho
 	}
 	if currentID.Valid {
 		var version PlanVersion
-		if err := tx.QueryRowContext(ctx, `SELECT version_id, fingerprint, source_revision, state FROM plan_versions WHERE version_id = ?`, currentID.String).Scan(&version.ID, &version.Fingerprint, &version.SourceRevision, &version.State); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT v.version_id, v.fingerprint, v.source_revision,
+COALESCE((SELECT state FROM plan_terminal_states WHERE version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions WHERE version_id = v.version_id) THEN ? ELSE v.state END)
+FROM plan_versions v WHERE v.version_id = ?`, StateCompleted, currentID.String).Scan(&version.ID, &version.Fingerprint, &version.SourceRevision, &version.State); err != nil {
 			return PlanVersion{}, err
 		}
 		if version.Fingerprint != fingerprint {
@@ -796,8 +827,9 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 
 func (s *Store) CurrentVersion(ctx context.Context, repository string, rootIssueID int64) (PlanVersion, error) {
 	var version PlanVersion
-	err := s.db.QueryRowContext(ctx, `SELECT v.version_id, p.repository, p.root_issue_id, p.root_issue_number, v.fingerprint, v.source_revision, v.state
-FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND p.root_issue_id = ?`, repository, rootIssueID).
+	err := s.db.QueryRowContext(ctx, `SELECT v.version_id, p.repository, p.root_issue_id, p.root_issue_number, v.fingerprint, v.source_revision,
+COALESCE((SELECT state FROM plan_terminal_states WHERE version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions WHERE version_id = v.version_id) THEN ? ELSE v.state END)
+FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND p.root_issue_id = ?`, StateCompleted, repository, rootIssueID).
 		Scan(&version.ID, &version.Repository, &version.RootIssueID, &version.RootIssueNumber, &version.Fingerprint, &version.SourceRevision, &version.State)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PlanVersion{}, ErrNotFound

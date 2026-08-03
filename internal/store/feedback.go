@@ -288,7 +288,10 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 	if err != nil {
 		return false, err
 	}
-	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "closed_unmerged_impact", report, now); err != nil {
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, issueID, "closed_unmerged_impact", report, now); err != nil {
+		return false, err
+	}
+	if err := recordClosedUnmergedQuestionContextTx(ctx, tx, repository, versionID, issueID); err != nil {
 		return false, err
 	}
 	if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "pull request closed without merge", now); err != nil {
@@ -307,6 +310,29 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 		return false, err
 	}
 	return true, nil
+}
+
+func recordClosedUnmergedQuestionContextTx(ctx context.Context, tx *sql.Tx, repository, versionID string, issueID int64) error {
+	var questionID string
+	if err := tx.QueryRowContext(ctx, `SELECT question_id FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = ? AND kind = 'closed_unmerged_impact' AND state = 'open'`, repository, versionID, issueID).Scan(&questionID); err != nil {
+		return err
+	}
+	var ticketNumber, pullRequestNumber int64
+	var commit, diagnostics, evidence string
+	err := tx.QueryRowContext(ctx, `SELECT t.issue_number, COALESCE(td.pull_request_number, 0), COALESCE(s.accepted_commit, ''),
+COALESCE((SELECT rd.diagnostics_path FROM run_diagnostics rd JOIN worker_runs r ON r.run_id = rd.run_id WHERE r.session_id = s.session_id ORDER BY rd.created_at DESC LIMIT 1), ''),
+COALESCE((SELECT c.structured_output FROM candidate_revisions c WHERE c.session_id = s.session_id ORDER BY c.created_at DESC LIMIT 1), '')
+FROM plan_tickets t
+LEFT JOIN ticket_deliveries td ON td.version_id = t.version_id AND td.issue_id = t.issue_id
+LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
+WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&ticketNumber, &pullRequestNumber, &commit, &diagnostics, &evidence)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO workflow_question_contexts(question_id, ticket_number, pull_request_number, accepted_commit, diagnostics_path, candidate_evidence)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(question_id) DO NOTHING`, questionID, ticketNumber, pullRequestNumber, commit, diagnostics, evidence)
+	return err
 }
 
 func closedUnmergedImpactReportTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64) (string, string, error) {
