@@ -78,7 +78,7 @@ func TestReadPlanRetainsUntypedChildForIncompletePublication(t *testing.T) {
 	}
 }
 
-func TestReadPlanHydratesClosedDeliveredBlockerFromMergedPullRequest(t *testing.T) {
+func TestReadPlanDoesNotDeriveDeliveredFromPullRequestBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -90,8 +90,6 @@ func TestReadPlanHydratesClosedDeliveredBlockerFromMergedPullRequest(t *testing.
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case "/repos/owner/repo/issues/12/dependencies/blocked_by":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}}})
-		case "/repos/owner/repo/pulls":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 24, "body": "Fixes #11", "merged_at": "2026-08-03T00:00:00Z", "base": map[string]string{"ref": "main"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -101,11 +99,11 @@ func TestReadPlanHydratesClosedDeliveredBlockerFromMergedPullRequest(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.Children[0].Delivered || !snapshot.BlockedBy[2][0].Delivered {
-		t.Fatalf("delivery facts = %#v", snapshot)
+	if snapshot.Children[0].Delivered || snapshot.BlockedBy[2][0].Delivered {
+		t.Fatalf("PR prose created delivery facts: %#v", snapshot)
 	}
-	if err := snapshot.Validate(); err != nil {
-		t.Fatal(err)
+	if err := snapshot.Validate(); err == nil {
+		t.Fatal("Validate() accepted a closed blocker without a verified delivery fact")
 	}
 }
 

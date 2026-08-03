@@ -164,12 +164,16 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	if err := db.db.QueryRowContext(ctx, `SELECT replacement, state, retired_issue_id, replacement_version_id, replacement_issue_id FROM replacement_tickets WHERE question_id = ?`, question.ID).Scan(&replacement, &state, &retiredID, &replacementVersionID, &replacementIssueID); err != nil {
 		t.Fatal(err)
 	}
-	if replacement != `{"plan_root_issue_id":200}` || state != "active" || retiredID != 1 || replacementVersionID != replacementVersion.ID || replacementIssueID != 0 {
+	if replacement != `{"plan_root_issue_id":200}` || state != "approved" || retiredID != 1 || replacementVersionID != replacementVersion.ID || replacementIssueID != 0 {
 		t.Fatalf("replacement = %q, %q, %d, %q, %d", replacement, state, retiredID, replacementVersionID, replacementIssueID)
 	}
 	activatedReplacement, err := db.CurrentVersion(ctx, snapshot.Repository, replacementSnapshot.Root.ID)
-	if err != nil || activatedReplacement.State != StateActive {
+	if err != nil || activatedReplacement.State != StateProjecting {
 		t.Fatalf("replacement activation = %#v, %v", activatedReplacement, err)
+	}
+	selectedRoot, err := db.SchedulerRoot(ctx, snapshot.Repository, snapshot.Root.Number, now.Add(2*time.Second))
+	if err != nil || selectedRoot != replacementSnapshot.Root.Number {
+		t.Fatalf("projecting replacement root = %d, %v", selectedRoot, err)
 	}
 	frontier, err := db.ReadyFrontier(ctx, version.ID, 2, now.Add(3*time.Second))
 	if err != nil {
@@ -182,14 +186,24 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, int64(1)).Scan(&runtime); err != nil {
 		t.Fatal(err)
 	}
-	if runtime != plan.StateCancelled {
-		t.Fatalf("retired runtime = %q", runtime)
+	if runtime == plan.StateCancelled {
+		t.Fatalf("source was cancelled before replacement projection confirmation")
 	}
-	replacementFrontier, err := db.ReadyFrontier(ctx, replacementVersion.ID, 2, now.Add(3*time.Second))
+	if err := db.MarkActive(ctx, replacementVersion.ID); err != nil {
+		t.Fatal(err)
+	}
+	selectedRoot, err = db.SchedulerRoot(ctx, snapshot.Repository, snapshot.Root.Number, now.Add(4*time.Second))
+	if err != nil || selectedRoot != replacementSnapshot.Root.Number {
+		t.Fatalf("active replacement root = %d, %v", selectedRoot, err)
+	}
+	if state, err := db.CurrentVersion(ctx, snapshot.Repository, snapshot.Root.ID); err != nil || state.State != "cancelled" {
+		t.Fatalf("source after handoff = %#v, %v", state, err)
+	}
+	replacementFrontier, err := db.ReadyFrontier(ctx, replacementVersion.ID, 2, now.Add(5*time.Second))
 	if err != nil || len(replacementFrontier) != 1 || replacementFrontier[0].IssueID != 101 {
 		t.Fatalf("replacement frontier = %#v, %v", replacementFrontier, err)
 	}
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: replacementVersion.ID, TicketID: 101, Owner: "replacement-agent", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now.Add(3 * time.Second)}); err != nil {
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: replacementVersion.ID, TicketID: 101, Owner: "replacement-agent", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now.Add(5 * time.Second)}); err != nil {
 		t.Fatalf("replacement handoff was not schedulable: %v", err)
 	}
 }

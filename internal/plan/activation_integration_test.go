@@ -119,6 +119,31 @@ func TestActivationPreservesCompletedProjection(t *testing.T) {
 	}
 }
 
+func TestActivationCompletesAnInitiallyDeliveredPlan(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "approved spec", Labels: []string{plan.PlanLabel}, UpdatedAt: "source-1"},
+		Children: []plan.Issue{
+			{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "closed", Delivered: true},
+		},
+		BlockedBy: map[int64][]plan.Issue{},
+	}
+	runtimeStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+	projector := &integrationProjector{body: snapshot.Root.Body}
+	version, err := (plan.Activator{Reader: &integrationReader{snapshot: snapshot}, Projector: projector, Store: runtimeStore}).Activate(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.State != store.StateCompleted || !contains(projector.body, "`Completed`") {
+		t.Fatalf("activation = %#v, body = %q", version, projector.body)
+	}
+}
+
 func contains(value, target string) bool {
 	return len(target) == 0 || (len(value) >= len(target) && index(value, target) >= 0)
 }

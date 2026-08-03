@@ -18,6 +18,7 @@ type RootProjector interface {
 type VersionStore interface {
 	BeginActivation(context.Context, Snapshot, string, string) (Version, error)
 	MarkActive(context.Context, string) error
+	ActivationState(context.Context, string) (string, error)
 }
 
 // Version is the narrow store contract used by the plan domain. The concrete
@@ -75,7 +76,10 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 		if err := a.Store.MarkActive(ctx, version.ID); err != nil {
 			return Version{}, err
 		}
-		version.State = "active"
+		version.State, err = a.Store.ActivationState(ctx, version.ID)
+		if err != nil {
+			return Version{}, err
+		}
 	}
 	projection.State = displayState(version.State)
 	if err := a.Projector.ProjectPlan(ctx, repository, rootNumber, projection, ""); err != nil {

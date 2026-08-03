@@ -426,36 +426,84 @@ WHERE t.version_id = ? AND t.issue_id = ? AND p.repository = ? AND r.delivered =
 	}
 	stamp := formatTimestamp(now)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO replacement_tickets(question_id, version_id, retired_issue_id, replacement, replacement_version_id, replacement_issue_id, state, approved_at)
-VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`, questionID, versionID, frozenIssueID, string(replacementJSON), replacementVersionID, replacementIssueID, stamp); err != nil {
+VALUES (?, ?, ?, ?, ?, ?, 'approved', ?)`, questionID, versionID, frozenIssueID, string(replacementJSON), replacementVersionID, replacementIssueID, stamp); err != nil {
 		return err
-	}
-	if err := activateReplacementPlanTx(ctx, tx, replacementVersionID, now); err != nil {
-		return err
-	}
-	return cancelPlanTx(ctx, tx, versionID, now)
-}
-
-func activateReplacementPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
-	stamp := formatTimestamp(now)
-	if _, err := tx.ExecContext(ctx, `UPDATE plan_versions SET state = ? WHERE version_id = ? AND state = ?`, StateActive, versionID, StateProjecting); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, stamp, versionID, StateProjecting)
-	if err != nil {
-		return err
-	}
-	if count, err := result.RowsAffected(); err != nil {
-		return err
-	} else if count == 0 {
-		var planState string
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM plans WHERE current_version_id = ?`, versionID).Scan(&planState); err != nil {
-			return err
-		}
-		if planState != StateActive {
-			return ErrNotReady
-		}
 	}
 	return nil
+}
+
+func (s *Store) SchedulerRoot(ctx context.Context, repository string, configuredRoot int64, now time.Time) (int64, error) {
+	if repository == "" || configuredRoot <= 0 {
+		return 0, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var sourceVersionID string
+	err = tx.QueryRowContext(ctx, `SELECT p.current_version_id FROM plans p WHERE p.repository = ? AND p.root_issue_number = ?`, repository, configuredRoot).Scan(&sourceVersionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	var handoffState, targetVersionID string
+	err = tx.QueryRowContext(ctx, `SELECT state, replacement_version_id FROM replacement_tickets
+WHERE version_id = ? AND state IN ('approved', 'active') ORDER BY approved_at DESC LIMIT 1`, sourceVersionID).Scan(&handoffState, &targetVersionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return configuredRoot, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var targetRoot int64
+	var targetVersionState, targetPlanState string
+	err = tx.QueryRowContext(ctx, `SELECT p.root_issue_number,
+COALESCE((SELECT terminal.state FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id) THEN ? ELSE v.state END), p.state
+FROM plan_versions v JOIN plans p ON p.id = v.plan_id
+WHERE v.version_id = ? AND p.repository = ? AND p.current_version_id = v.version_id`, StateCompleted, targetVersionID, repository).Scan(&targetRoot, &targetVersionState, &targetPlanState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotReady
+	}
+	if err != nil {
+		return 0, err
+	}
+	var frozen int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM plan_freezes WHERE version_id = ?`, targetVersionID).Scan(&frozen)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	targetFrozen := err == nil
+	if !targetFrozen && handoffState == "approved" && targetVersionState == StateProjecting && targetPlanState == StateProjecting {
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return targetRoot, nil
+	}
+	targetActivated := targetPlanState == StateActive && (targetVersionState == StateActive || targetVersionState == StateCompleted)
+	if targetFrozen || !targetActivated {
+		return 0, ErrNotReady
+	}
+	if handoffState == "approved" {
+		if err := cancelPlanTx(ctx, tx, sourceVersionID, now); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE replacement_tickets SET state = 'active' WHERE version_id = ? AND state = 'approved'`, sourceVersionID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return targetRoot, nil
 }
 
 func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, acceptedCommit string, now time.Time) error {

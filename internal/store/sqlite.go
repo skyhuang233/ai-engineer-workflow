@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 23
+	latestSchemaVersion = 24
 )
 
 var (
@@ -638,6 +638,33 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return err
 		}
 	}
+	if applied < 24 {
+		statements := []string{
+			`CREATE TABLE replacement_tickets_v24 (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    retired_issue_id INTEGER NOT NULL,
+    replacement TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('approved', 'active')),
+    approved_at TEXT NOT NULL,
+    replacement_version_id TEXT NOT NULL DEFAULT '',
+    replacement_issue_id INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (version_id, retired_issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`INSERT INTO replacement_tickets_v24(question_id, version_id, retired_issue_id, replacement, state, approved_at, replacement_version_id, replacement_issue_id)
+SELECT question_id, version_id, retired_issue_id, replacement, state, approved_at, replacement_version_id, replacement_issue_id FROM replacement_tickets`,
+			`DROP TABLE replacement_tickets`,
+			`ALTER TABLE replacement_tickets_v24 RENAME TO replacement_tickets`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 24: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (24, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -864,7 +891,20 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
+	if err := markPlanCompletedTx(ctx, tx, versionID, formatTimestamp(time.Now())); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func (s *Store) ActivationState(ctx context.Context, versionID string) (string, error) {
+	var state string
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT terminal.state FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id) THEN ? ELSE v.state END)
+FROM plan_versions v WHERE v.version_id = ?`, StateCompleted, versionID).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return state, err
 }
 
 func (s *Store) CurrentVersion(ctx context.Context, repository string, rootIssueID int64) (PlanVersion, error) {
