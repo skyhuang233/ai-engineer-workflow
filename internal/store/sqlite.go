@@ -444,6 +444,33 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return err
 		}
 	}
+	if applied < 13 {
+		statements := []string{
+			`ALTER TABLE ticket_deliveries ADD COLUMN checks_etag TEXT NOT NULL DEFAULT ''`,
+			`CREATE TABLE workflow_questions (
+    question_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'answered')),
+    answer TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    answered_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(repository, version_id, issue_id, kind),
+    FOREIGN KEY (version_id) REFERENCES plan_versions(version_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 13: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

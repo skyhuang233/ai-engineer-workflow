@@ -109,7 +109,13 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, c.now()); err != nil {
 		return Candidate{}, err
 	}
-	result, runErr := c.Runtime.Run(ctx, spec)
+	runCtx := ctx
+	cancelRun := func() {}
+	if !request.Claim.LeaseExpiresAt.IsZero() {
+		runCtx, cancelRun = context.WithDeadline(ctx, request.Claim.LeaseExpiresAt)
+	}
+	result, runErr := c.Runtime.Run(runCtx, spec)
+	cancelRun()
 	handoffCtx := context.WithoutCancel(ctx)
 	if err := c.Store.RecordWorkerAudit(handoffCtx, store.WorkerAudit{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, ContainerID: result.ContainerID, ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions}); err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(result.Output))

@@ -94,47 +94,62 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		return PollResult{}, err
 	}
 	result := PollResult{Deliveries: len(deliveries)}
+	updatedPullRequests, err := p.Client.UpdatedPullRequestsSince(ctx, repository, since, full)
+	if err != nil {
+		return PollResult{}, err
+	}
 	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
 	for _, delivery := range deliveries {
-		terminal, err := reconciler.ReconcileTicket(ctx, delivery)
-		if err != nil {
-			return PollResult{}, err
-		}
-		if terminal {
-			continue
-		}
-		events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
-		if err != nil {
-			return PollResult{}, err
-		}
-		feedback := make([]store.ReviewFeedback, 0, len(events))
-		for _, event := range events {
-			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
-		}
-		inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
-		if err != nil {
-			return PollResult{}, err
-		}
-		result.Feedback += inserted
-		if p.LaunchReview != nil {
-			claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.MaxWorkerAttempts)
-			if claimErr == nil {
-				if err := p.LaunchReview(ctx, claim, prompt); err != nil {
+		if full || hasPullRequestUpdate(updatedPullRequests, delivery.PullRequestNumber) {
+			terminal, err := reconciler.ReconcileTicket(ctx, delivery)
+			if err != nil {
+				return PollResult{}, err
+			}
+			if !terminal {
+				events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
+				if err != nil {
 					return PollResult{}, err
 				}
-			} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
-				return PollResult{}, claimErr
+				feedback := make([]store.ReviewFeedback, 0, len(events))
+				for _, event := range events {
+					feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+				}
+				inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
+				if err != nil {
+					return PollResult{}, err
+				}
+				result.Feedback += inserted
+				if p.LaunchReview != nil {
+					claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.MaxWorkerAttempts)
+					if claimErr == nil {
+						if err := p.LaunchReview(ctx, claim, prompt); err != nil {
+							return PollResult{}, err
+						}
+					} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
+						return PollResult{}, claimErr
+					}
+				}
 			}
 		}
-		checks, err := p.Client.PullRequestChecks(ctx, repository, delivery.CandidateCommit)
+		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
 		if err != nil {
 			return PollResult{}, err
 		}
-		updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
-		if err != nil {
-			return PollResult{}, err
+		if changed {
+			updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
+			if err != nil {
+				return PollResult{}, err
+			}
+			if err := p.Store.RecordPullRequestChecksETag(ctx, delivery.VersionID, delivery.IssueID, etag); err != nil {
+				return PollResult{}, err
+			}
+			result.Checks += updated
 		}
-		result.Checks += updated
 	}
 	return result, nil
+}
+
+func hasPullRequestUpdate(updated map[int64]struct{}, number int64) bool {
+	_, ok := updated[number]
+	return ok
 }

@@ -17,13 +17,15 @@ import (
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered>")
+		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered|answer-inbox>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -37,8 +39,10 @@ func main() {
 		runPollGitHub(os.Args[2:])
 	case "reconcile-delivered":
 		runReconcileDelivered(os.Args[2:])
+	case "answer-inbox":
+		runAnswerInbox(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered>")
+		fmt.Fprintln(os.Stderr, "usage: workflow <doctor|run-ticket|gateway|poll-github|reconcile-delivered|answer-inbox>")
 		os.Exit(2)
 	}
 }
@@ -263,6 +267,7 @@ func runPollGitHub(args []string) {
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
+	rootNumber := flags.Int64("root", 0, "approved plan root issue number")
 	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	source := flags.String("source", "", "absolute local repository path for review revisions")
@@ -271,9 +276,10 @@ func runPollGitHub(args []string) {
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
+	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
 	_ = flags.Parse(args)
-	if *repository == "" || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *interval <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, read credential, review workspace configuration, Gateway URL, and positive interval")
+	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *interval <= 0 || *maxParallelRuns <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, read credential, workspace configuration, Gateway URL, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -285,6 +291,14 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
+	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+		go func() {
+			if err := runClaimWorker(context.WithoutCancel(ctx), db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent); err != nil {
+				fmt.Fprintln(os.Stderr, "workflow worker:", err)
+			}
+		}()
+		return nil
+	}
 	launcher := func(ctx context.Context, claim store.TicketClaim, prompt string) error {
 		deliveryState, err := db.TicketDelivery(ctx, claim.VersionID, claim.TicketID)
 		if err != nil {
@@ -294,13 +308,31 @@ func runPollGitHub(args []string) {
 		if expectedHead == "" {
 			expectedHead = deliveryState.CandidateCommit
 		}
-		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: *gatewayURL}
-		_, err = controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: deliveryState.Branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: deliveryState.Branch, ExpectedRemoteHead: expectedHead, Title: claim.TicketTitle}})
-		return err
+		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 	poll := func() error {
-		result, err := poller.Poll(context.Background(), *repository)
+		ctx := context.Background()
+		client := github.NewClient(*githubURL, *token, nil)
+		projector := delivery.PlanProjector{Gateway: delivery.Gateway{Store: db}}
+		activator := plan.Activator{Reader: client, Projector: projector, Store: db}
+		if _, err := activator.Activate(ctx, *repository, *rootNumber); err != nil {
+			return err
+		}
+		dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute}
+		if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
+			return err
+		}
+		claim, claimErr := dispatcher.Claim(ctx, *repository, *rootNumber, 0, "workflow-control-plane")
+		if claimErr == nil {
+			branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
+			if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
+				return err
+			}
+		} else if !errors.Is(claimErr, store.ErrNoReadyTickets) && !errors.Is(claimErr, store.ErrCapacity) && !errors.Is(claimErr, store.ErrNotReady) {
+			return claimErr
+		}
+		result, err := poller.Poll(ctx, *repository)
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
 			fmt.Fprintln(os.Stderr, err)
 			return err
@@ -321,6 +353,33 @@ func runPollGitHub(args []string) {
 	defer ticker.Stop()
 	for range ticker.C {
 		_ = poll()
+	}
+}
+
+func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, repository, source, workspaceRoot, stateRoot, gatewayURL string, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: workspaceRoot, CodexStateRoot: stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: gatewayURL}
+	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: repository, Branch: branch, ExpectedRemoteHead: expectedHead, ExpectRemoteAbsent: expectAbsent, Title: claim.TicketTitle}})
+	return err
+}
+
+func runAnswerInbox(args []string) {
+	flags := flag.NewFlagSet("answer-inbox", flag.ExitOnError)
+	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	repository := flags.String("repository", "", "GitHub owner/repository")
+	questionID := flags.String("question", "", "stable Workflow Inbox question ID")
+	answer := flags.String("answer", "", "human decision")
+	_ = flags.Parse(args)
+	if *repository == "" || *questionID == "" || *answer == "" {
+		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, and answer")
+		os.Exit(2)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	if err := db.AnswerWorkflowQuestion(context.Background(), *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+		fail(err)
 	}
 }
 

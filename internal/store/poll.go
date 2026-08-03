@@ -4,10 +4,22 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
+
+type WorkflowQuestion struct {
+	ID         string
+	Repository string
+	VersionID  string
+	IssueID    int64
+	Kind       string
+	Prompt     string
+	State      string
+	Answer     string
+}
 
 type GitHubPollCursor struct {
 	Repository          string
@@ -74,11 +86,69 @@ func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository str
 	} else {
 		now = now.UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
 WHERE delivered = 0 AND version_id IN (
   SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL
-)`, plan.StateNeedsAttention, formatTimestamp(now), repository)
-	return err
+)`, plan.StateNeedsAttention, formatTimestamp(now), repository); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL`, repository)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var versionID string
+		if err := rows.Scan(&versionID); err != nil {
+			return err
+		}
+		questionID := fmt.Sprintf("poll-failure-%s", versionID)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, prompt, state, created_at)
+VALUES (?, ?, ?, 0, 'poll_failure', ?, 'open', ?)
+ON CONFLICT(repository, version_id, issue_id, kind) DO NOTHING`, questionID, repository, versionID, "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", formatTimestamp(now)); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time) error {
+	if repository == "" || questionID == "" || answer == "" {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var kind string
+	err = tx.QueryRowContext(ctx, `SELECT kind FROM workflow_questions WHERE question_id = ? AND repository = ? AND state = 'open'`, questionID, repository).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = ?, answered_at = ? WHERE question_id = ?`, answer, formatTimestamp(now), questionID); err != nil {
+		return err
+	}
+	if kind == "poll_failure" {
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecordGitHubPollFailure(ctx context.Context, repository string, now time.Time) error {

@@ -102,15 +102,16 @@ type TicketDelivery struct {
 	CandidateCommit   string
 	Branch            string
 	RemoteHead        string
+	ChecksETag        string
 }
 
 func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
 	var delivery TicketDelivery
-	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head
+	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.checks_etag
 FROM ticket_deliveries d
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
 WHERE d.version_id = ? AND d.issue_id = ? AND d.pull_request_number > 0 AND s.accepted_commit != ''`, versionID, issueID).
-		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead)
+		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.ChecksETag)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketDelivery{}, ErrNotFound
 	}
@@ -380,7 +381,7 @@ ORDER BY o.created_at, CASE o.operation WHEN ? THEN 0 ELSE 1 END, o.idempotency_
 }
 
 func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.checks_etag
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
@@ -392,12 +393,26 @@ WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.a
 	var deliveries []TicketDelivery
 	for rows.Next() {
 		var delivery TicketDelivery
-		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead); err != nil {
+		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.ChecksETag); err != nil {
 			return nil, err
 		}
 		deliveries = append(deliveries, delivery)
 	}
 	return deliveries, rows.Err()
+}
+
+func (s *Store) RecordPullRequestChecksETag(ctx context.Context, versionID string, issueID int64, etag string) error {
+	if versionID == "" || issueID == 0 {
+		return ErrInvalidClaim
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE ticket_deliveries SET checks_etag = ?, updated_at = ? WHERE version_id = ? AND issue_id = ?`, etag, formatTimestamp(time.Now()), versionID, issueID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Time) (DeliveryOutbox, error) {

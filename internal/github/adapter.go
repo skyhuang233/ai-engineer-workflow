@@ -103,6 +103,35 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 	return result, nil
 }
 
+func (c *Client) UpdatedPullRequestsSince(ctx context.Context, repository string, since time.Time, full bool) (map[int64]struct{}, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return nil, err
+	}
+	type issue struct {
+		Number      int64     `json:"number"`
+		PullRequest *struct{} `json:"pull_request"`
+	}
+	updated := make(map[int64]struct{})
+	for page := 1; ; page++ {
+		path := "/repos/" + repository + "/issues?state=all&per_page=100&page=" + strconv.Itoa(page)
+		if !full && !since.IsZero() {
+			path += "&since=" + url.QueryEscape(since.UTC().Format(time.RFC3339))
+		}
+		var issues []issue
+		if err := c.getJSON(ctx, path, &issues); err != nil {
+			return nil, err
+		}
+		for _, value := range issues {
+			if value.PullRequest != nil {
+				updated[value.Number] = struct{}{}
+			}
+		}
+		if len(issues) < 100 {
+			return updated, nil
+		}
+	}
+}
+
 func changedSince(value string, since time.Time) bool {
 	if since.IsZero() || value == "" {
 		return true
