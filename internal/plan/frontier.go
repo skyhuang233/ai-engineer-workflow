@@ -8,6 +8,7 @@ const (
 	StateWaitingReview  = "waiting_review"
 	StateActive         = "active"
 	StateDelivered      = "delivered"
+	StateCancelled      = "cancelled"
 	StateNeedsAttention = "needs_attention"
 )
 

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,7 +98,7 @@ func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T
 	if err := dispatchPendingDeliveryClaims(ctx, db, snapshot.Repository, 1, time.Hour, now.Add(2*time.Second), func(_ context.Context, retry store.TicketClaim) error {
 		launched <- retry
 		return nil
-	}); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -117,7 +119,7 @@ func TestLaunchDeliveryClaimsDoesNotBlockControlLoop(t *testing.T) {
 		started <- claim.RunID
 		<-release
 		return nil
-	}); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatalf("launch delivery claims: %v", err)
 	}
 	for range claims {
@@ -128,4 +130,18 @@ func TestLaunchDeliveryClaimsDoesNotBlockControlLoop(t *testing.T) {
 		}
 	}
 	close(release)
+}
+
+func TestLaunchDeliveryClaimsJoinsOnceModeFailures(t *testing.T) {
+	var workers sync.WaitGroup
+	observed := make(chan error, 1)
+	if err := launchDeliveryClaims(context.Background(), []store.TicketClaim{{RunID: "delivery-1"}}, func(context.Context, store.TicketClaim) error {
+		return errors.New("delivery failed")
+	}, &workers, func(err error) { observed <- err }); err != nil {
+		t.Fatal(err)
+	}
+	workers.Wait()
+	if err := <-observed; err == nil || err.Error() != "delivery failed" {
+		t.Fatalf("observed failure = %v", err)
+	}
 }

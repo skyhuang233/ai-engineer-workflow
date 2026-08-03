@@ -47,6 +47,58 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	}
 }
 
+func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, version.ID, int64(1), "closed pull request", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 0, "closed_unmerged_impact", "choose", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("free-text answer = %v, want invalid claim", err)
+	}
+	question, err := db.WorkflowQuestion(ctx, snapshot.Repository, questions[0].ID)
+	if err != nil || question.State != "open" {
+		t.Fatalf("invalid answer changed question = %#v, %v", question, err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, `{"action":"cancel-plan"}`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Second)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("cancelled plan claim = %v, want not ready", err)
+	}
+}
+
 func TestNeedsAttentionAnswerRestoresTicketAndOpensNextGeneration(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

@@ -138,40 +138,34 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		return PollResult{}, err
 	}
 	result := PollResult{Deliveries: len(deliveries)}
-	updatedPullRequests, err := p.Client.UpdatedPullRequestsSince(ctx, repository, since, full)
-	if err != nil {
-		return PollResult{}, err
-	}
 	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
 	for _, delivery := range deliveries {
-		if full || hasPullRequestUpdate(updatedPullRequests, delivery.PullRequestNumber) {
-			terminal, err := reconciler.ReconcileTicket(ctx, delivery)
+		terminal, err := reconciler.ReconcileTicket(ctx, delivery)
+		if err != nil {
+			return PollResult{}, err
+		}
+		if !terminal {
+			events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
 			if err != nil {
 				return PollResult{}, err
 			}
-			if !terminal {
-				events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
-				if err != nil {
-					return PollResult{}, err
-				}
-				feedback := make([]store.ReviewFeedback, 0, len(events))
-				for _, event := range events {
-					feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
-				}
-				inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
-				if err != nil {
-					return PollResult{}, err
-				}
-				result.Feedback += inserted
-				if p.LaunchReview != nil {
-					claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
-					if claimErr == nil {
-						if err := p.LaunchReview(ctx, claim, prompt); err != nil {
-							return PollResult{}, err
-						}
-					} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
-						return PollResult{}, claimErr
+			feedback := make([]store.ReviewFeedback, 0, len(events))
+			for _, event := range events {
+				feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+			}
+			inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
+			if err != nil {
+				return PollResult{}, err
+			}
+			result.Feedback += inserted
+			if p.LaunchReview != nil {
+				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
+				if claimErr == nil {
+					if err := p.LaunchReview(ctx, claim, prompt); err != nil {
+						return PollResult{}, err
 					}
+				} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
+					return PollResult{}, claimErr
 				}
 			}
 		}
@@ -233,12 +227,11 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	}
 	projected := make([]plan.WorkflowQuestion, 0, len(questions))
 	for _, question := range questions {
-		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt})
+		projected = append(projected, workflowQuestionProjection(question))
 	}
 	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
-func hasPullRequestUpdate(updated map[int64]struct{}, number int64) bool {
-	_, ok := updated[number]
-	return ok
+func workflowQuestionProjection(question store.WorkflowQuestion) plan.WorkflowQuestion {
+	return plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence}
 }

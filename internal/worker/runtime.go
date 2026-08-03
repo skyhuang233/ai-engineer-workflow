@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -101,6 +102,26 @@ type ProcessRuntime struct {
 // run and never the Ticket Session's durable state.
 type DockerRuntime struct {
 	Binary string
+}
+
+func (r DockerRuntime) Unsafe(ctx context.Context) (bool, error) {
+	binary := r.Binary
+	if binary == "" {
+		binary = "docker"
+	}
+	output, err := exec.CommandContext(ctx, binary, "stats", "--all", "--no-stream", "--format", "{{.MemPerc}}").Output()
+	if err != nil {
+		return false, err
+	}
+	var total float64
+	for _, field := range strings.Fields(string(output)) {
+		percent, err := strconv.ParseFloat(strings.TrimSuffix(field, "%"), 64)
+		if err != nil {
+			return false, err
+		}
+		total += percent
+	}
+	return total >= 85, nil
 }
 
 func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {

@@ -340,6 +340,7 @@ func runPollGitHub(args []string) {
 		return controller.RetryDelivery(ctx, claim)
 	}
 	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+	var lastPollResult github.PollResult
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -351,14 +352,22 @@ func runPollGitHub(args []string) {
 				return err
 			}
 			workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}}
 			if err := dispatcher.Recover(ctx, *repository, *rootNumber); err != nil {
 				return err
 			}
 			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
 				return err
 			}
-			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, *maxParallelRuns, 30*time.Minute, time.Now().UTC(), launchDelivery); err != nil {
+			var deliveryWorkers *sync.WaitGroup
+			if *once {
+				deliveryWorkers = &workers
+			}
+			if err := dispatchPendingDeliveryClaims(ctx, db, *repository, *maxParallelRuns, 30*time.Minute, time.Now().UTC(), launchDelivery, deliveryWorkers, func(err error) {
+				workerErrorMu.Lock()
+				workerError = errors.Join(workerError, err)
+				workerErrorMu.Unlock()
+			}); err != nil {
 				return err
 			}
 			for {
@@ -381,6 +390,7 @@ func runPollGitHub(args []string) {
 			return err
 		}
 		if err == nil {
+			lastPollResult = result
 			encoded, _ := json.Marshal(result)
 			fmt.Println(string(encoded))
 		}
@@ -397,12 +407,23 @@ func runPollGitHub(args []string) {
 		}
 		return
 	}
-	_ = poll()
-	ticker := time.NewTicker(*interval)
-	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		_ = poll()
+		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func nextPollDelay(db *store.Store, repository string, interval time.Duration, result github.PollResult, now time.Time) time.Duration {
+	if cursor, err := db.GitHubPollCursor(context.Background(), repository); err == nil && cursor.NextAttemptAt.After(now) {
+		return cursor.NextAttemptAt.Sub(now)
+	}
+	if result.Feedback > 0 || result.Checks > 0 {
+		if delay := interval / 4; delay >= time.Second {
+			return delay
+		}
+		return time.Second
+	}
+	return interval
 }
 
 func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, repository, source, workspaceRoot, stateRoot, gatewayURL string, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
@@ -411,7 +432,7 @@ func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, 
 	return err
 }
 
-func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, repository string, maxParallelRuns int, leaseTTL time.Duration, now time.Time, launch func(context.Context, store.TicketClaim) error) error {
+func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, repository string, maxParallelRuns int, leaseTTL time.Duration, now time.Time, launch func(context.Context, store.TicketClaim) error, workers *sync.WaitGroup, observe func(error)) error {
 	if _, err := db.ClaimPendingDeliveryClaims(ctx, repository, maxParallelRuns, leaseTTL, now); err != nil {
 		return err
 	}
@@ -419,15 +440,24 @@ func dispatchPendingDeliveryClaims(ctx context.Context, db *store.Store, reposit
 	if err != nil {
 		return err
 	}
-	return launchDeliveryClaims(ctx, claims, launch)
+	return launchDeliveryClaims(ctx, claims, launch, workers, observe)
 }
 
-func launchDeliveryClaims(ctx context.Context, claims []store.TicketClaim, launch func(context.Context, store.TicketClaim) error) error {
+func launchDeliveryClaims(ctx context.Context, claims []store.TicketClaim, launch func(context.Context, store.TicketClaim) error, workers *sync.WaitGroup, observe func(error)) error {
 	for _, claim := range claims {
 		claim := claim
+		if workers != nil {
+			workers.Add(1)
+		}
 		go func() {
+			if workers != nil {
+				defer workers.Done()
+			}
 			if err := launch(context.WithoutCancel(ctx), claim); err != nil {
 				fmt.Fprintln(os.Stderr, "workflow recovered delivery:", err)
+				if observe != nil {
+					observe(err)
+				}
 			}
 		}()
 	}
@@ -462,7 +492,7 @@ func runAnswerInbox(args []string) {
 	}
 	projected := make([]plan.WorkflowQuestion, 0, len(questions))
 	for _, open := range questions {
-		projected = append(projected, plan.WorkflowQuestion{ID: open.ID, Prompt: open.Prompt})
+		projected = append(projected, plan.WorkflowQuestion{ID: open.ID, Prompt: open.Prompt, Repository: open.Repository, PlanNumber: open.RootNumber, TicketNumber: open.TicketNumber, PullRequest: open.PullRequest, Commit: open.Commit, Finding: open.Kind, Diagnostics: open.Diagnostics, Evidence: open.Evidence})
 	}
 	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectWorkflowInbox(ctx, *repository, projected); err != nil {
 		fail(err)

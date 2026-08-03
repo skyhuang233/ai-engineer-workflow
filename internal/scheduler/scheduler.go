@@ -17,11 +17,16 @@ type Dispatcher struct {
 	LeaseTTL        time.Duration
 	Now             func() time.Time
 	Recovery        RecoveryInspector
+	HostPressure    HostPressureInspector
 }
 
 type RecoveryInspector interface {
 	ContainerRunning(context.Context, string) (bool, error)
 	WorkspaceAvailable(context.Context, store.TicketSession) (bool, error)
+}
+
+type HostPressureInspector interface {
+	Unsafe(context.Context) (bool, error)
 }
 
 // Claim reads the Plan Root only for the current human body and repository
@@ -30,6 +35,15 @@ type RecoveryInspector interface {
 func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ticketID int64, owner string) (store.TicketClaim, error) {
 	if d.Store == nil || d.Reader == nil || d.Projector == nil {
 		return store.TicketClaim{}, fmt.Errorf("scheduler dependencies are incomplete")
+	}
+	if d.HostPressure != nil {
+		unsafe, err := d.HostPressure.Unsafe(ctx)
+		if err != nil {
+			return store.TicketClaim{}, fmt.Errorf("inspect host pressure: %w", err)
+		}
+		if unsafe {
+			return store.TicketClaim{}, store.ErrCapacity
+		}
 	}
 	snapshot, err := d.Reader.ReadPlan(ctx, repository, rootNumber)
 	if err != nil {

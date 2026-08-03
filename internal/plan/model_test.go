@@ -22,6 +22,15 @@ func validSnapshot() Snapshot {
 	}
 }
 
+func TestRenderWorkflowInboxIncludesDeliveryContext(t *testing.T) {
+	content := RenderWorkflowInbox([]WorkflowQuestion{{ID: "q-1", Prompt: "decide", Repository: "owner/repo", PlanNumber: 10, TicketNumber: 11, PullRequest: 12, Commit: "0123456789abcdef", Finding: "closed_unmerged_impact", Diagnostics: "diagnostics/run-1", Evidence: "candidate evidence"}})
+	for _, expected := range []string{"issues/10", "issues/11", "pull/12", "commit/0123456789abcdef", "finding: `closed_unmerged_impact`", "diagnostics: `diagnostics/run-1`", "evidence: `candidate evidence`"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("inbox content omitted %q: %s", expected, content)
+		}
+	}
+}
+
 func TestSnapshotValidateAcceptsTypedAcyclicGraph(t *testing.T) {
 	if err := validSnapshot().Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)

@@ -655,6 +655,9 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivere
 	}
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
+		if err := markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+			return err
+		}
 		return tx.Commit()
 	} else if err != nil {
 		return err
@@ -670,7 +673,29 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivere
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, now, sessionID); err != nil {
 		return err
 	}
+	if err := markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID, now string) error {
+	var remaining, liveRuns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID).Scan(&remaining); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE s.version_id = ? AND r.state = ?`, versionID, RunRunning).Scan(&liveRuns); err != nil {
+		return err
+	}
+	if remaining == 0 && liveRuns == 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, StateCompleted, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type frontierRows interface {
@@ -681,7 +706,7 @@ type frontierRows interface {
 func loadFrontierTx(ctx context.Context, tx frontierRows, versionID string, now time.Time) (plan.FrontierSnapshot, error) {
 	var snapshot plan.FrontierSnapshot
 	var versionState, planState string
-	err := tx.QueryRowContext(ctx, `SELECT v.state, p.state FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, versionID).Scan(&versionState, &planState)
+	err := tx.QueryRowContext(ctx, `SELECT CASE WHEN EXISTS (SELECT 1 FROM plan_terminal_states t WHERE t.version_id = v.version_id) THEN 'cancelled' ELSE v.state END, p.state FROM plan_versions v JOIN plans p ON p.id = v.plan_id WHERE v.version_id = ?`, versionID).Scan(&versionState, &planState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return snapshot, ErrNotFound
 	}

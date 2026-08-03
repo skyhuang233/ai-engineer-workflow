@@ -18,7 +18,8 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 19
+	StateCompleted      = "completed"
+	latestSchemaVersion = 21
 )
 
 var (
@@ -558,6 +559,29 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 			return fmt.Errorf("migration 19: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (19, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 20 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS completed_plan_versions (
+    version_id TEXT PRIMARY KEY REFERENCES plan_versions(version_id),
+    completed_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 20: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (20, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 21 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS plan_terminal_states (
+    version_id TEXT PRIMARY KEY REFERENCES plan_versions(version_id),
+    state TEXT NOT NULL CHECK (state IN ('completed', 'cancelled')),
+    recorded_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 21: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (21, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

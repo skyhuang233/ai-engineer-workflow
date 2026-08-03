@@ -14,8 +14,16 @@ type Projection struct {
 }
 
 type WorkflowQuestion struct {
-	ID     string `json:"id"`
-	Prompt string `json:"prompt"`
+	ID           string `json:"id"`
+	Prompt       string `json:"prompt"`
+	Repository   string `json:"repository,omitempty"`
+	PlanNumber   int64  `json:"plan_number,omitempty"`
+	TicketNumber int64  `json:"ticket_number,omitempty"`
+	PullRequest  int64  `json:"pull_request,omitempty"`
+	Commit       string `json:"commit,omitempty"`
+	Finding      string `json:"finding,omitempty"`
+	Diagnostics  string `json:"diagnostics,omitempty"`
+	Evidence     string `json:"evidence,omitempty"`
 }
 
 type ProjectionTicket struct {
@@ -109,8 +117,41 @@ func RenderWorkflowInbox(questions []WorkflowQuestion) string {
 	b.WriteString("\n## Open questions\n\n")
 	for _, question := range questions {
 		fmt.Fprintf(&b, "- `%s`: %s\n", question.ID, escapeCell(question.Prompt))
+		if context := workflowQuestionContext(question); len(context) > 0 {
+			fmt.Fprintf(&b, "  - %s\n", strings.Join(context, " | "))
+		}
 	}
 	return b.String()
+}
+
+func workflowQuestionContext(question WorkflowQuestion) []string {
+	if question.Repository == "" {
+		return nil
+	}
+	base := "https://github.com/" + question.Repository
+	context := make([]string, 0, 7)
+	if question.PlanNumber > 0 {
+		context = append(context, fmt.Sprintf("[plan/spec #%d](%s/issues/%d)", question.PlanNumber, base, question.PlanNumber))
+	}
+	if question.TicketNumber > 0 {
+		context = append(context, fmt.Sprintf("[ticket #%d](%s/issues/%d)", question.TicketNumber, base, question.TicketNumber))
+	}
+	if question.PullRequest > 0 {
+		context = append(context, fmt.Sprintf("[PR #%d](%s/pull/%d)", question.PullRequest, base, question.PullRequest))
+	}
+	if question.Commit != "" {
+		context = append(context, fmt.Sprintf("[commit %s](%s/commit/%s)", shortRevision(question.Commit), base, question.Commit))
+	}
+	if question.Finding != "" {
+		context = append(context, "finding: `"+question.Finding+"`")
+	}
+	if question.Diagnostics != "" {
+		context = append(context, "diagnostics: `"+question.Diagnostics+"`")
+	}
+	if question.Evidence != "" {
+		context = append(context, "evidence: `"+question.Evidence+"`")
+	}
+	return context
 }
 
 func pullRequestReference(number int64) string {

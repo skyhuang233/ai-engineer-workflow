@@ -18,7 +18,7 @@ func (s *Store) PlanProjection(ctx context.Context, versionID string) (plan.Proj
 
 func (s *Store) PlanProjectionAt(ctx context.Context, versionID string, now time.Time) (plan.Projection, error) {
 	var state string
-	if err := s.db.QueryRowContext(ctx, `SELECT state FROM plan_versions WHERE version_id = ?`, versionID).Scan(&state); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT t.state FROM plan_terminal_states t WHERE t.version_id = v.version_id), CASE WHEN EXISTS (SELECT 1 FROM completed_plan_versions c WHERE c.version_id = v.version_id) THEN ? ELSE v.state END) FROM plan_versions v WHERE v.version_id = ?`, StateCompleted, versionID).Scan(&state); errors.Is(err, sql.ErrNoRows) {
 		return plan.Projection{}, ErrNotFound
 	} else if err != nil {
 		return plan.Projection{}, err
@@ -116,14 +116,23 @@ WHERE d.version_id = ?`, versionID)
 	if err := dependencyRows.Err(); err != nil {
 		return plan.Projection{}, err
 	}
-	questionRows, err := s.db.QueryContext(ctx, `SELECT question_id, prompt FROM workflow_questions WHERE version_id = ? AND state = 'open' ORDER BY question_id`, versionID)
+	questionRows, err := s.db.QueryContext(ctx, `SELECT q.question_id, q.prompt, q.repository, p.root_issue_number, COALESCE(t.issue_number, 0), COALESCE(d.pull_request_number, 0), COALESCE(s.accepted_commit, ''), q.kind, COALESCE(rd.diagnostics_path, ''), COALESCE(c.structured_output, '')
+FROM workflow_questions q
+JOIN plan_versions v ON v.version_id = q.version_id
+JOIN plans p ON p.id = v.plan_id
+LEFT JOIN plan_tickets t ON t.version_id = q.version_id AND t.issue_id = q.issue_id
+LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.issue_id
+LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
+LEFT JOIN run_diagnostics rd ON rd.run_id = s.current_run_id
+LEFT JOIN candidate_revisions c ON c.run_id = s.current_run_id
+WHERE q.version_id = ? AND q.state = 'open' ORDER BY q.question_id`, versionID)
 	if err != nil {
 		return plan.Projection{}, err
 	}
 	defer questionRows.Close()
 	for questionRows.Next() {
 		var question plan.WorkflowQuestion
-		if err := questionRows.Scan(&question.ID, &question.Prompt); err != nil {
+		if err := questionRows.Scan(&question.ID, &question.Prompt, &question.Repository, &question.PlanNumber, &question.TicketNumber, &question.PullRequest, &question.Commit, &question.Finding, &question.Diagnostics, &question.Evidence); err != nil {
 			return plan.Projection{}, err
 		}
 		projection.Questions = append(projection.Questions, question)
@@ -137,6 +146,12 @@ WHERE d.version_id = ?`, versionID)
 func projectionState(state string) string {
 	if state == StateActive {
 		return "Active"
+	}
+	if state == StateCompleted {
+		return "Completed"
+	}
+	if state == "cancelled" {
+		return "Cancelled"
 	}
 	return "Building"
 }
