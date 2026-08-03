@@ -100,15 +100,17 @@ type TicketDelivery struct {
 	Repository        string
 	PullRequestNumber int64
 	CandidateCommit   string
+	Branch            string
+	RemoteHead        string
 }
 
 func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
 	var delivery TicketDelivery
-	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit
+	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head
 FROM ticket_deliveries d
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
 WHERE d.version_id = ? AND d.issue_id = ? AND d.pull_request_number > 0 AND s.accepted_commit != ''`, versionID, issueID).
-		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit)
+		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketDelivery{}, ErrNotFound
 	}
@@ -344,8 +346,41 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 	return result, nil
 }
 
+func (s *Store) DueDeliveryOutboxKeys(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT o.idempotency_key FROM delivery_outbox o
+WHERE o.state IN (?, ?) AND (o.state = ? OR o.next_attempt_at <= ?)
+AND (o.operation != ? OR EXISTS (
+  SELECT 1 FROM delivery_outbox pushed
+  WHERE pushed.operation = ? AND pushed.state = ?
+  AND json_extract(pushed.request_json, '$.run_id') = json_extract(o.request_json, '$.run_id')
+))
+ORDER BY o.created_at, CASE o.operation WHEN ? THEN 0 ELSE 1 END, o.idempotency_key LIMIT ?`,
+		OutboxPending, OutboxProcessing, OutboxProcessing, formatTimestamp(now), DeliveryUpsertPR, DeliveryPushCandidate, OutboxSucceeded, DeliveryPushCandidate, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
@@ -357,7 +392,7 @@ WHERE d.repository = ? AND d.pull_request_number > 0 AND r.delivered = 0 AND s.a
 	var deliveries []TicketDelivery
 	for rows.Next() {
 		var delivery TicketDelivery
-		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit); err != nil {
+		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead); err != nil {
 			return nil, err
 		}
 		deliveries = append(deliveries, delivery)

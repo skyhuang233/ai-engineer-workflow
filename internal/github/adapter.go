@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
@@ -30,6 +31,10 @@ type PullRequestFeedback struct {
 }
 
 func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository string, number int64) ([]PullRequestFeedback, error) {
+	return c.ActionablePullRequestFeedbackSince(ctx, repository, number, time.Time{}, true)
+}
+
+func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, repository string, number int64, since time.Time, full bool) ([]PullRequestFeedback, error) {
 	if err := ValidateRepository(repository); err != nil {
 		return nil, err
 	}
@@ -41,15 +46,17 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 		Type  string `json:"type"`
 	}
 	type review struct {
-		ID    int64  `json:"id"`
-		Body  string `json:"body"`
-		State string `json:"state"`
-		User  user   `json:"user"`
+		ID          int64  `json:"id"`
+		Body        string `json:"body"`
+		State       string `json:"state"`
+		User        user   `json:"user"`
+		SubmittedAt string `json:"submitted_at"`
 	}
 	type comment struct {
-		ID   int64  `json:"id"`
-		Body string `json:"body"`
-		User user   `json:"user"`
+		ID        int64  `json:"id"`
+		Body      string `json:"body"`
+		User      user   `json:"user"`
+		UpdatedAt string `json:"updated_at"`
 	}
 	var result []PullRequestFeedback
 	for page := 1; ; page++ {
@@ -59,7 +66,7 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableReview(value.User.Login, value.User.Type, value.Body) {
+			if value.State != "PENDING" && actionableReview(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
 				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
 			}
 		}
@@ -77,11 +84,14 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 		for page := 1; ; page++ {
 			var comments []comment
 			path := endpoint.path + "?per_page=100&page=" + strconv.Itoa(page)
+			if !full && !since.IsZero() {
+				path += "&since=" + url.QueryEscape(since.UTC().Format(time.RFC3339))
+			}
 			if err := c.getJSON(ctx, path, &comments); err != nil {
 				return nil, err
 			}
 			for _, value := range comments {
-				if actionableComment(value.User.Login, value.User.Type, value.Body) {
+				if actionableComment(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
 					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
 				}
 			}
@@ -91,6 +101,14 @@ func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository s
 		}
 	}
 	return result, nil
+}
+
+func changedSince(value string, since time.Time) bool {
+	if since.IsZero() || value == "" {
+		return true
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	return err != nil || !parsed.Before(since)
 }
 
 func actionableReview(login, accountType, body string) bool {
@@ -156,7 +174,69 @@ func (c *Client) ReadPlan(ctx context.Context, repository string, rootNumber int
 		}
 		blockedBy[child.ID] = blockers
 	}
-	return plan.Snapshot{Repository: repository, Root: root, Children: children, BlockedBy: blockedBy}, nil
+	snapshot := plan.Snapshot{Repository: repository, Root: root, Children: children, BlockedBy: blockedBy}
+	return c.hydrateDeliveredIssues(ctx, snapshot)
+}
+
+func (c *Client) hydrateDeliveredIssues(ctx context.Context, snapshot plan.Snapshot) (plan.Snapshot, error) {
+	closed := make(map[int64]struct{})
+	for _, issue := range snapshot.Children {
+		if strings.EqualFold(issue.State, "closed") {
+			closed[issue.Number] = struct{}{}
+		}
+	}
+	if len(closed) == 0 {
+		return snapshot, nil
+	}
+	type pull struct {
+		Number   int64  `json:"number"`
+		Body     string `json:"body"`
+		MergedAt string `json:"merged_at"`
+		Base     struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	}
+	delivered := make(map[int64]bool)
+	for page := 1; ; page++ {
+		var pulls []pull
+		path := "/repos/" + snapshot.Repository + "/pulls?state=closed&base=main&per_page=100&page=" + strconv.Itoa(page)
+		if err := c.getJSON(ctx, path, &pulls); err != nil {
+			return plan.Snapshot{}, err
+		}
+		for _, pull := range pulls {
+			if pull.MergedAt == "" || pull.Base.Ref != "main" {
+				continue
+			}
+			for number := range closed {
+				if closesIssue(pull.Body, number) {
+					delivered[number] = true
+				}
+			}
+		}
+		if len(pulls) < 100 {
+			break
+		}
+	}
+	for index := range snapshot.Children {
+		snapshot.Children[index].Delivered = delivered[snapshot.Children[index].Number]
+	}
+	for blocked, blockers := range snapshot.BlockedBy {
+		for index := range blockers {
+			blockers[index].Delivered = delivered[blockers[index].Number]
+		}
+		snapshot.BlockedBy[blocked] = blockers
+	}
+	return snapshot, nil
+}
+
+func closesIssue(body string, number int64) bool {
+	lower := strings.ToLower(body)
+	for _, verb := range []string{"fixes", "fixed", "closes", "closed", "resolves", "resolved"} {
+		if strings.Contains(lower, verb+" #"+strconv.FormatInt(number, 10)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) getIssue(ctx context.Context, repository string, number int64) (plan.Issue, error) {

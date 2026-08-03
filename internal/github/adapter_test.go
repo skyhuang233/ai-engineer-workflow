@@ -77,6 +77,37 @@ func TestReadPlanRetainsUntypedChildForIncompletePublication(t *testing.T) {
 	}
 }
 
+func TestReadPlanHydratesClosedDeliveredBlockerFromMergedPullRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/issues/10":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "labels": []map[string]string{{"name": "workflow:plan"}}})
+		case "/repos/owner/repo/issues/10/sub_issues":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}}, {"id": 2, "number": 12, "state": "open", "labels": []map[string]string{{"name": "workflow:ticket"}}}})
+		case "/repos/owner/repo/issues/11/dependencies/blocked_by":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case "/repos/owner/repo/issues/12/dependencies/blocked_by":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}}})
+		case "/repos/owner/repo/pulls":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 24, "body": "Fixes #11", "merged_at": "2026-08-03T00:00:00Z", "base": map[string]string{"ref": "main"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	snapshot, err := NewClient(server.URL, "", server.Client()).ReadPlan(context.Background(), "owner/repo", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Children[0].Delivered || !snapshot.BlockedBy[2][0].Delivered {
+		t.Fatalf("delivery facts = %#v", snapshot)
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestActionablePullRequestFeedbackIncludesHumanEventsOnly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

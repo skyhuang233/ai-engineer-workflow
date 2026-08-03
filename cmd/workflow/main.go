@@ -260,26 +260,48 @@ func runReconcileDelivered(args []string) {
 
 func runPollGitHub(args []string) {
 	flags := flag.NewFlagSet("poll-github", flag.ExitOnError)
+	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
+	source := flags.String("source", "", "absolute local repository path for review revisions")
+	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
+	stateRoot := flags.String("state-root", "", "absolute Codex state root")
+	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	_ = flags.Parse(args)
-	if *repository == "" || *token == "" || *interval <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, read credential, and positive interval")
+	if *repository == "" || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *interval <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, read credential, review workspace configuration, Gateway URL, and positive interval")
 		os.Exit(2)
+	}
+	config, err := doctor.LoadConfig(*configPath)
+	if err != nil {
+		fail(err)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil)}
+	launcher := func(ctx context.Context, claim store.TicketClaim, prompt string) error {
+		deliveryState, err := db.TicketDelivery(ctx, claim.VersionID, claim.TicketID)
+		if err != nil {
+			return err
+		}
+		expectedHead := deliveryState.RemoteHead
+		if expectedHead == "" {
+			expectedHead = deliveryState.CandidateCommit
+		}
+		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, ImageDigest: config.Worker.Image, ToolVersions: map[string]string{"no-mistakes": config.NoMistakes.Version, "codex": config.Codex.Version}, GatewayURL: *gatewayURL}
+		_, err = controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: deliveryState.Branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: deliveryState.Branch, ExpectedRemoteHead: expectedHead, Title: claim.TicketTitle}})
+		return err
+	}
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 	poll := func() error {
 		result, err := poller.Poll(context.Background(), *repository)
-		if err != nil && !errors.Is(err, store.ErrNotReady) {
+		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
@@ -310,8 +332,9 @@ func runGateway(args []string) {
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
 	gitBinary := flags.String("git", "git", "Git executable")
+	outboxInterval := flags.Duration("outbox-interval", time.Second, "durable outbox recovery interval")
 	_ = flags.Parse(args)
-	if *listen == "" || *token == "" {
+	if *listen == "" || *token == "" || *outboxInterval <= 0 {
 		fmt.Fprintln(os.Stderr, "gateway requires listen address and GitHub credential")
 		os.Exit(2)
 	}
@@ -320,7 +343,16 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	remote := github.DeliveryRemote{Client: github.NewClient(*githubURL, *token, nil), Store: db, Token: *token, PushURL: *pushURL, GitBinary: *gitBinary}
-	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: remote})}
+	gateway := delivery.Gateway{Store: db, Remote: remote}
+	go func() {
+		for {
+			if err := gateway.DispatchPending(context.Background(), 32); err != nil {
+				fmt.Fprintln(os.Stderr, "gateway outbox recovery:", err)
+			}
+			time.Sleep(*outboxInterval)
+		}
+	}()
+	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(gateway)}
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		_ = db.Close()
 		fail(err)

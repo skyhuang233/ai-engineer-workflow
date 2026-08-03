@@ -15,10 +15,16 @@ type PollResult struct {
 	Checks     int
 }
 
+type ReviewLauncher func(context.Context, store.TicketClaim, string) error
+
 type Poller struct {
-	Store  *store.Store
-	Client *Client
-	Now    func() time.Time
+	Store                 *store.Store
+	Client                *Client
+	Now                   func() time.Time
+	LaunchReview          ReviewLauncher
+	MaxFailures           int
+	MaxWorkerAttempts     int
+	FullReconcileInterval time.Duration
 }
 
 func (p Poller) now() time.Time {
@@ -36,25 +42,53 @@ func (p Poller) Poll(ctx context.Context, repository string) (PollResult, error)
 		return PollResult{}, err
 	}
 	now := p.now()
-	if cursor, err := p.Store.GitHubPollCursor(ctx, repository); err == nil && cursor.NextAttemptAt.After(now) {
-		return PollResult{}, store.ErrNotReady
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if err == nil {
+		if cursor.ConsecutiveFailures >= p.maxFailures() {
+			return PollResult{}, store.ErrNeedsAttention
+		}
+		if cursor.NextAttemptAt.After(now) {
+			return PollResult{}, store.ErrNotReady
+		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, err
 	}
-	result, err := p.poll(ctx, repository, now)
+	full := err != nil || cursor.LastFullReconcileAt.IsZero() || now.Sub(cursor.LastFullReconcileAt) >= p.fullReconcileInterval()
+	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
 		if recordErr := p.Store.RecordGitHubPollFailure(ctx, repository, now); recordErr != nil {
 			return PollResult{}, errors.Join(err, recordErr)
 		}
+		updated, cursorErr := p.Store.GitHubPollCursor(ctx, repository)
+		if cursorErr == nil && updated.ConsecutiveFailures >= p.maxFailures() {
+			if attentionErr := p.Store.MarkRepositoryNeedsAttention(ctx, repository, now); attentionErr != nil {
+				return PollResult{}, errors.Join(err, attentionErr)
+			}
+			return PollResult{}, store.ErrNeedsAttention
+		}
 		return PollResult{}, err
 	}
-	if err := p.Store.RecordGitHubPollSuccess(ctx, repository, now); err != nil {
+	if err := p.Store.RecordGitHubPollSuccess(ctx, repository, now, full); err != nil {
 		return PollResult{}, err
 	}
 	return result, nil
 }
 
-func (p Poller) poll(ctx context.Context, repository string, now time.Time) (PollResult, error) {
+func (p Poller) maxFailures() int {
+	if p.MaxFailures > 0 {
+		return p.MaxFailures
+	}
+	return store.DefaultMaxWorkerAttempts
+}
+
+func (p Poller) fullReconcileInterval() time.Duration {
+	if p.FullReconcileInterval > 0 {
+		return p.FullReconcileInterval
+	}
+	return 15 * time.Minute
+}
+
+func (p Poller) poll(ctx context.Context, repository string, now, since time.Time, full bool) (PollResult, error) {
 	deliveries, err := p.Store.PendingTicketDeliveries(ctx, repository)
 	if err != nil {
 		return PollResult{}, err
@@ -69,7 +103,7 @@ func (p Poller) poll(ctx context.Context, repository string, now time.Time) (Pol
 		if terminal {
 			continue
 		}
-		events, err := p.Client.ActionablePullRequestFeedback(ctx, repository, delivery.PullRequestNumber)
+		events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
 		if err != nil {
 			return PollResult{}, err
 		}
@@ -82,6 +116,16 @@ func (p Poller) poll(ctx context.Context, repository string, now time.Time) (Pol
 			return PollResult{}, err
 		}
 		result.Feedback += inserted
+		if p.LaunchReview != nil {
+			claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.MaxWorkerAttempts)
+			if claimErr == nil {
+				if err := p.LaunchReview(ctx, claim, prompt); err != nil {
+					return PollResult{}, err
+				}
+			} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
+				return PollResult{}, claimErr
+			}
+		}
 		checks, err := p.Client.PullRequestChecks(ctx, repository, delivery.CandidateCommit)
 		if err != nil {
 			return PollResult{}, err

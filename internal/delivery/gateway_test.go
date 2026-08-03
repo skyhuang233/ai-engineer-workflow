@@ -165,6 +165,30 @@ func TestGatewayUsesDurableOutboxAndReconcilesAnUncertainWrite(t *testing.T) {
 	}
 }
 
+func TestGatewayDispatchPendingPublishesAcceptedCandidateInOrder(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newPublishedCandidate(t, ctx)
+	defer db.Close()
+	_, handoff, err := db.AcceptedCandidateHandoff(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{observations: []delivery.Observation{{}, {RemoteHead: "accepted", RemoteExists: true}}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC) }}
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{handoff.PushOutboxKey, handoff.PROutboxKey} {
+		outbox, err := db.DeliveryOutbox(ctx, key)
+		if err != nil || outbox.State != store.OutboxSucceeded {
+			t.Fatalf("outbox %q = %#v, %v", key, outbox, err)
+		}
+	}
+	if remote.applyCalls != 2 {
+		t.Fatalf("apply calls = %d", remote.applyCalls)
+	}
+}
+
 func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditions(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)

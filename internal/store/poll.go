@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/plan"
 )
 
 type GitHubPollCursor struct {
@@ -48,16 +50,34 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&cursor.Reposit
 	return cursor, nil
 }
 
-func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time) error {
+func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time, fullReconcile bool) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
+	full := ""
+	if fullReconcile {
+		full = formatTimestamp(now)
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, last_success_at, last_full_reconcile_at, consecutive_failures, next_attempt_at, updated_at)
 VALUES (?, ?, ?, 0, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET last_success_at = excluded.last_success_at, last_full_reconcile_at = excluded.last_full_reconcile_at,
-consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), formatTimestamp(now), formatTimestamp(now), formatTimestamp(now))
+ON CONFLICT(repository) DO UPDATE SET last_success_at = excluded.last_success_at,
+last_full_reconcile_at = CASE WHEN excluded.last_full_reconcile_at = '' THEN github_poll_cursors.last_full_reconcile_at ELSE excluded.last_full_reconcile_at END,
+consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), full, formatTimestamp(now), formatTimestamp(now))
+	return err
+}
+
+func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
+WHERE delivered = 0 AND version_id IN (
+  SELECT current_version_id FROM plans WHERE repository = ? AND current_version_id IS NOT NULL
+)`, plan.StateNeedsAttention, formatTimestamp(now), repository)
 	return err
 }
 

@@ -138,6 +138,38 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	return g.succeed(ctx, outbox, result)
 }
 
+func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
+	if g.Store == nil || g.Remote == nil {
+		return errors.New("delivery gateway dependencies are incomplete")
+	}
+	var dispatchErr error
+	for dispatched := 0; dispatched < limit; {
+		keys, err := g.Store.DueDeliveryOutboxKeys(ctx, g.now(), limit-dispatched)
+		if err != nil {
+			return errors.Join(dispatchErr, err)
+		}
+		if len(keys) == 0 {
+			return dispatchErr
+		}
+		progressed := false
+		for _, key := range keys {
+			dispatched++
+			err := g.Dispatch(ctx, key)
+			if errors.Is(err, store.ErrDeliveryInProgress) {
+				continue
+			}
+			progressed = true
+			if err != nil {
+				dispatchErr = errors.Join(dispatchErr, err)
+			}
+		}
+		if !progressed {
+			return dispatchErr
+		}
+	}
+	return dispatchErr
+}
+
 func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox) error {
 	operationCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()

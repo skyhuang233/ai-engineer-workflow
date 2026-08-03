@@ -31,6 +31,7 @@ var (
 	ErrInvalidClaim       = errors.New("invalid ticket claim")
 	ErrDeliveryInProgress = errors.New("delivery outbox item is already being processed")
 	ErrWorkerLaunched     = errors.New("worker run has already been launched")
+	ErrNeedsAttention     = errors.New("workflow needs attention")
 )
 
 const (

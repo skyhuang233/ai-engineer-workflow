@@ -72,6 +72,12 @@ files or tool artifacts.
 
 # GITHUB ISSUE UPDATE
 
+GitHub writes are restricted to the GitHub Write Gateway. Do not invoke `gh`,
+`git push`, `curl`, or any other direct GitHub write command for comments,
+labels, issue closure, pull requests, or pushes. Submit every requested issue
+update through `WORKFLOW_GITHUB_GATEWAY_COMMAND`; if it is unavailable, stop
+and report the update as blocked.
+
 When the task is complete:
 
 1. Add a GitHub issue comment summarizing the change, verification, and any

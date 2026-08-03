@@ -25,7 +25,7 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	if cursor.ConsecutiveFailures != 1 || !cursor.NextAttemptAt.Equal(now.Add(time.Second)) {
 		t.Fatalf("failure cursor = %#v", cursor)
 	}
-	if err := db.RecordGitHubPollSuccess(ctx, "owner/repo", now.Add(time.Minute)); err != nil {
+	if err := db.RecordGitHubPollSuccess(ctx, "owner/repo", now.Add(time.Minute), true); err != nil {
 		t.Fatal(err)
 	}
 	cursor, err = db.GitHubPollCursor(ctx, "owner/repo")
@@ -34,5 +34,12 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	}
 	if cursor.ConsecutiveFailures != 0 || !cursor.NextAttemptAt.Equal(now.Add(time.Minute)) || !cursor.LastFullReconcileAt.Equal(now.Add(time.Minute)) {
 		t.Fatalf("success cursor = %#v", cursor)
+	}
+	if err := db.RecordGitHubPollSuccess(ctx, "owner/repo", now.Add(2*time.Minute), false); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, "owner/repo")
+	if err != nil || !cursor.LastFullReconcileAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("incremental cursor = %#v, %v", cursor, err)
 	}
 }

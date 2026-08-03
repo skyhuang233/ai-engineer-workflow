@@ -22,6 +22,10 @@ func HTTPHandler(gateway Gateway) http.Handler {
 			http.Error(writer, "invalid delivery command", http.StatusBadRequest)
 			return
 		}
+		if command.RunID == "" {
+			http.Error(writer, "control-plane commands are not accepted over the agent gateway", http.StatusForbidden)
+			return
+		}
 		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 			http.Error(writer, "invalid delivery command", http.StatusBadRequest)
 			return
