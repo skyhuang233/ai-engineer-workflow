@@ -22,6 +22,84 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+type PullRequestFeedback struct {
+	Source  string
+	EventID string
+	Author  string
+	Body    string
+}
+
+func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository string, number int64) ([]PullRequestFeedback, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return nil, err
+	}
+	if number <= 0 {
+		return nil, fmt.Errorf("pull request number is required")
+	}
+	type user struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	}
+	type review struct {
+		ID    int64  `json:"id"`
+		Body  string `json:"body"`
+		State string `json:"state"`
+		User  user   `json:"user"`
+	}
+	type comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+		User user   `json:"user"`
+	}
+	var result []PullRequestFeedback
+	for page := 1; ; page++ {
+		var reviews []review
+		path := "/repos/" + repository + "/pulls/" + strconv.FormatInt(number, 10) + "/reviews?per_page=100&page=" + strconv.Itoa(page)
+		if err := c.getJSON(ctx, path, &reviews); err != nil {
+			return nil, err
+		}
+		for _, value := range reviews {
+			if value.State != "PENDING" && actionableHuman(value.User.Login, value.User.Type, value.Body) {
+				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
+			}
+		}
+		if len(reviews) < 100 {
+			break
+		}
+	}
+	for _, endpoint := range []struct {
+		source string
+		path   string
+	}{
+		{source: "inline-comment", path: "/repos/" + repository + "/pulls/" + strconv.FormatInt(number, 10) + "/comments"},
+		{source: "conversation-comment", path: "/repos/" + repository + "/issues/" + strconv.FormatInt(number, 10) + "/comments"},
+	} {
+		for page := 1; ; page++ {
+			var comments []comment
+			path := endpoint.path + "?per_page=100&page=" + strconv.Itoa(page)
+			if err := c.getJSON(ctx, path, &comments); err != nil {
+				return nil, err
+			}
+			for _, value := range comments {
+				if actionableHuman(value.User.Login, value.User.Type, value.Body) {
+					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
+				}
+			}
+			if len(comments) < 100 {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func actionableHuman(login, accountType, body string) bool {
+	if strings.TrimSpace(body) == "" || strings.EqualFold(accountType, "bot") || strings.HasSuffix(strings.ToLower(login), "[bot]") {
+		return false
+	}
+	return !strings.Contains(body, "<!-- workflow-idempotency:")
+}
+
 type apiError struct {
 	Method     string
 	Path       string

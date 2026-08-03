@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
@@ -104,7 +107,7 @@ func runTicket(args []string) {
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	prompt := flags.String("prompt", "", "Worker prompt")
-	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback for the next revision round")
+	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback to queue for the next revision round")
 	branch := flags.String("branch", "", "ticket branch")
 	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
@@ -112,8 +115,8 @@ func runTicket(args []string) {
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *prompt == "" || *token == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
-		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, prompt, read credential, Gateway URL, and exactly one remote-head expectation")
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *token == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
+		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, read credential, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -136,16 +139,20 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
+	if err := syncReviewFeedback(ctx, db, client, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
+		fail(err)
+	}
 	claim, claimErr := db.CurrentClaim(ctx, version.ID, *ticketID)
 	if claimErr != nil {
-		if *reviewFeedback == "" {
-			fail(claimErr)
-		}
-		claim, claimErr = db.ClaimReviewRevision(ctx, version.ID, *ticketID, 30*time.Minute, time.Now().UTC())
+		var revisionPrompt string
+		claim, revisionPrompt, claimErr = db.ClaimQueuedReviewRevision(ctx, version.ID, *ticketID, 30*time.Minute, time.Now().UTC())
 		if claimErr != nil {
 			fail(claimErr)
 		}
-		*prompt = *reviewFeedback
+		*prompt = revisionPrompt
+	}
+	if *prompt == "" {
+		fail(fmt.Errorf("run-ticket requires prompt for an active worker run"))
 	}
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
@@ -157,6 +164,31 @@ func runTicket(args []string) {
 	}
 	encoded, _ := json.MarshalIndent(candidate, "", "  ")
 	fmt.Println(string(encoded))
+}
+
+func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Client, repository, versionID string, ticketID int64, manual string) error {
+	var feedback []store.ReviewFeedback
+	delivery, err := db.TicketDelivery(ctx, versionID, ticketID)
+	if err == nil {
+		events, err := client.ActionablePullRequestFeedback(ctx, repository, delivery.PullRequestNumber)
+		if err != nil {
+			return err
+		}
+		for _, event := range events {
+			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if strings.TrimSpace(manual) != "" {
+		digest := sha256.Sum256([]byte(strings.TrimSpace(manual)))
+		feedback = append(feedback, store.ReviewFeedback{Source: "manual", EventID: fmt.Sprintf("%x", digest), Author: "operator", Body: manual})
+	}
+	if len(feedback) == 0 {
+		return nil
+	}
+	_, err = db.RecordReviewFeedback(ctx, versionID, ticketID, feedback, time.Now().UTC())
+	return err
 }
 
 func runReconcileDelivered(args []string) {

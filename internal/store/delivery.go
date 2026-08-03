@@ -102,6 +102,19 @@ type TicketDelivery struct {
 	CandidateCommit   string
 }
 
+func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
+	var delivery TicketDelivery
+	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit
+FROM ticket_deliveries d
+JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
+WHERE d.version_id = ? AND d.issue_id = ? AND d.pull_request_number > 0 AND s.accepted_commit != ''`, versionID, issueID).
+		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketDelivery{}, ErrNotFound
+	}
+	return delivery, err
+}
+
 const maxDeliveryAttempts = 3
 
 type DeliveryAudit struct {

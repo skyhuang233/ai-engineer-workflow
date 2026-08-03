@@ -32,3 +32,21 @@ func TestPullRequestReachedMainRequiresMappedCandidateReachability(t *testing.T)
 		t.Fatal("mapped candidate reachable from main was not delivered")
 	}
 }
+
+func TestClosedUnmergedPullRequestFreezesInsteadOfDelivering(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo/pulls/7" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "closed", "merged_at": nil, "merge_commit_sha": nil, "base": map[string]string{"ref": "main"}})
+	}))
+	defer server.Close()
+	state, err := NewClient(server.URL, "", server.Client()).pullRequestDeliveryState(context.Background(), "owner/repo", 7, "candidate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != pullRequestClosedUnmerged {
+		t.Fatalf("state = %d, want closed-unmerged", state)
+	}
+}

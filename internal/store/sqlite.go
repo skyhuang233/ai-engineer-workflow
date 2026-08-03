@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 7
+	latestSchemaVersion = 8
 )
 
 var (
@@ -351,6 +351,38 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 8 {
+		statements := []string{
+			`CREATE TABLE review_feedback_events (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    claimed_run_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (version_id, issue_id, source, event_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE INDEX review_feedback_unclaimed_idx ON review_feedback_events(version_id, issue_id, claimed_run_id, received_at)`,
+			`CREATE TABLE plan_freezes (
+    version_id TEXT PRIMARY KEY REFERENCES plan_versions(version_id),
+    issue_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 8: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

@@ -209,6 +209,10 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_
 }
 
 func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int64) (TicketClaim, error) {
+	return s.currentClaimAt(ctx, versionID, issueID, time.Now().UTC())
+}
+
+func (s *Store) currentClaimAt(ctx context.Context, versionID string, issueID int64, now time.Time) (TicketClaim, error) {
 	var claim TicketClaim
 	var expiresText string
 	err := s.db.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.current_run_id, r.attempt, l.lease_token, l.generation, l.expires_at, t.issue_number, t.title
@@ -216,7 +220,7 @@ FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ?`, versionID, issueID, SessionRunning, RunRunning).
+WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?`, versionID, issueID, SessionRunning, RunRunning, LeaseActive, formatTimestamp(now)).
 		Scan(&claim.SessionID, &claim.Owner, &claim.RunID, &claim.Attempt, &claim.LeaseToken, &claim.LeaseGeneration, &expiresText, &claim.TicketNumber, &claim.TicketTitle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound
@@ -249,6 +253,11 @@ func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issue
 		return TicketClaim{}, err
 	}
 	defer tx.Rollback()
+	if frozen, err := planFrozenTx(ctx, tx, versionID); err != nil {
+		return TicketClaim{}, err
+	} else if frozen {
+		return TicketClaim{}, ErrNotReady
+	}
 	var sessionID, owner, sessionState, runtimeState string
 	var ticketNumber int64
 	var ticketTitle string
@@ -297,6 +306,15 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, err
 	}
 	return TicketClaim{VersionID: versionID, TicketID: issueID, TicketNumber: ticketNumber, TicketTitle: ticketTitle, Owner: owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: generation, LeaseExpiresAt: expiresAt}, nil
+}
+
+func planFrozenTx(ctx context.Context, tx frontierRows, versionID string) (bool, error) {
+	var frozen int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM plan_freezes WHERE version_id = ?`, versionID).Scan(&frozen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // MarkTicketDelivered records the durable delivery fact that unlocks dependent
@@ -356,7 +374,13 @@ func loadFrontierTx(ctx context.Context, tx frontierRows, versionID string, now 
 		return snapshot, err
 	}
 	snapshot.VersionID = versionID
-	if versionState == StateActive && planState == StateActive {
+	frozen, err := planFrozenTx(ctx, tx, versionID)
+	if err != nil {
+		return snapshot, err
+	}
+	if frozen {
+		snapshot.PlanState = plan.StateNeedsAttention
+	} else if versionState == StateActive && planState == StateActive {
 		snapshot.PlanState = plan.StateActive
 	} else {
 		snapshot.PlanState = versionState

@@ -24,6 +24,14 @@ func (s *Store) PlanProjectionAt(ctx context.Context, versionID string, now time
 		return plan.Projection{}, err
 	}
 	projection := plan.Projection{VersionID: versionID, State: projectionState(state)}
+	var frozen int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM plan_freezes WHERE version_id = ?`, versionID).Scan(&frozen)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return plan.Projection{}, err
+	}
+	if frozen != 0 {
+		projection.State = "Needs Attention"
+	}
 	now = now.UTC()
 	rows, err := s.db.QueryContext(ctx, `SELECT t.issue_id, t.issue_number, t.title, COALESCE(rt.delivered, t.delivered), COALESCE(rt.state, ''),
 COALESCE(s.owner, ''), COALESCE(s.session_id, ''), COALESCE(r.run_id, ''),

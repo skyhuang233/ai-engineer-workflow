@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,13 +33,14 @@ func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	now := time.Now().UTC()
 	claimed, err := db.ClaimReady(ctx, ClaimRequest{
 		VersionID:       version.ID,
 		TicketID:        1,
 		Owner:           "agent-1",
 		MaxParallelRuns: 1,
 		LeaseTTL:        time.Minute,
-		Now:             time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
+		Now:             now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +58,134 @@ func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 2, LeaseTTL: time.Minute}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("blocked ticket claim error = %v, want ErrNotReady", err)
+	}
+}
+
+func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC().Add(-2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired CurrentClaim error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}, {Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 1 {
+		t.Fatalf("inserted = %d, want 1", inserted)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 || !strings.Contains(prompt, "Please rename this.") {
+		t.Fatalf("revision = %#v, prompt = %q", revision, prompt)
+	}
+	inserted, err = db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "100", Author: "human", Body: "Please rename this."}}, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 0 {
+		t.Fatalf("repeated event inserted = %d, want 0", inserted)
+	}
+}
+
+func TestClosedPullRequestFreezesPlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozen {
+		t.Fatal("plan was not frozen")
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.State != "Needs Attention" {
+		t.Fatalf("projection state = %q", projection.State)
+	}
+	frontier, err := db.ReadyFrontier(ctx, version.ID, 1, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 0 {
+		t.Fatalf("frozen frontier = %#v", frontier)
 	}
 }
 

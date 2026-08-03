@@ -77,6 +77,30 @@ func TestReadPlanRetainsUntypedChildForIncompletePublication(t *testing.T) {
 	}
 }
 
+func TestActionablePullRequestFeedbackIncludesHumanEventsOnly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/7/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "Please change this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 2, "body": "bot message", "state": "COMMENTED", "user": map[string]string{"login": "ci[bot]", "type": "Bot"}}})
+		case "/repos/owner/repo/pulls/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 3, "body": "Inline concern.", "user": map[string]string{"login": "reviewer", "type": "User"}}})
+		case "/repos/owner/repo/issues/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 4, "body": "Conversation concern.", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 5, "body": "<!-- workflow-idempotency:x -->", "user": map[string]string{"login": "workflow", "type": "User"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	events, err := NewClient(server.URL, "", server.Client()).ActionablePullRequestFeedback(context.Background(), "owner/repo", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0].Source != "review" || events[1].Source != "inline-comment" || events[2].Source != "conversation-comment" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
 func TestUpdateIssueBodyPreservesPatchPayloadAndHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch || r.URL.Path != "/repos/owner/repo/issues/10" {
