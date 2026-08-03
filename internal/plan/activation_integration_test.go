@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -141,6 +142,42 @@ func TestActivationCompletesAnInitiallyDeliveredPlan(t *testing.T) {
 	}
 	if version.State != store.StateCompleted || !contains(projector.body, "`Completed`") {
 		t.Fatalf("activation = %#v, body = %q", version, projector.body)
+	}
+}
+
+func TestActivationRestoresDeliveredBlockersFromStore(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "approved spec", Labels: []string{plan.PlanLabel}, UpdatedAt: "source-1"},
+		Children: []plan.Issue{
+			{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"},
+			{ID: 2, Number: 12, Title: "second", Labels: []string{plan.TicketLabel}, State: "open"},
+		},
+		BlockedBy: map[int64][]plan.Issue{2: {{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}},
+	}
+	runtimeStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+	reader := &integrationReader{snapshot: snapshot}
+	activator := plan.Activator{Reader: reader, Projector: &integrationProjector{body: snapshot.Root.Body}, Store: runtimeStore}
+	version, err := activator.Activate(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeStore.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	reader.snapshot.Children[0].State = "closed"
+	reader.snapshot.BlockedBy[2][0].State = "closed"
+	if _, err := activator.Activate(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatalf("activation with closed delivered blocker = %v", err)
+	}
+	frontier, err := runtimeStore.ReadyFrontier(ctx, version.ID, 1, time.Now().UTC())
+	if err != nil || len(frontier) != 1 || frontier[0].IssueID != 2 {
+		t.Fatalf("frontier after restored delivery = %#v, %v", frontier, err)
 	}
 }
 

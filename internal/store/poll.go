@@ -447,7 +447,10 @@ func (s *Store) SchedulerRoot(ctx context.Context, repository string, configured
 	var sourceVersionID string
 	err = tx.QueryRowContext(ctx, `SELECT p.current_version_id FROM plans p WHERE p.repository = ? AND p.root_issue_number = ?`, repository, configuredRoot).Scan(&sourceVersionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, ErrNotFound
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return configuredRoot, nil
 	}
 	if err != nil {
 		return 0, err

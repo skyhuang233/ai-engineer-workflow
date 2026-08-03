@@ -907,6 +907,43 @@ FROM plan_versions v WHERE v.version_id = ?`, StateCompleted, versionID).Scan(&s
 	return state, err
 }
 
+func (s *Store) SnapshotWithDeliveryFacts(ctx context.Context, snapshot plan.Snapshot) (plan.Snapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.issue_id
+FROM plans p
+JOIN plan_versions v ON v.version_id = p.current_version_id
+JOIN ticket_runtime r ON r.version_id = v.version_id
+WHERE p.repository = ? AND p.root_issue_id = ? AND r.delivered = 1`, snapshot.Repository, snapshot.Root.ID)
+	if err != nil {
+		return plan.Snapshot{}, err
+	}
+	defer rows.Close()
+	delivered := make(map[int64]struct{})
+	for rows.Next() {
+		var issueID int64
+		if err := rows.Scan(&issueID); err != nil {
+			return plan.Snapshot{}, err
+		}
+		delivered[issueID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return plan.Snapshot{}, err
+	}
+	for index := range snapshot.Children {
+		if _, ok := delivered[snapshot.Children[index].ID]; ok {
+			snapshot.Children[index].Delivered = true
+		}
+	}
+	for blockedID, blockers := range snapshot.BlockedBy {
+		for index := range blockers {
+			if _, ok := delivered[blockers[index].ID]; ok {
+				blockers[index].Delivered = true
+			}
+		}
+		snapshot.BlockedBy[blockedID] = blockers
+	}
+	return snapshot, nil
+}
+
 func (s *Store) CurrentVersion(ctx context.Context, repository string, rootIssueID int64) (PlanVersion, error) {
 	var version PlanVersion
 	err := s.db.QueryRowContext(ctx, `SELECT v.version_id, p.repository, p.root_issue_id, p.root_issue_number, v.fingerprint, v.source_revision,

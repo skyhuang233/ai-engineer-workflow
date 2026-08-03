@@ -47,6 +47,20 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	}
 }
 
+func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	root, err := db.SchedulerRoot(ctx, "owner/repo", 10, time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC))
+	if err != nil || root != 10 {
+		t.Fatalf("fresh scheduler root = %d, %v", root, err)
+	}
+}
+
 func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -101,7 +115,8 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 
 func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +214,14 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	if state, err := db.CurrentVersion(ctx, snapshot.Repository, snapshot.Root.ID); err != nil || state.State != "cancelled" {
 		t.Fatalf("source after handoff = %#v, %v", state, err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
 	replacementFrontier, err := db.ReadyFrontier(ctx, replacementVersion.ID, 2, now.Add(5*time.Second))
 	if err != nil || len(replacementFrontier) != 1 || replacementFrontier[0].IssueID != 101 {
 		t.Fatalf("replacement frontier = %#v, %v", replacementFrontier, err)

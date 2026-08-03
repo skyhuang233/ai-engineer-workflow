@@ -21,6 +21,10 @@ type VersionStore interface {
 	ActivationState(context.Context, string) (string, error)
 }
 
+type deliveryFactStore interface {
+	SnapshotWithDeliveryFacts(context.Context, Snapshot) (Snapshot, error)
+}
+
 // Version is the narrow store contract used by the plan domain. The concrete
 // store package aliases this shape through an adapter to avoid a dependency
 // from the core domain onto SQLite.
@@ -44,6 +48,12 @@ func (a Activator) Activate(ctx context.Context, repository string, rootNumber i
 	snapshot, err := a.Reader.ReadPlan(ctx, repository, rootNumber)
 	if err != nil {
 		return Version{}, err
+	}
+	if deliveryFacts, ok := a.Store.(deliveryFactStore); ok {
+		snapshot, err = deliveryFacts.SnapshotWithDeliveryFacts(ctx, snapshot)
+		if err != nil {
+			return Version{}, err
+		}
 	}
 	if err := snapshot.Validate(); err != nil {
 		return Version{}, err
