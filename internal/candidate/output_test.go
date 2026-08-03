@@ -14,6 +14,7 @@ func TestValidateMatchesCandidateSchema(t *testing.T) {
 		{name: "missing summary", output: `{"tests":[]}`},
 		{name: "null commit", output: `{"summary":"implemented","commit":null}`},
 		{name: "non-string test", output: `{"summary":"implemented","tests":[1]}`},
+		{name: "null test", output: `{"summary":"implemented","tests":[null]}`},
 		{name: "trailing JSON", output: `{"summary":"implemented"} {}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

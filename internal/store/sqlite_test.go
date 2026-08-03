@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,6 +114,74 @@ func TestMigrationBackupCanBeRestored(t *testing.T) {
 	if err := restored.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestMigrationFromV17BacksUpBeforeAddingDeliveryRetryPending(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = 18"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_sessions DROP COLUMN delivery_retry_pending"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+
+	backup, err := sql.Open("sqlite", dbPath+".migration.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "ticket_sessions", "delivery_retry_pending") {
+		t.Fatal("migration backup includes the v18 delivery retry column")
+	}
+	if !hasColumn(t, ctx, migrated.db, "ticket_sessions", "delivery_retry_pending") {
+		t.Fatal("migration did not add the delivery retry column")
+	}
+}
+
+func hasColumn(t *testing.T, ctx context.Context, db *sql.DB, table, column string) bool {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return false
 }
 
 func TestBeginActivationRejectsChangedImmutablePlan(t *testing.T) {

@@ -18,7 +18,7 @@ import (
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
-	latestSchemaVersion = 17
+	latestSchemaVersion = 18
 )
 
 var (

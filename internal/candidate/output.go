@@ -51,9 +51,15 @@ func Validate(output []byte) error {
 		}
 	}
 	if tests, ok := fields["tests"]; ok {
-		var testNames []string
+		var testNames []json.RawMessage
 		if err := json.Unmarshal(tests, &testNames); err != nil || jsonNull(tests) {
 			return errors.New("structured result tests must be strings")
+		}
+		for _, testName := range testNames {
+			var name string
+			if err := json.Unmarshal(testName, &name); err != nil || jsonNull(testName) {
+				return errors.New("structured result tests must be strings")
+			}
 		}
 	}
 	return nil
