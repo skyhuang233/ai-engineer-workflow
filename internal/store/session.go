@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/plan"
 )
 
@@ -267,7 +268,7 @@ func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision
 	if candidate.RunID == "" || candidate.LeaseToken == "" || candidate.CodexSessionID == "" || candidate.CommitSHA == "" || len(candidate.StructuredOutput) == 0 || candidate.Publication.Repository == "" || candidate.Publication.Branch == "" || candidate.Publication.Title == "" || (candidate.Publication.ExpectedRemoteHead == "") == !candidate.Publication.ExpectRemoteAbsent {
 		return TicketClaim{}, ErrInvalidClaim
 	}
-	if !json.Valid(candidate.StructuredOutput) {
+	if candidateoutput.Validate(candidate.StructuredOutput) != nil {
 		return TicketClaim{}, ErrInvalidClaim
 	}
 	if candidate.Now.IsZero() {

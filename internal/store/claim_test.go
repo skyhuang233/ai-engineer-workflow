@@ -89,6 +89,43 @@ func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestCandidateAcceptanceRejectsAdditionalStructuredOutputProperties(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.AcceptCandidateForDelivery(ctx, CandidateRevision{
+		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted",
+		StructuredOutput: []byte(`{"summary":"candidate","unexpected":"value"}`), Now: now,
+		Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"},
+	}, time.Hour)
+	if !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("candidate acceptance error = %v, want ErrInvalidClaim", err)
+	}
+	if _, err := db.CandidateRevision(ctx, claim.RunID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invalid Candidate was persisted: %v", err)
+	}
+}
+
 func TestExpiredDeliveryControllerNeedsAttentionBeforeAgentRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

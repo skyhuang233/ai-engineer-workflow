@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	toon "github.com/toon-format/toon-go"
@@ -90,7 +91,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
 	schemaPath := c.Workspace.schemaPath(ws.CodexState)
-	if err := os.WriteFile(schemaPath, []byte(candidateOutputSchema), 0o600); err != nil {
+	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
 		return Candidate{}, fmt.Errorf("write Candidate output schema: %w", err)
 	}
 	command := []string{"codex", "exec", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", request.Prompt}
@@ -162,6 +163,10 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output))
 	}
+	gatewayURL := strings.TrimSpace(c.GatewayURL)
+	if gatewayURL == "" {
+		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Gateway URL is required before candidate acceptance", string(output))
+	}
 	publication := request.Publication
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
@@ -189,9 +194,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
 		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
 	}
-	if c.GatewayURL != "" {
-		deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = c.GatewayURL
-	}
+	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	deliverySpec := spec
 	deliverySpec.Command = []string{noMistakes, "axi", "run", "--intent", request.Prompt}
 	deliverySpec.Environment = deliveryEnvironment
@@ -256,17 +259,6 @@ func parseDeliveryTOON(output []byte) error {
 	return nil
 }
 
-const candidateOutputSchema = `{
-  "type": "object",
-  "required": ["summary"],
-  "properties": {
-    "summary": {"type": "string", "minLength": 1},
-    "commit": {"type": "string"},
-    "tests": {"type": "array", "items": {"type": "string"}}
-  },
-  "additionalProperties": false
-}`
-
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {
 	diagnostic, diagnosticErr := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, baseCommit, output, reason)
 	restoreCommit := session.AcceptedCommit
@@ -310,7 +302,7 @@ func parseOutput(output []byte, existing string) (string, []byte, error) {
 		}
 		if value.Type == "item.completed" && value.Item.Type == "agent_message" {
 			candidate := []byte(strings.TrimSpace(value.Item.Text))
-			if validateStructuredOutput(candidate) == nil {
+			if candidateoutput.Validate(candidate) == nil {
 				structured = append([]byte(nil), candidate...)
 			}
 		}
@@ -322,31 +314,6 @@ func parseOutput(output []byte, existing string) (string, []byte, error) {
 		return "", nil, errors.New("Codex output did not contain a session and structured result")
 	}
 	return sessionID, structured, nil
-}
-
-func validateStructuredOutput(output []byte) error {
-	var value struct {
-		Summary any   `json:"summary"`
-		Commit  any   `json:"commit"`
-		Tests   []any `json:"tests"`
-	}
-	if len(output) == 0 || json.Unmarshal(output, &value) != nil {
-		return errors.New("structured result is not a JSON object")
-	}
-	if summary, ok := value.Summary.(string); !ok || strings.TrimSpace(summary) == "" {
-		return errors.New("structured result requires a nonempty summary")
-	}
-	if value.Commit != nil {
-		if _, ok := value.Commit.(string); !ok {
-			return errors.New("structured result commit must be a string")
-		}
-	}
-	for _, test := range value.Tests {
-		if _, ok := test.(string); !ok {
-			return errors.New("structured result tests must be strings")
-		}
-	}
-	return nil
 }
 
 func candidateSummary(output []byte) string {

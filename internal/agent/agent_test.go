@@ -104,7 +104,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	runtime := &fakeRuntime{dirty: true, ignoredFile: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
-	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket")); err == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
@@ -164,7 +164,7 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	started := make(chan struct{})
 	release := make(chan struct{})
-	expired := agent.Controller{Store: db, Workspace: manager, Runtime: blockingFailureRuntime{started: started, release: release}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	expired := agent.Controller{Store: db, Workspace: manager, Runtime: blockingFailureRuntime{started: started, release: release}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	errCh := make(chan error, 1)
 	go func() {
 		_, err := expired.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
@@ -177,7 +177,7 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 		t.Fatalf("claim replacement: %v", err)
 	}
 	replacementRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("replacement-session", "replacement"), ContainerID: "replacement-container"}}}
-	replacementController := agent.Controller{Store: db, Workspace: manager, Runtime: replacementRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	replacementController := agent.Controller{Store: db, Workspace: manager, Runtime: replacementRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := replacementController.Run(ctx, candidateRequest(replacement, source, "ticket-1", "replace"))
 	if err != nil {
 		t.Fatalf("run replacement: %v", err)
@@ -269,7 +269,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	first := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "implemented"), ContainerID: "container-1"}}}
-	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket"))
 	if err != nil {
 		t.Fatal(err)
@@ -301,6 +301,9 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
 	}
+	if first.specs[1].Environment["NO_MISTAKES_GATEWAY_URL"] != "http://gateway.test" {
+		t.Fatalf("Delivery Controller Gateway URL = %#v", first.specs[1].Environment)
+	}
 	if !first.deliveryDeadline.After(claim.LeaseExpiresAt) {
 		t.Fatalf("Delivery Controller deadline = %s, want after Agent deadline %s", first.deliveryDeadline, claim.LeaseExpiresAt)
 	}
@@ -331,6 +334,28 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	}
 }
 
+func TestControllerRequiresGatewayBeforeCandidateAcceptance(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "Gateway URL is required") {
+		t.Fatalf("missing Gateway URL error = %v", err)
+	}
+	if len(runtime.specs) != 1 {
+		t.Fatalf("worker specs = %#v, want only the Agent runtime", runtime.specs)
+	}
+	if _, err := db.CandidateRevision(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Candidate accepted without a Gateway URL: %v", err)
+	}
+}
+
 func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -338,7 +363,7 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: []byte("run:\n  status: completed\noutcome: failed\n")}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "did not pass") {
 		t.Fatalf("failed Delivery Controller error = %v", err)
 	}
@@ -369,7 +394,7 @@ func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T
 			db, _, claim := createClaim(t, ctx, root)
 			defer db.Close()
 			manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
-			controller := agent.Controller{Store: db, Workspace: manager, Runtime: test.runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+			controller := agent.Controller{Store: db, Workspace: manager, Runtime: test.runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 			if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
 				t.Fatal("abnormal worker run returned nil error")
 			}
@@ -402,7 +427,7 @@ func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{
 		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
-		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: "https://user:token@github.com/owner/repo.git", Branch: "ticket-1", Prompt: "implement"})
 	if err == nil || !strings.Contains(err.Error(), "absolute local path") {
@@ -424,7 +449,7 @@ func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
-	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +479,7 @@ func TestControllerRejectsCredentialBearingWorkspacePushURL(t *testing.T) {
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
-	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +506,7 @@ func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
-	firstController := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}}
+	firstController := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	accepted, err := firstController.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement"))
 	if err != nil {
 		t.Fatal(err)
