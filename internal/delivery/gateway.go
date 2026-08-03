@@ -120,6 +120,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if errors.Is(err, store.ErrDeliveryRejected) {
 			return g.reject(ctx, outbox, err)
 		}
+		if errors.Is(err, store.ErrDeliveryUncertain) {
+			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
+				return finishErr
+			}
+			return err
+		}
 		var uncertain *uncertainWriteError
 		if errors.As(err, &uncertain) {
 			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {

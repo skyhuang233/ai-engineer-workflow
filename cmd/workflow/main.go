@@ -135,18 +135,13 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	session, err := db.TicketSession(ctx, version.ID, *ticketID)
-	if err != nil {
-		fail(err)
-	}
-	remote := github.DeliveryRemote{Client: client, Pusher: github.WorkspacePusher{WorkspacePath: session.WorkspacePath, Token: *token}}
-	gateway := delivery.Gateway{Store: db, Remote: remote}
 	claim, claimErr := db.CurrentClaim(ctx, version.ID, *ticketID)
 	if claimErr != nil {
 		accepted, handoff, handoffErr := db.AcceptedCandidateHandoff(ctx, version.ID, *ticketID)
 		if handoffErr != nil {
 			fail(claimErr)
 		}
+		gateway := ticketGateway(ctx, db, client, version.ID, *ticketID, *token)
 		dispatchStoredDelivery(ctx, gateway, handoff.PushOutboxKey)
 		dispatchStoredDelivery(ctx, gateway, handoff.PROutboxKey)
 		fmt.Println(string(accepted.StructuredOutput))
@@ -160,10 +155,19 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
+	gateway := ticketGateway(ctx, db, client, version.ID, *ticketID, *token)
 	dispatchStoredDelivery(ctx, gateway, candidate.PushOutboxKey)
 	dispatchStoredDelivery(ctx, gateway, candidate.PROutboxKey)
 	encoded, _ := json.MarshalIndent(candidate, "", "  ")
 	fmt.Println(string(encoded))
+}
+
+func ticketGateway(ctx context.Context, db *store.Store, client *github.Client, versionID string, ticketID int64, token string) delivery.Gateway {
+	session, err := db.TicketSession(ctx, versionID, ticketID)
+	if err != nil {
+		fail(err)
+	}
+	return delivery.Gateway{Store: db, Remote: github.DeliveryRemote{Client: client, Pusher: github.WorkspacePusher{WorkspacePath: session.WorkspacePath, Token: token}}}
 }
 
 func runReconcileDelivered(args []string) {

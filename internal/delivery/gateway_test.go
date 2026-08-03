@@ -102,13 +102,6 @@ func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
 	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, third.ClaimToken, store.OutboxPending, "third failure", time.Date(2026, 7, 31, 1, 3, 2, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	fourth, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, time.Date(2026, 7, 31, 1, 3, 4, 0, time.UTC))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, fourth.ClaimToken, store.OutboxPending, "fourth failure", time.Date(2026, 7, 31, 1, 3, 4, 0, time.UTC)); err != nil {
-		t.Fatal(err)
-	}
 	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +206,49 @@ func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditio
 	}
 	if finished.State != store.OutboxSucceeded || finished.Uncertain || remote.applyCalls != 1 {
 		t.Fatalf("reconciled outbox = %#v, apply calls = %d", finished, remote.applyCalls)
+	}
+}
+
+func TestGatewayBoundsUncertainReconciliation(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	remote := &fakeRemote{
+		applyErr:     errors.New("request timed out"),
+		observations: []delivery.Observation{{RemoteHead: "base"}},
+		observeErrs:  []error{nil, errors.New("ambiguous write"), errors.New("reconciliation failed"), errors.New("reconciliation failed")},
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("ambiguous write returned nil error")
+	}
+	for range 2 {
+		now = now.Add(2 * time.Second)
+		if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+			t.Fatal("failed reconciliation returned nil error")
+		}
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != store.OutboxRejected || outbox.Attempts != 3 || remote.applyCalls != 1 {
+		t.Fatalf("bounded uncertain reconciliation = %#v, applies=%d", outbox, remote.applyCalls)
+	}
+	projection, err := db.PlanProjectionAt(ctx, claim.VersionID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("projection after exhausted reconciliation = %#v", projection)
 	}
 }
 
@@ -389,8 +425,47 @@ func TestGatewayBoundsExternalWriteByLeaseDeadline(t *testing.T) {
 	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
 		t.Fatal("lease-bounded external write returned nil error")
 	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outbox.Uncertain || outbox.State != store.OutboxPending {
+		t.Fatalf("expired post-write outbox = %#v", outbox)
+	}
 	if !remote.deadlineSeen || time.Since(started) > time.Second {
 		t.Fatalf("external write was not bounded by lease deadline; deadline=%t elapsed=%s", remote.deadlineSeen, time.Since(started))
+	}
+}
+
+func TestGatewayTreatsPostDeadlineSuccessAsUncertain(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &blockingRemote{entered: make(chan struct{}), release: make(chan struct{})}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		return time.Date(2026, 7, 31, 0, 59, 59, 950000000, time.UTC)
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration,
+		Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan error, 1)
+	go func() { dispatched <- gateway.Dispatch(ctx, queued.IdempotencyKey) }()
+	<-remote.entered
+	time.Sleep(75 * time.Millisecond)
+	close(remote.release)
+	if err := <-dispatched; !errors.Is(err, store.ErrDeliveryUncertain) {
+		t.Fatalf("post-deadline success error = %v, want uncertain outcome", err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != store.OutboxPending || !outbox.Uncertain {
+		t.Fatalf("post-deadline success outbox = %#v", outbox)
 	}
 }
 
@@ -448,7 +523,7 @@ func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reclaimed.Attempts != 1 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly {
+	if reclaimed.Attempts != 2 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly {
 		t.Fatalf("reclaimed outbox = %#v", reclaimed)
 	}
 }

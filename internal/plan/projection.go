@@ -20,6 +20,10 @@ type ProjectionTicket struct {
 	SessionID       string  `json:"session_id,omitempty"`
 	RunID           string  `json:"run_id,omitempty"`
 	LeaseGeneration int64   `json:"lease_generation,omitempty"`
+	PullRequest     int64   `json:"pull_request,omitempty"`
+	Revision        string  `json:"revision,omitempty"`
+	GateResult      string  `json:"gate_result,omitempty"`
+	LastActivity    string  `json:"last_activity,omitempty"`
 	Blockers        []int64 `json:"blockers,omitempty"`
 }
 
@@ -57,13 +61,13 @@ func renderBlock(projection Projection) string {
 	} else {
 		runtime := false
 		for _, ticket := range tickets {
-			if ticket.State != "" || ticket.Owner != "" || ticket.SessionID != "" || ticket.RunID != "" || ticket.LeaseGeneration != 0 {
+			if ticket.State != "" || ticket.Owner != "" || ticket.SessionID != "" || ticket.RunID != "" || ticket.LeaseGeneration != 0 || ticket.PullRequest != 0 || ticket.Revision != "" || ticket.GateResult != "" || ticket.LastActivity != "" {
 				runtime = true
 				break
 			}
 		}
 		if runtime {
-			b.WriteString("| Ticket | State | Owner | Session | Run | Lease | Blocked by |\n| --- | --- | --- | --- | --- | --- | --- |\n")
+			b.WriteString("| Ticket | State | Owner | Session | Run | Lease | Pull request | Revision | Gate | Last activity | Blocked by |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 		} else {
 			b.WriteString("| Ticket | Blocked by |\n| --- | --- |\n")
 		}
@@ -74,7 +78,7 @@ func renderBlock(projection Projection) string {
 			}
 			sort.Strings(blockers)
 			if runtime {
-				fmt.Fprintf(&b, "| #%d %s | %s | %s | %s | %s | %d | %s |\n", ticket.Number, escapeCell(ticket.Title), escapeCell(ticket.State), escapeCell(ticket.Owner), escapeCell(ticket.SessionID), escapeCell(ticket.RunID), ticket.LeaseGeneration, strings.Join(blockers, ", "))
+				fmt.Fprintf(&b, "| #%d %s | %s | %s | %s | %s | %d | %s | %s | %s | %s | %s |\n", ticket.Number, escapeCell(ticket.Title), escapeCell(ticket.State), escapeCell(ticket.Owner), escapeCell(ticket.SessionID), escapeCell(ticket.RunID), ticket.LeaseGeneration, pullRequestReference(ticket.PullRequest), escapeCell(shortRevision(ticket.Revision)), escapeCell(ticket.GateResult), escapeCell(ticket.LastActivity), strings.Join(blockers, ", "))
 			} else {
 				fmt.Fprintf(&b, "| #%d %s | %s |\n", ticket.Number, escapeCell(ticket.Title), strings.Join(blockers, ", "))
 			}
@@ -82,6 +86,20 @@ func renderBlock(projection Projection) string {
 	}
 	fmt.Fprintf(&b, "%s", ProjectionEnd)
 	return b.String()
+}
+
+func pullRequestReference(number int64) string {
+	if number == 0 {
+		return ""
+	}
+	return fmt.Sprintf("#%d", number)
+}
+
+func shortRevision(revision string) string {
+	if len(revision) <= 12 {
+		return revision
+	}
+	return revision[:12]
 }
 
 func escapeCell(value string) string {

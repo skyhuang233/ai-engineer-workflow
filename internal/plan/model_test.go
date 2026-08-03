@@ -156,6 +156,18 @@ func TestRenderProjectionPreservesHumanSpec(t *testing.T) {
 	}
 }
 
+func TestRenderProjectionIncludesTicketControlFacts(t *testing.T) {
+	updated, err := RenderProjection("", Projection{VersionID: "pv-1", State: "Active", Tickets: []ProjectionTicket{{Number: 11, Title: "Ticket", PullRequest: 17, Revision: "0123456789abcdef", GateResult: "succeeded", LastActivity: "2026-08-03T00:00:00Z"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Pull request", "#17", "0123456789ab", "succeeded", "2026-08-03T00:00:00Z"} {
+		if !strings.Contains(updated, expected) {
+			t.Fatalf("ticket control facts missing %q from %q", expected, updated)
+		}
+	}
+}
+
 func TestRenderProjectionRejectsHalfWrittenMarker(t *testing.T) {
 	_, err := RenderProjection("spec\n"+ProjectionStart, Projection{VersionID: "pv-1", State: "Active"})
 	if !errors.Is(err, ErrMalformedStatus) {

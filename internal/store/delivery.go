@@ -28,7 +28,10 @@ const (
 	OutboxRejected   = "rejected"
 )
 
-var ErrDeliveryRejected = errors.New("delivery command rejected")
+var (
+	ErrDeliveryRejected  = errors.New("delivery command rejected")
+	ErrDeliveryUncertain = errors.New("delivery outcome is uncertain")
+)
 
 // DeliveryRequest is the schema-only command accepted from a Ticket Agent.
 // The gateway derives all authoritative ownership fields from RunID and the
@@ -282,7 +285,7 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, err
 	}
 	if err := operationCtx.Err(); err != nil {
-		return DeliveryResult{}, fmt.Errorf("delivery lease expired during external write: %w", err)
+		return DeliveryResult{}, fmt.Errorf("%w: delivery lease expired during external write: %v", ErrDeliveryUncertain, err)
 	}
 	return deliveryResult, nil
 }
@@ -414,7 +417,7 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		}
 	}
 	reconcileOnly := uncertain != 0 || state == OutboxProcessing
-	if attempts >= maxDeliveryAttempts && !reconcileOnly {
+	if attempts >= maxDeliveryAttempts {
 		var request DeliveryRequest
 		if err := json.Unmarshal([]byte(raw), &request); err != nil {
 			return DeliveryOutbox{}, err
@@ -434,11 +437,7 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
-	attemptIncrement := 1
-	if reconcileOnly {
-		attemptIncrement = 0
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + ?, claim_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ?) OR (state = ? AND claim_token = ?))`, OutboxProcessing, attemptIncrement, claimToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, OutboxProcessing, previousClaimToken)
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + 1, claim_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ?) OR (state = ? AND claim_token = ?))`, OutboxProcessing, claimToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, OutboxProcessing, previousClaimToken)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -489,7 +488,7 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	nextAttempt := formatTimestamp(now)
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
-	} else if attempts >= maxDeliveryAttempts && !uncertain {
+	} else if attempts >= maxDeliveryAttempts {
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError

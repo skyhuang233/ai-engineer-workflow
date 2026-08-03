@@ -27,12 +27,16 @@ func (s *Store) PlanProjectionAt(ctx context.Context, versionID string, now time
 	now = now.UTC()
 	rows, err := s.db.QueryContext(ctx, `SELECT t.issue_id, t.issue_number, t.title, COALESCE(rt.delivered, t.delivered), COALESCE(rt.state, ''),
 COALESCE(s.owner, ''), COALESCE(s.session_id, ''), COALESCE(r.run_id, ''),
-COALESCE(r.state, ''), COALESCE(l.generation, 0), COALESCE(l.state, ''), COALESCE(l.expires_at, '')
+COALESCE(r.state, ''), COALESCE(l.generation, 0), COALESCE(l.state, ''), COALESCE(l.expires_at, ''),
+COALESCE(td.pull_request_number, 0), COALESCE(s.accepted_commit, ''),
+COALESCE((SELECT o.state FROM delivery_outbox o WHERE json_extract(o.request_json, '$.run_id') = r.run_id AND o.operation = 'upsert_pull_request' ORDER BY o.updated_at DESC LIMIT 1), ''),
+MAX(COALESCE(rt.updated_at, ''), COALESCE(s.updated_at, ''), COALESCE(r.started_at, ''), COALESCE(r.finished_at, ''), COALESCE(td.updated_at, ''))
 FROM plan_tickets t
 LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.issue_id
 LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
 LEFT JOIN worker_runs r ON r.run_id = s.current_run_id
 LEFT JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+LEFT JOIN ticket_deliveries td ON td.version_id = t.version_id AND td.issue_id = t.issue_id
 WHERE t.version_id = ?`, versionID)
 	if err != nil {
 		return plan.Projection{}, err
@@ -45,7 +49,7 @@ WHERE t.version_id = ?`, versionID)
 		var delivered int
 		var runtimeState string
 		var runState, leaseState, expiresText string
-		if err := rows.Scan(&issueID, &ticket.Number, &ticket.Title, &delivered, &runtimeState, &ticket.Owner, &ticket.SessionID, &ticket.RunID, &runState, &ticket.LeaseGeneration, &leaseState, &expiresText); err != nil {
+		if err := rows.Scan(&issueID, &ticket.Number, &ticket.Title, &delivered, &runtimeState, &ticket.Owner, &ticket.SessionID, &ticket.RunID, &runState, &ticket.LeaseGeneration, &leaseState, &expiresText, &ticket.PullRequest, &ticket.Revision, &ticket.GateResult, &ticket.LastActivity); err != nil {
 			return plan.Projection{}, err
 		}
 		ticket.State = "Queued"
