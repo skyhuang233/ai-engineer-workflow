@@ -408,5 +408,19 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, failure.RunID, failure.LeaseToken, LeaseActive); err != nil {
 		return err
 	}
+	result, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, failure.RunID)
+	if err != nil {
+		return err
+	}
+	claimedFeedback, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if claimedFeedback > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
+WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?) AND state = ? AND delivered = 0`, plan.StateWaitingReview, now, failure.RunID, plan.StateRunning); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }

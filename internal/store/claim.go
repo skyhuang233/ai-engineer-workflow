@@ -212,6 +212,18 @@ func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int6
 	return s.currentClaimAt(ctx, versionID, issueID, time.Now().UTC())
 }
 
+func (s *Store) RecoveryOwner(ctx context.Context, versionID string, issueID int64) (string, error) {
+	var owner string
+	err := s.db.QueryRowContext(ctx, `SELECT s.owner
+FROM ticket_sessions s
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+WHERE s.version_id = ? AND s.issue_id = ? AND s.state = ? AND rt.state = ? AND s.owner != ''`, versionID, issueID, SessionRunning, plan.StateRunning).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return owner, err
+}
+
 func (s *Store) currentClaimAt(ctx context.Context, versionID string, issueID int64, now time.Time) (TicketClaim, error) {
 	var claim TicketClaim
 	var expiresText string

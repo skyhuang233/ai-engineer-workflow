@@ -142,13 +142,11 @@ func runTicket(args []string) {
 	if err := syncReviewFeedback(ctx, db, client, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
 		fail(err)
 	}
-	claim, claimErr := db.CurrentClaim(ctx, version.ID, *ticketID)
-	if claimErr != nil {
-		var revisionPrompt string
-		claim, revisionPrompt, claimErr = db.ClaimQueuedReviewRevision(ctx, version.ID, *ticketID, 30*time.Minute, time.Now().UTC())
-		if claimErr != nil {
-			fail(claimErr)
-		}
+	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	if revisionPrompt != "" {
 		*prompt = revisionPrompt
 	}
 	if *prompt == "" {
@@ -170,6 +168,13 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 	var feedback []store.ReviewFeedback
 	delivery, err := db.TicketDelivery(ctx, versionID, ticketID)
 	if err == nil {
+		terminal, err := (github.DeliveredReconciler{Store: db, Client: client}).ReconcileTicket(ctx, delivery)
+		if err != nil {
+			return err
+		}
+		if terminal {
+			return store.ErrNotReady
+		}
 		events, err := client.ActionablePullRequestFeedback(ctx, repository, delivery.PullRequestNumber)
 		if err != nil {
 			return err
@@ -189,6 +194,36 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 	}
 	_, err = db.RecordReviewFeedback(ctx, versionID, ticketID, feedback, time.Now().UTC())
 	return err
+}
+
+func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, now time.Time) (store.TicketClaim, string, error) {
+	claim, err := db.CurrentClaim(ctx, versionID, ticketID)
+	if err == nil {
+		return claim, "", nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return store.TicketClaim{}, "", err
+	}
+	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now)
+	if revisionErr == nil {
+		return revision, revisionPrompt, nil
+	}
+	owner, ownerErr := db.RecoveryOwner(ctx, versionID, ticketID)
+	if ownerErr != nil {
+		return store.TicketClaim{}, "", err
+	}
+	replacement, replacementErr := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID:       versionID,
+		TicketID:        ticketID,
+		Owner:           owner,
+		MaxParallelRuns: 1,
+		LeaseTTL:        30 * time.Minute,
+		Now:             now,
+	})
+	if replacementErr != nil {
+		return store.TicketClaim{}, "", replacementErr
+	}
+	return replacement, "", nil
 }
 
 func runReconcileDelivered(args []string) {

@@ -28,23 +28,44 @@ func (r DeliveredReconciler) Reconcile(ctx context.Context, repository string) (
 	}
 	marked := 0
 	for _, delivery := range deliveries {
-		state, err := r.Client.pullRequestDeliveryState(ctx, repository, delivery.PullRequestNumber, delivery.CandidateCommit)
+		state, err := r.reconcileTicket(ctx, delivery)
 		if err != nil {
 			return marked, err
 		}
-		switch state {
-		case pullRequestDelivered:
-			if err := r.Store.MarkTicketDelivered(ctx, delivery.VersionID, delivery.IssueID); err != nil {
-				return marked, err
-			}
+		if state == pullRequestDelivered {
 			marked++
-		case pullRequestClosedUnmerged:
-			if _, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, time.Now().UTC()); err != nil {
-				return marked, err
-			}
 		}
 	}
 	return marked, nil
+}
+
+func (r DeliveredReconciler) ReconcileTicket(ctx context.Context, delivery store.TicketDelivery) (bool, error) {
+	if r.Store == nil || r.Client == nil {
+		return false, fmt.Errorf("delivered reconciler dependencies are incomplete")
+	}
+	if err := ValidateRepository(delivery.Repository); err != nil {
+		return false, err
+	}
+	state, err := r.reconcileTicket(ctx, delivery)
+	return state != pullRequestPending, err
+}
+
+func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store.TicketDelivery) (pullRequestState, error) {
+	state, err := r.Client.pullRequestDeliveryState(ctx, delivery.Repository, delivery.PullRequestNumber, delivery.CandidateCommit)
+	if err != nil {
+		return pullRequestPending, err
+	}
+	switch state {
+	case pullRequestDelivered:
+		if err := r.Store.MarkTicketDelivered(ctx, delivery.VersionID, delivery.IssueID); err != nil {
+			return pullRequestPending, err
+		}
+	case pullRequestClosedUnmerged:
+		if _, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, time.Now().UTC()); err != nil {
+			return pullRequestPending, err
+		}
+	}
+	return state, nil
 }
 
 type pullRequestState int
