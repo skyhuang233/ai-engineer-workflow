@@ -172,6 +172,55 @@ func TestMigrationFromV17BacksUpBeforeAddingRuntimeRetentionColumns(t *testing.T
 	}
 }
 
+func TestMigrationFromV22BacksUpBeforeAddingReplacementIdentity(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 23"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE replacement_tickets DROP COLUMN replacement_version_id"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE replacement_tickets DROP COLUMN replacement_issue_id"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	backup, err := sql.Open("sqlite", dbPath+".migration.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "replacement_tickets", "replacement_version_id") || hasColumn(t, ctx, backup, "replacement_tickets", "replacement_issue_id") {
+		t.Fatal("migration backup includes v23 replacement identity columns")
+	}
+	if !hasColumn(t, ctx, migrated.db, "replacement_tickets", "replacement_version_id") || !hasColumn(t, ctx, migrated.db, "replacement_tickets", "replacement_issue_id") {
+		t.Fatal("migration did not add replacement identity columns")
+	}
+}
+
 func hasColumn(t *testing.T, ctx context.Context, db *sql.DB, table, column string) bool {
 	t.Helper()
 	rows, err := db.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)

@@ -394,7 +394,7 @@ func replaceFrozenPlanTx(ctx context.Context, tx *sql.Tx, repository, questionID
 		err := tx.QueryRowContext(ctx, `SELECT v.version_id
 FROM plans p
 JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND p.root_issue_id = ? AND `+currentActiveUnfrozenPlanPredicate, repository, replacement.PlanRootIssueID).Scan(&replacementVersionID)
+WHERE p.repository = ? AND p.root_issue_id = ? AND `+currentSchedulableReplacementPlanPredicate, repository, replacement.PlanRootIssueID).Scan(&replacementVersionID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotReady
 		}
@@ -429,7 +429,33 @@ WHERE t.version_id = ? AND t.issue_id = ? AND p.repository = ? AND r.delivered =
 VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`, questionID, versionID, frozenIssueID, string(replacementJSON), replacementVersionID, replacementIssueID, stamp); err != nil {
 		return err
 	}
+	if err := activateReplacementPlanTx(ctx, tx, replacementVersionID, now); err != nil {
+		return err
+	}
 	return cancelPlanTx(ctx, tx, versionID, now)
+}
+
+func activateReplacementPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
+	stamp := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE plan_versions SET state = ? WHERE version_id = ? AND state = ?`, StateActive, versionID, StateProjecting); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, stamp, versionID, StateProjecting)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count == 0 {
+		var planState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM plans WHERE current_version_id = ?`, versionID).Scan(&planState); err != nil {
+			return err
+		}
+		if planState != StateActive {
+			return ErrNotReady
+		}
+	}
+	return nil
 }
 
 func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, acceptedCommit string, now time.Time) error {

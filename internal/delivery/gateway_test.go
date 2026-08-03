@@ -85,7 +85,7 @@ func TestGatewayPreservesWorkflowQuestionContext(t *testing.T) {
 		}
 	}
 	want := closedQuestion
-	if got.ID != want.ID || got.Prompt != want.Prompt || got.Repository != want.Repository || got.PlanNumber != want.RootNumber || got.TicketNumber != want.TicketNumber || got.PullRequest != want.PullRequest || got.Commit != want.Commit || got.Diagnostics != want.Diagnostics || got.Evidence != want.Evidence {
+	if got.ID != want.ID || got.Prompt != want.Prompt || got.Repository != want.Repository || got.PlanNumber != want.RootNumber || got.TicketNumber != want.TicketNumber || got.PullRequest != want.PullRequest || got.Commit != want.Commit || got.Finding != want.Kind || got.Diagnostics != want.Diagnostics || got.Evidence != want.Evidence {
 		t.Fatalf("published question = %#v, want %#v", got, want)
 	}
 }

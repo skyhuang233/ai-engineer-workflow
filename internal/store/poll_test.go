@@ -134,9 +134,6 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkActive(ctx, replacementVersion.ID); err != nil {
-		t.Fatal(err)
-	}
 	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now); err != nil {
 		t.Fatal(err)
@@ -170,6 +167,10 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	if replacement != `{"plan_root_issue_id":200}` || state != "active" || retiredID != 1 || replacementVersionID != replacementVersion.ID || replacementIssueID != 0 {
 		t.Fatalf("replacement = %q, %q, %d, %q, %d", replacement, state, retiredID, replacementVersionID, replacementIssueID)
 	}
+	activatedReplacement, err := db.CurrentVersion(ctx, snapshot.Repository, replacementSnapshot.Root.ID)
+	if err != nil || activatedReplacement.State != StateActive {
+		t.Fatalf("replacement activation = %#v, %v", activatedReplacement, err)
+	}
 	frontier, err := db.ReadyFrontier(ctx, version.ID, 2, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +188,9 @@ func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	replacementFrontier, err := db.ReadyFrontier(ctx, replacementVersion.ID, 2, now.Add(3*time.Second))
 	if err != nil || len(replacementFrontier) != 1 || replacementFrontier[0].IssueID != 101 {
 		t.Fatalf("replacement frontier = %#v, %v", replacementFrontier, err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: replacementVersion.ID, TicketID: 101, Owner: "replacement-agent", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now.Add(3 * time.Second)}); err != nil {
+		t.Fatalf("replacement handoff was not schedulable: %v", err)
 	}
 }
 

@@ -98,7 +98,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				request.WorkflowQuestions = append(request.WorkflowQuestions, plan.WorkflowQuestion{
 					ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
 					PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
-					PullRequest: question.PullRequest, Commit: question.Commit, Diagnostics: question.Diagnostics,
+					PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics,
 					Evidence: question.Evidence,
 				})
 			}
