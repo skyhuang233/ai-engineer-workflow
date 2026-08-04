@@ -76,7 +76,7 @@ func TestGatewayPauseFencesNewDispatchAdmissionsAndWaitsForExistingOnes(t *testi
 	}
 }
 
-func TestPausedGatewayRecoversExpiredDeliveryClaimsBeforeWaitingForQuiescence(t *testing.T) {
+func TestPausedGatewayWaitsForUnownedControlPlaneClaimAcknowledgement(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -102,13 +102,20 @@ func TestPausedGatewayRecoversExpiredDeliveryClaimsBeforeWaitingForQuiescence(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outbox.State != OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
-		t.Fatalf("recovered outbox = %#v", outbox)
+	if outbox.State != OutboxProcessing || outbox.ClaimToken != claim.ClaimToken {
+		t.Fatalf("unacknowledged outbox = %#v", outbox)
 	}
-	if err := db.WaitForGatewayWritesQuiesced(ctx); err != nil {
+	quiesced := make(chan error, 1)
+	go func() { quiesced <- db.WaitForGatewayWritesQuiesced(ctx) }()
+	select {
+	case err := <-quiesced:
+		t.Fatalf("wait returned before control-plane dispatch acknowledgement: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, claim.ClaimToken, OutboxSucceeded, "", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, claim.ClaimToken, OutboxSucceeded, "", now); !errors.Is(err, ErrFencingConflict) {
-		t.Fatalf("expired claim completion error = %v, want fencing conflict", err)
+	if err := <-quiesced; err != nil {
+		t.Fatal(err)
 	}
 }

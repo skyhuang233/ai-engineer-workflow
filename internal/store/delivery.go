@@ -527,11 +527,7 @@ func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, upda
 		return false, err
 	}
 	if request.RunID == "" {
-		updatedAt, err := time.Parse(time.RFC3339Nano, updatedText)
-		if err != nil {
-			return false, err
-		}
-		return !updatedAt.After(now.Add(-time.Minute)), nil
+		return false, nil
 	}
 	var expiresText string
 	err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
