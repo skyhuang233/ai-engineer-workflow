@@ -4,6 +4,8 @@ package delivery
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -41,9 +43,18 @@ type credentialAwareRemote interface {
 }
 
 type Gateway struct {
-	Store  *store.Store
-	Remote Remote
-	Now    func() time.Time
+	Store           *store.Store
+	Remote          Remote
+	Now             func() time.Time
+	DispatcherToken string
+}
+
+func NewGateway(store *store.Store, remote Remote) (Gateway, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return Gateway{}, err
+	}
+	return Gateway{Store: store, Remote: remote, DispatcherToken: "gateway-dispatcher-" + hex.EncodeToString(bytes)}, nil
 }
 
 type uncertainWriteError struct {
@@ -81,7 +92,14 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
 	}
-	outbox, err := g.Store.ClaimDeliveryOutbox(ctx, key, g.now())
+	dispatcherToken := g.DispatcherToken
+	if dispatcherToken == "" {
+		dispatcherToken = "legacy-gateway-dispatcher"
+	}
+	if err := g.Store.EnsureGatewayDispatcher(ctx, dispatcherToken, g.now()); err != nil {
+		return err
+	}
+	outbox, err := g.Store.ClaimDeliveryOutboxForDispatcher(ctx, key, dispatcherToken, g.now())
 	if err != nil {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
 			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)

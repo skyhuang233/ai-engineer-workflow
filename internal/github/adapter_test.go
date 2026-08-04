@@ -23,20 +23,20 @@ func TestReadPlanUsesNativeSubIssuesAndBlockedByEndpoints(t *testing.T) {
 			writeIssue(w, 100, 10, "Plan", []string{"workflow:plan"})
 		case "/repos/owner/repo/issues/10/sub_issues":
 			json.NewEncoder(w).Encode([]issueJSON{
-				{ID: 1, Number: 11, Title: "first", Labels: []labelJSON{{Name: "workflow:ticket"}}},
-				{ID: 2, Number: 12, Title: "second", Labels: []labelJSON{{Name: "workflow:ticket"}}},
+				{ID: 1, Number: 11, Title: "first", Labels: []labelJSON{{Name: "workflow:ticket"}}, User: userResponse{Login: "owner", Type: "User"}},
+				{ID: 2, Number: 12, Title: "second", Labels: []labelJSON{{Name: "workflow:ticket"}}, User: userResponse{Login: "owner", Type: "User"}},
 			})
 		case "/repos/owner/repo/issues/11/dependencies/blocked_by":
 			json.NewEncoder(w).Encode([]issueJSON{})
 		case "/repos/owner/repo/issues/12/dependencies/blocked_by":
-			json.NewEncoder(w).Encode([]issueJSON{{ID: 1, Number: 11, Title: "first", Labels: []labelJSON{{Name: "workflow:ticket"}}}})
+			json.NewEncoder(w).Encode([]issueJSON{{ID: 1, Number: 11, Title: "first", Labels: []labelJSON{{Name: "workflow:ticket"}}, User: userResponse{Login: "owner", Type: "User"}}})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	snapshot, err := NewClient(server.URL, "token", server.Client()).ReadPlan(context.Background(), "owner/repo", 10)
+	snapshot, err := NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner").ReadPlan(context.Background(), "owner/repo", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestReadPlanRetainsUntypedChildForIncompletePublication(t *testing.T) {
 		case "/repos/owner/repo/issues/10":
 			writeIssue(w, 100, 10, "Plan", []string{"workflow:plan"})
 		case "/repos/owner/repo/issues/10/sub_issues":
-			json.NewEncoder(w).Encode([]issueJSON{{ID: 1, Number: 11, Title: "partial", Labels: []labelJSON{{Name: "bug"}}}})
+			json.NewEncoder(w).Encode([]issueJSON{{ID: 1, Number: 11, Title: "partial", Labels: []labelJSON{{Name: "bug"}}, User: userResponse{Login: "owner", Type: "User"}}})
 		case "/repos/owner/repo/issues/11/dependencies/blocked_by":
 			json.NewEncoder(w).Encode([]issueJSON{})
 		default:
@@ -66,7 +66,7 @@ func TestReadPlanRetainsUntypedChildForIncompletePublication(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	snapshot, err := NewClient(server.URL, "", server.Client()).ReadPlan(context.Background(), "owner/repo", 10)
+	snapshot, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ReadPlan(context.Background(), "owner/repo", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,19 +83,19 @@ func TestReadPlanDoesNotDeriveDeliveredFromPullRequestBody(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/owner/repo/issues/10":
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "labels": []map[string]string{{"name": "workflow:plan"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "labels": []map[string]string{{"name": "workflow:plan"}}, "user": map[string]string{"login": "owner", "type": "User"}})
 		case "/repos/owner/repo/issues/10/sub_issues":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}}, {"id": 2, "number": 12, "state": "open", "labels": []map[string]string{{"name": "workflow:ticket"}}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}, "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "number": 12, "state": "open", "labels": []map[string]string{{"name": "workflow:ticket"}}, "user": map[string]string{"login": "owner", "type": "User"}}})
 		case "/repos/owner/repo/issues/11/dependencies/blocked_by":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case "/repos/owner/repo/issues/12/dependencies/blocked_by":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "number": 11, "state": "closed", "labels": []map[string]string{{"name": "workflow:ticket"}}, "user": map[string]string{"login": "owner", "type": "User"}}})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	snapshot, err := NewClient(server.URL, "", server.Client()).ReadPlan(context.Background(), "owner/repo", 10)
+	snapshot, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ReadPlan(context.Background(), "owner/repo", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,10 +360,11 @@ func TestRateLimitRetryAtUsesGitHubReset(t *testing.T) {
 }
 
 type issueJSON struct {
-	ID     int64       `json:"id"`
-	Number int64       `json:"number"`
-	Title  string      `json:"title"`
-	Labels []labelJSON `json:"labels"`
+	ID     int64        `json:"id"`
+	Number int64        `json:"number"`
+	Title  string       `json:"title"`
+	Labels []labelJSON  `json:"labels"`
+	User   userResponse `json:"user"`
 }
 
 type labelJSON struct {
@@ -375,5 +376,22 @@ func writeIssue(w http.ResponseWriter, id, number int64, title string, labels []
 	for i, label := range labels {
 		converted[i] = labelJSON{Name: label}
 	}
-	json.NewEncoder(w).Encode(issueJSON{ID: id, Number: number, Title: title, Labels: converted})
+	json.NewEncoder(w).Encode(issueJSON{ID: id, Number: number, Title: title, Labels: converted, User: userResponse{Login: "owner", Type: "User"}})
+}
+
+func TestReadPlanRejectsNonOwnerPlanInput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/repos/owner/repo/issues/10" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "number": 10, "labels": []map[string]string{{"name": "workflow:plan"}}, "user": map[string]string{"login": "outsider", "type": "User"}})
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ReadPlan(context.Background(), "owner/repo", 10)
+	if err == nil || !strings.Contains(err.Error(), "not the configured repository owner") {
+		t.Fatalf("non-owner plan error = %v", err)
+	}
 }

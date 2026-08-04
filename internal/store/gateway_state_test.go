@@ -76,7 +76,7 @@ func TestGatewayPauseFencesNewDispatchAdmissionsAndWaitsForExistingOnes(t *testi
 	}
 }
 
-func TestPausedGatewayWaitsForUnownedControlPlaneClaimAcknowledgement(t *testing.T) {
+func TestPausedGatewayRecoversStaleControlPlaneClaimOnlyAfterDispatcherExpires(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -84,11 +84,11 @@ func TestPausedGatewayWaitsForUnownedControlPlaneClaimAcknowledgement(t *testing
 	}
 	defer db.Close()
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now.Add(-2*time.Minute))
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(-2*time.Minute))
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,19 +103,16 @@ func TestPausedGatewayWaitsForUnownedControlPlaneClaimAcknowledgement(t *testing
 		t.Fatal(err)
 	}
 	if outbox.State != OutboxProcessing || outbox.ClaimToken != claim.ClaimToken {
-		t.Fatalf("unacknowledged outbox = %#v", outbox)
+		t.Fatalf("live dispatcher outbox = %#v", outbox)
 	}
-	quiesced := make(chan error, 1)
-	go func() { quiesced <- db.WaitForGatewayWritesQuiesced(ctx) }()
-	select {
-	case err := <-quiesced:
-		t.Fatalf("wait returned before control-plane dispatch acknowledgement: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, claim.ClaimToken, OutboxSucceeded, "", now); err != nil {
+	if err := db.RecoverExpiredGatewayDeliveryClaims(ctx, now.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-quiesced; err != nil {
+	outbox, err = db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if outbox.State != OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("recovered stale outbox = %#v", outbox)
 	}
 }

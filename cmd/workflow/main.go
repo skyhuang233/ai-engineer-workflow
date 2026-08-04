@@ -687,7 +687,11 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, token, nil), Store: db, Token: token, PushURL: *pushURL, CredentialSource: credentialSource}
-	gateway := delivery.Gateway{Store: db, Remote: remote}
+	gateway, err := delivery.NewGateway(db, remote)
+	if err != nil {
+		_ = db.Close()
+		fail(err)
+	}
 	go func() {
 		for {
 			if err := gateway.DispatchPending(context.Background(), 32); err != nil {

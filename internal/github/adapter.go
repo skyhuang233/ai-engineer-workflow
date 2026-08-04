@@ -330,8 +330,14 @@ func (c *Client) ReadPlan(ctx context.Context, repository string, rootNumber int
 	if err := ValidateRepository(repository); err != nil {
 		return plan.Snapshot{}, err
 	}
+	if strings.TrimSpace(c.RepositoryOwner) == "" {
+		return plan.Snapshot{}, fmt.Errorf("configured repository owner is required to admit a plan")
+	}
 	root, err := c.getIssue(ctx, repository, rootNumber)
 	if err != nil {
+		return plan.Snapshot{}, err
+	}
+	if err := c.requirePlanAuthor(root); err != nil {
 		return plan.Snapshot{}, err
 	}
 	children, err := c.listIssues(ctx, fmt.Sprintf("/repos/%s/issues/%d/sub_issues", repository, rootNumber))
@@ -340,13 +346,28 @@ func (c *Client) ReadPlan(ctx context.Context, repository string, rootNumber int
 	}
 	blockedBy := make(map[int64][]plan.Issue, len(children))
 	for _, child := range children {
+		if err := c.requirePlanAuthor(child); err != nil {
+			return plan.Snapshot{}, err
+		}
 		blockers, err := c.listIssues(ctx, fmt.Sprintf("/repos/%s/issues/%d/dependencies/blocked_by", repository, child.Number))
 		if err != nil {
 			return plan.Snapshot{}, err
 		}
+		for _, blocker := range blockers {
+			if err := c.requirePlanAuthor(blocker); err != nil {
+				return plan.Snapshot{}, err
+			}
+		}
 		blockedBy[child.ID] = blockers
 	}
 	return plan.Snapshot{Repository: repository, Root: root, Children: children, BlockedBy: blockedBy}, nil
+}
+
+func (c *Client) requirePlanAuthor(issue plan.Issue) error {
+	if !actionableAuthor(c.RepositoryOwner, issue.Author, issue.AuthorType) {
+		return fmt.Errorf("plan issue #%d author %q is not the configured repository owner", issue.Number, issue.Author)
+	}
+	return nil
 }
 
 func (c *Client) getIssue(ctx context.Context, repository string, number int64) (plan.Issue, error) {
@@ -577,6 +598,12 @@ type issueResponse struct {
 	State     string          `json:"state"`
 	UpdatedAt string          `json:"updated_at"`
 	Labels    []labelResponse `json:"labels"`
+	User      userResponse    `json:"user"`
+}
+
+type userResponse struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
 }
 
 type labelResponse struct {
@@ -588,7 +615,7 @@ func (i issueResponse) issue() plan.Issue {
 	for _, label := range i.Labels {
 		labels = append(labels, label.Name)
 	}
-	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt}
+	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt, Author: i.User.Login, AuthorType: i.User.Type}
 }
 
 // ValidateRepository prevents accidental path traversal when a repository is

@@ -9,6 +9,8 @@ import (
 
 const GatewayCredentialInboxKey = "gateway-credential"
 
+const gatewayDispatcherLeaseTTL = 2 * time.Minute
+
 type WorkflowInboxItem struct {
 	Key       string
 	Kind      string
@@ -70,6 +72,15 @@ func (s *Store) WaitForGatewayWritesQuiesced(ctx context.Context) error {
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		paused, _, err := s.GatewayWritesPaused(ctx)
+		if err != nil {
+			return err
+		}
+		if paused {
+			if err := s.RecoverExpiredGatewayDeliveryClaims(ctx, time.Now().UTC()); err != nil {
+				return err
+			}
+		}
 		var processing int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_outbox WHERE state = 'processing'`).Scan(&processing); err != nil {
 			return err
@@ -83,6 +94,42 @@ func (s *Store) WaitForGatewayWritesQuiesced(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *Store) EnsureGatewayDispatcher(ctx context.Context, dispatcherToken string, now time.Time) error {
+	if dispatcherToken == "" {
+		return errors.New("Gateway dispatcher token is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var activeToken, expiresText string
+	if err := tx.QueryRowContext(ctx, `SELECT dispatcher_token, dispatcher_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeToken, &expiresText); err != nil {
+		return err
+	}
+	if activeToken != "" && activeToken != dispatcherToken && expiresText != "" {
+		expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+		if parseErr != nil {
+			return parseErr
+		}
+		if expiresAt.After(now) {
+			return ErrDeliveryInProgress
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE gateway_runtime SET dispatcher_token = ?, dispatcher_expires_at = ?, updated_at = ? WHERE singleton = 1`, dispatcherToken, formatTimestamp(now.Add(gatewayDispatcherLeaseTTL)), formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecoverExpiredGatewayDeliveryClaims(ctx context.Context, now time.Time) error {
@@ -105,35 +152,37 @@ func (s *Store) RecoverExpiredGatewayDeliveryClaims(ctx context.Context, now tim
 	if writesPaused == 0 {
 		return errors.New("Gateway writes must be paused before recovering delivery claims")
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT idempotency_key, request_json, updated_at, claim_token FROM delivery_outbox WHERE state = ?`, OutboxProcessing)
+	rows, err := tx.QueryContext(ctx, `SELECT idempotency_key, request_json, updated_at, claim_token, dispatcher_token FROM delivery_outbox WHERE state = ?`, OutboxProcessing)
 	if err != nil {
 		return err
 	}
 	type expiredClaim struct {
-		key        string
-		claimToken string
+		key             string
+		claimToken      string
+		dispatcherToken string
 	}
 	var expired []expiredClaim
 	for rows.Next() {
 		var key, raw, updatedAt, claimToken string
-		if err := rows.Scan(&key, &raw, &updatedAt, &claimToken); err != nil {
+		var dispatcherToken string
+		if err := rows.Scan(&key, &raw, &updatedAt, &claimToken, &dispatcherToken); err != nil {
 			rows.Close()
 			return err
 		}
-		recoverable, recoverErr := deliveryOutboxClaimRecoverableTx(ctx, tx, raw, updatedAt, now)
+		recoverable, recoverErr := deliveryOutboxClaimRecoverableTx(ctx, tx, raw, updatedAt, dispatcherToken, now)
 		if recoverErr != nil {
 			rows.Close()
 			return recoverErr
 		}
 		if recoverable {
-			expired = append(expired, expiredClaim{key: key, claimToken: claimToken})
+			expired = append(expired, expiredClaim{key: key, claimToken: claimToken, dispatcherToken: dispatcherToken})
 		}
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, claim := range expired {
-		result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, OutboxPending, "delivery claim expired while Gateway writes were paused", formatTimestamp(now), formatTimestamp(now), claim.key, OutboxProcessing, claim.claimToken)
+		result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', dispatcher_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ? AND dispatcher_token = ?`, OutboxPending, "delivery claim expired while Gateway writes were paused", formatTimestamp(now), formatTimestamp(now), claim.key, OutboxProcessing, claim.claimToken, claim.dispatcherToken)
 		if err != nil {
 			return err
 		}

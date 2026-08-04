@@ -28,12 +28,16 @@ func (p WorkspacePusher) Push(ctx context.Context, repository, branch, commit, e
 		return errors.New("credential-owning push adapter is incomplete")
 	}
 	pushURL := p.PushURL
+	canonicalURL := "https://github.com/" + repository + ".git"
 	if pushURL == "" {
-		pushURL = "https://github.com/" + repository + ".git"
+		pushURL = canonicalURL
 	}
 	endpoint, err := url.Parse(pushURL)
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
 		return errors.New("credential-owning push adapter requires an HTTPS push URL without embedded credentials")
+	}
+	if pushURL != canonicalURL {
+		return errors.New("credential-owning push adapter requires the admitted GitHub repository push URL")
 	}
 	repositoryStore, err := git.PlainOpen(p.WorkspacePath)
 	if err != nil {

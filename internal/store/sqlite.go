@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 28
+	latestSchemaVersion = 29
 )
 
 var (
@@ -762,6 +762,31 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (28, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 29 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "gateway_runtime", name: "dispatcher_token", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "gateway_runtime", name: "dispatcher_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "delivery_outbox", name: "dispatcher_token", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 29: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 29: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (29, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
