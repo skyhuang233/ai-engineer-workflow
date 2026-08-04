@@ -262,6 +262,9 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+	if err := client.RequirePublicRepository(ctx, *repository); err != nil {
+		fail(err)
+	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
 	if err != nil {
 		fail(err)
@@ -470,6 +473,9 @@ func runPollGitHub(args []string) {
 			return err
 		}
 		client := github.NewClient(*githubURL, token, nil)
+		if err := client.RequirePublicRepository(ctx, *repository); err != nil {
+			return err
+		}
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		poller := github.Poller{Store: db, Client: client.WithRepositoryOwner(config.GitHub.Credential.Owner), LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {

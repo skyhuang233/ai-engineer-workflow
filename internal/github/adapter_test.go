@@ -302,6 +302,25 @@ func TestValidateRepository(t *testing.T) {
 	}
 }
 
+func TestRequirePublicRepositoryRejectsPrivateRepositories(t *testing.T) {
+	private := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"private": private})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "", server.Client())
+	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err != nil {
+		t.Fatalf("public repository: %v", err)
+	}
+	private = true
+	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err == nil || !strings.Contains(err.Error(), "must be public") {
+		t.Fatalf("private repository error = %v", err)
+	}
+}
+
 func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

@@ -173,6 +173,22 @@ func (c *Client) WithRepositoryOwner(owner string) *Client {
 	return &configured
 }
 
+func (c *Client) RequirePublicRepository(ctx context.Context, repository string) error {
+	if err := ValidateRepository(repository); err != nil {
+		return err
+	}
+	var target struct {
+		Private bool `json:"private"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository, &target); err != nil {
+		return fmt.Errorf("verify repository visibility: %w", err)
+	}
+	if target.Private {
+		return fmt.Errorf("repository %q must be public", repository)
+	}
+	return nil
+}
+
 const workflowInboxLabel = "workflow:inbox"
 
 func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, questionIDs []string) (map[string]string, error) {

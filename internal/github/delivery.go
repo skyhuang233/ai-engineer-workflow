@@ -220,14 +220,8 @@ func (r *DeliveryRemote) pusher(ctx context.Context, request store.DeliveryReque
 }
 
 func requirePublicRepository(ctx context.Context, client *Client, repository string) error {
-	var target struct {
-		Private bool `json:"private"`
-	}
-	if err := client.getJSON(ctx, "/repos/"+repository, &target); err != nil {
-		return fmt.Errorf("verify delivery repository visibility: %w", err)
-	}
-	if target.Private {
-		return fmt.Errorf("%w: delivery repository must be public", store.ErrDeliveryRejected)
+	if err := client.RequirePublicRepository(ctx, repository); err != nil {
+		return fmt.Errorf("%w: %v", store.ErrDeliveryRejected, err)
 	}
 	return nil
 }
