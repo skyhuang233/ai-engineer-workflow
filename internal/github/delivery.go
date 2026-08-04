@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -21,30 +22,54 @@ type GitPusher interface {
 }
 
 type DeliveryRemote struct {
-	Client  *Client
-	Pusher  GitPusher
-	Store   *store.Store
-	Token   string
-	PushURL string
+	Client           *Client
+	Pusher           GitPusher
+	Store            *store.Store
+	Token            string
+	PushURL          string
+	CredentialSource func(context.Context) (string, error)
+	mu               sync.RWMutex
 }
 
-func (r DeliveryRemote) CredentialAvailable(context.Context) error {
-	if r.Client == nil || strings.TrimSpace(r.Client.Token) == "" {
+func (r *DeliveryRemote) CredentialAvailable(ctx context.Context) error {
+	if r.CredentialSource == nil {
+		client := r.client()
+		if client == nil || strings.TrimSpace(client.Token) == "" {
+			return delivery.ErrGatewayCredentialRejected
+		}
+		return nil
+	}
+	token, err := r.CredentialSource(ctx)
+	if err != nil || strings.TrimSpace(token) == "" {
 		return delivery.ErrGatewayCredentialRejected
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Client == nil {
+		return delivery.ErrGatewayCredentialRejected
+	}
+	r.Token = token
+	r.Client = NewClient(r.Client.BaseURL, token, r.Client.HTTP).WithRepositoryOwner(r.Client.RepositoryOwner)
 	return nil
 }
 
-func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
-	if r.Client == nil {
+func (r *DeliveryRemote) client() *Client {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.Client
+}
+
+func (r *DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	client := r.client()
+	if client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
-	if err := r.requirePublicRepository(ctx, request.Repository); err != nil {
+	if err := requirePublicRepository(ctx, client, request.Repository); err != nil {
 		return delivery.Observation{}, err
 	}
 	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryProjectInbox || request.Operation == store.DeliveryAddIssueLabel {
 		if request.Operation == store.DeliveryProjectInbox {
-			applied, err := r.Client.HasWorkflowInboxProjection(ctx, request.Repository, request.WorkflowQuestions)
+			applied, err := client.HasWorkflowInboxProjection(ctx, request.Repository, request.WorkflowQuestions)
 			if err != nil {
 				return delivery.Observation{}, err
 			}
@@ -54,7 +79,7 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
 		if request.Operation == store.DeliveryAddIssueLabel {
-			issue, err := r.Client.getIssue(ctx, request.Repository, request.RootNumber)
+			issue, err := client.getIssue(ctx, request.Repository, request.RootNumber)
 			if err != nil {
 				return delivery.Observation{}, err
 			}
@@ -65,13 +90,13 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 			}
 			return delivery.Observation{}, nil
 		}
-		applied, err := r.Client.HasPlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection)
+		applied, err := client.HasPlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection)
 		if err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: applied}, nil
 	}
-	head, exists, err := r.Client.branchHead(ctx, request.Repository, request.Branch)
+	head, exists, err := client.branchHead(ctx, request.Repository, request.Branch)
 	if err != nil {
 		return delivery.Observation{}, err
 	}
@@ -81,7 +106,7 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 		return observation, nil
 	}
 	if request.Operation == store.DeliveryUpsertPR {
-		pull, found, findErr := r.findPullRequest(ctx, request)
+		pull, found, findErr := findPullRequest(ctx, client, request)
 		if findErr != nil {
 			return observation, findErr
 		}
@@ -92,7 +117,7 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 		}
 		return observation, nil
 	}
-	comments, err := r.listComments(ctx, request.Repository, request.PullRequestNumber)
+	comments, err := client.listIssueComments(ctx, request.Repository, request.PullRequestNumber)
 	if err != nil {
 		return observation, err
 	}
@@ -106,13 +131,14 @@ func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryReque
 	return observation, nil
 }
 
-func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
-	if r.Client == nil {
+func (r *DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	client := r.client()
+	if client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
 	switch request.Operation {
 	case store.DeliveryPushCandidate:
-		pusher, err := r.pusher(ctx, request)
+		pusher, err := r.pusher(ctx, request, client.Token)
 		if err != nil {
 			return delivery.Observation{}, err
 		}
@@ -124,18 +150,18 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		}
 		return delivery.Observation{Applied: true, RemoteHead: request.CommitSHA, RemoteExists: true}, nil
 	case store.DeliveryUpsertPR:
-		pull, found, err := r.findPullRequest(ctx, request)
+		pull, found, err := findPullRequest(ctx, client, request)
 		if err != nil {
 			return delivery.Observation{}, err
 		}
 		if !found {
 			payload := map[string]string{"title": request.Title, "head": request.Branch, "base": "main", "body": request.Body}
-			if err := r.Client.requestJSON(ctx, http.MethodPost, "/repos/"+request.Repository+"/pulls", payload, &pull); err != nil {
+			if err := client.requestJSON(ctx, http.MethodPost, "/repos/"+request.Repository+"/pulls", payload, &pull); err != nil {
 				return delivery.Observation{}, err
 			}
 		} else {
 			payload := map[string]string{"title": request.Title, "body": request.Body}
-			if err := r.Client.requestJSON(ctx, http.MethodPatch, "/repos/"+request.Repository+"/pulls/"+strconv.FormatInt(pull.Number, 10), payload, &pull); err != nil {
+			if err := client.requestJSON(ctx, http.MethodPatch, "/repos/"+request.Repository+"/pulls/"+strconv.FormatInt(pull.Number, 10), payload, &pull); err != nil {
 				return delivery.Observation{}, err
 			}
 		}
@@ -149,7 +175,7 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 	case store.DeliveryReplyEvidence:
 		body := fmt.Sprintf("%s\n\n<!-- workflow-idempotency:%s -->", request.Evidence, request.IdempotencyKey)
 		payload := map[string]string{"body": body}
-		if err := r.Client.requestJSON(ctx, http.MethodPost, "/repos/"+request.Repository+"/issues/"+strconv.FormatInt(request.PullRequestNumber, 10)+"/comments", payload, nil); err != nil {
+		if err := client.requestJSON(ctx, http.MethodPost, "/repos/"+request.Repository+"/issues/"+strconv.FormatInt(request.PullRequestNumber, 10)+"/comments", payload, nil); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true, PullRequestNumber: request.PullRequestNumber}, nil
@@ -157,12 +183,12 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		if request.PlanProjection == nil {
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
-		if err := r.Client.UpdatePlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection); err != nil {
+		if err := client.UpdatePlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
 	case store.DeliveryProjectInbox:
-		if err := r.Client.ProjectWorkflowInbox(ctx, request.Repository, request.WorkflowQuestions); err != nil {
+		if err := client.ProjectWorkflowInbox(ctx, request.Repository, request.WorkflowQuestions); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
@@ -170,7 +196,7 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 		if request.PlanProjection == nil || request.Label == "" {
 			return delivery.Observation{}, fmt.Errorf("plan label is incomplete")
 		}
-		if err := r.Client.AddIssueLabel(ctx, request.Repository, request.RootNumber, request.Label); err != nil {
+		if err := client.AddIssueLabel(ctx, request.Repository, request.RootNumber, request.Label); err != nil {
 			return delivery.Observation{}, err
 		}
 		return delivery.Observation{Applied: true}, nil
@@ -179,25 +205,25 @@ func (r DeliveryRemote) Apply(ctx context.Context, request store.DeliveryRequest
 	}
 }
 
-func (r DeliveryRemote) pusher(ctx context.Context, request store.DeliveryRequest) (GitPusher, error) {
+func (r *DeliveryRemote) pusher(ctx context.Context, request store.DeliveryRequest, token string) (GitPusher, error) {
 	if r.Pusher != nil {
 		return r.Pusher, nil
 	}
-	if r.Store == nil || r.Token == "" {
+	if r.Store == nil || token == "" {
 		return nil, nil
 	}
 	workspace, err := r.Store.WorkspaceForRun(ctx, request.RunID)
 	if err != nil {
 		return nil, err
 	}
-	return WorkspacePusher{WorkspacePath: workspace, Token: r.Token, PushURL: r.PushURL}, nil
+	return WorkspacePusher{WorkspacePath: workspace, Token: token, PushURL: r.PushURL}, nil
 }
 
-func (r DeliveryRemote) requirePublicRepository(ctx context.Context, repository string) error {
+func requirePublicRepository(ctx context.Context, client *Client, repository string) error {
 	var target struct {
 		Private bool `json:"private"`
 	}
-	if err := r.Client.getJSON(ctx, "/repos/"+repository, &target); err != nil {
+	if err := client.getJSON(ctx, "/repos/"+repository, &target); err != nil {
 		return fmt.Errorf("verify delivery repository visibility: %w", err)
 	}
 	if target.Private {
@@ -230,10 +256,10 @@ type commentResponse struct {
 	} `json:"user"`
 }
 
-func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.DeliveryRequest) (pullRequestResponse, bool, error) {
+func findPullRequest(ctx context.Context, client *Client, request store.DeliveryRequest) (pullRequestResponse, bool, error) {
 	if request.PullRequestNumber != 0 {
 		var pull pullRequestResponse
-		err := r.Client.getJSON(ctx, "/repos/"+request.Repository+"/pulls/"+strconv.FormatInt(request.PullRequestNumber, 10), &pull)
+		err := client.getJSON(ctx, "/repos/"+request.Repository+"/pulls/"+strconv.FormatInt(request.PullRequestNumber, 10), &pull)
 		if err != nil {
 			return pullRequestResponse{}, false, err
 		}
@@ -244,7 +270,7 @@ func (r DeliveryRemote) findPullRequest(ctx context.Context, request store.Deliv
 	}
 	var pulls []pullRequestResponse
 	path := "/repos/" + request.Repository + "/pulls?state=all&head=" + url.QueryEscape(strings.Split(request.Repository, "/")[0]+":"+request.Branch) + "&per_page=100"
-	if err := r.Client.getJSON(ctx, path, &pulls); err != nil {
+	if err := client.getJSON(ctx, path, &pulls); err != nil {
 		return pullRequestResponse{}, false, err
 	}
 	for _, pull := range pulls {
@@ -269,10 +295,6 @@ func validatePullRequest(pull pullRequestResponse, request store.DeliveryRequest
 		return fmt.Errorf("mapped pull request does not target main")
 	}
 	return nil
-}
-
-func (r DeliveryRemote) listComments(ctx context.Context, repository string, number int64) ([]commentResponse, error) {
-	return r.Client.listIssueComments(ctx, repository, number)
 }
 
 func (c *Client) branchHead(ctx context.Context, repository, branch string) (string, bool, error) {

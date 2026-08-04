@@ -645,12 +645,15 @@ func runGateway(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	token, err := gatewayCredential(context.Background())
+	credentialSource := func(ctx context.Context) (string, error) {
+		return verifiedGatewayCredential(ctx, db)
+	}
+	token, err := credentialSource(context.Background())
 	if err != nil {
 		_ = db.Close()
 		fail(err)
 	}
-	remote := github.DeliveryRemote{Client: github.NewClient(*githubURL, token, nil), Store: db, Token: token, PushURL: *pushURL}
+	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, token, nil), Store: db, Token: token, PushURL: *pushURL, CredentialSource: credentialSource}
 	gateway := delivery.Gateway{Store: db, Remote: remote}
 	go func() {
 		for {
@@ -676,6 +679,21 @@ func gatewayCredential(ctx context.Context) (string, error) {
 	token = strings.TrimSpace(token)
 	if !strings.HasPrefix(token, "github_pat_") {
 		return "", errors.New("Gateway Credential is not a fine-grained PAT")
+	}
+	return token, nil
+}
+
+func verifiedGatewayCredential(ctx context.Context, database *store.Store) (string, error) {
+	token, err := gatewayCredential(ctx)
+	if err != nil {
+		return "", err
+	}
+	verification, err := database.GatewayCredentialVerification(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read Gateway Credential verification: %w", err)
+	}
+	if credential.Fingerprint(token) != verification.FingerprintSHA256 {
+		return "", errors.New("Gateway Credential differs from the verified credential")
 	}
 	return token, nil
 }

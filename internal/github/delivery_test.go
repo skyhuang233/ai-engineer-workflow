@@ -24,6 +24,29 @@ func (p *recordingPusher) Push(_ context.Context, _, _, _, expected string, abse
 	return nil
 }
 
+func TestDeliveryRemoteRefreshesCredentialAtDispatchBoundary(t *testing.T) {
+	token := "github_pat_before"
+	remote := DeliveryRemote{
+		Client: NewClient("https://api.github.com", "github_pat_stale", nil),
+		CredentialSource: func(context.Context) (string, error) {
+			return token, nil
+		},
+	}
+	if err := remote.CredentialAvailable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := remote.client().Token; got != "github_pat_before" {
+		t.Fatalf("initial credential = %q", got)
+	}
+	token = "github_pat_after"
+	if err := remote.CredentialAvailable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := remote.client().Token; got != "github_pat_after" {
+		t.Fatalf("refreshed credential = %q", got)
+	}
+}
+
 func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
@@ -145,7 +168,8 @@ func TestDeliveryRemoteRejectsPrivateRepository(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-	_, err := (DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}).Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
 	if !errors.Is(err, store.ErrDeliveryRejected) {
 		t.Fatalf("private repository error = %v", err)
 	}
@@ -196,7 +220,8 @@ func TestDeliveryRemoteRejectsInvalidPullRequestReturnedByApply(t *testing.T) {
 				http.NotFound(w, r)
 			}
 		}))
-		_, err := (DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}).Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
+		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+		_, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
 		server.Close()
 		if !errors.Is(err, store.ErrDeliveryRejected) {
 			t.Fatalf("invalid response error = %v", err)

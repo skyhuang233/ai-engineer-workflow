@@ -10,11 +10,14 @@ import (
 
 func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	config := validConfig()
+	private := false
 	manifest := `{"schema_version":1,"worker_version":"0.1.0","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","image":"ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","codex_version":"0.146.0","no_mistakes_version":"v1.41.2","no_mistakes_commit":"867d64d9c2df89f3f204ad1f5528e5bf7b460caa","github_actions_run_id":123}`
 	workflowID := int64(77)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/repos/skyhuang233/workflow":
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"private":%t}`, private)))
 		case "/repos/skyhuang233/workflow/releases/tags/worker-v0.1.0":
 			_, _ = w.Write([]byte(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":9,"name":"worker-release.json"}]}`))
 		case "/repos/skyhuang233/workflow/releases/assets/9":
@@ -38,5 +41,9 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	workflowID = 88
 	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest attributed to an unrelated successful workflow")
+	}
+	private = true
+	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+		t.Fatal("accepted a private Worker Release repository")
 	}
 }

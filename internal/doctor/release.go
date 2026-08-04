@@ -29,6 +29,15 @@ type ReleaseFetcher struct {
 
 func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkerReleaseManifest, []byte, error) {
 	client := githubapi.NewClient(f.APIBase, token, f.HTTP)
+	var repository struct {
+		Private bool `json:"private"`
+	}
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+config.Worker.ReleaseRepository, nil, &repository); err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker Release repository visibility: %w", err)
+	}
+	if repository.Private {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository must be public")
+	}
 	tag := "worker-v" + config.Worker.Version
 	var release struct {
 		TargetCommitish string `json:"target_commitish"`
