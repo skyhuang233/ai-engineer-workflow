@@ -265,14 +265,11 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if !contractPassed {
 		return Result{Status: Fail, Summary: "integration workflow has not succeeded for the current default-branch revision"}
 	}
-	var forkRepository struct {
-		Private bool `json:"private"`
+	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.UpstreamRepository, "no-mistakes upstream"); result != nil {
+		return *result
 	}
-	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository, &forkRepository); err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read no-mistakes fork repository: %v", err)}
-	}
-	if forkRepository.Private {
-		return Result{Status: Fail, Summary: "no-mistakes fork repository must be public"}
+	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.ForkRepository, "no-mistakes fork"); result != nil {
+		return *result
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
@@ -282,6 +279,19 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit"}
 	}
 	return Result{Status: Pass, Summary: "integration workflow and pinned fork release verified; owner-only merge remains the governance boundary"}
+}
+
+func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repository, name string) *Result {
+	var target struct {
+		Private bool `json:"private"`
+	}
+	if err := githubGET(ctx, apiBase, token, "repos/"+repository, &target); err != nil {
+		return &Result{Status: Fail, Summary: fmt.Sprintf("read %s repository: %v", name, err)}
+	}
+	if target.Private {
+		return &Result{Status: Fail, Summary: name + " repository must be public"}
+	}
+	return nil
 }
 
 func githubGET(ctx context.Context, apiBase, token, path string, destination any) error {

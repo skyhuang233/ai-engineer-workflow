@@ -3,14 +3,33 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"private":true}`))
+	}))
+	defer server.Close()
+	err := requirePublicControlPlaneRepository(context.Background(), github.NewClient(server.URL, "", server.Client()), "owner/repo")
+	if err == nil || !strings.Contains(err.Error(), "must be public") {
+		t.Fatalf("private repository admission error = %v", err)
+	}
+}
 
 func TestAcquireTicketClaimReplacesExpiredWorker(t *testing.T) {
 	ctx := context.Background()

@@ -262,7 +262,7 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-	if err := client.RequirePublicRepository(ctx, *repository); err != nil {
+	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
 		fail(err)
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
@@ -380,12 +380,16 @@ func runReconcileDelivered(args []string) {
 	if err != nil {
 		fail(err)
 	}
+	client := github.NewClient(*githubURL, token, nil)
+	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
+		fail(err)
+	}
 	db, err := store.Open(ctx, *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
-	marked, err := (github.DeliveredReconciler{Store: db, Client: github.NewClient(*githubURL, token, nil)}).Reconcile(ctx, *repository)
+	marked, err := (github.DeliveredReconciler{Store: db, Client: client}).Reconcile(ctx, *repository)
 	if err != nil {
 		fail(err)
 	}
@@ -473,7 +477,7 @@ func runPollGitHub(args []string) {
 			return err
 		}
 		client := github.NewClient(*githubURL, token, nil)
-		if err := client.RequirePublicRepository(ctx, *repository); err != nil {
+		if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
 			return err
 		}
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
@@ -612,6 +616,7 @@ func runAnswerInbox(args []string) {
 	answer := flags.String("answer", "", "human decision")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
+	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
 	if *repository == "" || *questionID == "" || *answer == "" || *gatewayURL == "" || *gatewayControlToken == "" {
 		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, answer, Gateway URL, and control credential")
@@ -623,6 +628,13 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
+	token, err := verifiedGatewayCredential(ctx, db)
+	if err != nil {
+		fail(err)
+	}
+	if err := requirePublicControlPlaneRepository(ctx, github.NewClient(*githubURL, token, nil), *repository); err != nil {
+		fail(err)
+	}
 	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
@@ -637,6 +649,13 @@ func runAnswerInbox(args []string) {
 	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectWorkflowInbox(ctx, *repository, projected); err != nil {
 		fail(err)
 	}
+}
+
+func requirePublicControlPlaneRepository(ctx context.Context, client *github.Client, repository string) error {
+	if err := client.RequirePublicRepository(ctx, repository); err != nil {
+		return fmt.Errorf("control-plane repository admission: %w", err)
+	}
+	return nil
 }
 
 func runGateway(args []string) {
