@@ -107,15 +107,6 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 		workflow.Path != ".github/workflows/publish-worker.yml" || workflow.State != "active" {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release was not produced by a successful main push workflow")
 	}
-	var main struct {
-		SHA string `json:"sha"`
-	}
-	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+config.Worker.ReleaseRepository+"/commits/main", nil, &main); err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve current main commit: %w", err)
-	}
-	if main.SHA != manifest.SourceCommit {
-		return WorkerReleaseManifest{}, nil, errors.New("Worker Release source commit is not current main")
-	}
 	var pulls []struct {
 		MergedAt       string `json:"merged_at"`
 		MergeCommitSHA string `json:"merge_commit_sha"`

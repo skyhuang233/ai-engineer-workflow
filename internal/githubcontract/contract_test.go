@@ -38,24 +38,34 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 			_, _ = w.Write([]byte(`{"number":12}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls"):
 			_, _ = w.Write([]byte(`{"number":13}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/"):
+			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
 		default:
 			_ = json.NewEncoder(w).Encode(map[string]any{})
 		}
 	}))
 	defer server.Close()
 
-	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
+	gitPushes := 0
+	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(_ context.Context, token, repository, defaultBranch string) (GitPushArtifact, error) {
+		gitPushes++
+		if token != "github_pat_test" || repository != "owner/integration" || defaultBranch != "main" {
+			t.Fatalf("Git push contract inputs = %q, %q, %q", token, repository, defaultBranch)
+		}
+		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
+	}}).Verify(
 		context.Background(), "github_pat_test", "owner", "owner/integration",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if gitPushes != 1 {
+		t.Fatalf("Git push lifecycle = %d pushes", gitPushes)
+	}
 	joined := strings.Join(calls, "\n")
 	for _, wanted := range []string{
 		"GET /user",
 		"GET /repos/owner/integration/actions/workflows",
-		"POST /repos/owner/integration/git/refs",
-		"PUT /repos/owner/integration/contents/.workflow-credential-contract",
 		"POST /repos/owner/integration/issues",
 		"POST /repos/owner/integration/labels",
 		"POST /repos/owner/integration/issues/12/labels",
@@ -63,7 +73,8 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 		"POST /repos/owner/integration/issues/13/comments",
 		"PATCH /repos/owner/integration/pulls/13",
 		"PATCH /repos/owner/integration/issues/12",
-		"DELETE /repos/owner/integration/git/refs/heads/workflow-credential-contract",
+		"GET /repos/owner/integration/git/ref/heads/workflow-credential-contract-0123456789abcdef01234567",
+		"DELETE /repos/owner/integration/git/refs/heads/workflow-credential-contract-0123456789abcdef01234567",
 	} {
 		if !strings.Contains(joined, wanted) {
 			t.Fatalf("missing %q in calls:\n%s", wanted, joined)
@@ -95,5 +106,34 @@ func TestVerifyRejectsPrivateIntegrationRepositoryBeforeMutations(t *testing.T) 
 	}
 	if got := strings.Join(calls, "\n"); strings.Contains(got, "POST ") || strings.Contains(got, "PUT ") || strings.Contains(got, "PATCH ") || strings.Contains(got, "DELETE ") {
 		t.Fatalf("private integration repository was mutated:\n%s", got)
+	}
+}
+
+func TestVerifyRefusesToDeleteAChangedTemporaryBranch(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"owner"}`))
+		case "/repos/owner/integration":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/owner/integration/git/ref/heads/workflow-credential-contract-0123456789abcdef01234567":
+			_, _ = w.Write([]byte(`{"object":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`))
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		}
+	}))
+	defer server.Close()
+
+	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(context.Context, string, string, string) (GitPushArtifact, error) {
+		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
+	}}).Verify(context.Background(), "github_pat_test", "owner", "owner/integration")
+	if err == nil || !strings.Contains(err.Error(), "head changed") {
+		t.Fatalf("Verify error = %v", err)
+	}
+	if strings.Contains(strings.Join(calls, "\n"), "DELETE /repos/owner/integration/git/refs/heads/") {
+		t.Fatalf("deleted changed branch:\n%s", strings.Join(calls, "\n"))
 	}
 }
