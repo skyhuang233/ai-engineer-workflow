@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,10 +12,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/credential"
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestShouldPauseGatewayForCredential(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "missing", err: credential.ErrNotFound, want: true},
+		{name: "rejected", err: fmt.Errorf("%w: fingerprint mismatch", delivery.ErrGatewayCredentialRejected), want: true},
+		{name: "transient store error", err: errors.New("database temporarily unavailable")},
+		{name: "cancelled", err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldPauseGatewayForCredential(test.err); got != test.want {
+				t.Fatalf("should pause = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
 
 func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

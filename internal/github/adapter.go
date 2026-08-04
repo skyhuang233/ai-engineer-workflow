@@ -599,7 +599,7 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
 		detail := strings.TrimSpace(string(message))
-		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
+		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, detail, time.Now().UTC())}
 	}
 	if destination == nil {
 		return nil
@@ -607,21 +607,29 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	return json.NewDecoder(response.Body).Decode(destination)
 }
 
-func rateLimitRetryAt(response *http.Response, now time.Time) time.Time {
+func rateLimitRetryAt(response *http.Response, detail string, now time.Time) time.Time {
 	if response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusForbidden {
 		return time.Time{}
 	}
 	if retryAfter, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && retryAfter > 0 {
 		return now.Add(time.Duration(retryAfter) * time.Second)
 	}
-	if response.Header.Get("X-RateLimit-Remaining") != "0" {
-		return time.Time{}
+	if response.Header.Get("X-RateLimit-Remaining") == "0" {
+		reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64)
+		if err == nil && reset > 0 {
+			return time.Unix(reset, 0).UTC()
+		}
+		return now.Add(time.Minute)
 	}
-	reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64)
-	if err != nil || reset <= 0 {
-		return time.Time{}
+	if response.StatusCode == http.StatusTooManyRequests || isSecondaryRateLimitMessage(detail) {
+		return now.Add(time.Minute)
 	}
-	return time.Unix(reset, 0).UTC()
+	return time.Time{}
+}
+
+func isSecondaryRateLimitMessage(detail string) bool {
+	message := strings.ToLower(detail)
+	return strings.Contains(message, "secondary rate limit") || strings.Contains(message, "abuse detection mechanism")
 }
 
 type issueResponse struct {

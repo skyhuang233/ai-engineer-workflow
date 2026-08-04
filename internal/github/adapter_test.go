@@ -366,9 +366,20 @@ func TestRateLimitRetryAtUsesGitHubReset(t *testing.T) {
 	headers.Set("X-RateLimit-Remaining", "0")
 	headers.Set("X-RateLimit-Reset", "1785715260")
 	response := &http.Response{StatusCode: http.StatusForbidden, Header: headers}
-	got := rateLimitRetryAt(response, time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC))
+	got := rateLimitRetryAt(response, "", time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC))
 	if !got.Equal(time.Unix(1785715260, 0).UTC()) {
 		t.Fatalf("retry at = %s", got)
+	}
+}
+
+func TestRateLimitRetryAtDefersHeaderlessSecondaryLimit(t *testing.T) {
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
+		response := &http.Response{StatusCode: status, Header: make(http.Header)}
+		got := rateLimitRetryAt(response, `{"message":"You have exceeded a secondary rate limit."}`, now)
+		if !got.Equal(now.Add(time.Minute)) {
+			t.Fatalf("status %d retry at = %s", status, got)
+		}
 	}
 }
 

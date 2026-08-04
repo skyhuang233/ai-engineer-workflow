@@ -748,7 +748,7 @@ func runGateway(args []string) {
 		_ = db.Close()
 		fail(err)
 	}
-	if _, err := credentialSource(context.Background()); err != nil {
+	if _, err := credentialSource(context.Background()); shouldPauseGatewayForCredential(err) {
 		if pauseErr := db.PauseGatewayWrites(context.Background(), "Gateway Credential is unavailable; replace and verify it to resume writes", time.Now().UTC()); pauseErr != nil {
 			_ = db.Close()
 			fail(pauseErr)
@@ -781,7 +781,7 @@ func gatewayCredential(ctx context.Context) (string, error) {
 	}
 	token = strings.TrimSpace(token)
 	if !strings.HasPrefix(token, "github_pat_") {
-		return "", errors.New("Gateway Credential is not a fine-grained PAT")
+		return "", fmt.Errorf("%w: Gateway Credential is not a fine-grained PAT", delivery.ErrGatewayCredentialRejected)
 	}
 	return token, nil
 }
@@ -796,9 +796,13 @@ func verifiedGatewayCredential(ctx context.Context, database *store.Store) (stri
 		return "", fmt.Errorf("read Gateway Credential verification: %w", err)
 	}
 	if credential.Fingerprint(token) != verification.FingerprintSHA256 {
-		return "", errors.New("Gateway Credential differs from the verified credential")
+		return "", fmt.Errorf("%w: Gateway Credential differs from the verified credential", delivery.ErrGatewayCredentialRejected)
 	}
 	return token, nil
+}
+
+func shouldPauseGatewayForCredential(err error) bool {
+	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
 }
 
 func fail(err error) {

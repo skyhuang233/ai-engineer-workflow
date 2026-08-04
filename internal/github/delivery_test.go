@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -56,6 +57,7 @@ func TestDeliveryRemoteOnlyClassifiesMissingCredentialAsRejected(t *testing.T) {
 		want error
 	}{
 		{name: "missing", err: credential.ErrNotFound, want: delivery.ErrGatewayCredentialRejected},
+		{name: "rejected", err: fmt.Errorf("%w: fingerprint mismatch", delivery.ErrGatewayCredentialRejected), want: delivery.ErrGatewayCredentialRejected},
 		{name: "transient", err: errors.New("credential manager unavailable")},
 		{name: "cancelled", err: context.Canceled, want: context.Canceled},
 	} {
