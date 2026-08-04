@@ -138,7 +138,21 @@ jobs:
             echo "exists=true" >> "$GITHUB_OUTPUT"
           elif grep --quiet 'HTTP 404' "$lookup_error"; then
             rm "$lookup_error"
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            image="${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}"
+            image_lookup_error="$(mktemp)"
+            if docker buildx imagetools inspect "$image" > /dev/null 2>"$image_lookup_error"; then
+              rm "$image_lookup_error"
+              echo "Worker image tag already exists without a complete Worker Release" >&2
+              exit 1
+            elif grep --extended-regexp --ignore-case --quiet 'not found|manifest unknown|no such manifest|HTTP 404' "$image_lookup_error"; then
+              rm "$image_lookup_error"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              cat "$image_lookup_error" >&2
+              rm "$image_lookup_error"
+              echo "Unable to determine whether the immutable Worker image tag already exists" >&2
+              exit 1
+            fi
           else
             cat "$lookup_error" >&2
             rm "$lookup_error"

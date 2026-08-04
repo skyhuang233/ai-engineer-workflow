@@ -81,20 +81,6 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
 	}
-	if paused, reason, err := g.Store.GatewayWritesPaused(ctx); err != nil {
-		return err
-	} else if paused {
-		return fmt.Errorf("%w: %s", ErrGatewayWritesPaused, reason)
-	}
-	if remote, ok := g.Remote.(credentialAwareRemote); ok {
-		if err := remote.CredentialAvailable(ctx); err != nil {
-			reason := "Gateway Credential is missing; provision and verify it to resume writes"
-			if pauseErr := g.Store.PauseGatewayWrites(ctx, reason, g.now()); pauseErr != nil {
-				return fmt.Errorf("%v; persist Gateway pause: %w", err, pauseErr)
-			}
-			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
-		}
-	}
 	outbox, err := g.Store.ClaimDeliveryOutbox(ctx, key, g.now())
 	if err != nil {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
@@ -107,6 +93,11 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
+	}
+	if remote, ok := g.Remote.(credentialAwareRemote); ok {
+		if err := remote.CredentialAvailable(ctx); err != nil {
+			return g.pauseForCredential(ctx, outbox, err)
+		}
 	}
 	if outbox.ReconcileOnly {
 		return g.reconcileOnly(ctx, outbox)

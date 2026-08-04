@@ -123,6 +123,18 @@ func (r *blockingRemote) Apply(context.Context, store.DeliveryRequest) (delivery
 	return delivery.Observation{Applied: true, RemoteHead: "accepted", RemoteExists: true}, nil
 }
 
+type credentialBarrierRemote struct {
+	fakeRemote
+	credentialEntered chan struct{}
+	releaseCredential chan struct{}
+}
+
+func (r *credentialBarrierRemote) CredentialAvailable(context.Context) error {
+	close(r.credentialEntered)
+	<-r.releaseCredential
+	return nil
+}
+
 func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
@@ -193,6 +205,48 @@ func TestMissingCredentialPausesBeforeAnyRemoteCall(t *testing.T) {
 		t.Fatal("missing Gateway Credential reached the remote")
 	}
 	if _, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending {
+		t.Fatalf("outbox after unavailable credential = %#v, %v", outbox, err)
+	}
+}
+
+func TestCredentialBindingFollowsDurableDispatchAdmission(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	remote := &credentialBarrierRemote{
+		fakeRemote:        fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}}},
+		credentialEntered: make(chan struct{}),
+		releaseCredential: make(chan struct{}),
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan error, 1)
+	go func() { dispatched <- gateway.Dispatch(ctx, queued.IdempotencyKey) }()
+	select {
+	case <-remote.credentialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch did not reach credential binding")
+	}
+	quiesced := make(chan error, 1)
+	go func() { quiesced <- db.WaitForGatewayWritesQuiesced(ctx) }()
+	select {
+	case err := <-quiesced:
+		t.Fatalf("rotation could bypass credential-binding dispatch: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(remote.releaseCredential)
+	if err := <-dispatched; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-quiesced; err != nil {
 		t.Fatal(err)
 	}
 }
