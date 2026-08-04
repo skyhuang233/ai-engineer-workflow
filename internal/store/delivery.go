@@ -596,14 +596,18 @@ func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, upda
 }
 
 func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true)
 }
 
 func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true)
 }
 
-func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time) error {
+func (s *Store) RequeueDeliveryOutboxClaim(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false)
+}
+
+func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool) error {
 	if state != OutboxPending && state != OutboxSucceeded && state != OutboxRejected {
 		return ErrInvalidClaim
 	}
@@ -631,8 +635,10 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	if err := json.Unmarshal([]byte(raw), &request); err != nil {
 		return err
 	}
-	if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
-		return err
+	if requireDispatcher {
+		if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
+			return err
+		}
 	}
 	completed := ""
 	nextAttempt := formatTimestamp(now)

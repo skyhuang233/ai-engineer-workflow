@@ -64,7 +64,7 @@ jobs:
         run: |
           deploy_worker_tree="$(git rev-parse "${GITHUB_SHA}:deploy/worker")"
           publish_worker_workflow_blob="$(git rev-parse "${GITHUB_SHA}:.github/workflows/publish-worker.yml")"
-          identity="$(jq --compact-output --null-input \
+          identity_json="$(jq --compact-output --null-input \
             --arg deploy_worker_tree "$deploy_worker_tree" \
             --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
             --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
@@ -77,7 +77,8 @@ jobs:
             --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
             --arg worker_image_repository "${{ steps.pins.outputs.image_repository }}" \
             --arg worker_release_repository "${{ steps.pins.outputs.worker_release_repository }}" \
-            '{schema_version:1,deploy_worker_tree:$deploy_worker_tree,publish_worker_workflow_blob:$publish_worker_workflow_blob,codex:{version:$codex_version},no_mistakes:{version:$no_mistakes_version,upstream_repository:$no_mistakes_upstream_repository,upstream_commit:$no_mistakes_commit,fork_repository:$no_mistakes_fork_repository,fork_release:$no_mistakes_fork_release,linux_amd64_sha256:$no_mistakes_linux_amd64_sha256},worker:{version:$worker_version,image_repository:$worker_image_repository,release_repository:$worker_release_repository}}' | sha256sum | awk '{print $1}')"
+            '{schema_version:1,deploy_worker_tree:$deploy_worker_tree,publish_worker_workflow_blob:$publish_worker_workflow_blob,codex:{version:$codex_version},no_mistakes:{version:$no_mistakes_version,upstream_repository:$no_mistakes_upstream_repository,upstream_commit:$no_mistakes_commit,fork_repository:$no_mistakes_fork_repository,fork_release:$no_mistakes_fork_release,linux_amd64_sha256:$no_mistakes_linux_amd64_sha256},worker:{version:$worker_version,image_repository:$worker_image_repository,release_repository:$worker_release_repository}}')"
+          identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
           test "$identity" =~ ^[0-9a-f]{64}$
           echo "identity=$identity" >> "$GITHUB_OUTPUT"
       - name: Detect Worker release input changes

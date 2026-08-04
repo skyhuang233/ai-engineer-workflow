@@ -19,7 +19,10 @@ var (
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
 )
 
-const controlPlaneRemoteTimeout = time.Minute
+const (
+	controlPlaneRemoteTimeout = time.Minute
+	outboxCleanupTimeout      = 5 * time.Second
+)
 
 type authenticationFailure interface {
 	AuthenticationFailure() bool
@@ -116,17 +119,22 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	operationCtx, stopDispatcher, err := g.controlPlaneDispatchContext(ctx, outbox, dispatcherToken)
 	if err != nil {
-		return err
+		return errors.Join(err, g.requeueClaim(outbox, err, false))
 	}
 	if remote, ok := g.Remote.(credentialAwareRemote); ok {
 		if err := g.credentialAvailable(operationCtx, outbox.Request, remote); err != nil {
-			_ = stopDispatcher()
-			return g.pauseForCredential(ctx, outbox, err)
+			if leaseErr := stopDispatcher(); leaseErr != nil {
+				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, false))
+			}
+			return g.pauseForCredential(outbox, err)
 		}
 	}
 	if outbox.ReconcileOnly {
 		err := g.reconcileOnly(operationCtx, outbox)
-		return errors.Join(err, stopDispatcher())
+		if leaseErr := stopDispatcher(); leaseErr != nil {
+			return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
+		}
+		return err
 	}
 	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
 		if request.Operation == store.DeliveryProjectPlan {
@@ -179,31 +187,31 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 	})
 	if leaseErr := stopDispatcher(); leaseErr != nil {
-		return errors.Join(err, leaseErr)
+		return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 	}
 	if err != nil {
 		if isCredentialRejection(err) {
-			return g.pauseForCredential(ctx, outbox, err)
+			return g.pauseForCredential(outbox, err)
 		}
 		if errors.Is(err, store.ErrDeliveryRejected) {
-			return g.reject(ctx, outbox, err)
+			return g.reject(outbox, err)
 		}
 		if errors.Is(err, store.ErrDeliveryUncertain) {
-			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
-				return finishErr
+			if finishErr := g.markUncertain(outbox, err); finishErr != nil {
+				return errors.Join(err, finishErr)
 			}
 			return err
 		}
 		var uncertain *uncertainWriteError
 		if errors.As(err, &uncertain) {
-			if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
-				return finishErr
+			if finishErr := g.markUncertain(outbox, err); finishErr != nil {
+				return errors.Join(err, finishErr)
 			}
 			return err
 		}
-		return g.retry(ctx, outbox, err)
+		return g.retry(outbox, err)
 	}
-	return g.succeed(ctx, outbox, result)
+	return g.succeed(outbox, result)
 }
 
 func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
@@ -258,17 +266,17 @@ func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox)
 	observation, err := g.observe(ctx, outbox.Request)
 	if err != nil {
 		if isCredentialRejection(err) {
-			return g.pauseForCredential(ctx, outbox, err)
+			return g.pauseForCredential(outbox, err)
 		}
-		if finishErr := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, err.Error(), g.now()); finishErr != nil {
-			return finishErr
+		if finishErr := g.markUncertain(outbox, err); finishErr != nil {
+			return errors.Join(err, finishErr)
 		}
 		return err
 	}
 	if observation.Applied {
-		return g.succeed(ctx, outbox, resultFrom(observation))
+		return g.succeed(outbox, resultFrom(observation))
 	}
-	return g.reject(ctx, outbox, fmt.Errorf("%w: uncertain delivery was not observed", store.ErrDeliveryRejected))
+	return g.reject(outbox, fmt.Errorf("%w: uncertain delivery was not observed", store.ErrDeliveryRejected))
 }
 
 func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.DeliveryOutbox, dispatcherToken string) (context.Context, func() error, error) {
@@ -305,7 +313,10 @@ func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.D
 		close(stop)
 		cancel()
 		<-done
-		return renewalErr
+		if renewalErr != nil {
+			return renewalErr
+		}
+		return g.Store.RenewGatewayDispatcher(context.Background(), dispatcherToken, g.now())
 	}, nil
 }
 
@@ -338,34 +349,85 @@ func resultFrom(observation Observation) store.DeliveryResult {
 	return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}
 }
 
-func (g Gateway) succeed(ctx context.Context, outbox store.DeliveryOutbox, result store.DeliveryResult) error {
-	return g.Store.CompleteDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, result, g.now())
+func (g Gateway) cleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), outboxCleanupTimeout)
 }
 
-func (g Gateway) reject(ctx context.Context, outbox store.DeliveryOutbox, err error) error {
-	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", err.Error(), g.now())
-	if finishErr := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, err.Error(), g.now()); finishErr != nil {
-		return finishErr
+func (g Gateway) requeueClaim(outbox store.DeliveryOutbox, cause error, uncertain bool) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	err := g.Store.RequeueDeliveryOutboxClaim(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), uncertain, g.now())
+	if errors.Is(err, store.ErrFencingConflict) {
+		return nil
 	}
 	return err
 }
 
-func (g Gateway) retry(ctx context.Context, outbox store.DeliveryOutbox, err error) error {
-	if finishErr := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, err.Error(), g.now()); finishErr != nil {
-		return finishErr
+func (g Gateway) succeed(outbox store.DeliveryOutbox, result store.DeliveryResult) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	err := g.Store.CompleteDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, result, g.now())
+	if errors.Is(err, store.ErrFencingConflict) {
+		return errors.Join(err, g.requeueClaim(outbox, err, true))
 	}
 	return err
 }
 
-func (g Gateway) pauseForCredential(ctx context.Context, outbox store.DeliveryOutbox, cause error) error {
+func (g Gateway) markUncertain(outbox store.DeliveryOutbox, cause error) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	err := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), g.now())
+	if errors.Is(err, store.ErrFencingConflict) {
+		return errors.Join(err, g.requeueClaim(outbox, cause, true))
+	}
+	return err
+}
+
+func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", cause.Error(), g.now())
+	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, cause.Error(), g.now())
+	if errors.Is(err, store.ErrFencingConflict) {
+		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
+	}
+	if err != nil {
+		return err
+	}
+	return cause
+}
+
+func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), g.now())
+	if errors.Is(err, store.ErrFencingConflict) {
+		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
+	}
+	if err != nil {
+		return err
+	}
+	return cause
+}
+
+func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
 	reason := "Gateway Credential was rejected; replace and verify it to resume writes"
 	if err := g.Store.PauseGatewayWrites(ctx, reason, g.now()); err != nil {
-		return fmt.Errorf("%v; persist Gateway pause: %w", cause, err)
+		return errors.Join(fmt.Errorf("%v; persist Gateway pause: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
 	if err := g.QueueGatewayCredentialInboxProjections(ctx); err != nil {
-		return fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err)
+		return errors.Join(fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
-	_ = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now())
+	if err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now()); err != nil {
+		if !errors.Is(err, store.ErrFencingConflict) {
+			return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err)
+		}
+		if requeueErr := g.requeueClaim(outbox, cause, false); requeueErr != nil {
+			return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), requeueErr)
+		}
+	}
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)
 }
 

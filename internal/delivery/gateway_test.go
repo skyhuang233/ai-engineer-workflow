@@ -167,6 +167,16 @@ type blockingRemote struct {
 	release chan struct{}
 }
 
+type advancingRemote struct {
+	fakeRemote
+	advance func()
+}
+
+func (r *advancingRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	r.advance()
+	return r.fakeRemote.Apply(ctx, request)
+}
+
 func (r *blockingRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
 	return delivery.Observation{RemoteHead: "base", RemoteExists: true}, nil
 }
@@ -302,6 +312,67 @@ func TestCredentialBindingFollowsDurableDispatchAdmission(t *testing.T) {
 	}
 	if err := <-quiesced; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGatewayRequeuesControlPlaneClaimAfterCancellationBeforeRenewal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	calls := 0
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time {
+		calls++
+		if calls == 4 {
+			cancel()
+		}
+		return now
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("cancelled control-plane dispatch returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(context.Background(), queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.ClaimToken != "" {
+		t.Fatalf("cancelled control-plane outbox = %#v, %v", outbox, err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := gateway.Dispatch(context.Background(), queued.IdempotencyKey); err != nil {
+		t.Fatalf("recovered control-plane dispatch = %v", err)
+	}
+}
+
+func TestGatewayRequeuesUncertainControlPlaneClaimAfterLostLease(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	remote := &advancingRemote{
+		fakeRemote: fakeRemote{observations: []delivery.Observation{{}, {Applied: true, RemoteHead: "accepted", RemoteExists: true}}},
+		advance:    func() { now = now.Add(2 * time.Hour) },
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("lost control-plane lease returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("lost-lease control-plane outbox = %#v, %v", outbox, err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatalf("recovered lost-lease control-plane dispatch = %v", err)
+	}
+	outbox, err = db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxSucceeded {
+		t.Fatalf("reconciled lost-lease control-plane outbox = %#v, %v", outbox, err)
 	}
 }
 

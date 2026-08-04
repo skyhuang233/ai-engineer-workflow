@@ -1,6 +1,26 @@
 package doctor
 
-import "testing"
+import (
+	"crypto/sha256"
+	"fmt"
+	"testing"
+)
+
+func TestWorkerBuildInputIdentityUsesNewlineFreeCanonicalJSON(t *testing.T) {
+	config := validConfig()
+	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	canonical := fmt.Sprintf(`{"schema_version":1,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
+		workerTree, publisherWorkflow, config.Codex.Version, config.NoMistakes.Version,
+		config.NoMistakes.UpstreamRepository, config.NoMistakes.UpstreamCommit,
+		config.NoMistakes.ForkRepository, config.NoMistakes.ForkRelease,
+		config.NoMistakes.LinuxAMD64SHA256, config.Worker.Version,
+		config.Worker.ImageRepository, config.Worker.ReleaseRepository)
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
+	if got := workerBuildInputIdentity(config, workerTree, publisherWorkflow); got != want {
+		t.Fatalf("identity = %s, want canonical newline-free SHA-256 %s", got, want)
+	}
+}
 
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
