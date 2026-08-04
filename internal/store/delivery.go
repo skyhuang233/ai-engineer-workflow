@@ -468,31 +468,12 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return s.DeliveryOutbox(ctx, key)
 	}
 	if state == OutboxProcessing {
-		var request DeliveryRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			return DeliveryOutbox{}, err
+		recoverable, recoverErr := deliveryOutboxClaimRecoverableTx(ctx, tx, raw, updatedText, now)
+		if recoverErr != nil {
+			return DeliveryOutbox{}, recoverErr
 		}
-		if request.RunID == "" {
-			updatedAt, parseErr := time.Parse(time.RFC3339Nano, updatedText)
-			if parseErr != nil {
-				return DeliveryOutbox{}, parseErr
-			}
-			if updatedAt.After(now.Add(-time.Minute)) {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
-		} else {
-			var expiresText string
-			err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
-			if err != nil {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
-			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
-			if parseErr != nil {
-				return DeliveryOutbox{}, parseErr
-			}
-			if expiresAt.After(now) {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
+		if !recoverable {
+			return DeliveryOutbox{}, ErrDeliveryInProgress
 		}
 	}
 	if state == OutboxPending && nextAttemptText != "" {
@@ -538,6 +519,33 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	claimed, err := s.DeliveryOutbox(ctx, key)
 	claimed.ReconcileOnly = reconcileOnly
 	return claimed, err
+}
+
+func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, updatedText string, now time.Time) (bool, error) {
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return false, err
+	}
+	if request.RunID == "" {
+		updatedAt, err := time.Parse(time.RFC3339Nano, updatedText)
+		if err != nil {
+			return false, err
+		}
+		return !updatedAt.After(now.Add(-time.Minute)), nil
+	}
+	var expiresText string
+	err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return false, err
+	}
+	return !expiresAt.After(now), nil
 }
 
 func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {

@@ -35,6 +35,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			_, _ = w.Write([]byte(`{"private":false}`))
 		case r.URL.Path == "/repos/kunchenguid/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
+		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract","path":".github/workflows/workflow-contract.yml"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
@@ -68,6 +70,34 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		if strings.Contains(path, "protection") {
 			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
 		}
+	}
+}
+
+func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
+	config := validConfig()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
+			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
+		case r.URL.Path == "/repos/kunchenguid/no-mistakes", r.URL.Path == "/repos/skyhuang233/no-mistakes":
+			_, _ = w.Write([]byte(`{"private":false}`))
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"target_commitish": config.NoMistakes.UpstreamCommit})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: memoryCredential{secret: "github_pat_test"}, APIBase: server.URL}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "pinned upstream commit") {
+		t.Fatalf("GitHub check = %#v, want unavailable upstream commit failure", result)
 	}
 }
 
@@ -192,6 +222,8 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 			_, _ = w.Write([]byte(`{"private":false}`))
 		case r.URL.Path == "/repos/kunchenguid/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
+		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{
 				{"id": 7, "name": config.GitHub.RequiredCheck, "path": ".github/workflows/unrelated.yml"},

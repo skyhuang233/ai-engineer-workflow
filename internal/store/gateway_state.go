@@ -85,6 +85,67 @@ func (s *Store) WaitForGatewayWritesQuiesced(ctx context.Context) error {
 	}
 }
 
+func (s *Store) RecoverExpiredGatewayDeliveryClaims(ctx context.Context, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var writesPaused int
+	if err := tx.QueryRowContext(ctx, `SELECT writes_paused FROM gateway_runtime WHERE singleton = 1`).Scan(&writesPaused); err != nil {
+		return err
+	}
+	if writesPaused == 0 {
+		return errors.New("Gateway writes must be paused before recovering delivery claims")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT idempotency_key, request_json, updated_at, claim_token FROM delivery_outbox WHERE state = ?`, OutboxProcessing)
+	if err != nil {
+		return err
+	}
+	type expiredClaim struct {
+		key        string
+		claimToken string
+	}
+	var expired []expiredClaim
+	for rows.Next() {
+		var key, raw, updatedAt, claimToken string
+		if err := rows.Scan(&key, &raw, &updatedAt, &claimToken); err != nil {
+			rows.Close()
+			return err
+		}
+		recoverable, recoverErr := deliveryOutboxClaimRecoverableTx(ctx, tx, raw, updatedAt, now)
+		if recoverErr != nil {
+			rows.Close()
+			return recoverErr
+		}
+		if recoverable {
+			expired = append(expired, expiredClaim{key: key, claimToken: claimToken})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, claim := range expired {
+		result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, OutboxPending, "delivery claim expired while Gateway writes were paused", formatTimestamp(now), formatTimestamp(now), claim.key, OutboxProcessing, claim.claimToken)
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil {
+			return err
+		} else if count != 1 {
+			return ErrFencingConflict
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) WorkflowInboxItem(ctx context.Context, key string) (WorkflowInboxItem, error) {
 	var item WorkflowInboxItem
 	var createdAt, updatedAt string

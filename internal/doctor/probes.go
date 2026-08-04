@@ -271,6 +271,12 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.ForkRepository, "no-mistakes fork"); result != nil {
 		return *result
 	}
+	var upstreamCommit struct {
+		SHA string `json:"sha"`
+	}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.UpstreamRepository+"/git/commits/"+c.NoMistakes.UpstreamCommit, &upstreamCommit); err != nil || upstreamCommit.SHA != c.NoMistakes.UpstreamCommit {
+		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository"}
+	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
 	}

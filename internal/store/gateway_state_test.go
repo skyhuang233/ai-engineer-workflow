@@ -75,3 +75,40 @@ func TestGatewayPauseFencesNewDispatchAdmissionsAndWaitsForExistingOnes(t *testi
 		t.Fatal(err)
 	}
 }
+
+func TestPausedGatewayRecoversExpiredDeliveryClaimsBeforeWaitingForQuiescence(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now.Add(-2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(-2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PauseGatewayWrites(ctx, "credential rotation", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverExpiredGatewayDeliveryClaims(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("recovered outbox = %#v", outbox)
+	}
+	if err := db.WaitForGatewayWritesQuiesced(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDeliveryOutbox(ctx, queued.IdempotencyKey, claim.ClaimToken, OutboxSucceeded, "", now); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("expired claim completion error = %v, want fencing conflict", err)
+	}
+}

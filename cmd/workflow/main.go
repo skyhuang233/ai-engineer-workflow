@@ -191,6 +191,9 @@ func credentialCommand() {
 	if err := database.PauseGatewayWrites(ctx, "Gateway Credential rotation is in progress", time.Now().UTC()); err != nil {
 		exitError(err)
 	}
+	if err := database.RecoverExpiredGatewayDeliveryClaims(ctx, time.Now().UTC()); err != nil {
+		exitError(fmt.Errorf("recover expired Gateway delivery claims before credential rotation: %w", err))
+	}
 	if err := database.WaitForGatewayWritesQuiesced(ctx); err != nil {
 		exitError(fmt.Errorf("wait for Gateway writes to finish before credential rotation: %w", err))
 	}
