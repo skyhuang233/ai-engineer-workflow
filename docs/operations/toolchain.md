@@ -22,7 +22,11 @@
 
 Provision or rotate the Gateway Credential. This hidden-input command performs
 real, idempotent writes in the dedicated integration repository and cleans up
-its temporary branch, issue, and PR:
+its temporary branch, issue, and PR. During replacement, the durable Gateway
+rotation pauses new writes and safely recovers an expired claim before the live
+contract runs; a failed replacement leaves writes paused. A Gateway that starts
+without its verified credential likewise persists the pause and projects one
+recovery request to each affected repository Workflow Inbox:
 
 ```powershell
 go run ./cmd/workflow credential provision `
@@ -60,10 +64,12 @@ pull request closes without merge.
 The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
 registry. The Release Manifest's exact digest must resolve from GHCR and pass
-the Docker contract. A successful complete run atomically makes that digest the
-Active Worker Image for new Worker Runs; existing runs remain pinned to their
-recorded image. The report must be reviewed before the production baseline is
-approved.
+the Docker contract. It also requires the sole manifest asset for the current
+`main` commit, published by the fixed `publish-worker` push workflow after an
+unambiguous non-bot merge by the configured owner. A successful complete run
+atomically makes that digest the Active Worker Image for new Worker Runs;
+existing runs remain pinned to their recorded image. The report must be
+reviewed before the production baseline is approved.
 
 ## Upgrade rule
 
