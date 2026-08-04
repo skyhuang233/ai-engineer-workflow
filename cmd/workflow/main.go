@@ -310,11 +310,7 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	token, err := gatewayCredential(ctx)
-	if err != nil {
-		fail(err)
-	}
-	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+	client := github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
 		fail(err)
 	}
@@ -532,7 +528,7 @@ func runPollGitHub(args []string) {
 		defer cancel()
 		token, err := verifiedGatewayCredential(ctx, db)
 		if err != nil {
-			return err
+			return persistGatewayCredentialPause(ctx, db, err, time.Now().UTC())
 		}
 		client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
@@ -760,6 +756,9 @@ func runGateway(args []string) {
 	}
 	go func() {
 		for {
+			if err := gateway.QueueGatewayCredentialInboxProjections(context.Background()); err != nil {
+				fmt.Fprintln(os.Stderr, "gateway credential recovery projection:", err)
+			}
 			if err := gateway.DispatchPending(context.Background(), 32); err != nil {
 				fmt.Fprintln(os.Stderr, "gateway outbox recovery:", err)
 			}
@@ -810,6 +809,16 @@ func gatewayCredentialVerificationError(err error) error {
 
 func shouldPauseGatewayForCredential(err error) bool {
 	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
+}
+
+func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {
+	if !shouldPauseGatewayForCredential(credentialErr) {
+		return credentialErr
+	}
+	if err := database.PauseGatewayWrites(ctx, "Gateway Credential is unavailable; replace and verify it to resume writes", now); err != nil {
+		return errors.Join(credentialErr, fmt.Errorf("persist Gateway Credential pause: %w", err))
+	}
+	return credentialErr
 }
 
 func fail(err error) {

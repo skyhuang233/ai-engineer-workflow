@@ -58,6 +58,65 @@ func TestGatewayCredentialVerificationReadFailureIsRetryable(t *testing.T) {
 	}
 }
 
+func TestPersistGatewayCredentialPauseCreatesLocalRecoveryInbox(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	credentialErr := fmt.Errorf("load credential: %w", credential.ErrNotFound)
+	if err := persistGatewayCredentialPause(ctx, db, credentialErr, now); !errors.Is(err, credential.ErrNotFound) {
+		t.Fatalf("credential pause error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || !paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+	inbox, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
+	if err != nil || inbox.State != "open" {
+		t.Fatalf("credential recovery inbox = %#v, %v", inbox, err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("credential recovery questions = %#v, %v", questions, err)
+	}
+}
+
+func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	transient := errors.New("Credential Manager temporarily unavailable")
+	if err := persistGatewayCredentialPause(ctx, db, transient, time.Now().UTC()); !errors.Is(err, transient) {
+		t.Fatalf("transient credential error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+}
+
 func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/owner/repo" {
