@@ -118,23 +118,51 @@ func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 			return
 		}
 		pages++
-		comments := make([]map[string]string, 100)
+		comments := make([]map[string]any, 100)
 		for i := range comments {
-			comments[i] = map[string]string{"body": "other"}
+			comments[i] = map[string]any{"body": "other", "user": map[string]string{"login": "owner", "type": "User"}}
 		}
 		if r.URL.Query().Get("page") == "2" {
-			comments = []map[string]string{{"body": "<!-- workflow-idempotency:key -->"}}
+			comments = []map[string]any{{"body": "<!-- workflow-idempotency:key -->", "user": map[string]string{"login": "owner", "type": "User"}}}
 		}
 		_ = json.NewEncoder(w).Encode(comments)
 	}))
 	defer server.Close()
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 	observation, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryReplyEvidence, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, IdempotencyKey: "key"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !observation.Applied || pages != 2 {
 		t.Fatalf("observation = %#v, pages = %d", observation, pages)
+	}
+}
+
+func TestDeliveryRemoteIgnoresNonOwnerEvidenceMarker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/ticket-1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "head"}})
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/7/comments" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"body": "<!-- workflow-idempotency:key -->", "user": map[string]string{"login": "reviewer", "type": "User"}}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
+	observation, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryReplyEvidence, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, IdempotencyKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.Applied {
+		t.Fatalf("non-owner evidence marker was accepted: %#v", observation)
 	}
 }
 

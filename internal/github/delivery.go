@@ -121,9 +121,12 @@ func (r *DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequ
 	if err != nil {
 		return observation, err
 	}
+	if err := client.requireRepositoryOwner(); err != nil {
+		return observation, err
+	}
 	marker := "workflow-idempotency:" + request.IdempotencyKey
 	for _, comment := range comments {
-		if strings.Contains(comment.Body, marker) {
+		if actionableAuthor(client.RepositoryOwner, comment.User.Login, comment.User.Type) && strings.Contains(comment.Body, marker) {
 			observation.Applied = true
 			break
 		}
