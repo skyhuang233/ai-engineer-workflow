@@ -93,8 +93,8 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 			assetID = asset.ID
 		}
 	}
-	if manifestAssets != 1 || assetID == 0 {
-		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must have exactly one worker-release.json asset")
+	if len(release.Assets) != 1 || manifestAssets != 1 || assetID == 0 {
+		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must contain only one worker-release.json asset")
 	}
 	raw, err := client.RequestBytes(ctx,
 		fmt.Sprintf("/repos/%s/releases/assets/%d", config.Worker.ReleaseRepository, assetID),

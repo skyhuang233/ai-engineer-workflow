@@ -104,6 +104,10 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a release with duplicate worker-release.json assets")
 	}
+	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"unexpected-asset.txt"}]`
+	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+		t.Fatal("accepted a release with an asset other than worker-release.json")
+	}
 	assets = `[{"id":9,"name":"worker-release.json"}]`
 	workflowID = 88
 	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
