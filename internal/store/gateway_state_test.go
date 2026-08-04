@@ -18,6 +18,7 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	}
 	defer db.Close()
 	first := time.Date(2026, 7, 31, 3, 0, 0, 0, time.UTC)
+	activateWorkflowInboxPlan(t, ctx, db, "owner/repository")
 	if err := db.PauseGatewayWrites(ctx, "credential rejected", first); err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +33,14 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	if err != nil || item.State != "open" || !item.CreatedAt.Equal(first) {
 		t.Fatalf("inbox item = %#v, %v", item, err)
 	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repository", 0)
+	if err != nil || len(questions) != 1 || questions[0].Kind != gatewayCredentialQuestionKind {
+		t.Fatalf("credential recovery questions = %#v, %v", questions, err)
+	}
+	repositories, err := db.GatewayCredentialAttentionRepositories(ctx)
+	if err != nil || len(repositories) != 1 || repositories[0] != "owner/repository" {
+		t.Fatalf("credential recovery repositories = %#v, %v", repositories, err)
+	}
 	rotation, err := db.BeginGatewayCredentialRotation(ctx, "rotation-a", "credential rotation", first.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +52,10 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	item, itemErr := db.WorkflowInboxItem(ctx, GatewayCredentialInboxKey)
 	if err != nil || itemErr != nil || paused || item.State != "resolved" {
 		t.Fatalf("resumed pause=%t item=%#v errors=%v/%v", paused, item, err, itemErr)
+	}
+	questions, err = db.OpenWorkflowQuestions(ctx, "owner/repository", 0)
+	if err != nil || len(questions) != 0 {
+		t.Fatalf("unresolved credential recovery questions = %#v, %v", questions, err)
 	}
 }
 

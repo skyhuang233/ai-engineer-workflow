@@ -50,8 +50,10 @@ applies retry backoff, reconciles every active ticket pull request, and
 deduplicates newly observed reviews and comments before the owning Ticket
 Session is resumed. `--review-feedback` and `workflow answer-inbox` are
 privileged local Control Plane operations: run them only on the trusted Control
-Plane host, with its Gateway control-plane credential. They use the same
-durable queue for manual routing and decisions. `workflow reconcile-delivered` checks merged pull requests
+Plane host. `answer-inbox` forwards the resulting inbox projection through the
+Gateway control-plane credential; that transport credential is not the local
+operator authorization boundary. They use the same durable queue for manual
+routing and decisions. `workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 

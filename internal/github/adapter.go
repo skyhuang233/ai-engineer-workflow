@@ -192,6 +192,9 @@ func (c *Client) RequirePublicRepository(ctx context.Context, repository string)
 const workflowInboxLabel = "workflow:inbox"
 
 func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, questionIDs []string) (map[string]string, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return nil, err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return nil, err
 	}
@@ -228,6 +231,9 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 }
 
 func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -248,6 +254,9 @@ func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, qu
 }
 
 func (c *Client) HasWorkflowInboxProjection(ctx context.Context, repository string, questions []plan.WorkflowQuestion) (bool, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return false, err
+	}
 	inbox, found, err := c.workflowInbox(ctx, repository)
 	if err != nil || !found {
 		return false, err
@@ -262,6 +271,9 @@ func (c *Client) workflowInbox(ctx context.Context, repository string) (plan.Iss
 	}
 	var inboxes []plan.Issue
 	for _, issue := range issues {
+		if !actionableAuthor(c.RepositoryOwner, issue.Author, issue.AuthorType) {
+			continue
+		}
 		for _, label := range issue.Labels {
 			if label == workflowInboxLabel {
 				inboxes = append(inboxes, issue)
@@ -409,6 +421,9 @@ func (c *Client) UpdateIssueBody(ctx context.Context, repository string, number 
 }
 
 func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) error {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -419,7 +434,7 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 	if err != nil {
 		return err
 	}
-	status, err := planProjectionStatusComment(comments)
+	status, err := planProjectionStatusComment(comments, c.RepositoryOwner)
 	if err != nil {
 		return err
 	}
@@ -430,6 +445,9 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 }
 
 func (c *Client) HasPlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) (bool, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return false, err
+	}
 	marker := planProjectionMarker(projection)
 	statusComments := 0
 	matched := false
@@ -440,6 +458,9 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 			return false, err
 		}
 		for _, comment := range comments {
+			if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
+				continue
+			}
 			if isLegacyPlanProjectionComment(comment) {
 				return false, fmt.Errorf("legacy workflow projection comment found")
 			}
@@ -459,6 +480,13 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 	}
 }
 
+func (c *Client) requireRepositoryOwner() error {
+	if strings.TrimSpace(c.RepositoryOwner) == "" {
+		return fmt.Errorf("configured repository owner is required for GitHub observations")
+	}
+	return nil
+}
+
 func planProjectionComment(projection plan.Projection) string {
 	content, _ := plan.RenderProjection("", projection)
 	return content + "\n\n" + planProjectionIdentity + "\n" + planProjectionMarker(projection)
@@ -468,9 +496,12 @@ const planProjectionIdentity = "<!-- workflow:control-plane -->"
 
 const planProjectionMarkerPrefix = "workflow-projection:"
 
-func planProjectionStatusComment(comments []commentResponse) (*commentResponse, error) {
+func planProjectionStatusComment(comments []commentResponse, owner string) (*commentResponse, error) {
 	var status *commentResponse
 	for index := range comments {
+		if !actionableAuthor(owner, comments[index].User.Login, comments[index].User.Type) {
+			continue
+		}
 		if isLegacyPlanProjectionComment(comments[index]) {
 			return nil, fmt.Errorf("legacy workflow projection comment found")
 		}

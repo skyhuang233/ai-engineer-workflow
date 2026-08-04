@@ -189,7 +189,7 @@ func TestUpdatePlanProjectionCreatesOneStatusComment(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
-	client := NewClient(server.URL, "", server.Client())
+	client := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")
 	if err := client.UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestUpdatePlanProjectionUpdatesTheExistingStatusComment(t *testing.T) {
 	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 42, "body": planProjectionIdentity}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 42, "body": planProjectionIdentity, "user": map[string]string{"login": "owner", "type": "User"}}})
 			return
 		}
 		if r.Method != http.MethodPatch || r.URL.Path != "/repos/owner/repo/issues/comments/42" {
@@ -218,7 +218,7 @@ func TestUpdatePlanProjectionUpdatesTheExistingStatusComment(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	if err := NewClient(server.URL, "", server.Client()).UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
+	if err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(comment, "state: `Active`") {
@@ -230,11 +230,11 @@ func TestHasPlanProjectionRejectsLegacyAndDuplicateStatusComments(t *testing.T) 
 	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
 	marker := planProjectionMarker(projection)
 	for _, comments := range [][]map[string]any{
-		{{"id": 1, "body": marker}},
-		{{"id": 1, "body": planProjectionIdentity + marker}, {"id": 2, "body": planProjectionIdentity}},
+		{{"id": 1, "body": marker, "user": map[string]string{"login": "owner", "type": "User"}}},
+		{{"id": 1, "body": planProjectionIdentity + marker, "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": planProjectionIdentity, "user": map[string]string{"login": "owner", "type": "User"}}},
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(comments) }))
-		_, err := NewClient(server.URL, "", server.Client()).HasPlanProjection(context.Background(), "owner/repo", 10, projection)
+		_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, projection)
 		server.Close()
 		if err == nil {
 			t.Fatalf("invalid status comments were accepted: %#v", comments)
@@ -247,11 +247,11 @@ func TestUpdatePlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T)
 		if r.Method != http.MethodGet {
 			t.Fatalf("legacy projection comment allowed mutation: %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->"}})
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->", "user": map[string]string{"login": "owner", "type": "User"}}})
 	}))
 	defer server.Close()
 
-	err := NewClient(server.URL, "", server.Client()).UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
+	err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
 	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("UpdatePlanProjection error = %v", err)
 	}
@@ -259,11 +259,11 @@ func TestUpdatePlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T)
 
 func TestHasPlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->"}})
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "<!-- workflow-projection:obsolete -->", "user": map[string]string{"login": "owner", "type": "User"}}})
 	}))
 	defer server.Close()
 
-	_, err := NewClient(server.URL, "", server.Client()).HasPlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
+	_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
 	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("HasPlanProjection error = %v", err)
 	}
@@ -273,6 +273,19 @@ func TestDeliveredLabelIsProjectionOnly(t *testing.T) {
 	issue := issueResponse{ID: 1, Number: 11, State: "closed", Labels: []labelResponse{{Name: "workflow:ticket"}, {Name: "workflow:delivered"}}}.issue()
 	if issue.IsDelivered() {
 		t.Fatal("workflow:delivered label became authoritative delivery state")
+	}
+}
+
+func TestProjectionObservationsIgnoreNonOwnerArtifacts(t *testing.T) {
+	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
+	marker := planProjectionMarker(projection)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": planProjectionIdentity + marker, "user": map[string]string{"login": "outsider", "type": "User"}}})
+	}))
+	defer server.Close()
+	applied, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, projection)
+	if err != nil || applied {
+		t.Fatalf("non-owner projection observation = %t, %v", applied, err)
 	}
 }
 
@@ -328,7 +341,7 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 			if r.Method != http.MethodGet || r.URL.Query().Get("labels") != workflowInboxLabel {
 				t.Fatalf("request = %s %s", r.Method, r.URL.String())
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 10, "number": 10, "title": "Workflow Inbox", "body": "", "labels": []map[string]string{{"name": workflowInboxLabel}}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 10, "number": 10, "title": "Workflow Inbox", "body": "", "labels": []map[string]string{{"name": workflowInboxLabel}}, "user": map[string]string{"login": "owner", "type": "User"}}})
 		case "/repos/owner/repo/issues/10/comments":
 			if r.Method != http.MethodGet {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)

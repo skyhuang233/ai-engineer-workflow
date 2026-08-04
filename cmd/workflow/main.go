@@ -273,14 +273,13 @@ func runTicket(args []string) {
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	prompt := flags.String("prompt", "", "Worker prompt")
 	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback to queue for the next revision round")
-	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "trusted control-plane credential required for manual review feedback")
 	branch := flags.String("branch", "", "ticket branch")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	expectedHead := flags.String("expected-remote-head", "", "current remote ticket branch head")
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent || (strings.TrimSpace(*reviewFeedback) != "" && strings.TrimSpace(*gatewayControlToken) == "") {
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
 		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
@@ -661,8 +660,8 @@ func runAnswerInbox(args []string) {
 	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *questionID == "" || *answer == "" || *gatewayURL == "" || *gatewayControlToken == "" {
-		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, answer, Gateway URL, and control credential")
+	if *repository == "" || *questionID == "" || *answer == "" || *gatewayURL == "" {
+		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, answer, and Gateway URL")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
@@ -703,6 +702,7 @@ func requirePublicControlPlaneRepository(ctx context.Context, client *github.Cli
 
 func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
+	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
@@ -718,12 +718,27 @@ func runGateway(args []string) {
 	if err != nil {
 		fail(err)
 	}
+	config, err := doctor.LoadConfig(*configPath)
+	if err != nil {
+		_ = db.Close()
+		fail(err)
+	}
 	credentialSource := func(ctx context.Context) (string, error) {
 		return verifiedGatewayCredential(ctx, db)
 	}
-	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
+	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
 	gateway, err := delivery.NewGateway(db, remote)
 	if err != nil {
+		_ = db.Close()
+		fail(err)
+	}
+	if _, err := credentialSource(context.Background()); err != nil {
+		if pauseErr := db.PauseGatewayWrites(context.Background(), "Gateway Credential is unavailable; replace and verify it to resume writes", time.Now().UTC()); pauseErr != nil {
+			_ = db.Close()
+			fail(pauseErr)
+		}
+	}
+	if err := gateway.QueueGatewayCredentialInboxProjections(context.Background()); err != nil {
 		_ = db.Close()
 		fail(err)
 	}

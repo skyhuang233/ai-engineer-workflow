@@ -135,7 +135,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				return store.DeliveryResult{}, projectionErr
 			}
 			request.PlanProjection = &projection
-		} else if request.Operation == store.DeliveryProjectInbox {
+		} else if request.Operation == store.DeliveryProjectInbox && request.WorkflowQuestions == nil {
 			questions, questionsErr := g.Store.OpenWorkflowQuestions(operationCtx, request.Repository, 0)
 			if questionsErr != nil {
 				return store.DeliveryResult{}, questionsErr
@@ -236,6 +236,35 @@ func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
 		}
 	}
 	return dispatchErr
+}
+
+func (g Gateway) QueueGatewayCredentialInboxProjections(ctx context.Context) error {
+	if g.Store == nil {
+		return errors.New("delivery gateway store is missing")
+	}
+	repositories, err := g.Store.GatewayCredentialAttentionRepositories(ctx)
+	if err != nil {
+		return err
+	}
+	for _, repository := range repositories {
+		questions, err := g.Store.OpenWorkflowQuestions(ctx, repository, 0)
+		if err != nil {
+			return err
+		}
+		projected := make([]plan.WorkflowQuestion, 0, len(questions))
+		for _, question := range questions {
+			projected = append(projected, plan.WorkflowQuestion{
+				ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
+				PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
+				PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind,
+				Diagnostics: question.Diagnostics, Evidence: question.Evidence,
+			})
+		}
+		if _, err := g.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: projected}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox) error {
@@ -345,6 +374,9 @@ func (g Gateway) pauseForCredential(ctx context.Context, outbox store.DeliveryOu
 	reason := "Gateway Credential was rejected; replace and verify it to resume writes"
 	if err := g.Store.PauseGatewayWrites(ctx, reason, g.now()); err != nil {
 		return fmt.Errorf("%v; persist Gateway pause: %w", cause, err)
+	}
+	if err := g.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		return fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err)
 	}
 	_ = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now())
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)

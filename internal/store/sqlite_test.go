@@ -89,6 +89,45 @@ func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV29AddsRotationFencingColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 30"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	for _, column := range []string{"rotation_owner", "rotation_generation", "rotation_expires_at"} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE gateway_runtime DROP COLUMN "+column); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for _, column := range []string{"rotation_owner", "rotation_generation", "rotation_expires_at"} {
+		if !hasColumn(t, ctx, migrated.db, "gateway_runtime", column) {
+			t.Fatalf("migration did not add gateway_runtime.%s", column)
+		}
+	}
+}
+
 func TestMigrationBackupCanBeRestored(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

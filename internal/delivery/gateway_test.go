@@ -94,6 +94,28 @@ func TestGatewayPreservesWorkflowQuestionContext(t *testing.T) {
 	}
 }
 
+func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Now: func() time.Time { return now }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now, 1)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, keys[0])
+	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || len(outbox.Request.WorkflowQuestions) != 1 || outbox.Request.WorkflowQuestions[0].Finding != "gateway_credential" {
+		t.Fatalf("credential recovery outbox = %#v, %v", outbox, err)
+	}
+}
+
 type deadlineRemote struct {
 	deadlineSeen bool
 }

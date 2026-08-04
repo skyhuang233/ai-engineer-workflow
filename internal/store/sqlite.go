@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 29
+	latestSchemaVersion = 30
 )
 
 var (

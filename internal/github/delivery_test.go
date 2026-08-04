@@ -97,7 +97,7 @@ func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 	}))
 	defer server.Close()
 	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 	if _, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryProjectPlan, Repository: "owner/repo", RootNumber: 10, PlanProjection: &projection}); err != nil {
 		t.Fatal(err)
 	}

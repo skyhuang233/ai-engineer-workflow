@@ -8,6 +8,7 @@ import (
 )
 
 const GatewayCredentialInboxKey = "gateway-credential"
+const gatewayCredentialQuestionKind = "gateway_credential"
 
 const gatewayDispatcherLeaseTTL = 2 * time.Minute
 const gatewayCredentialRotationLeaseTTL = 5 * time.Minute
@@ -46,6 +47,9 @@ func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.
 VALUES (?, 'credential', 'Gateway Credential requires attention', ?, 'open', ?, ?)
 ON CONFLICT(item_key) DO UPDATE SET body=excluded.body, state='open', updated_at=excluded.updated_at`,
 		GatewayCredentialInboxKey, reason, timestamp, timestamp); err != nil {
+		return err
+	}
+	if err := ensureGatewayCredentialQuestionsTx(ctx, tx, reason, now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -90,6 +94,9 @@ func (s *Store) BeginGatewayCredentialRotation(ctx context.Context, owner, reaso
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_inbox(item_key, kind, title, body, state, created_at, updated_at)
 VALUES (?, 'credential', 'Gateway Credential requires attention', ?, 'open', ?, ?)
 ON CONFLICT(item_key) DO UPDATE SET body=excluded.body, state='open', updated_at=excluded.updated_at`, GatewayCredentialInboxKey, reason, timestamp, timestamp); err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	if err := ensureGatewayCredentialQuestionsTx(ctx, tx, reason, now); err != nil {
 		return GatewayCredentialRotation{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -157,7 +164,64 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredent
 	if _, err := tx.ExecContext(ctx, `UPDATE workflow_inbox SET state = 'resolved', updated_at = ? WHERE item_key = ?`, timestamp, GatewayCredentialInboxKey); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = 'credential restored', answered_at = ? WHERE kind = ? AND state = 'open'`, timestamp, gatewayCredentialQuestionKind); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func ensureGatewayCredentialQuestionsTx(ctx context.Context, tx *sql.Tx, reason string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT p.repository, v.version_id
+FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE `+currentActivePlanPredicate)
+	if err != nil {
+		return err
+	}
+	var plans []struct {
+		repository string
+		versionID  string
+	}
+	for rows.Next() {
+		var repository, versionID string
+		if err := rows.Scan(&repository, &versionID); err != nil {
+			rows.Close()
+			return err
+		}
+		plans = append(plans, struct {
+			repository string
+			versionID  string
+		}{repository: repository, versionID: versionID})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		if err := ensureWorkflowQuestionTx(ctx, tx, plan.repository, plan.versionID, 0, gatewayCredentialQuestionKind, reason, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) GatewayCredentialAttentionRepositories(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT repository FROM workflow_questions WHERE kind = ? AND state = 'open' ORDER BY repository`, gatewayCredentialQuestionKind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var repositories []string
+	for rows.Next() {
+		var repository string
+		if err := rows.Scan(&repository); err != nil {
+			return nil, err
+		}
+		repositories = append(repositories, repository)
+	}
+	return repositories, rows.Err()
 }
 
 func (s *Store) GatewayWritesPaused(ctx context.Context) (bool, string, error) {
