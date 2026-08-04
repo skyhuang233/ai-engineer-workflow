@@ -19,20 +19,21 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 27
+	latestSchemaVersion = 28
 )
 
 var (
-	ErrVersionConflict    = errors.New("plan has already been activated with a different version")
-	ErrNotFound           = errors.New("plan not found")
-	ErrFencingConflict    = errors.New("fencing conflict: ticket is already owned")
-	ErrNoReadyTickets     = errors.New("no ready tickets")
-	ErrCapacity           = errors.New("run capacity is full")
-	ErrNotReady           = errors.New("ticket is not ready")
-	ErrInvalidClaim       = errors.New("invalid ticket claim")
-	ErrDeliveryInProgress = errors.New("delivery outbox item is already being processed")
-	ErrWorkerLaunched     = errors.New("worker run has already been launched")
-	ErrNeedsAttention     = errors.New("workflow needs attention")
+	ErrVersionConflict     = errors.New("plan has already been activated with a different version")
+	ErrNotFound            = errors.New("plan not found")
+	ErrFencingConflict     = errors.New("fencing conflict: ticket is already owned")
+	ErrNoReadyTickets      = errors.New("no ready tickets")
+	ErrCapacity            = errors.New("run capacity is full")
+	ErrNotReady            = errors.New("ticket is not ready")
+	ErrInvalidClaim        = errors.New("invalid ticket claim")
+	ErrDeliveryInProgress  = errors.New("delivery outbox item is already being processed")
+	ErrGatewayWritesPaused = errors.New("gateway writes are paused")
+	ErrWorkerLaunched      = errors.New("worker run has already been launched")
+	ErrNeedsAttention      = errors.New("workflow needs attention")
 )
 
 const (

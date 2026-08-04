@@ -66,9 +66,13 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	}
 	var repo struct {
 		DefaultBranch string `json:"default_branch"`
+		Private       bool   `json:"private"`
 	}
 	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository, nil, &repo); err != nil {
 		return fmt.Errorf("verify repository metadata: %w", err)
+	}
+	if repo.Private {
+		return errors.New("integration repository must be public")
 	}
 	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository+"/actions/workflows", nil, &struct{}{}); err != nil {
 		return fmt.Errorf("verify Actions read permission: %w", err)

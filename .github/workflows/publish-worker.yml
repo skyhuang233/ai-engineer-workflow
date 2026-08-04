@@ -32,6 +32,7 @@ jobs:
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Detect Worker release input changes
@@ -58,14 +59,48 @@ jobs:
         if: steps.changes.outputs.required == 'true'
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="worker-v${{ steps.pins.outputs.worker_version }}"
-          if target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .target_commitish 2>/dev/null)"; then
+          if release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null)"; then
+            target="$(jq -r .target_commitish <<<"$release")"
             test "$target" = "$GITHUB_SHA" || {
               echo "Worker version already belongs to a different accepted commit" >&2
               exit 1
             }
+            asset_id="$(jq -r '[.assets[]? | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end' <<<"$release")"
+            test -n "$asset_id" || {
+              echo "Existing Worker Release has no unambiguous release manifest" >&2
+              exit 1
+            }
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > worker-release.json
+            jq --exit-status \
+              --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
+              --arg source_commit "$GITHUB_SHA" \
+              --arg image_repository "${{ steps.pins.outputs.image_repository }}" \
+              --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+              --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
+              --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+              --arg no_mistakes_fork_repository "${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
+              --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+              --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+              '(.schema_version == 1) and
+               (.worker_version == $worker_version) and
+               (.source_commit == $source_commit) and
+               (.image | type == "string") and
+               (.image | startswith($image_repository + "@sha256:")) and
+               (.image | test("^.+@sha256:[0-9a-f]{64}$")) and
+               (.codex_version == $codex_version) and
+               (.no_mistakes_version == $no_mistakes_version) and
+               (.no_mistakes_commit == $no_mistakes_commit) and
+               (.no_mistakes_fork_repository == $no_mistakes_fork_repository) and
+               (.no_mistakes_fork_release == $no_mistakes_fork_release) and
+               (.no_mistakes_linux_amd64_sha256 == $no_mistakes_linux_amd64_sha256) and
+               (.github_actions_run_id | type == "number" and . > 0)' \
+              worker-release.json > /dev/null || {
+                echo "Existing Worker Release has an incomplete or invalid release manifest" >&2
+                exit 1
+              }
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -105,12 +140,14 @@ jobs:
             --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
             --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
             --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --arg no_mistakes_fork_repository "${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
             --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
             --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
             --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
             '{schema_version:1, worker_version:$worker_version, source_commit:$source_commit,
               image:$image, codex_version:$codex_version, no_mistakes_version:$no_mistakes_version,
-              no_mistakes_commit:$no_mistakes_commit, no_mistakes_fork_release:$no_mistakes_fork_release,
+              no_mistakes_commit:$no_mistakes_commit, no_mistakes_fork_repository:$no_mistakes_fork_repository,
+              no_mistakes_fork_release:$no_mistakes_fork_release,
               no_mistakes_linux_amd64_sha256:$no_mistakes_linux_amd64_sha256, github_actions_run_id:$github_actions_run_id}' \
             > worker-release.json
           jq --exit-status . worker-release.json

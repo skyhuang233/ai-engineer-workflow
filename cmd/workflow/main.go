@@ -188,11 +188,14 @@ func credentialCommand() {
 		exitError(err)
 	}
 	defer database.Close()
-	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
-		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
-	}
 	if err := database.PauseGatewayWrites(ctx, "Gateway Credential rotation is in progress", time.Now().UTC()); err != nil {
 		exitError(err)
+	}
+	if err := database.WaitForGatewayWritesQuiesced(ctx); err != nil {
+		exitError(fmt.Errorf("wait for Gateway writes to finish before credential rotation: %w", err))
+	}
+	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
+		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
 	}
 	previousToken, previousErr := credentialStore.Get(context.Background(), credential.GatewayTarget)
 	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {

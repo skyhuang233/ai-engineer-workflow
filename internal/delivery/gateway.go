@@ -97,6 +97,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	outbox, err := g.Store.ClaimDeliveryOutbox(ctx, key, g.now())
 	if err != nil {
+		if errors.Is(err, store.ErrGatewayWritesPaused) {
+			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
+		}
 		return err
 	}
 	if outbox.State == store.OutboxSucceeded {

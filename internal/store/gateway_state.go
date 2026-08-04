@@ -66,6 +66,25 @@ func (s *Store) GatewayWritesPaused(ctx context.Context) (bool, string, error) {
 	return paused != 0, reason, err
 }
 
+func (s *Store) WaitForGatewayWritesQuiesced(ctx context.Context) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var processing int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_outbox WHERE state = 'processing'`).Scan(&processing); err != nil {
+			return err
+		}
+		if processing == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Store) WorkflowInboxItem(ctx context.Context, key string) (WorkflowInboxItem, error) {
 	var item WorkflowInboxItem
 	var createdAt, updatedAt string

@@ -445,6 +445,14 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
+	var writesPaused int
+	var pauseReason string
+	if err := tx.QueryRowContext(ctx, `SELECT writes_paused, reason FROM gateway_runtime WHERE singleton = 1`).Scan(&writesPaused, &pauseReason); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if writesPaused != 0 {
+		return DeliveryOutbox{}, fmt.Errorf("%w: %s", ErrGatewayWritesPaused, pauseReason)
+	}
 	var state, updatedText, nextAttemptText, raw, previousClaimToken string
 	var attempts int
 	var uncertain int

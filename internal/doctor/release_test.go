@@ -12,6 +12,7 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 		CodexVersion:               config.Codex.Version,
 		NoMistakesVersion:          config.NoMistakes.Version,
 		NoMistakesCommit:           config.NoMistakes.UpstreamCommit,
+		NoMistakesForkRepository:   config.NoMistakes.ForkRepository,
 		NoMistakesForkRelease:      config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256: config.NoMistakes.LinuxAMD64SHA256,
 		GitHubActionsRunID:         123,
@@ -27,5 +28,10 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 	manifest.NoMistakesForkRelease = "wrong-release"
 	if err := manifest.Validate(config); err == nil {
 		t.Fatal("manifest accepted a different no-mistakes fork release")
+	}
+	manifest.NoMistakesForkRelease = config.NoMistakes.ForkRelease
+	manifest.NoMistakesForkRepository = "wrong/repository"
+	if err := manifest.Validate(config); err == nil {
+		t.Fatal("manifest accepted a different no-mistakes fork repository")
 	}
 }

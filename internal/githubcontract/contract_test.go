@@ -70,3 +70,30 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyRejectsPrivateIntegrationRepositoryBeforeMutations(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"owner"}`))
+		case "/repos/owner/integration":
+			_, _ = w.Write([]byte(`{"default_branch":"main","private":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
+		context.Background(), "github_pat_test", "owner", "owner/integration",
+	)
+	if err == nil || !strings.Contains(err.Error(), "must be public") {
+		t.Fatalf("private integration repository error = %v", err)
+	}
+	if got := strings.Join(calls, "\n"); strings.Contains(got, "POST ") || strings.Contains(got, "PUT ") || strings.Contains(got, "PATCH ") || strings.Contains(got, "DELETE ") {
+		t.Fatalf("private integration repository was mutated:\n%s", got)
+	}
+}
