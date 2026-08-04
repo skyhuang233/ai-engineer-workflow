@@ -47,8 +47,27 @@ type credentialAwareRemote interface {
 	CredentialAvailable(context.Context) error
 }
 
+type gatewayStore interface {
+	EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error)
+	EnsureGatewayDispatcher(context.Context, string, time.Time) error
+	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
+	ExecuteDelivery(context.Context, store.DeliveryRequest, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
+	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
+	OpenWorkflowQuestions(context.Context, string, int64) ([]store.WorkflowQuestion, error)
+	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
+	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
+	GatewayCredentialAttentionRepositories(context.Context) ([]string, error)
+	RenewGatewayDispatcher(context.Context, string, time.Time) error
+	RequeueDeliveryOutboxClaim(context.Context, string, string, string, bool, time.Time) error
+	CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error
+	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time) error
+	RecordDeliveryAudit(context.Context, store.DeliveryRequest, string, string, time.Time) error
+	FinishDeliveryOutbox(context.Context, string, string, string, string, time.Time) error
+	PauseGatewayWrites(context.Context, string, time.Time) error
+}
+
 type Gateway struct {
-	Store           *store.Store
+	Store           gatewayStore
 	Remote          Remote
 	Now             func() time.Time
 	DispatcherToken string
@@ -283,13 +302,13 @@ func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.D
 	if outbox.Request.RunID != "" {
 		return ctx, func() error { return nil }, nil
 	}
-	if err := g.Store.RenewGatewayDispatcher(ctx, dispatcherToken, g.now()); err != nil {
+	if err := g.renewDispatcher(dispatcherToken); err != nil {
 		return nil, nil, err
 	}
 	operationCtx, cancel := context.WithCancel(ctx)
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	var renewalErr error
+	renewalErr := make(chan error, 1)
 	go func() {
 		ticker := time.NewTicker(controlPlaneRemoteTimeout / 3)
 		defer ticker.Stop()
@@ -301,8 +320,8 @@ func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.D
 			case <-operationCtx.Done():
 				return
 			case <-ticker.C:
-				if err := g.Store.RenewGatewayDispatcher(context.Background(), dispatcherToken, g.now()); err != nil {
-					renewalErr = err
+				if err := g.renewDispatcher(dispatcherToken); err != nil {
+					renewalErr <- err
 					cancel()
 					return
 				}
@@ -313,10 +332,12 @@ func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.D
 		close(stop)
 		cancel()
 		<-done
-		if renewalErr != nil {
-			return renewalErr
+		select {
+		case err := <-renewalErr:
+			return err
+		default:
 		}
-		return g.Store.RenewGatewayDispatcher(context.Background(), dispatcherToken, g.now())
+		return g.renewDispatcher(dispatcherToken)
 	}, nil
 }
 
@@ -353,6 +374,12 @@ func (g Gateway) cleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), outboxCleanupTimeout)
 }
 
+func (g Gateway) renewDispatcher(dispatcherToken string) error {
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	return g.Store.RenewGatewayDispatcher(ctx, dispatcherToken, g.now())
+}
+
 func (g Gateway) requeueClaim(outbox store.DeliveryOutbox, cause error, uncertain bool) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
@@ -367,20 +394,20 @@ func (g Gateway) succeed(outbox store.DeliveryOutbox, result store.DeliveryResul
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	err := g.Store.CompleteDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, result, g.now())
-	if errors.Is(err, store.ErrFencingConflict) {
+	if err != nil {
 		return errors.Join(err, g.requeueClaim(outbox, err, true))
 	}
-	return err
+	return nil
 }
 
 func (g Gateway) markUncertain(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	err := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), g.now())
-	if errors.Is(err, store.ErrFencingConflict) {
+	if err != nil {
 		return errors.Join(err, g.requeueClaim(outbox, cause, true))
 	}
-	return err
+	return nil
 }
 
 func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
@@ -388,11 +415,8 @@ func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
 	defer cancel()
 	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", cause.Error(), g.now())
 	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, cause.Error(), g.now())
-	if errors.Is(err, store.ErrFencingConflict) {
-		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
-	}
 	if err != nil {
-		return err
+		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
 	return cause
 }
@@ -401,11 +425,8 @@ func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), g.now())
-	if errors.Is(err, store.ErrFencingConflict) {
-		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
-	}
 	if err != nil {
-		return err
+		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
 	return cause
 }
@@ -421,12 +442,7 @@ func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) er
 		return errors.Join(fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
 	if err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now()); err != nil {
-		if !errors.Is(err, store.ErrFencingConflict) {
-			return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err)
-		}
-		if requeueErr := g.requeueClaim(outbox, cause, false); requeueErr != nil {
-			return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), requeueErr)
-		}
+		return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err, g.requeueClaim(outbox, cause, false))
 	}
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)
 }

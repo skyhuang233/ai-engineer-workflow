@@ -95,7 +95,7 @@ jobs:
               jq --sort-keys '{codex,no_mistakes,worker}' > /tmp/worker-inputs-before.json
             jq --sort-keys '{codex,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
             if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
-               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker; then
+               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker .github/workflows/publish-worker.yml; then
               required=true
             fi
           fi

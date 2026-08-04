@@ -24,6 +24,15 @@ type fakeRemote struct {
 	credentialErr error
 }
 
+type completionFailingStore struct {
+	*store.Store
+	err error
+}
+
+func (s completionFailingStore) CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error {
+	return s.err
+}
+
 func (f *fakeRemote) CredentialAvailable(context.Context) error { return f.credentialErr }
 
 func (f *fakeRemote) Observe(_ context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
@@ -373,6 +382,25 @@ func TestGatewayRequeuesUncertainControlPlaneClaimAfterLostLease(t *testing.T) {
 	outbox, err = db.DeliveryOutbox(ctx, queued.IdempotencyKey)
 	if err != nil || outbox.State != store.OutboxSucceeded {
 		t.Fatalf("reconciled lost-lease control-plane outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayRequeuesClaimWhenCompletionFinalizationFails(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: completionFailingStore{Store: db, err: errors.New("completion store temporarily unavailable")}, Remote: &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("dispatch with an unfinalizable delivery returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("completion failure outbox = %#v, %v", outbox, err)
 	}
 }
 
