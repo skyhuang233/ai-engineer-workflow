@@ -64,12 +64,18 @@ pull request closes without merge.
 The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
 registry. The Release Manifest's exact digest must resolve from GHCR and pass
-the Docker contract. It also requires the sole manifest asset for the current
-`main` commit, published by the fixed `publish-worker` push workflow after an
-unambiguous non-bot merge by the configured owner. A successful complete run
-atomically makes that digest the Active Worker Image for new Worker Runs;
-existing runs remain pinned to their recorded image. The report must be
-reviewed before the production baseline is approved.
+the Docker contract. Doctor may activate the latest owner-accepted manifest
+even after unrelated `main` commits, but only while every pinned toolchain
+input remains current and the deterministic build-input identity still matches
+both its source commit and current `main`. That identity covers the
+`deploy/worker` Git tree, the pinned `publish-worker` workflow blob, and the
+Worker toolchain inputs consumed by the build. The manifest must be the sole
+asset for the configured Worker release and must be published by the fixed
+`publish-worker` push workflow after an unambiguous non-bot merge by the
+configured owner. A successful complete run atomically makes that digest the
+Active Worker Image for new Worker Runs; existing runs remain pinned to their
+recorded image. The report must be reviewed before the production baseline is
+approved.
 
 ## Upgrade rule
 

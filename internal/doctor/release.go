@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +24,23 @@ type WorkerReleaseManifest struct {
 	NoMistakesForkRepository     string `json:"no_mistakes_fork_repository"`
 	NoMistakesForkRelease        string `json:"no_mistakes_fork_release"`
 	NoMistakesLinuxAMD64SHA256   string `json:"no_mistakes_linux_amd64_sha256"`
+	BuildInputIdentity           string `json:"build_input_identity"`
 	GitHubActionsRunID           int64  `json:"github_actions_run_id"`
+}
+
+type workerBuildInputs struct {
+	SchemaVersion             int           `json:"schema_version"`
+	DeployWorkerTree          string        `json:"deploy_worker_tree"`
+	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
+	Codex                     ToolPin       `json:"codex"`
+	NoMistakes                NoMistakesPin `json:"no_mistakes"`
+	Worker                    WorkerPin     `json:"worker"`
+}
+
+type resolvedWorkerBuildInputs struct {
+	CommitSHA string
+	Config    Config
+	Identity  string
 }
 
 type ReleaseFetcher struct {
@@ -81,6 +98,20 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if release.TargetCommitish != manifest.SourceCommit {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release target does not match manifest source commit")
 	}
+	currentInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, "main")
+	if err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve current Worker build inputs: %w", err)
+	}
+	sourceInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, manifest.SourceCommit)
+	if err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve Worker Release source build inputs: %w", err)
+	}
+	if sourceInputs.CommitSHA != manifest.SourceCommit || sourceInputs.Identity != manifest.BuildInputIdentity {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker Release manifest does not match its source build inputs")
+	}
+	if currentInputs.Identity != manifest.BuildInputIdentity {
+		return WorkerReleaseManifest{}, nil, errors.New("current main Worker build inputs do not match the Worker Release manifest")
+	}
 	var run struct {
 		HeadSHA    string `json:"head_sha"`
 		HeadBranch string `json:"head_branch"`
@@ -136,7 +167,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 
 func (m WorkerReleaseManifest) Validate(config Config) error {
 	switch {
-	case m.SchemaVersion != 1:
+	case m.SchemaVersion != 2:
 		return errors.New("unsupported Worker Release Manifest schema")
 	case m.WorkerVersion != config.Worker.Version:
 		return errors.New("Worker Release version does not match toolchain")
@@ -151,9 +182,95 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 		m.NoMistakesForkRepository != config.NoMistakes.ForkRepository || m.NoMistakesForkRelease != config.NoMistakes.ForkRelease ||
 		m.NoMistakesLinuxAMD64SHA256 != config.NoMistakes.LinuxAMD64SHA256:
 		return errors.New("Worker Release no-mistakes pin does not match toolchain")
+	case !sha256Pattern.MatchString(m.BuildInputIdentity):
+		return errors.New("Worker Release build input identity must be SHA-256")
 	case m.GitHubActionsRunID <= 0:
 		return errors.New("Worker Release Actions run ID is required")
 	default:
 		return nil
 	}
+}
+
+func resolveWorkerBuildInputs(ctx context.Context, client *githubapi.Client, repository, ref string) (resolvedWorkerBuildInputs, error) {
+	var commit struct {
+		SHA    string `json:"sha"`
+		Commit struct {
+			Tree struct {
+				SHA string `json:"sha"`
+			} `json:"tree"`
+		} `json:"commit"`
+	}
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/commits/"+ref, nil, &commit); err != nil {
+		return resolvedWorkerBuildInputs{}, fmt.Errorf("resolve commit %q: %w", ref, err)
+	}
+	if !shaPattern.MatchString(commit.SHA) || !shaPattern.MatchString(commit.Commit.Tree.SHA) {
+		return resolvedWorkerBuildInputs{}, errors.New("Worker build input commit has an invalid Git object identity")
+	}
+	configData, err := client.RequestBytes(ctx, "/repos/"+repository+"/contents/config/toolchain.json?ref="+ref, "application/vnd.github.raw+json")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, fmt.Errorf("read toolchain config at %q: %w", ref, err)
+	}
+	var config Config
+	decoder := json.NewDecoder(strings.NewReader(string(configData)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return resolvedWorkerBuildInputs{}, fmt.Errorf("decode toolchain config at %q: %w", ref, err)
+	}
+	if err := config.Validate(); err != nil {
+		return resolvedWorkerBuildInputs{}, fmt.Errorf("validate toolchain config at %q: %w", ref, err)
+	}
+	deployTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "deploy", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	workerTree, err := gitTreeEntry(ctx, client, repository, deployTree, "worker", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	githubTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, ".github", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	workflowsTree, err := gitTreeEntry(ctx, client, repository, githubTree, "workflows", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	publisherWorkflow, err := gitTreeEntry(ctx, client, repository, workflowsTree, "publish-worker.yml", "blob")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	return resolvedWorkerBuildInputs{CommitSHA: commit.SHA, Config: config, Identity: workerBuildInputIdentity(config, workerTree, publisherWorkflow)}, nil
+}
+
+func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tree, path, objectType string) (string, error) {
+	var response struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			SHA  string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/git/trees/"+tree, nil, &response); err != nil {
+		return "", fmt.Errorf("read Git tree %q: %w", tree, err)
+	}
+	for _, entry := range response.Tree {
+		if entry.Path == path && entry.Type == objectType && shaPattern.MatchString(entry.SHA) {
+			return entry.SHA, nil
+		}
+	}
+	return "", fmt.Errorf("Git tree %q lacks %s %q", tree, objectType, path)
+}
+
+func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
+	inputs := workerBuildInputs{
+		SchemaVersion:             1,
+		DeployWorkerTree:          workerTree,
+		PublishWorkerWorkflowBlob: publisherWorkflow,
+		Codex:                     config.Codex,
+		NoMistakes:                config.NoMistakes,
+		Worker:                    config.Worker,
+	}
+	encoded, _ := json.Marshal(inputs)
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest)
 }

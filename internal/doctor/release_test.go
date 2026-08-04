@@ -5,7 +5,7 @@ import "testing"
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
 	manifest := WorkerReleaseManifest{
-		SchemaVersion:                1,
+		SchemaVersion:                2,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -16,6 +16,7 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 		NoMistakesForkRepository:     config.NoMistakes.ForkRepository,
 		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
+		BuildInputIdentity:           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 		GitHubActionsRunID:           123,
 	}
 	if err := manifest.Validate(config); err != nil {
