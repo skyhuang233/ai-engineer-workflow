@@ -532,7 +532,7 @@ func runPollGitHub(args []string) {
 		}
 		client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
-			return err
+			return persistGatewayPollError(ctx, db, err, time.Now().UTC())
 		}
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		poller := github.Poller{Store: db, Client: client, LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
@@ -584,6 +584,7 @@ func runPollGitHub(args []string) {
 			}
 		})
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
+			err = persistGatewayPollError(ctx, db, err, time.Now().UTC())
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
@@ -819,6 +820,14 @@ func persistGatewayCredentialPause(ctx context.Context, database *store.Store, c
 		return errors.Join(credentialErr, fmt.Errorf("persist Gateway Credential pause: %w", err))
 	}
 	return credentialErr
+}
+
+func persistGatewayPollError(ctx context.Context, database *store.Store, pollErr error, now time.Time) error {
+	var authenticationFailure interface{ AuthenticationFailure() bool }
+	if errors.As(pollErr, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
+		pollErr = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, pollErr)
+	}
+	return persistGatewayCredentialPause(ctx, database, pollErr, now)
 }
 
 func fail(err error) {
