@@ -12,17 +12,18 @@ import (
 )
 
 type WorkerReleaseManifest struct {
-	SchemaVersion              int    `json:"schema_version"`
-	WorkerVersion              string `json:"worker_version"`
-	SourceCommit               string `json:"source_commit"`
-	Image                      string `json:"image"`
-	CodexVersion               string `json:"codex_version"`
-	NoMistakesVersion          string `json:"no_mistakes_version"`
-	NoMistakesCommit           string `json:"no_mistakes_commit"`
-	NoMistakesForkRepository   string `json:"no_mistakes_fork_repository"`
-	NoMistakesForkRelease      string `json:"no_mistakes_fork_release"`
-	NoMistakesLinuxAMD64SHA256 string `json:"no_mistakes_linux_amd64_sha256"`
-	GitHubActionsRunID         int64  `json:"github_actions_run_id"`
+	SchemaVersion                int    `json:"schema_version"`
+	WorkerVersion                string `json:"worker_version"`
+	SourceCommit                 string `json:"source_commit"`
+	Image                        string `json:"image"`
+	CodexVersion                 string `json:"codex_version"`
+	NoMistakesVersion            string `json:"no_mistakes_version"`
+	NoMistakesUpstreamRepository string `json:"no_mistakes_upstream_repository"`
+	NoMistakesCommit             string `json:"no_mistakes_commit"`
+	NoMistakesForkRepository     string `json:"no_mistakes_fork_repository"`
+	NoMistakesForkRelease        string `json:"no_mistakes_fork_release"`
+	NoMistakesLinuxAMD64SHA256   string `json:"no_mistakes_linux_amd64_sha256"`
+	GitHubActionsRunID           int64  `json:"github_actions_run_id"`
 }
 
 type ReleaseFetcher struct {
@@ -120,7 +121,8 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 		return errors.New("Worker Release image does not match the immutable toolchain repository")
 	case m.CodexVersion != config.Codex.Version:
 		return errors.New("Worker Release Codex version does not match toolchain")
-	case m.NoMistakesVersion != config.NoMistakes.Version || m.NoMistakesCommit != config.NoMistakes.UpstreamCommit ||
+	case m.NoMistakesVersion != config.NoMistakes.Version || m.NoMistakesUpstreamRepository != config.NoMistakes.UpstreamRepository ||
+		m.NoMistakesCommit != config.NoMistakes.UpstreamCommit ||
 		m.NoMistakesForkRepository != config.NoMistakes.ForkRepository || m.NoMistakesForkRelease != config.NoMistakes.ForkRelease ||
 		m.NoMistakesLinuxAMD64SHA256 != config.NoMistakes.LinuxAMD64SHA256:
 		return errors.New("Worker Release no-mistakes pin does not match toolchain")
