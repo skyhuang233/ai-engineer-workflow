@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/plan"
 )
 
 func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
@@ -84,6 +86,7 @@ func TestGatewayPauseFencesNewDispatchAdmissionsAndWaitsForExistingOnes(t *testi
 		t.Fatal(err)
 	}
 	defer db.Close()
+	activateWorkflowInboxPlan(t, ctx, db, "owner/repository")
 	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +123,7 @@ func TestPausedGatewayRecoversStaleControlPlaneClaimOnlyAfterDispatcherExpires(t
 		t.Fatal(err)
 	}
 	defer db.Close()
+	activateWorkflowInboxPlan(t, ctx, db, "owner/repository")
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now.Add(-time.Minute))
 	if err != nil {
@@ -161,6 +165,7 @@ func TestGatewayDispatcherRenewalRetainsControlPlaneClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	activateWorkflowInboxPlan(t, ctx, db, "owner/repository")
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now)
 	if err != nil {
@@ -184,5 +189,41 @@ func TestGatewayDispatcherRenewalRetainsControlPlaneClaim(t *testing.T) {
 	}
 	if outbox.State != OutboxProcessing {
 		t.Fatalf("renewed control-plane outbox = %#v", outbox)
+	}
+}
+
+func TestWorkflowInboxProjectionRequiresActiveDeliveryPlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/unplanned"}, time.Now().UTC()); !errors.Is(err, ErrDeliveryRejected) {
+		t.Fatalf("unplanned inbox projection error = %v, want delivery rejection", err)
+	}
+	activateWorkflowInboxPlan(t, ctx, db, "owner/admitted")
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/admitted"}, time.Now().UTC()); err != nil {
+		t.Fatalf("active-plan inbox projection error = %v", err)
+	}
+}
+
+func activateWorkflowInboxPlan(t *testing.T, ctx context.Context, db *Store, repository string) {
+	t.Helper()
+	snapshot := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "workflow-inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
 	}
 }

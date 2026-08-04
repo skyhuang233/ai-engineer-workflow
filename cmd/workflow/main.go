@@ -721,12 +721,7 @@ func runGateway(args []string) {
 	credentialSource := func(ctx context.Context) (string, error) {
 		return verifiedGatewayCredential(ctx, db)
 	}
-	token, err := credentialSource(context.Background())
-	if err != nil {
-		_ = db.Close()
-		fail(err)
-	}
-	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, token, nil), Store: db, Token: token, PushURL: *pushURL, CredentialSource: credentialSource}
+	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
 	gateway, err := delivery.NewGateway(db, remote)
 	if err != nil {
 		_ = db.Close()

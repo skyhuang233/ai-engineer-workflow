@@ -55,14 +55,15 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("read authoritative Worker Release: %w", err)
 	}
 	var assetID int64
+	manifestAssets := 0
 	for _, asset := range release.Assets {
 		if asset.Name == "worker-release.json" {
+			manifestAssets++
 			assetID = asset.ID
-			break
 		}
 	}
-	if assetID == 0 {
-		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release has no worker-release.json asset")
+	if manifestAssets != 1 || assetID == 0 {
+		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must have exactly one worker-release.json asset")
 	}
 	raw, err := client.RequestBytes(ctx,
 		fmt.Sprintf("/repos/%s/releases/assets/%d", config.Worker.ReleaseRepository, assetID),
