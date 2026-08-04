@@ -31,6 +31,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
+			_, _ = w.Write([]byte(`{"private":false}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract","path":".github/workflows/workflow-contract.yml"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
@@ -101,6 +103,8 @@ func TestGitHubCheckRejectsContractRunFromAnOldDefaultHead(t *testing.T) {
 			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
+			_, _ = w.Write([]byte(`{"private":false}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract","path":".github/workflows/workflow-contract.yml"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
@@ -119,6 +123,32 @@ func TestGitHubCheckRejectsContractRunFromAnOldDefaultHead(t *testing.T) {
 	}
 }
 
+func TestGitHubCheckRejectsPrivateNoMistakesFork(t *testing.T) {
+	config := validConfig()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
+			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
+		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
+			_, _ = w.Write([]byte(`{"private":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: memoryCredential{secret: "github_pat_test"}, APIBase: server.URL}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "must be public") {
+		t.Fatalf("GitHub check = %#v, want private fork failure", result)
+	}
+}
+
 func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 	config := validConfig()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +158,8 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 			_, _ = w.Write([]byte(`{"default_branch":"main","private":false}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
+			_, _ = w.Write([]byte(`{"private":false}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{
 				{"id": 7, "name": config.GitHub.RequiredCheck, "path": ".github/workflows/unrelated.yml"},

@@ -48,8 +48,10 @@ URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
 applies retry backoff, reconciles every active ticket pull request, and
 deduplicates newly observed reviews and comments before the owning Ticket
-Session is resumed. `--review-feedback` uses that same durable queue for manual
-routing. `workflow reconcile-delivered` checks merged pull requests
+Session is resumed. `--review-feedback` and `workflow answer-inbox` are
+privileged local Control Plane operations: run them only on the trusted Control
+Plane host, with its Gateway control-plane credential. They use the same
+durable queue for manual routing and decisions. `workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 

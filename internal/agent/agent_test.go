@@ -409,6 +409,15 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending delivery claims = %#v, %v", pending, err)
 	}
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version:        "0.2.0",
+		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
+		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","no_mistakes_version":"v2.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	retryRuntime := &fakeRuntime{}
 	controller.Runtime = retryRuntime
 	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
@@ -416,6 +425,9 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	}
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
+	}
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("retried delivery image = %q, want accepted Candidate image", retryRuntime.specs[0].ImageDigest)
 	}
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {

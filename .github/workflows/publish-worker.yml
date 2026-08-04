@@ -105,10 +105,13 @@ jobs:
             --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
             --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
             --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+            --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
             --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
             '{schema_version:1, worker_version:$worker_version, source_commit:$source_commit,
               image:$image, codex_version:$codex_version, no_mistakes_version:$no_mistakes_version,
-              no_mistakes_commit:$no_mistakes_commit, github_actions_run_id:$github_actions_run_id}' \
+              no_mistakes_commit:$no_mistakes_commit, no_mistakes_fork_release:$no_mistakes_fork_release,
+              no_mistakes_linux_amd64_sha256:$no_mistakes_linux_amd64_sha256, github_actions_run_id:$github_actions_run_id}' \
             > worker-release.json
           jq --exit-status . worker-release.json
       - name: Publish Worker Release Manifest

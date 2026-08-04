@@ -739,6 +739,31 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 		}
 		applied = 27
 	}
+	if applied < 28 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "candidate_revisions", name: "image_digest", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "candidate_revisions", name: "tool_versions_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+			{table: "ticket_sessions", name: "accepted_candidate_run_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 28: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 28: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (28, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

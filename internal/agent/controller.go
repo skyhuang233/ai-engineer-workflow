@@ -176,13 +176,13 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
 	}
-	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
+	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, ImageDigest: imageDigest, ToolVersions: toolVersions, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
 	if err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	session.AcceptedCommit = commit
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
-	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt); err != nil {
+	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt, imageDigest, toolVersions); err != nil {
 		return candidate, err
 	}
 	return candidate, nil
@@ -219,6 +219,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err := validateLocalRemotes(finalizationCtx, ws.Path); err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
+	imageDigest, toolVersions, err := c.Store.CandidateWorkerRuntime(finalizationCtx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("resolve accepted Candidate runtime: %w", err))
+	}
 	publication := store.CandidatePublication{
 		Repository:         delivery.Repository,
 		Branch:             delivery.Branch,
@@ -228,17 +232,13 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		Body:               "Retry delivery of the accepted Candidate Revision.",
 	}
 	intent := fmt.Sprintf("Retry delivery of accepted Candidate Revision %s for ticket #%d.", delivery.CandidateCommit, claim.TicketNumber)
-	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent)
+	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent, imageDigest, toolVersions)
 }
 
-func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {
+func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent, imageDigest string, toolVersions map[string]string) error {
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
-	}
-	imageDigest, toolVersions, err := c.activeWorkerRuntime(ctx)
-	if err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {

@@ -265,6 +265,15 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if !contractPassed {
 		return Result{Status: Fail, Summary: "integration workflow has not succeeded for the current default-branch revision"}
 	}
+	var forkRepository struct {
+		Private bool `json:"private"`
+	}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository, &forkRepository); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read no-mistakes fork repository: %v", err)}
+	}
+	if forkRepository.Private {
+		return Result{Status: Fail, Summary: "no-mistakes fork repository must be public"}
+	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
 	}

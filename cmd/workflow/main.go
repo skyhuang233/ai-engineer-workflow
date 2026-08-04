@@ -232,13 +232,14 @@ func runTicket(args []string) {
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	prompt := flags.String("prompt", "", "Worker prompt")
 	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback to queue for the next revision round")
+	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "trusted control-plane credential required for manual review feedback")
 	branch := flags.String("branch", "", "ticket branch")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	expectedHead := flags.String("expected-remote-head", "", "current remote ticket branch head")
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent || (strings.TrimSpace(*reviewFeedback) != "" && strings.TrimSpace(*gatewayControlToken) == "") {
 		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
@@ -415,10 +416,6 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	token, err := gatewayCredential(context.Background())
-	if err != nil {
-		fail(err)
-	}
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -461,13 +458,17 @@ func runPollGitHub(args []string) {
 		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
 		return controller.RetryDelivery(ctx, claim)
 	}
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	var lastPollResult github.PollResult
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+		token, err := verifiedGatewayCredential(ctx, db)
+		if err != nil {
+			return err
+		}
 		client := github.NewClient(*githubURL, token, nil)
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
+		poller := github.Poller{Store: db, Client: client.WithRepositoryOwner(config.GitHub.Credential.Owner), LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
