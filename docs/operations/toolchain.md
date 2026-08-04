@@ -8,7 +8,7 @@
   repository, fork release, and Linux release-asset checksum.
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
-  in its `worker-release.json` GitHub Release asset.
+  in its source-keyed `worker-release.json` GitHub Release asset.
 - The dedicated GitHub integration repository and its required workflow path
   are explicit and public. Branch protection is not a prerequisite: the
   repository owner retains merge authority.
@@ -69,8 +69,10 @@ even after unrelated `main` commits, but only while every pinned toolchain
 input remains current and the deterministic build-input identity still matches
 both its source commit and current `main`. That identity covers the
 `deploy/worker` Git tree, the pinned `publish-worker` workflow blob, and the
-Worker toolchain inputs consumed by the build. The manifest must be the sole
-asset for the configured Worker release and must be published by the fixed
+Worker toolchain inputs consumed by the build. Release and image tags contain
+the declared Worker version and this identity, allowing an input change to
+produce a new immutable release without a manual version bump. The manifest
+must be the sole asset for that exact source-keyed Worker release and must be published by the fixed
 `publish-worker` push workflow after an unambiguous non-bot merge by the
 configured owner. A successful complete run atomically makes that digest the
 Active Worker Image for new Worker Runs; existing runs remain pinned to their

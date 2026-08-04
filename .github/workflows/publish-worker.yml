@@ -64,23 +64,15 @@ jobs:
         run: |
           deploy_worker_tree="$(git rev-parse "${GITHUB_SHA}:deploy/worker")"
           publish_worker_workflow_blob="$(git rev-parse "${GITHUB_SHA}:.github/workflows/publish-worker.yml")"
-          identity_json="$(jq --compact-output --null-input \
+          identity_json="$(jq --compact-output \
             --arg deploy_worker_tree "$deploy_worker_tree" \
             --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
-            --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
-            --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
-            --arg no_mistakes_upstream_repository "${{ steps.pins.outputs.no_mistakes_upstream_repository }}" \
-            --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
-            --arg no_mistakes_fork_repository "${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
-            --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
-            --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
-            --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
-            --arg worker_image_repository "${{ steps.pins.outputs.image_repository }}" \
-            --arg worker_release_repository "${{ steps.pins.outputs.worker_release_repository }}" \
-            '{schema_version:1,deploy_worker_tree:$deploy_worker_tree,publish_worker_workflow_blob:$publish_worker_workflow_blob,codex:{version:$codex_version},no_mistakes:{version:$no_mistakes_version,upstream_repository:$no_mistakes_upstream_repository,upstream_commit:$no_mistakes_commit,fork_repository:$no_mistakes_fork_repository,fork_release:$no_mistakes_fork_release,linux_amd64_sha256:$no_mistakes_linux_amd64_sha256},worker:{version:$worker_version,image_repository:$worker_image_repository,release_repository:$worker_release_repository}}')"
+            '{schema_version:2,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
+            config/toolchain.json)"
           identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
           test "$identity" =~ ^[0-9a-f]{64}$
           echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "release_identity=worker-v${{ steps.pins.outputs.worker_version }}-$identity" >> "$GITHUB_OUTPUT"
       - name: Detect Worker release input changes
         id: changes
         shell: bash
@@ -115,7 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="worker-v${{ steps.pins.outputs.worker_version }}"
+          tag="${{ steps.build-inputs.outputs.release_identity }}"
           lookup_error="$(mktemp)"
           if release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$lookup_error")"; then
             rm "$lookup_error"
@@ -185,7 +177,7 @@ jobs:
             echo "exists=true" >> "$GITHUB_OUTPUT"
           elif grep --quiet 'HTTP 404' "$lookup_error"; then
             rm "$lookup_error"
-            image="${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}"
+            image="${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}"
             image_lookup_error="$(mktemp)"
             if docker buildx imagetools inspect "$image" > /dev/null 2>"$image_lookup_error"; then
               rm "$image_lookup_error"
@@ -214,7 +206,7 @@ jobs:
           context: .
           file: deploy/worker/Dockerfile
           push: true
-          tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.pins.outputs.worker_version }}
+          tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}
           build-args: |
             CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
             NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
@@ -253,8 +245,8 @@ jobs:
         if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: worker-v${{ steps.pins.outputs.worker_version }}
+          tag_name: ${{ steps.build-inputs.outputs.release_identity }}
           target_commitish: ${{ github.sha }}
-          name: Worker v${{ steps.pins.outputs.worker_version }}
+          name: Worker ${{ steps.build-inputs.outputs.release_identity }}
           body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
           files: worker-release.json

@@ -122,6 +122,8 @@ func (c Config) Validate() error {
 		return errors.New("no-mistakes Linux asset checksum must be SHA-256")
 	case !versionPattern.MatchString(c.Worker.Version):
 		return errors.New("worker version must be a path-safe version")
+	case len(c.Worker.Version) > 55:
+		return errors.New("worker version is too long for a source-keyed image tag")
 	case !strings.HasPrefix(c.Worker.ImageRepository, "ghcr.io/") || strings.Contains(c.Worker.ImageRepository, "@"):
 		return errors.New("worker image repository must be an unpinned GHCR repository")
 	case !repoPattern.MatchString(c.Worker.ReleaseRepository):

@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,15 @@ type workerBuildInputs struct {
 	Worker                    WorkerPin     `json:"worker"`
 }
 
+type canonicalWorkerBuildInputs struct {
+	SchemaVersion             int           `json:"schema_version"`
+	DeployWorkerTree          string        `json:"deploy_worker_tree"`
+	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
+	Codex                     ToolPin       `json:"codex"`
+	NoMistakes                NoMistakesPin `json:"no_mistakes"`
+	Worker                    WorkerPin     `json:"worker"`
+}
+
 type resolvedWorkerBuildInputs struct {
 	CommitSHA string
 	Config    Config
@@ -59,7 +69,11 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if repository.Private {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository must be public")
 	}
-	tag := "worker-v" + config.Worker.Version
+	currentInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, "main")
+	if err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve current Worker build inputs: %w", err)
+	}
+	tag := workerReleaseTag(currentInputs.Config.Worker.Version, currentInputs.Identity)
 	var release struct {
 		TargetCommitish string `json:"target_commitish"`
 		Assets          []struct {
@@ -97,10 +111,6 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	}
 	if release.TargetCommitish != manifest.SourceCommit {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release target does not match manifest source commit")
-	}
-	currentInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, "main")
-	if err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve current Worker build inputs: %w", err)
 	}
 	sourceInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, manifest.SourceCommit)
 	if err != nil {
@@ -263,14 +273,42 @@ func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tre
 
 func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
 	inputs := workerBuildInputs{
-		SchemaVersion:             1,
+		SchemaVersion:             2,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
 		NoMistakes:                config.NoMistakes,
 		Worker:                    config.Worker,
 	}
-	encoded, _ := json.Marshal(inputs)
+	encoded, _ := json.Marshal(canonicalizeWorkerBuildInputs(inputs))
 	digest := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", digest)
+}
+
+func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuildInputs {
+	return canonicalWorkerBuildInputs{
+		SchemaVersion:             inputs.SchemaVersion,
+		DeployWorkerTree:          base64.StdEncoding.EncodeToString([]byte(inputs.DeployWorkerTree)),
+		PublishWorkerWorkflowBlob: base64.StdEncoding.EncodeToString([]byte(inputs.PublishWorkerWorkflowBlob)),
+		Codex: ToolPin{
+			Version: base64.StdEncoding.EncodeToString([]byte(inputs.Codex.Version)),
+		},
+		NoMistakes: NoMistakesPin{
+			Version:            base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.Version)),
+			UpstreamRepository: base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.UpstreamRepository)),
+			UpstreamCommit:     base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.UpstreamCommit)),
+			ForkRepository:     base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.ForkRepository)),
+			ForkRelease:        base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.ForkRelease)),
+			LinuxAMD64SHA256:   base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.LinuxAMD64SHA256)),
+		},
+		Worker: WorkerPin{
+			Version:           base64.StdEncoding.EncodeToString([]byte(inputs.Worker.Version)),
+			ImageRepository:   base64.StdEncoding.EncodeToString([]byte(inputs.Worker.ImageRepository)),
+			ReleaseRepository: base64.StdEncoding.EncodeToString([]byte(inputs.Worker.ReleaseRepository)),
+		},
+	}
+}
+
+func workerReleaseTag(workerVersion, buildInputIdentity string) string {
+	return "worker-v" + workerVersion + "-" + buildInputIdentity
 }

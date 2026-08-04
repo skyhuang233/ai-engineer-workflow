@@ -27,6 +27,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	sourceWorkflowsTree := strings.Repeat("8", 40)
 	mainWorkflowsTree := strings.Repeat("9", 40)
 	publisherWorkflowBlob := strings.Repeat("b", 40)
+	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob)
 	manifestData, err := json.Marshal(WorkerReleaseManifest{
 		SchemaVersion:                2,
 		WorkerVersion:                config.Worker.Version,
@@ -39,7 +40,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		NoMistakesForkRepository:     config.NoMistakes.ForkRepository,
 		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
-		BuildInputIdentity:           workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob),
+		BuildInputIdentity:           buildInputIdentity,
 		GitHubActionsRunID:           123,
 	})
 	if err != nil {
@@ -57,7 +58,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/skyhuang233/workflow":
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"private":%t}`, private)))
-		case "/repos/skyhuang233/workflow/releases/tags/worker-v0.1.0":
+		case "/repos/skyhuang233/workflow/releases/tags/" + workerReleaseTag(config.Worker.Version, buildInputIdentity):
 			_, _ = w.Write([]byte(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":` + assets + `}`))
 		case "/repos/skyhuang233/workflow/releases/assets/9":
 			_, _ = w.Write([]byte(manifest))
