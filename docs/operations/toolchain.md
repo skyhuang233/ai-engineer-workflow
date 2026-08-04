@@ -10,8 +10,8 @@
   registry digest is recorded only after an accepted main commit is published
   in its `worker-release.json` GitHub Release asset.
 - The dedicated GitHub integration repository and its required workflow are
-  explicit. Repository visibility and branch protection are not prerequisites:
-  Owner-Guarded Mode reserves merge authority to the repository owner.
+  explicit and public. Branch protection is not a prerequisite: the repository
+  owner retains merge authority.
 - The Gateway uses one fine-grained PAT for all owner repositories with exactly
   metadata/actions read and contents/issues/pull-requests write. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite

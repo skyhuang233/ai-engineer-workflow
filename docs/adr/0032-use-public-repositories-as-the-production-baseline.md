@@ -1,5 +1,5 @@
 ---
-status: superseded by ADR-0033
+status: accepted
 ---
 
 # Use public repositories as the production baseline

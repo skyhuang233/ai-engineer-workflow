@@ -150,10 +150,11 @@ func (c WorkerRegistryCheck) Run(ctx context.Context) Result {
 }
 
 type GitHubCredentialCheck struct {
-	Pin          GitHubCredentialPin
-	Credentials  credential.Store
-	Verification store.GatewayCredentialVerification
-	APIBase      string
+	Pin                   GitHubCredentialPin
+	IntegrationRepository string
+	Credentials           credential.Store
+	Verification          store.GatewayCredentialVerification
+	APIBase               string
 }
 
 func (GitHubCredentialCheck) Name() string { return "Gateway Credential contract" }
@@ -182,7 +183,10 @@ func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 	if identity.Login != c.Pin.Owner || c.Verification.Owner != c.Pin.Owner {
 		return Result{Status: Fail, Summary: "Gateway Credential owner does not match the verified owner"}
 	}
-	return Result{Status: Pass, Summary: "Credential Manager secret matches the verified fine-grained PAT and owner"}
+	if c.Verification.IntegrationRepository != c.IntegrationRepository {
+		return Result{Status: Fail, Summary: "Gateway Credential verification does not match the configured integration repository"}
+	}
+	return Result{Status: Pass, Summary: "Credential Manager secret matches the verified fine-grained PAT, owner, and integration repository"}
 }
 
 type GitHubCheck struct {

@@ -2,19 +2,22 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
-	"os/exec"
 	"path/filepath"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
 
 type WorkspacePusher struct {
 	WorkspacePath string
 	Token         string
 	PushURL       string
-	Binary        string
 }
 
 func (p WorkspacePusher) Push(ctx context.Context, repository, branch, commit, expectedHead string, expectAbsent bool) error {
@@ -28,56 +31,43 @@ func (p WorkspacePusher) Push(ctx context.Context, repository, branch, commit, e
 	if pushURL == "" {
 		pushURL = "https://github.com/" + repository + ".git"
 	}
-	lease := "refs/heads/" + branch + ":" + expectedHead
-	if expectAbsent {
-		lease = "refs/heads/" + branch + ":"
+	endpoint, err := url.Parse(pushURL)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
+		return errors.New("credential-owning push adapter requires an HTTPS push URL without embedded credentials")
 	}
-	binary := p.Binary
-	if binary == "" {
-		binary = "git"
-	}
-	credentialStore, err := p.createCredentialStore(pushURL)
+	repositoryStore, err := git.PlainOpen(p.WorkspacePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("open candidate workspace: %w", err)
 	}
-	defer os.Remove(credentialStore)
-	cmd := pushCommand(ctx, binary, p.WorkspacePath, credentialStore, lease, pushURL, commit, branch)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("push candidate branch: %w (%s)", err, string(output))
+	refID := fmt.Sprintf("%x", sha256.Sum256([]byte(branch+"\x00"+commit)))
+	localRef := plumbing.ReferenceName("refs/workflow-gateway/" + refID)
+	remoteRef := plumbing.NewBranchReferenceName(branch)
+	trackingRef := plumbing.ReferenceName("refs/remotes/workflow-gateway/" + refID)
+	if err := repositoryStore.Storer.SetReference(plumbing.NewHashReference(localRef, plumbing.NewHash(commit))); err != nil {
+		return fmt.Errorf("stage candidate ref: %w", err)
+	}
+	defer repositoryStore.Storer.RemoveReference(localRef)
+	expected := plumbing.ZeroHash
+	if !expectAbsent {
+		expected = plumbing.NewHash(expectedHead)
+	}
+	if err := repositoryStore.Storer.SetReference(plumbing.NewHashReference(trackingRef, expected)); err != nil {
+		return fmt.Errorf("stage remote lease: %w", err)
+	}
+	defer repositoryStore.Storer.RemoveReference(trackingRef)
+
+	remote := git.NewRemote(repositoryStore.Storer, &config.RemoteConfig{Name: "workflow-gateway", URLs: []string{pushURL}})
+	err = remote.PushContext(ctx, &git.PushOptions{
+		RemoteName: "workflow-gateway",
+		RefSpecs:   []config.RefSpec{config.RefSpec("+" + localRef.String() + ":" + remoteRef.String())},
+		Auth:       &http.BasicAuth{Username: "x-access-token", Password: p.Token},
+		ForceWithLease: &git.ForceWithLease{
+			RefName: remoteRef,
+			Hash:    expected,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("push candidate branch: %w", err)
 	}
 	return nil
-}
-
-func (p WorkspacePusher) createCredentialStore(pushURL string) (string, error) {
-	endpoint, err := url.Parse(pushURL)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
-		return "", errors.New("credential-owning push adapter requires an HTTPS push URL")
-	}
-	credentialStore, err := os.CreateTemp("", ".workflow-git-credential-*")
-	if err != nil {
-		return "", fmt.Errorf("create temporary git credential store: %w", err)
-	}
-	credentialPath := credentialStore.Name()
-	fail := func(err error) (string, error) {
-		_ = credentialStore.Close()
-		_ = os.Remove(credentialPath)
-		return "", err
-	}
-	if err := credentialStore.Chmod(0o600); err != nil {
-		return fail(fmt.Errorf("secure temporary git credential store: %w", err))
-	}
-	credentialURL := (&url.URL{Scheme: endpoint.Scheme, Host: endpoint.Host, User: url.UserPassword("x-access-token", p.Token)}).String()
-	if _, err := credentialStore.WriteString(credentialURL + "\n"); err != nil {
-		return fail(fmt.Errorf("write temporary git credential store: %w", err))
-	}
-	if err := credentialStore.Close(); err != nil {
-		_ = os.Remove(credentialPath)
-		return "", fmt.Errorf("close temporary git credential store: %w", err)
-	}
-	return credentialPath, nil
-}
-
-func pushCommand(ctx context.Context, binary, workspacePath, credentialStore, lease, pushURL, commit, branch string) *exec.Cmd {
-	credentialHelper := "credential.helper=store --file=\"" + filepath.ToSlash(credentialStore) + "\""
-	return exec.CommandContext(ctx, binary, "-C", workspacePath, "-c", credentialHelper, "push", "--force-with-lease="+lease, pushURL, commit+":refs/heads/"+branch)
 }

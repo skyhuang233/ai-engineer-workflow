@@ -90,17 +90,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
-	activeRelease, err := c.Store.ActiveWorkerRelease(ctx)
+	imageDigest, toolVersions, err := c.activeWorkerRuntime(ctx)
 	if err != nil {
-		return Candidate{}, fmt.Errorf("resolve Active Worker Image: %w", err)
-	}
-	var releaseManifest struct {
-		CodexVersion      string `json:"codex_version"`
-		NoMistakesVersion string `json:"no_mistakes_version"`
-	}
-	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
-		releaseManifest.CodexVersion == "" || releaseManifest.NoMistakesVersion == "" {
-		return Candidate{}, errors.New("Active Worker Image has an invalid release manifest")
+		return Candidate{}, err
 	}
 	schemaPath := c.Workspace.schemaPath(ws.CodexState)
 	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
@@ -116,11 +108,10 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	spec := worker.Spec{
 		RunID:   request.Claim.RunID,
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
-		AgentIdentity: session.AgentIdentity, ImageDigest: activeRelease.ImageReference,
-		ToolVersions: map[string]string{"codex": releaseManifest.CodexVersion, "no-mistakes": releaseManifest.NoMistakesVersion},
-		Environment:  environment,
-		Mounts:       []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
-		ExtraHosts:   []string{worker.GatewayHostMapping},
+		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
+		Environment: environment,
+		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
+		ExtraHosts:  []string{worker.GatewayHostMapping},
 	}
 	if err := spec.Validate(); err != nil {
 		return Candidate{}, err
@@ -245,6 +236,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
 	}
+	imageDigest, toolVersions, err := c.activeWorkerRuntime(ctx)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
+	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
@@ -267,7 +262,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliverySpec := worker.Spec{
 		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
-		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
+		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: deliveryEnvironment,
 		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
 		ExtraHosts:  []string{worker.GatewayHostMapping},
@@ -296,6 +291,22 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return err
 	}
 	return nil
+}
+
+func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {
+	activeRelease, err := c.Store.ActiveWorkerRelease(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
+	}
+	var releaseManifest struct {
+		CodexVersion      string `json:"codex_version"`
+		NoMistakesVersion string `json:"no_mistakes_version"`
+	}
+	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
+		releaseManifest.CodexVersion == "" || releaseManifest.NoMistakesVersion == "" {
+		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
+	}
+	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {

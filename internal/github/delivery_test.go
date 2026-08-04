@@ -26,6 +26,10 @@ func (p *recordingPusher) Push(_ context.Context, _, _, _, expected string, abse
 
 func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
@@ -47,6 +51,10 @@ func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
 			_ = json.NewEncoder(w).Encode([]any{})
 			return
@@ -78,6 +86,10 @@ func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
 		if strings.Contains(r.URL.Path, "/git/ref/") {
 			_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "head"}})
 			return
@@ -108,7 +120,13 @@ func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
 		{"number": 7, "state": "closed", "head": map[string]string{"ref": "ticket-1", "sha": "candidate"}, "base": map[string]string{"ref": "main"}},
 		{"number": 7, "state": "open", "head": map[string]string{"ref": "ticket-1", "sha": "candidate"}, "base": map[string]string{"ref": "release"}},
 	} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(pull) }))
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/repos/owner/repo" {
+				_, _ = w.Write([]byte(`{"private":false}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(pull)
+		}))
 		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
 		_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, CommitSHA: "candidate"})
 		server.Close()
@@ -118,8 +136,27 @@ func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
 	}
 }
 
+func TestDeliveryRemoteRejectsPrivateRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":true}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	_, err := (DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}).Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
+	if !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("private repository error = %v", err)
+	}
+}
+
 func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
 			_ = json.NewEncoder(w).Encode([]any{})
@@ -146,6 +183,10 @@ func TestDeliveryRemoteRejectsInvalidPullRequestReturnedByApply(t *testing.T) {
 		{"number": 7, "state": "open", "head": map[string]string{"ref": "ticket-1", "sha": "accepted"}, "base": map[string]string{"ref": "release"}},
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+				_, _ = w.Write([]byte(`{"private":false}`))
+				return
+			}
 			switch r.Method {
 			case http.MethodGet:
 				_ = json.NewEncoder(w).Encode([]any{})

@@ -122,7 +122,7 @@ func runDoctor(args []string) {
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},
 		doctor.WorkerRegistryCheck{Image: manifest.Image},
-		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, Credentials: credentialStore, Verification: verification},
+		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: credentialStore, Verification: verification},
 		doctor.GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentialStore},
 	}, Secrets: []string{secret}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -232,14 +232,13 @@ func runTicket(args []string) {
 	prompt := flags.String("prompt", "", "Worker prompt")
 	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback to queue for the next revision round")
 	branch := flags.String("branch", "", "ticket branch")
-	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	expectedHead := flags.String("expected-remote-head", "", "current remote ticket branch head")
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *token == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
-		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, read credential, Gateway URL, and exactly one remote-head expectation")
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
+		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -253,7 +252,11 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	client := github.NewClient(*githubURL, *token, nil)
+	token, err := gatewayCredential(ctx)
+	if err != nil {
+		fail(err)
+	}
+	client := github.NewClient(*githubURL, token, nil)
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
 	if err != nil {
 		fail(err)
@@ -357,21 +360,24 @@ func runReconcileDelivered(args []string) {
 	flags := flag.NewFlagSet("reconcile-delivered", flag.ExitOnError)
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
-	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "Gateway GitHub credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *token == "" {
-		fmt.Fprintln(os.Stderr, "reconcile-delivered requires repository and credential")
+	if *repository == "" {
+		fmt.Fprintln(os.Stderr, "reconcile-delivered requires repository")
 		os.Exit(2)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	token, err := gatewayCredential(ctx)
+	if err != nil {
+		fail(err)
+	}
 	db, err := store.Open(ctx, *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
-	marked, err := (github.DeliveredReconciler{Store: db, Client: github.NewClient(*githubURL, *token, nil)}).Reconcile(ctx, *repository)
+	marked, err := (github.DeliveredReconciler{Store: db, Client: github.NewClient(*githubURL, token, nil)}).Reconcile(ctx, *repository)
 	if err != nil {
 		fail(err)
 	}
@@ -384,7 +390,6 @@ func runPollGitHub(args []string) {
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	rootNumber := flags.Int64("root", 0, "approved plan root issue number")
-	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "GitHub read credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	source := flags.String("source", "", "absolute local repository path for review revisions")
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
@@ -396,8 +401,8 @@ func runPollGitHub(args []string) {
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *token == "" || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, read credential, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
+	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
 	config, err := doctor.LoadConfig(*configPath)
@@ -409,6 +414,10 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
+	token, err := gatewayCredential(context.Background())
+	if err != nil {
+		fail(err)
+	}
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -451,12 +460,12 @@ func runPollGitHub(args []string) {
 		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
 		return controller.RetryDelivery(ctx, claim)
 	}
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, *token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	var lastPollResult github.PollResult
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		client := github.NewClient(*githubURL, *token, nil)
+		client := github.NewClient(*githubURL, token, nil)
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
@@ -623,22 +632,25 @@ func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
 	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
-	token := flags.String("github-token", os.Getenv("WORKFLOW_GITHUB_TOKEN"), "Gateway GitHub credential")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
-	gitBinary := flags.String("git", "git", "Git executable")
 	outboxInterval := flags.Duration("outbox-interval", time.Second, "durable outbox recovery interval")
 	_ = flags.Parse(args)
-	if *listen == "" || *token == "" || *controlToken == "" || *outboxInterval <= 0 {
-		fmt.Fprintln(os.Stderr, "gateway requires listen address, GitHub credential, and control-plane credential")
+	if *listen == "" || *controlToken == "" || *outboxInterval <= 0 {
+		fmt.Fprintln(os.Stderr, "gateway requires listen address and control-plane credential")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
-	remote := github.DeliveryRemote{Client: github.NewClient(*githubURL, *token, nil), Store: db, Token: *token, PushURL: *pushURL, GitBinary: *gitBinary}
+	token, err := gatewayCredential(context.Background())
+	if err != nil {
+		_ = db.Close()
+		fail(err)
+	}
+	remote := github.DeliveryRemote{Client: github.NewClient(*githubURL, token, nil), Store: db, Token: token, PushURL: *pushURL}
 	gateway := delivery.Gateway{Store: db, Remote: remote}
 	go func() {
 		for {
@@ -654,6 +666,18 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	_ = db.Close()
+}
+
+func gatewayCredential(ctx context.Context) (string, error) {
+	token, err := credential.NewStore().Get(ctx, credential.GatewayTarget)
+	if err != nil {
+		return "", fmt.Errorf("load Gateway Credential from Windows Credential Manager: %w", err)
+	}
+	token = strings.TrimSpace(token)
+	if !strings.HasPrefix(token, "github_pat_") {
+		return "", errors.New("Gateway Credential is not a fine-grained PAT")
+	}
+	return token, nil
 }
 
 func fail(err error) {

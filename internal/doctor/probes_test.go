@@ -49,7 +49,7 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		IntegrationRepository: config.GitHub.TestRepository,
 	}
 	if result := (GitHubCredentialCheck{
-		Pin: config.GitHub.Credential, Credentials: credentials,
+		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: credentials,
 		Verification: verification, APIBase: server.URL,
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("credential check = %#v", result)
@@ -64,6 +64,31 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		if strings.Contains(path, "protection") {
 			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
 		}
+	}
+}
+
+func TestGitHubCredentialCheckRejectsDifferentIntegrationRepository(t *testing.T) {
+	config := validConfig()
+	token := "github_pat_test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
+	}))
+	defer server.Close()
+	result := (GitHubCredentialCheck{
+		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
+		Credentials: memoryCredential{secret: token},
+		Verification: store.GatewayCredentialVerification{
+			FingerprintSHA256: credential.Fingerprint(token), Owner: config.GitHub.Credential.Owner,
+			IntegrationRepository: "skyhuang233/different-integration",
+		},
+		APIBase: server.URL,
+	}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "integration repository") {
+		t.Fatalf("credential check = %#v", result)
 	}
 }
 

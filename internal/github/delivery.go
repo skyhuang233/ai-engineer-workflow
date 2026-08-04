@@ -21,12 +21,11 @@ type GitPusher interface {
 }
 
 type DeliveryRemote struct {
-	Client    *Client
-	Pusher    GitPusher
-	Store     *store.Store
-	Token     string
-	PushURL   string
-	GitBinary string
+	Client  *Client
+	Pusher  GitPusher
+	Store   *store.Store
+	Token   string
+	PushURL string
 }
 
 func (r DeliveryRemote) CredentialAvailable(context.Context) error {
@@ -39,6 +38,9 @@ func (r DeliveryRemote) CredentialAvailable(context.Context) error {
 func (r DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	if r.Client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
+	}
+	if err := r.requirePublicRepository(ctx, request.Repository); err != nil {
+		return delivery.Observation{}, err
 	}
 	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryProjectInbox || request.Operation == store.DeliveryAddIssueLabel {
 		if request.Operation == store.DeliveryProjectInbox {
@@ -188,7 +190,20 @@ func (r DeliveryRemote) pusher(ctx context.Context, request store.DeliveryReques
 	if err != nil {
 		return nil, err
 	}
-	return WorkspacePusher{WorkspacePath: workspace, Token: r.Token, PushURL: r.PushURL, Binary: r.GitBinary}, nil
+	return WorkspacePusher{WorkspacePath: workspace, Token: r.Token, PushURL: r.PushURL}, nil
+}
+
+func (r DeliveryRemote) requirePublicRepository(ctx context.Context, repository string) error {
+	var target struct {
+		Private bool `json:"private"`
+	}
+	if err := r.Client.getJSON(ctx, "/repos/"+repository, &target); err != nil {
+		return fmt.Errorf("verify delivery repository visibility: %w", err)
+	}
+	if target.Private {
+		return fmt.Errorf("%w: delivery repository must be public", store.ErrDeliveryRejected)
+	}
+	return nil
 }
 
 type pullRequestResponse struct {
