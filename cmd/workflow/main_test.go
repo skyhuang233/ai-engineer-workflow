@@ -38,6 +38,26 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 	}
 }
 
+func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
+	err := gatewayCredentialVerificationError(store.ErrNotFound)
+	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("missing verification error = %v, want rejected credential", err)
+	}
+	if !shouldPauseGatewayForCredential(err) {
+		t.Fatal("missing verification credential error did not pause Gateway writes")
+	}
+}
+
+func TestGatewayCredentialVerificationReadFailureIsRetryable(t *testing.T) {
+	err := gatewayCredentialVerificationError(errors.New("database temporarily unavailable"))
+	if errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("verification read failure = %v, want retryable error", err)
+	}
+	if shouldPauseGatewayForCredential(err) {
+		t.Fatal("verification read failure paused Gateway writes")
+	}
+}
+
 func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/owner/repo" {

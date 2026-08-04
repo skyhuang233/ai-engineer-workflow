@@ -793,12 +793,19 @@ func verifiedGatewayCredential(ctx context.Context, database *store.Store) (stri
 	}
 	verification, err := database.GatewayCredentialVerification(ctx)
 	if err != nil {
-		return "", fmt.Errorf("read Gateway Credential verification: %w", err)
+		return "", gatewayCredentialVerificationError(err)
 	}
 	if credential.Fingerprint(token) != verification.FingerprintSHA256 {
 		return "", fmt.Errorf("%w: Gateway Credential differs from the verified credential", delivery.ErrGatewayCredentialRejected)
 	}
 	return token, nil
+}
+
+func gatewayCredentialVerificationError(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("%w: Gateway Credential has no persisted verification", delivery.ErrGatewayCredentialRejected)
+	}
+	return fmt.Errorf("read Gateway Credential verification: %w", err)
 }
 
 func shouldPauseGatewayForCredential(err error) bool {
