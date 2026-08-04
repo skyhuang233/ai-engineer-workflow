@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -279,12 +280,39 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
+		Assets          []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"assets"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
 		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
 		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit"}
 	}
-	return Result{Status: Pass, Summary: "integration workflow and pinned fork release verified; owner-only merge remains the governance boundary"}
+	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
+	assetID := int64(0)
+	for _, asset := range forkRelease.Assets {
+		if asset.Name != assetName {
+			continue
+		}
+		if assetID != 0 {
+			return Result{Status: Fail, Summary: "fork release has multiple pinned no-mistakes Linux assets"}
+		}
+		assetID = asset.ID
+	}
+	if assetID == 0 {
+		return Result{Status: Fail, Summary: "fork release is missing the pinned no-mistakes Linux asset"}
+	}
+	asset, err := githubapi.NewClient(c.APIBase, token, nil).RequestBytes(ctx,
+		fmt.Sprintf("/repos/%s/releases/assets/%d", c.NoMistakes.ForkRepository, assetID), "application/octet-stream")
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("download pinned no-mistakes Linux asset: %v", err)}
+	}
+	digest := sha256.Sum256(asset)
+	if hex.EncodeToString(digest[:]) != c.NoMistakes.LinuxAMD64SHA256 {
+		return Result{Status: Fail, Summary: "pinned no-mistakes Linux asset checksum does not match"}
+	}
+	return Result{Status: Pass, Summary: "integration workflow, pinned fork release, and Linux asset checksum verified; owner-only merge remains the governance boundary"}
 }
 
 func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repository, name string) *Result {

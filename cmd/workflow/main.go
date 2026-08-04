@@ -148,11 +148,27 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	defer database.Close()
-	if err := database.ActivateWorkerRelease(context.Background(), store.WorkerRelease{
+	expectedActiveImage := ""
+	if active, activeErr := database.ActiveWorkerRelease(context.Background()); activeErr == nil {
+		expectedActiveImage = active.ImageReference
+	} else if !errors.Is(activeErr, store.ErrNotFound) {
+		fmt.Fprintln(os.Stderr, activeErr)
+		os.Exit(1)
+	}
+	currentManifest, currentManifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if currentManifest != manifest || string(currentManifestJSON) != string(manifestJSON) {
+		fmt.Fprintln(os.Stderr, "Worker Release changed during doctor verification")
+		os.Exit(1)
+	}
+	if err := database.ActivateWorkerReleaseFenced(context.Background(), store.WorkerRelease{
 		Version: manifest.WorkerVersion, SourceCommit: manifest.SourceCommit,
 		ImageReference: manifest.Image, ManifestJSON: string(manifestJSON),
 		VerifiedAt: report.GeneratedAt, ActivatedAt: report.GeneratedAt,
-	}); err != nil {
+	}, expectedActiveImage); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

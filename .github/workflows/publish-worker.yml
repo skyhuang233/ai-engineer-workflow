@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   packages: write
+  pull-requests: read
 
 concurrency:
   group: publish-worker
@@ -23,6 +24,26 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+      - name: Verify owner-merged main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0)' config/toolchain.json)"
+          pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
+          matches="$(jq --arg owner "$owner" --arg source_commit "$GITHUB_SHA" '
+            [.[] | select(
+              (.merged_at != null) and
+              (.merge_commit_sha == $source_commit) and
+              (.base.ref == "main") and
+              ((.merged_by.login | ascii_downcase) == ($owner | ascii_downcase)) and
+              ((.merged_by.type | ascii_downcase) != "bot") and
+              ((.merged_by.login | ascii_downcase | endswith("[bot]") | not))
+            )] | length' <<<"$pulls")"
+          test "$matches" = 1 || {
+            echo "Refusing to publish: main commit lacks an unambiguous non-bot owner merge" >&2
+            exit 1
+          }
       - name: Read accepted release inputs
         id: pins
         shell: bash

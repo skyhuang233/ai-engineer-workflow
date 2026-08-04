@@ -106,6 +106,36 @@ func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 	}
 }
 
+func TestDeliveryRemoteReappliesActiveLabelWithoutTrustingObservation(t *testing.T) {
+	labelWrites := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
+			_, _ = w.Write([]byte(`{"private":false}`))
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/10/labels" {
+			labelWrites++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	projection := plan.Projection{VersionID: "pv-1", State: "Active"}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
+	request := store.DeliveryRequest{Operation: store.DeliveryAddIssueLabel, Repository: "owner/repo", RootNumber: 10, PlanProjection: &projection, Label: plan.ActiveLabel}
+	observation, err := remote.Observe(context.Background(), request)
+	if err != nil || observation.Applied {
+		t.Fatalf("label observation = %#v, err = %v", observation, err)
+	}
+	if _, err := remote.Apply(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if labelWrites != 1 {
+		t.Fatalf("label writes = %d, want one idempotent Gateway write", labelWrites)
+	}
+}
+
 func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -24,6 +24,14 @@ type WorkerRelease struct {
 }
 
 func (s *Store) ActivateWorkerRelease(ctx context.Context, release WorkerRelease) error {
+	return s.activateWorkerRelease(ctx, release, nil)
+}
+
+func (s *Store) ActivateWorkerReleaseFenced(ctx context.Context, release WorkerRelease, expectedActiveImage string) error {
+	return s.activateWorkerRelease(ctx, release, &expectedActiveImage)
+}
+
+func (s *Store) activateWorkerRelease(ctx context.Context, release WorkerRelease, expectedActiveImage *string) error {
 	if release.Version == "" || release.ManifestJSON == "" ||
 		!fullCommitPattern.MatchString(release.SourceCommit) ||
 		!imageDigestPattern.MatchString(release.ImageReference) {
@@ -43,6 +51,18 @@ func (s *Store) ActivateWorkerRelease(ctx context.Context, release WorkerRelease
 		return err
 	}
 	defer tx.Rollback()
+	if expectedActiveImage != nil {
+		var current string
+		err := tx.QueryRowContext(ctx, `SELECT image_digest FROM active_worker_image WHERE singleton = 1`).Scan(&current)
+		if errors.Is(err, sql.ErrNoRows) {
+			current = ""
+		} else if err != nil {
+			return err
+		}
+		if current != *expectedActiveImage {
+			return ErrFencingConflict
+		}
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO worker_releases(image_digest, version, source_commit, manifest_json, verified_at, activated_at)
 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(image_digest) DO NOTHING`,
 		release.ImageReference, release.Version, release.SourceCommit, release.ManifestJSON,

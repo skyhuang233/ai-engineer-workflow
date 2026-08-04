@@ -111,8 +111,40 @@ func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
 		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
 	}
 	outbox, err := db.DeliveryOutbox(ctx, keys[0])
-	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || len(outbox.Request.WorkflowQuestions) != 1 || outbox.Request.WorkflowQuestions[0].Finding != "gateway_credential" {
+	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil {
 		t.Fatalf("credential recovery outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now, 1)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
+	}
+	rotation, err := db.BeginGatewayCredentialRotation(ctx, "operator", "replace credential", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, rotation, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, keys[0]); err != nil {
+		t.Fatal(err)
+	}
+	remote := gateway.Remote.(*fakeRemote)
+	if len(remote.requests) == 0 || len(remote.requests[0].WorkflowQuestions) != 0 {
+		t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
 	}
 }
 

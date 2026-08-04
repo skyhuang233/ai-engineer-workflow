@@ -247,20 +247,7 @@ func (g Gateway) QueueGatewayCredentialInboxProjections(ctx context.Context) err
 		return err
 	}
 	for _, repository := range repositories {
-		questions, err := g.Store.OpenWorkflowQuestions(ctx, repository, 0)
-		if err != nil {
-			return err
-		}
-		projected := make([]plan.WorkflowQuestion, 0, len(questions))
-		for _, question := range questions {
-			projected = append(projected, plan.WorkflowQuestion{
-				ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
-				PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
-				PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind,
-				Diagnostics: question.Diagnostics, Evidence: question.Evidence,
-			})
-		}
-		if _, err := g.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: projected}); err != nil {
+		if _, err := g.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository}); err != nil {
 			return err
 		}
 	}

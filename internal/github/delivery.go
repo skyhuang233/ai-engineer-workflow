@@ -79,15 +79,6 @@ func (r *DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequ
 			return delivery.Observation{}, fmt.Errorf("plan projection is missing")
 		}
 		if request.Operation == store.DeliveryAddIssueLabel {
-			issue, err := client.getIssue(ctx, request.Repository, request.RootNumber)
-			if err != nil {
-				return delivery.Observation{}, err
-			}
-			for _, label := range issue.Labels {
-				if label == request.Label {
-					return delivery.Observation{Applied: true}, nil
-				}
-			}
 			return delivery.Observation{}, nil
 		}
 		applied, err := client.HasPlanProjection(ctx, request.Repository, request.RootNumber, *request.PlanProjection)
