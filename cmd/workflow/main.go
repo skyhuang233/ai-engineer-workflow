@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +25,8 @@ import (
 	"github.com/skyhuang233/workflow/internal/worker"
 	"golang.org/x/term"
 )
+
+const defaultControlPlaneDatabase = "workflow.db"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -67,7 +68,7 @@ func usage() {
 func runDoctor(args []string) {
 	flags := flag.NewFlagSet("doctor", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", filepath.Join(os.TempDir(), "workflow-doctor.db"), "SQLite probe database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	reportPath := flags.String("report", "", "optional Markdown report path")
 	_ = flags.Parse(args)
 
@@ -163,7 +164,7 @@ func credentialCommand() {
 	}
 	flags := flag.NewFlagSet("credential provision", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", filepath.Join(os.TempDir(), "workflow.db"), "control-plane SQLite database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "control-plane SQLite database")
 	_ = flags.Parse(os.Args[3:])
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
@@ -222,7 +223,7 @@ func exitError(err error) {
 func runTicket(args []string) {
 	flags := flag.NewFlagSet("run-ticket", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	rootNumber := flags.Int64("root", 0, "plan root issue number")
 	ticketID := flags.Int64("ticket-id", 0, "GitHub ticket node ID")
@@ -358,7 +359,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 
 func runReconcileDelivered(args []string) {
 	flags := flag.NewFlagSet("reconcile-delivered", flag.ExitOnError)
-	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
@@ -387,7 +388,7 @@ func runReconcileDelivered(args []string) {
 func runPollGitHub(args []string) {
 	flags := flag.NewFlagSet("poll-github", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	rootNumber := flags.Int64("root", 0, "approved plan root issue number")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
@@ -595,7 +596,7 @@ func launchDeliveryClaims(ctx context.Context, claims []store.TicketClaim, launc
 
 func runAnswerInbox(args []string) {
 	flags := flag.NewFlagSet("answer-inbox", flag.ExitOnError)
-	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	questionID := flags.String("question", "", "stable Workflow Inbox question ID")
 	answer := flags.String("answer", "", "human decision")
@@ -630,7 +631,7 @@ func runAnswerInbox(args []string) {
 
 func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
-	databasePath := flags.String("database", "workflow.db", "SQLite control-plane database")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")

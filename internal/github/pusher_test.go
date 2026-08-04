@@ -4,7 +4,18 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
 )
+
+func TestGatewayLeaseTrackingRefPreservesNonBranchLocalPrefix(t *testing.T) {
+	localRef := plumbing.ReferenceName("refs/workflow-gateway/candidate")
+	got := gatewayLeaseTrackingRef(localRef)
+	want := plumbing.ReferenceName("refs/remotes/workflow-gateway/refs/workflow-gateway/candidate")
+	if got != want {
+		t.Fatalf("tracking ref = %q, want %q", got, want)
+	}
+}
 
 func TestWorkspacePusherRejectsPushURLWithEmbeddedCredential(t *testing.T) {
 	err := (WorkspacePusher{WorkspacePath: t.TempDir(), Token: "secret-token", PushURL: "https://x-access-token:secret-token@github.com/owner/repo.git"}).Push(context.Background(), "owner/repo", "ticket-1", "abc123", "", true)

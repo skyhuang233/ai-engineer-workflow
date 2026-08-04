@@ -42,7 +42,7 @@ func (p WorkspacePusher) Push(ctx context.Context, repository, branch, commit, e
 	refID := fmt.Sprintf("%x", sha256.Sum256([]byte(branch+"\x00"+commit)))
 	localRef := plumbing.ReferenceName("refs/workflow-gateway/" + refID)
 	remoteRef := plumbing.NewBranchReferenceName(branch)
-	trackingRef := plumbing.ReferenceName("refs/remotes/workflow-gateway/" + refID)
+	trackingRef := gatewayLeaseTrackingRef(localRef)
 	if err := repositoryStore.Storer.SetReference(plumbing.NewHashReference(localRef, plumbing.NewHash(commit))); err != nil {
 		return fmt.Errorf("stage candidate ref: %w", err)
 	}
@@ -70,4 +70,8 @@ func (p WorkspacePusher) Push(ctx context.Context, repository, branch, commit, e
 		return fmt.Errorf("push candidate branch: %w", err)
 	}
 	return nil
+}
+
+func gatewayLeaseTrackingRef(localRef plumbing.ReferenceName) plumbing.ReferenceName {
+	return plumbing.ReferenceName("refs/remotes/workflow-gateway/" + localRef.String())
 }
