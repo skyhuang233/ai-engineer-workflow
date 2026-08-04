@@ -372,6 +372,16 @@ func TestRateLimitRetryAtUsesGitHubReset(t *testing.T) {
 	}
 }
 
+func TestAPIErrorDistinguishesRateLimitedForbiddenFromCredentialRejection(t *testing.T) {
+	retryAt := time.Date(2026, 8, 4, 0, 7, 0, 0, time.UTC)
+	if (&apiError{StatusCode: http.StatusForbidden, RetryAt: retryAt}).AuthenticationFailure() {
+		t.Fatal("rate-limited forbidden response was classified as credential rejection")
+	}
+	if !(&apiError{StatusCode: http.StatusForbidden}).AuthenticationFailure() {
+		t.Fatal("unqualified forbidden response was not classified as credential rejection")
+	}
+}
+
 type issueJSON struct {
 	ID     int64        `json:"id"`
 	Number int64        `json:"number"`

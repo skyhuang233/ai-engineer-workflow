@@ -596,18 +596,22 @@ func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, upda
 }
 
 func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true, time.Time{})
 }
 
 func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true, time.Time{})
 }
 
 func (s *Store) RequeueDeliveryOutboxClaim(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false, time.Time{})
 }
 
-func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool) error {
+func (s *Store) DeferDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, retryAt, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, true, retryAt)
+}
+
+func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool, retryAt time.Time) error {
 	if state != OutboxPending && state != OutboxSucceeded && state != OutboxRejected {
 		return ErrInvalidClaim
 	}
@@ -660,6 +664,9 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		}
 	} else {
 		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(attempts-1))))
+		if retryAt.After(now) {
+			nextAttempt = formatTimestamp(retryAt.UTC())
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', next_attempt_at = ?, updated_at = ?, completed_at = CASE WHEN ? = '' THEN completed_at ELSE ? END, uncertain = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, state, lastError, nextAttempt, formatTimestamp(now), completed, completed, boolInt(uncertain), key, OutboxProcessing, claimToken)
 	if err != nil {

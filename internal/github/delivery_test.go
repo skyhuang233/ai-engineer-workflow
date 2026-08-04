@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/skyhuang233/workflow/internal/credential"
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -44,6 +46,32 @@ func TestDeliveryRemoteRefreshesCredentialAtDispatchBoundary(t *testing.T) {
 	}
 	if got := remote.client().Token; got != "github_pat_after" {
 		t.Fatalf("refreshed credential = %q", got)
+	}
+}
+
+func TestDeliveryRemoteOnlyClassifiesMissingCredentialAsRejected(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "missing", err: credential.ErrNotFound, want: delivery.ErrGatewayCredentialRejected},
+		{name: "transient", err: errors.New("credential manager unavailable")},
+		{name: "cancelled", err: context.Canceled, want: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			remote := DeliveryRemote{Client: NewClient("https://api.github.com", "stale", nil), CredentialSource: func(context.Context) (string, error) { return "", test.err }}
+			err := remote.CredentialAvailable(context.Background())
+			if test.want != nil {
+				if !errors.Is(err, test.want) {
+					t.Fatalf("credential error = %v, want %v", err, test.want)
+				}
+				return
+			}
+			if err == nil || errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+				t.Fatalf("transient credential error = %v", err)
+			}
+		})
 	}
 }
 

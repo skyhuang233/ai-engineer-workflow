@@ -286,6 +286,55 @@ func TestMissingCredentialPausesBeforeAnyRemoteCall(t *testing.T) {
 	}
 }
 
+func TestGatewayRequeuesTransientCredentialSourceFailure(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	remote := &fakeRemote{credentialErr: errors.New("credential manager temporarily unavailable")}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("transient credential failure returned nil")
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway pause = %t, %v", paused, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.NextAttemptAt == nil {
+		t.Fatalf("transient credential outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayDefersRateLimitedWriteUntilGitHubRetryTime(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	retryAfter := now.Add(7 * time.Minute)
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}}, applyErr: &githubapi.APIError{Method: "POST", Path: "/repos/owner/repo", StatusCode: 403, RetryAt: retryAfter}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("rate-limited delivery returned nil")
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway pause = %t, %v", paused, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.NextAttemptAt == nil || !outbox.NextAttemptAt.Equal(retryAfter) {
+		t.Fatalf("rate-limited outbox = %#v, %v", outbox, err)
+	}
+}
+
 func TestCredentialBindingFollowsDurableDispatchAdmission(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)

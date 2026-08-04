@@ -28,6 +28,10 @@ type authenticationFailure interface {
 	AuthenticationFailure() bool
 }
 
+type retryAtFailure interface {
+	RetryAtTime() time.Time
+}
+
 type Observation struct {
 	Applied           bool
 	RemoteHead        string
@@ -63,6 +67,7 @@ type gatewayStore interface {
 	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time) error
 	RecordDeliveryAudit(context.Context, store.DeliveryRequest, string, string, time.Time) error
 	FinishDeliveryOutbox(context.Context, string, string, string, string, time.Time) error
+	DeferDeliveryOutbox(context.Context, string, string, string, bool, time.Time, time.Time) error
 	PauseGatewayWrites(context.Context, string, time.Time) error
 }
 
@@ -145,7 +150,10 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, false))
 			}
-			return g.pauseForCredential(outbox, err)
+			if isCredentialRejection(err) {
+				return g.pauseForCredential(outbox, err)
+			}
+			return g.retry(outbox, err)
 		}
 	}
 	if outbox.ReconcileOnly {
@@ -192,6 +200,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 		observation, applyErr := g.apply(operationCtx, request)
 		if applyErr != nil {
+			if retryAt(applyErr).After(g.now()) {
+				return store.DeliveryResult{}, applyErr
+			}
 			observed, observeErr := g.observe(operationCtx, request)
 			if observeErr == nil && observed.Applied {
 				observation = observed
@@ -403,7 +414,15 @@ func (g Gateway) succeed(outbox store.DeliveryOutbox, result store.DeliveryResul
 func (g Gateway) markUncertain(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
-	err := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), g.now())
+	now := g.now()
+	if retryAfter := retryAt(cause); retryAfter.After(now) {
+		err := g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), true, retryAfter, now)
+		if err != nil {
+			return errors.Join(err, g.requeueClaim(outbox, cause, true))
+		}
+		return nil
+	}
+	err := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), now)
 	if err != nil {
 		return errors.Join(err, g.requeueClaim(outbox, cause, true))
 	}
@@ -424,7 +443,13 @@ func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
 func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
-	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), g.now())
+	now := g.now()
+	var err error
+	if retryAfter := retryAt(cause); retryAfter.After(now) {
+		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), false, retryAfter, now)
+	} else {
+		err = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), now)
+	}
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
@@ -453,4 +478,12 @@ func isCredentialRejection(err error) bool {
 	}
 	var failure authenticationFailure
 	return errors.As(err, &failure) && failure.AuthenticationFailure()
+}
+
+func retryAt(err error) time.Time {
+	var failure retryAtFailure
+	if errors.As(err, &failure) {
+		return failure.RetryAtTime()
+	}
+	return time.Time{}
 }

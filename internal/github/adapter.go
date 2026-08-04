@@ -152,7 +152,11 @@ func (e *apiError) Error() string {
 }
 
 func (e *apiError) AuthenticationFailure() bool {
-	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+	return e.StatusCode == http.StatusUnauthorized || (e.StatusCode == http.StatusForbidden && e.RetryAt.IsZero())
+}
+
+func (e *apiError) RetryAtTime() time.Time {
+	return e.RetryAt
 }
 
 type APIError = apiError

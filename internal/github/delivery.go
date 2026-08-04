@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -40,13 +41,19 @@ func (r *DeliveryRemote) CredentialAvailable(ctx context.Context) error {
 		return nil
 	}
 	token, err := r.CredentialSource(ctx)
-	if err != nil || strings.TrimSpace(token) == "" {
+	if err != nil {
+		if errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+			return delivery.ErrGatewayCredentialRejected
+		}
+		return fmt.Errorf("load Gateway Credential: %w", err)
+	}
+	if strings.TrimSpace(token) == "" {
 		return delivery.ErrGatewayCredentialRejected
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.Client == nil {
-		return delivery.ErrGatewayCredentialRejected
+		return errors.New("GitHub client is missing")
 	}
 	r.Token = token
 	r.Client = NewClient(r.Client.BaseURL, token, r.Client.HTTP).WithRepositoryOwner(r.Client.RepositoryOwner)
