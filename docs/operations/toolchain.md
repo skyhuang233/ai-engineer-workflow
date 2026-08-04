@@ -76,8 +76,8 @@ must be the sole asset for that exact source-keyed Worker release and must be pu
 `publish-worker` push workflow after an unambiguous non-bot merge by the
 configured owner. A successful complete run atomically makes that digest the
 Active Worker Image for new Worker Runs; existing runs remain pinned to their
-recorded image. The report must be reviewed before the production baseline is
-approved.
+recorded image. After a production activation, save the redacted doctor report
+and record its result in Issue #7.
 
 ## Upgrade rule
 

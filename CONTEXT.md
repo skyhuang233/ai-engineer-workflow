@@ -61,7 +61,7 @@ A numbered, bounded execution episode in which the Ticket Agent actively works o
 _Avoid_: Ticket Agent, agent session, Docker task
 
 **Worker Image Release（Worker 镜像发布）**:
-An approved, content-addressed version of the workflow platform's execution environment, published only from an owner-accepted commit on `main` when the Worker toolchain changes and consumed by later Worker Runs.
+An approved, source-keyed immutable version of the workflow platform's execution environment, published only from an owner-accepted commit on `main` when the Worker toolchain changes and consumed by later Worker Runs.
 _Avoid_: Executable Ticket delivery, Candidate Revision, application deployment
 
 **Active Worker Image（生效 Worker 镜像）**:
@@ -69,7 +69,7 @@ The latest Worker Image Release from an owner-accepted `main` commit that passed
 _Avoid_: Published image, candidate image, mutable latest tag
 
 **Worker Release Manifest（Worker 发布清单）**:
-The machine-readable GitHub Worker Release record that binds an accepted source commit and pinned toolchain to the exact published GHCR digest for cross-host recovery and verification.
+The machine-readable, sole GitHub Release asset that binds an accepted source commit, build-input identity, and pinned toolchain to the exact published GHCR digest for cross-host recovery and verification.
 _Avoid_: Toolchain source config, local Docker metadata, Active Worker Image state
 
 **Run Lease（运行租约）**:
