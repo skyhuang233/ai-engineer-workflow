@@ -30,13 +30,50 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	if err != nil || item.State != "open" || !item.CreatedAt.Equal(first) {
 		t.Fatalf("inbox item = %#v, %v", item, err)
 	}
-	if err := db.ResumeGatewayWrites(ctx, first.Add(2*time.Minute)); err != nil {
+	rotation, err := db.BeginGatewayCredentialRotation(ctx, "rotation-a", "credential rotation", first.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, rotation, first.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	paused, _, err = db.GatewayWritesPaused(ctx)
 	item, itemErr := db.WorkflowInboxItem(ctx, GatewayCredentialInboxKey)
 	if err != nil || itemErr != nil || paused || item.State != "resolved" {
 		t.Fatalf("resumed pause=%t item=%#v errors=%v/%v", paused, item, err, itemErr)
+	}
+}
+
+func TestGatewayCredentialRotationRequiresLiveOwnerToResume(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	first, err := db.BeginGatewayCredentialRotation(ctx, "rotation-a", "credential rotation", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BeginGatewayCredentialRotation(ctx, "rotation-b", "credential rotation", now.Add(time.Minute)); !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("concurrent rotation error = %v", err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, GatewayCredentialRotation{Owner: "rotation-b", Generation: first.Generation}, now.Add(time.Minute)); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("foreign resume error = %v", err)
+	}
+	second, err := db.BeginGatewayCredentialRotation(ctx, "rotation-b", "credential rotation", now.Add(6*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Generation != first.Generation+1 {
+		t.Fatalf("generation = %d, want %d", second.Generation, first.Generation+1)
+	}
+	if err := db.ResumeGatewayWrites(ctx, first, now.Add(6*time.Minute)); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("stale resume error = %v", err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, second, now.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -114,5 +151,38 @@ func TestPausedGatewayRecoversStaleControlPlaneClaimOnlyAfterDispatcherExpires(t
 	}
 	if outbox.State != OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
 		t.Fatalf("recovered stale outbox = %#v", outbox)
+	}
+}
+
+func TestGatewayDispatcherRenewalRetainsControlPlaneClaim(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/repository"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RenewGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PauseGatewayWrites(ctx, "credential rotation", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecoverExpiredGatewayDeliveryClaims(ctx, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != OutboxProcessing {
+		t.Fatalf("renewed control-plane outbox = %#v", outbox)
 	}
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -188,21 +190,45 @@ func credentialCommand() {
 		exitError(err)
 	}
 	defer database.Close()
-	if err := database.PauseGatewayWrites(ctx, "Gateway Credential rotation is in progress", time.Now().UTC()); err != nil {
+	if err := provisionGatewayCredential(ctx, database, credentialStore, config, token); err != nil {
 		exitError(err)
 	}
+	fmt.Println("Gateway Credential stored in Windows Credential Manager and live write contract verified")
+}
+
+func provisionGatewayCredential(ctx context.Context, database *store.Store, credentialStore credential.Store, config doctor.Config, token string) (resultErr error) {
+	owner, err := credentialRotationOwner()
+	if err != nil {
+		return err
+	}
+	rotation, err := database.BeginGatewayCredentialRotation(ctx, owner, "Gateway Credential rotation is in progress", time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	resumed := false
+	defer func() {
+		if !resumed {
+			resultErr = errors.Join(resultErr, database.EndGatewayCredentialRotation(context.Background(), rotation, time.Now().UTC()))
+		}
+	}()
 	if err := database.RecoverExpiredGatewayDeliveryClaims(ctx, time.Now().UTC()); err != nil {
-		exitError(fmt.Errorf("recover expired Gateway delivery claims before credential rotation: %w", err))
+		return fmt.Errorf("recover expired Gateway delivery claims before credential rotation: %w", err)
 	}
 	if err := database.WaitForGatewayWritesQuiesced(ctx); err != nil {
-		exitError(fmt.Errorf("wait for Gateway writes to finish before credential rotation: %w", err))
+		return fmt.Errorf("wait for Gateway writes to finish before credential rotation: %w", err)
+	}
+	if err := database.RenewGatewayCredentialRotation(ctx, rotation, time.Now().UTC()); err != nil {
+		return err
 	}
 	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
-		exitError(fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err))
+		return fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err)
 	}
 	previousToken, previousErr := credentialStore.Get(context.Background(), credential.GatewayTarget)
 	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
-		exitError(fmt.Errorf("replace Gateway Credential; writes remain paused because replacement state is uncertain: %w", err))
+		return fmt.Errorf("replace Gateway Credential; writes remain paused because replacement state is uncertain: %w", err)
+	}
+	if err := database.RenewGatewayCredentialRotation(ctx, rotation, time.Now().UTC()); err != nil {
+		return err
 	}
 	if err := database.RecordGatewayCredentialVerification(ctx, store.GatewayCredentialVerification{
 		FingerprintSHA256:     credential.Fingerprint(token),
@@ -213,12 +239,21 @@ func credentialCommand() {
 		if previousErr == nil && previousToken != "" {
 			_ = credentialStore.Set(context.Background(), credential.GatewayTarget, previousToken)
 		}
-		exitError(fmt.Errorf("record verification; Gateway writes remain paused and the prior credential was restored when available: %w", err))
+		return fmt.Errorf("record verification; Gateway writes remain paused and the prior credential was restored when available: %w", err)
 	}
-	if err := database.ResumeGatewayWrites(ctx, time.Now().UTC()); err != nil {
-		exitError(err)
+	if err := database.ResumeGatewayWrites(ctx, rotation, time.Now().UTC()); err != nil {
+		return err
 	}
-	fmt.Println("Gateway Credential stored in Windows Credential Manager and live write contract verified")
+	resumed = true
+	return nil
+}
+
+func credentialRotationOwner() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return "credential-rotation-" + hex.EncodeToString(bytes), nil
 }
 
 func exitError(err error) {
@@ -369,6 +404,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 
 func runReconcileDelivered(args []string) {
 	flags := flag.NewFlagSet("reconcile-delivered", flag.ExitOnError)
+	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
@@ -379,11 +415,15 @@ func runReconcileDelivered(args []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	config, err := doctor.LoadConfig(*configPath)
+	if err != nil {
+		fail(err)
+	}
 	token, err := gatewayCredential(ctx)
 	if err != nil {
 		fail(err)
 	}
-	client := github.NewClient(*githubURL, token, nil)
+	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
 		fail(err)
 	}
@@ -479,12 +519,12 @@ func runPollGitHub(args []string) {
 		if err != nil {
 			return err
 		}
-		client := github.NewClient(*githubURL, token, nil)
+		client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
 			return err
 		}
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
-		poller := github.Poller{Store: db, Client: client.WithRepositoryOwner(config.GitHub.Credential.Owner), LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+		poller := github.Poller{Store: db, Client: client, LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {

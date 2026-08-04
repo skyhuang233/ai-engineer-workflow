@@ -10,6 +10,13 @@ import (
 const GatewayCredentialInboxKey = "gateway-credential"
 
 const gatewayDispatcherLeaseTTL = 2 * time.Minute
+const gatewayCredentialRotationLeaseTTL = 5 * time.Minute
+
+type GatewayCredentialRotation struct {
+	Owner      string
+	Generation int64
+	ExpiresAt  time.Time
+}
 
 type WorkflowInboxItem struct {
 	Key       string
@@ -44,7 +51,95 @@ ON CONFLICT(item_key) DO UPDATE SET body=excluded.body, state='open', updated_at
 	return tx.Commit()
 }
 
-func (s *Store) ResumeGatewayWrites(ctx context.Context, now time.Time) error {
+func (s *Store) BeginGatewayCredentialRotation(ctx context.Context, owner, reason string, now time.Time) (GatewayCredentialRotation, error) {
+	if owner == "" || reason == "" {
+		return GatewayCredentialRotation{}, errors.New("Gateway Credential rotation owner and reason are required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	defer tx.Rollback()
+	var activeOwner, expiresText string
+	var generation int64
+	if err := tx.QueryRowContext(ctx, `SELECT rotation_owner, rotation_generation, rotation_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeOwner, &generation, &expiresText); err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	if activeOwner != "" && expiresText != "" {
+		expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+		if parseErr != nil {
+			return GatewayCredentialRotation{}, parseErr
+		}
+		if expiresAt.After(now) {
+			return GatewayCredentialRotation{}, ErrDeliveryInProgress
+		}
+	}
+	generation++
+	expiresAt := now.Add(gatewayCredentialRotationLeaseTTL)
+	timestamp := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 1, reason = ?, rotation_owner = ?, rotation_generation = ?, rotation_expires_at = ?, updated_at = ? WHERE singleton = 1`, reason, owner, generation, formatTimestamp(expiresAt), timestamp); err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_inbox(item_key, kind, title, body, state, created_at, updated_at)
+VALUES (?, 'credential', 'Gateway Credential requires attention', ?, 'open', ?, ?)
+ON CONFLICT(item_key) DO UPDATE SET body=excluded.body, state='open', updated_at=excluded.updated_at`, GatewayCredentialInboxKey, reason, timestamp, timestamp); err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GatewayCredentialRotation{}, err
+	}
+	return GatewayCredentialRotation{Owner: owner, Generation: generation, ExpiresAt: expiresAt}, nil
+}
+
+func (s *Store) RenewGatewayCredentialRotation(ctx context.Context, rotation GatewayCredentialRotation, now time.Time) error {
+	if rotation.Owner == "" || rotation.Generation <= 0 {
+		return ErrFencingConflict
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE gateway_runtime SET rotation_expires_at = ?, updated_at = ? WHERE singleton = 1 AND rotation_owner = ? AND rotation_generation = ? AND rotation_expires_at > ?`, formatTimestamp(now.Add(gatewayCredentialRotationLeaseTTL)), formatTimestamp(now), rotation.Owner, rotation.Generation, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrFencingConflict
+	}
+	return nil
+}
+
+func (s *Store) EndGatewayCredentialRotation(ctx context.Context, rotation GatewayCredentialRotation, now time.Time) error {
+	if rotation.Owner == "" || rotation.Generation <= 0 {
+		return ErrFencingConflict
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE gateway_runtime SET rotation_owner = '', rotation_expires_at = '', updated_at = ? WHERE singleton = 1 AND rotation_owner = ? AND rotation_generation = ?`, formatTimestamp(now), rotation.Owner, rotation.Generation)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrFencingConflict
+	}
+	return nil
+}
+
+func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredentialRotation, now time.Time) error {
+	if rotation.Owner == "" || rotation.Generation <= 0 {
+		return ErrFencingConflict
+	}
 	now = now.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -52,8 +147,12 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, now time.Time) error {
 	}
 	defer tx.Rollback()
 	timestamp := now.Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 0, reason = '', updated_at = ? WHERE singleton = 1`, timestamp); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 0, reason = '', rotation_owner = '', rotation_expires_at = '', updated_at = ? WHERE singleton = 1 AND rotation_owner = ? AND rotation_generation = ? AND rotation_expires_at > ?`, timestamp, rotation.Owner, rotation.Generation, timestamp)
+	if err != nil {
 		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrFencingConflict
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE workflow_inbox SET state = 'resolved', updated_at = ? WHERE item_key = ?`, timestamp, GatewayCredentialInboxKey); err != nil {
 		return err
@@ -130,6 +229,25 @@ func (s *Store) EnsureGatewayDispatcher(ctx context.Context, dispatcherToken str
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) RenewGatewayDispatcher(ctx context.Context, dispatcherToken string, now time.Time) error {
+	if dispatcherToken == "" {
+		return errors.New("Gateway dispatcher token is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE gateway_runtime SET dispatcher_expires_at = ?, updated_at = ? WHERE singleton = 1 AND dispatcher_token = ? AND dispatcher_expires_at > ?`, formatTimestamp(now.Add(gatewayDispatcherLeaseTTL)), formatTimestamp(now), dispatcherToken, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return ErrFencingConflict
+	}
+	return nil
 }
 
 func (s *Store) RecoverExpiredGatewayDeliveryClaims(ctx context.Context, now time.Time) error {

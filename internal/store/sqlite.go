@@ -790,6 +790,31 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 			return err
 		}
 	}
+	if applied < 30 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "gateway_runtime", name: "rotation_owner", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "gateway_runtime", name: "rotation_generation", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{table: "gateway_runtime", name: "rotation_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 30: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 30: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (30, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

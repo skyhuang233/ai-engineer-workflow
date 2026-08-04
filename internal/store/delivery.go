@@ -621,10 +621,17 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	}
 	defer tx.Rollback()
 	var attempts int
-	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT attempts, request_json FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&attempts, &raw); errors.Is(err, sql.ErrNoRows) {
+	var raw, dispatcherToken string
+	if err := tx.QueryRowContext(ctx, `SELECT attempts, request_json, dispatcher_token FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&attempts, &raw, &dispatcherToken); errors.Is(err, sql.ErrNoRows) {
 		return ErrFencingConflict
 	} else if err != nil {
+		return err
+	}
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return err
+	}
+	if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
 		return err
 	}
 	completed := ""
@@ -632,10 +639,6 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
 		if state == OutboxRejected {
-			var request DeliveryRequest
-			if err := json.Unmarshal([]byte(raw), &request); err != nil {
-				return err
-			}
 			if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
 				if err := markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 					return err
@@ -646,10 +649,6 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
-		var request DeliveryRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			return err
-		}
 		if err := markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 			return err
 		}
@@ -681,14 +680,17 @@ func (s *Store) CompleteDeliveryOutbox(ctx context.Context, key, claimToken stri
 		return err
 	}
 	defer tx.Rollback()
-	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT request_json FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&raw); errors.Is(err, sql.ErrNoRows) {
+	var raw, dispatcherToken string
+	if err := tx.QueryRowContext(ctx, `SELECT request_json, dispatcher_token FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&raw, &dispatcherToken); errors.Is(err, sql.ErrNoRows) {
 		return ErrFencingConflict
 	} else if err != nil {
 		return err
 	}
 	var request DeliveryRequest
 	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return err
+	}
+	if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
 		return err
 	}
 	if deliveryResult.PullRequestNumber != 0 && request.Operation == DeliveryUpsertPR {
@@ -710,6 +712,30 @@ AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryRe
 		return ErrFencingConflict
 	}
 	return tx.Commit()
+}
+
+func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, dispatcherToken string, now time.Time) error {
+	if request.RunID != "" {
+		return nil
+	}
+	if dispatcherToken == "" {
+		return ErrFencingConflict
+	}
+	var activeToken, expiresText string
+	if err := tx.QueryRowContext(ctx, `SELECT dispatcher_token, dispatcher_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeToken, &expiresText); err != nil {
+		return err
+	}
+	if activeToken != dispatcherToken || expiresText == "" {
+		return ErrFencingConflict
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(now) {
+		return ErrFencingConflict
+	}
+	return nil
 }
 
 func markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, reason string, now time.Time) error {

@@ -19,6 +19,8 @@ var (
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
 )
 
+const controlPlaneRemoteTimeout = time.Minute
+
 type authenticationFailure interface {
 	AuthenticationFailure() bool
 }
@@ -112,15 +114,21 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if outbox.State == store.OutboxRejected {
 		return fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError)
 	}
+	operationCtx, stopDispatcher, err := g.controlPlaneDispatchContext(ctx, outbox, dispatcherToken)
+	if err != nil {
+		return err
+	}
 	if remote, ok := g.Remote.(credentialAwareRemote); ok {
-		if err := remote.CredentialAvailable(ctx); err != nil {
+		if err := g.credentialAvailable(operationCtx, outbox.Request, remote); err != nil {
+			_ = stopDispatcher()
 			return g.pauseForCredential(ctx, outbox, err)
 		}
 	}
 	if outbox.ReconcileOnly {
-		return g.reconcileOnly(ctx, outbox)
+		err := g.reconcileOnly(operationCtx, outbox)
+		return errors.Join(err, stopDispatcher())
 	}
-	result, err := g.Store.ExecuteDelivery(ctx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
 		if request.Operation == store.DeliveryProjectPlan {
 			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
 			if projectionErr != nil {
@@ -142,7 +150,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				})
 			}
 		}
-		observation, observeErr := g.Remote.Observe(operationCtx, request)
+		observation, observeErr := g.observe(operationCtx, request)
 		if observeErr != nil {
 			return store.DeliveryResult{}, observeErr
 		}
@@ -155,9 +163,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
 			return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
 		}
-		observation, applyErr := g.Remote.Apply(operationCtx, request)
+		observation, applyErr := g.apply(operationCtx, request)
 		if applyErr != nil {
-			observed, observeErr := g.Remote.Observe(operationCtx, request)
+			observed, observeErr := g.observe(operationCtx, request)
 			if observeErr == nil && observed.Applied {
 				observation = observed
 				applyErr = nil
@@ -170,6 +178,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 	})
+	if leaseErr := stopDispatcher(); leaseErr != nil {
+		return errors.Join(err, leaseErr)
+	}
 	if err != nil {
 		if isCredentialRejection(err) {
 			return g.pauseForCredential(ctx, outbox, err)
@@ -228,9 +239,7 @@ func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
 }
 
 func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox) error {
-	operationCtx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	observation, err := g.Remote.Observe(operationCtx, outbox.Request)
+	observation, err := g.observe(ctx, outbox.Request)
 	if err != nil {
 		if isCredentialRejection(err) {
 			return g.pauseForCredential(ctx, outbox, err)
@@ -244,6 +253,69 @@ func (g Gateway) reconcileOnly(ctx context.Context, outbox store.DeliveryOutbox)
 		return g.succeed(ctx, outbox, resultFrom(observation))
 	}
 	return g.reject(ctx, outbox, fmt.Errorf("%w: uncertain delivery was not observed", store.ErrDeliveryRejected))
+}
+
+func (g Gateway) controlPlaneDispatchContext(ctx context.Context, outbox store.DeliveryOutbox, dispatcherToken string) (context.Context, func() error, error) {
+	if outbox.Request.RunID != "" {
+		return ctx, func() error { return nil }, nil
+	}
+	if err := g.Store.RenewGatewayDispatcher(ctx, dispatcherToken, g.now()); err != nil {
+		return nil, nil, err
+	}
+	operationCtx, cancel := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var renewalErr error
+	go func() {
+		ticker := time.NewTicker(controlPlaneRemoteTimeout / 3)
+		defer ticker.Stop()
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-operationCtx.Done():
+				return
+			case <-ticker.C:
+				if err := g.Store.RenewGatewayDispatcher(context.Background(), dispatcherToken, g.now()); err != nil {
+					renewalErr = err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return operationCtx, func() error {
+		close(stop)
+		cancel()
+		<-done
+		return renewalErr
+	}, nil
+}
+
+func (g Gateway) credentialAvailable(ctx context.Context, request store.DeliveryRequest, remote credentialAwareRemote) error {
+	operationCtx, cancel := g.remoteContext(ctx, request)
+	defer cancel()
+	return remote.CredentialAvailable(operationCtx)
+}
+
+func (g Gateway) observe(ctx context.Context, request store.DeliveryRequest) (Observation, error) {
+	operationCtx, cancel := g.remoteContext(ctx, request)
+	defer cancel()
+	return g.Remote.Observe(operationCtx, request)
+}
+
+func (g Gateway) apply(ctx context.Context, request store.DeliveryRequest) (Observation, error) {
+	operationCtx, cancel := g.remoteContext(ctx, request)
+	defer cancel()
+	return g.Remote.Apply(operationCtx, request)
+}
+
+func (g Gateway) remoteContext(ctx context.Context, request store.DeliveryRequest) (context.Context, context.CancelFunc) {
+	if request.RunID != "" {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, controlPlaneRemoteTimeout)
 }
 
 func resultFrom(observation Observation) store.DeliveryResult {

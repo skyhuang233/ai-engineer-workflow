@@ -83,9 +83,10 @@ func (c *Client) pullRequestReachedMain(ctx context.Context, repository string, 
 
 func (c *Client) pullRequestDeliveryState(ctx context.Context, repository string, number int64, candidateCommit string) (pullRequestState, error) {
 	var pull struct {
-		State          string `json:"state"`
-		MergedAt       string `json:"merged_at"`
-		MergeCommitSHA string `json:"merge_commit_sha"`
+		State          string       `json:"state"`
+		MergedAt       string       `json:"merged_at"`
+		MergeCommitSHA string       `json:"merge_commit_sha"`
+		MergedBy       userResponse `json:"merged_by"`
 		Base           struct {
 			Ref string `json:"ref"`
 		} `json:"base"`
@@ -98,6 +99,9 @@ func (c *Client) pullRequestDeliveryState(ctx context.Context, repository string
 	}
 	if pull.MergedAt == "" {
 		return pullRequestClosedUnmerged, nil
+	}
+	if !actionableAuthor(c.RepositoryOwner, pull.MergedBy.Login, pull.MergedBy.Type) {
+		return pullRequestPending, nil
 	}
 	if pull.MergeCommitSHA == "" || pull.Base.Ref != "main" || candidateCommit == "" {
 		return pullRequestPending, nil
