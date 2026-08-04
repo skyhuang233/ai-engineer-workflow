@@ -228,7 +228,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	var workflows struct {
 		Workflows []struct {
 			ID   int64  `json:"id"`
-			Name string `json:"name"`
+			Path string `json:"path"`
 		} `json:"workflows"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository+"/actions/workflows", &workflows); err != nil {
@@ -236,12 +236,13 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	var workflowID int64
 	for _, workflow := range workflows.Workflows {
-		if workflow.Name == c.GitHub.RequiredCheck {
+		if workflow.Path == c.GitHub.WorkflowPath {
 			workflowID = workflow.ID
+			break
 		}
 	}
 	if workflowID == 0 {
-		return Result{Status: Fail, Summary: "integration workflow is missing"}
+		return Result{Status: Fail, Summary: "integration workflow at the configured path is missing"}
 	}
 	var runs struct {
 		WorkflowRuns []struct {

@@ -107,26 +107,26 @@ func TestReadPlanDoesNotDeriveDeliveredFromPullRequestBody(t *testing.T) {
 	}
 }
 
-func TestActionablePullRequestFeedbackIncludesHumanEventsOnly(t *testing.T) {
+func TestActionablePullRequestFeedbackIncludesOwnerEventsOnly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/owner/repo/pulls/7/reviews":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "Please change this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 2, "body": "bot message", "state": "COMMENTED", "user": map[string]string{"login": "ci[bot]", "type": "Bot"}}, {"id": 6, "body": "", "state": "APPROVED", "user": map[string]string{"login": "approver", "type": "User"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "Please change this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "bot message", "state": "COMMENTED", "user": map[string]string{"login": "ci[bot]", "type": "Bot"}}, {"id": 6, "body": "", "state": "APPROVED", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 7, "body": "foreign review", "state": "COMMENTED", "user": map[string]string{"login": "reviewer", "type": "User"}}})
 		case "/repos/owner/repo/pulls/7/comments":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 3, "body": "Inline concern.", "user": map[string]string{"login": "reviewer", "type": "User"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 3, "body": "Inline concern.", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 8, "body": "foreign inline concern", "user": map[string]string{"login": "reviewer", "type": "User"}}})
 		case "/repos/owner/repo/issues/7/comments":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 4, "body": "Conversation concern.", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 5, "body": "<!-- workflow-idempotency:x -->", "user": map[string]string{"login": "workflow", "type": "User"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 4, "body": "Conversation concern.", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 5, "body": "<!-- workflow-idempotency:x -->", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 9, "body": "foreign conversation concern", "user": map[string]string{"login": "reviewer", "type": "User"}}})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	events, err := NewClient(server.URL, "", server.Client()).ActionablePullRequestFeedback(context.Background(), "owner/repo", 7)
+	events, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ActionablePullRequestFeedback(context.Background(), "owner/repo", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 4 || events[0].Source != "review" || events[1].Source != "review" || events[1].Author != "approver" || events[1].Body != "Review submitted with state: APPROVED" || events[2].Source != "inline-comment" || events[3].Source != "conversation-comment" {
+	if len(events) != 4 || events[0].Source != "review" || events[1].Source != "review" || events[1].Author != "owner" || events[1].Body != "Review submitted with state: APPROVED" || events[2].Source != "inline-comment" || events[3].Source != "conversation-comment" {
 		t.Fatalf("events = %#v", events)
 	}
 }
@@ -314,13 +314,13 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored"}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "workflow-answer:needs-attention-pv-1-1-g1: cancel-plan", "user": map[string]string{"login": "reviewer", "type": "User"}}})
 		default:
 			t.Fatalf("request = %s %s", r.Method, r.URL.String())
 		}
 	}))
 	defer server.Close()
-	answers, err := NewClient(server.URL, "", server.Client()).WorkflowInboxAnswers(context.Background(), "owner/repo", []string{"needs-attention-pv-1-1-g1"})
+	answers, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").WorkflowInboxAnswers(context.Background(), "owner/repo", []string{"needs-attention-pv-1-1-g1"})
 	if err != nil {
 		t.Fatal(err)
 	}

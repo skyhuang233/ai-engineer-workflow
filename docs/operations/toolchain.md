@@ -9,9 +9,9 @@
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its `worker-release.json` GitHub Release asset.
-- The dedicated GitHub integration repository and its required workflow are
-  explicit and public. Branch protection is not a prerequisite: the repository
-  owner retains merge authority.
+- The dedicated GitHub integration repository and its required workflow path
+  are explicit and public. Branch protection is not a prerequisite: the
+  repository owner retains merge authority.
 - The Gateway uses one fine-grained PAT for all owner repositories with exactly
   metadata/actions read and contents/issues/pull-requests write. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite

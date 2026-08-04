@@ -18,9 +18,10 @@ import (
 const apiVersion = "2022-11-28"
 
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
+	BaseURL         string
+	Token           string
+	HTTP            *http.Client
+	RepositoryOwner string
 }
 
 type PullRequestFeedback struct {
@@ -66,7 +67,7 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableReview(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
+			if value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
 				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
 			}
 		}
@@ -91,7 +92,7 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 				return nil, err
 			}
 			for _, value := range comments {
-				if actionableComment(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
+				if actionableComment(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
 					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
 				}
 			}
@@ -111,19 +112,19 @@ func changedSince(value string, since time.Time) bool {
 	return err != nil || !parsed.Before(since)
 }
 
-func actionableReview(login, accountType, body string) bool {
-	return actionableAuthor(login, accountType) && !strings.Contains(body, "<!-- workflow-idempotency:")
+func actionableReview(owner, login, accountType, body string) bool {
+	return actionableAuthor(owner, login, accountType) && !strings.Contains(body, "<!-- workflow-idempotency:")
 }
 
-func actionableComment(login, accountType, body string) bool {
-	return strings.TrimSpace(body) != "" && actionableReview(login, accountType, body)
+func actionableComment(owner, login, accountType, body string) bool {
+	return strings.TrimSpace(body) != "" && actionableReview(owner, login, accountType, body)
 }
 
-func actionableAuthor(login, accountType string) bool {
+func actionableAuthor(owner, login, accountType string) bool {
 	if strings.EqualFold(accountType, "bot") || strings.HasSuffix(strings.ToLower(login), "[bot]") {
 		return false
 	}
-	return true
+	return strings.TrimSpace(owner) != "" && strings.EqualFold(strings.TrimSpace(login), strings.TrimSpace(owner))
 }
 
 func reviewFeedbackBody(state, body string) string {
@@ -166,6 +167,12 @@ func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
 }
 
+func (c *Client) WithRepositoryOwner(owner string) *Client {
+	configured := *c
+	configured.RepositoryOwner = strings.TrimSpace(owner)
+	return &configured
+}
+
 const workflowInboxLabel = "workflow:inbox"
 
 func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, questionIDs []string) (map[string]string, error) {
@@ -192,7 +199,7 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 	}
 	answers := make(map[string]string)
 	for _, comment := range comments {
-		if !actionableAuthor(comment.User.Login, comment.User.Type) {
+		if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
 			continue
 		}
 		for questionID, answer := range parseWorkflowInboxAnswers(comment.Body) {

@@ -51,6 +51,7 @@ type GitHubPin struct {
 	TestRepository string              `json:"test_repository"`
 	DefaultBranch  string              `json:"default_branch"`
 	RequiredCheck  string              `json:"required_check"`
+	WorkflowPath   string              `json:"workflow_path"`
 	Credential     GitHubCredentialPin `json:"credential"`
 }
 
@@ -76,11 +77,12 @@ type Config struct {
 }
 
 var (
-	shaPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	sha256Pattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	imagePattern   = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
-	repoPattern    = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	versionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	shaPattern      = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	imagePattern    = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+	repoPattern     = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	versionPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	workflowPattern = regexp.MustCompile(`^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$`)
 )
 
 func LoadConfig(path string) (Config, error) {
@@ -132,6 +134,8 @@ func (c Config) Validate() error {
 		return errors.New("GitHub default branch is required")
 	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
 		return errors.New("GitHub required check is required")
+	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
+		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
 	case c.GitHub.Credential.Kind != "fine-grained-pat":
 		return errors.New("Gateway Credential must be a fine-grained PAT")
 	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":

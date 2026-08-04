@@ -256,7 +256,7 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	client := github.NewClient(*githubURL, token, nil)
+	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
 	if err != nil {
 		fail(err)
@@ -460,7 +460,7 @@ func runPollGitHub(args []string) {
 		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
 		return controller.RetryDelivery(ctx, claim)
 	}
-	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, token, nil), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+	poller := github.Poller{Store: db, Client: github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner), LaunchReview: launcher, InboxProjector: delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 	var lastPollResult github.PollResult
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

@@ -23,6 +23,7 @@
     "test_repository": "skyhuang233/workflow-integration-test",
     "default_branch": "main",
     "required_check": "workflow-contract",
+    "workflow_path": ".github/workflows/workflow-contract.yml",
     "credential": {
       "kind": "fine-grained-pat",
       "owner": "skyhuang233",

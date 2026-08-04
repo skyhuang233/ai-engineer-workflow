@@ -28,6 +28,7 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
 		{"integration repository", func(c *Config) { c.GitHub.TestRepository = "" }},
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
+		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
 		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
 	}
 	for _, tt := range tests {
@@ -154,6 +155,7 @@ func validConfig() Config {
 			TestRepository: "skyhuang233/workflow-integration-test",
 			DefaultBranch:  "main",
 			RequiredCheck:  "workflow-contract",
+			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
 				Kind:            "fine-grained-pat",
 				Owner:           "skyhuang233",
