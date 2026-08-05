@@ -37,3 +37,24 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 		t.Fatal("publisher workflow does not pass the complete no-mistakes commit to the Worker build")
 	}
 }
+
+func TestPublishWorkflowLoadsFullPullBeforeOwnerAdmission(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	workflow, err := os.ReadFile(filepath.Join(filepath.Dir(file), "..", "..", ".github", "workflows", "publish-worker.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(workflow)
+	if !strings.Contains(text, `gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}"`) {
+		t.Fatal("publisher workflow does not load the full pull request before checking merged_by")
+	}
+	if !strings.Contains(text, `test -n "$pull_number"`) {
+		t.Fatal("publisher workflow does not fail closed when the merge commit lacks one unambiguous pull request")
+	}
+	if !strings.Contains(text, `((.merged_by.type? // "") | ascii_downcase) == "user"`) {
+		t.Fatal("publisher workflow does not require a non-bot user from the full pull request")
+	}
+}

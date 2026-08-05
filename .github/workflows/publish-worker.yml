@@ -31,16 +31,25 @@ jobs:
         run: |
           owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0)' config/toolchain.json)"
           pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
-          matches="$(jq --arg owner "$owner" --arg source_commit "$GITHUB_SHA" '
+          pull_number="$(jq --raw-output --arg source_commit "$GITHUB_SHA" '
             [.[] | select(
               (.merged_at != null) and
               (.merge_commit_sha == $source_commit) and
-              (.base.ref == "main") and
-              ((.merged_by.login | ascii_downcase) == ($owner | ascii_downcase)) and
-              ((.merged_by.type | ascii_downcase) != "bot") and
-              ((.merged_by.login | ascii_downcase | endswith("[bot]") | not))
-            )] | length' <<<"$pulls")"
-          test "$matches" = 1 || {
+              (.base.ref == "main")
+            )] | if length == 1 then .[0].number else empty end' <<<"$pulls")"
+          test -n "$pull_number" || {
+            echo "Refusing to publish: main commit lacks an unambiguous non-bot owner merge" >&2
+            exit 1
+          }
+          pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}")"
+          jq --exit-status --arg owner "$owner" --arg source_commit "$GITHUB_SHA" '
+            (.merged_at != null) and
+            (.merge_commit_sha == $source_commit) and
+            (.base.ref == "main") and
+            (((.merged_by.login? // "") | ascii_downcase) == ($owner | ascii_downcase)) and
+            (((.merged_by.type? // "") | ascii_downcase) == "user") and
+            (((.merged_by.login? // "") | ascii_downcase | endswith("[bot]") | not))
+          ' <<<"$pull" > /dev/null || {
             echo "Refusing to publish: main commit lacks an unambiguous non-bot owner merge" >&2
             exit 1
           }
