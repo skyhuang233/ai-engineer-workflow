@@ -33,6 +33,11 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 		!strings.Contains(string(workflow), "test \"$configured_owner\" = \"${GITHUB_REPOSITORY_OWNER,,}\"") {
 		t.Fatal("publisher workflow does not enforce an owner-controlled same-repository release boundary")
 	}
+	if !strings.Contains(string(workflow), `gh api "repos/${GITHUB_REPOSITORY}"`) ||
+		!strings.Contains(string(workflow), `(.full_name | ascii_downcase) == ($worker_release_repository | ascii_downcase)`) ||
+		!strings.Contains(string(workflow), `(.owner.login | ascii_downcase) == $configured_owner`) {
+		t.Fatal("publisher workflow does not admit GitHub canonical Worker Release repository identity")
+	}
 	if strings.Contains(string(workflow), ".private == false") || strings.Contains(string(workflow), "must be public") {
 		t.Fatal("publisher workflow rejects an owner-controlled private release repository")
 	}
@@ -75,7 +80,12 @@ func TestIntegrationWorkflowAdmitsOwnerGuardedPrivateRepository(t *testing.T) {
 	if strings.Contains(text, ".private == false") || strings.Contains(text, "public Owner-Guarded") {
 		t.Fatal("integration workflow rejects an owner-controlled private repository")
 	}
-	if !strings.Contains(text, `.full_name == env.GITHUB_REPOSITORY`) || !strings.Contains(text, `.owner.login | ascii_downcase`) || !strings.Contains(text, `(.default_branch | length > 0)`) {
+	if !strings.Contains(text, `CONFIGURED_INTEGRATION_REPOSITORY: ${{ vars.WORKFLOW_INTEGRATION_REPOSITORY }}`) ||
+		!strings.Contains(text, `CONFIGURED_GATEWAY_CREDENTIAL_OWNER: ${{ vars.WORKFLOW_GATEWAY_CREDENTIAL_OWNER }}`) ||
+		!strings.Contains(text, `test "$configured_repository" = "${GITHUB_REPOSITORY,,}"`) ||
+		!strings.Contains(text, `(.full_name | ascii_downcase) == $configured_repository`) ||
+		!strings.Contains(text, `(.owner.login | ascii_downcase) == $configured_owner`) ||
+		!strings.Contains(text, `(.default_branch | length > 0)`) {
 		t.Fatal("integration workflow does not verify its owner-controlled repository identity")
 	}
 }

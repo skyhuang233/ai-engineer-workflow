@@ -15,6 +15,10 @@
   are explicit. The repository may be public or private, but its owner must
   match the configured Gateway Credential owner. Branch protection is not a
   prerequisite: that owner retains sole merge authority.
+- Set the integration repository's `WORKFLOW_INTEGRATION_REPOSITORY` and
+  `WORKFLOW_GATEWAY_CREDENTIAL_OWNER` Actions variables to those configured
+  values. Its contract workflow fails closed unless the variables, runner
+  repository, and canonical GitHub repository metadata all agree.
 - The Gateway uses one fine-grained PAT for all owner repositories with exactly
   metadata/actions read and contents/issues/pull-requests write. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite

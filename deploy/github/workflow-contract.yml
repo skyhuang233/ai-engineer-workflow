@@ -24,11 +24,22 @@ jobs:
       - name: Verify the Owner-Guarded repository contract
         env:
           GH_TOKEN: ${{ github.token }}
+          CONFIGURED_INTEGRATION_REPOSITORY: ${{ vars.WORKFLOW_INTEGRATION_REPOSITORY }}
+          CONFIGURED_GATEWAY_CREDENTIAL_OWNER: ${{ vars.WORKFLOW_GATEWAY_CREDENTIAL_OWNER }}
         run: |
           set -euo pipefail
+          configured_repository="${CONFIGURED_INTEGRATION_REPOSITORY,,}"
+          configured_owner="${CONFIGURED_GATEWAY_CREDENTIAL_OWNER,,}"
+          test -n "$configured_repository" && test -n "$configured_owner"
+          test "$configured_repository" = "${GITHUB_REPOSITORY,,}"
           repository="$(gh api "repos/${GITHUB_REPOSITORY}")"
           default_branch="$(jq -r '.default_branch' <<<"$repository")"
-          jq -e '.full_name == env.GITHUB_REPOSITORY and ((.owner.login | ascii_downcase) == (env.GITHUB_REPOSITORY_OWNER | ascii_downcase)) and (.default_branch | length > 0)' <<<"$repository" >/dev/null
+          jq --exit-status \
+            --arg configured_repository "$configured_repository" \
+            --arg configured_owner "$configured_owner" \
+            '((.full_name | ascii_downcase) == $configured_repository) and
+             ((.owner.login | ascii_downcase) == $configured_owner) and
+             (.default_branch | length > 0)' <<<"$repository" >/dev/null
           gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${default_branch}" --jq '.object.sha' | grep -Eq '^[0-9a-f]{40}$'
           gh api "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=1" >/dev/null
           gh api "repos/${GITHUB_REPOSITORY}/pulls?state=all&per_page=1" >/dev/null

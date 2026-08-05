@@ -69,6 +69,8 @@ jobs:
           echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Verify Worker Release repository boundary
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           worker_release_repository="$(jq --exit-status --raw-output '.worker.release_repository | select(type == "string" and length > 0)' config/toolchain.json)"
           configured_owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0) | ascii_downcase' config/toolchain.json)"
@@ -80,6 +82,16 @@ jobs:
             echo "Refusing to publish: Worker Release repository owner differs from the configured owner" >&2
             exit 1
           }
+          repository="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          jq --exit-status \
+            --arg worker_release_repository "$worker_release_repository" \
+            --arg configured_owner "$configured_owner" '
+              ((.full_name | ascii_downcase) == ($worker_release_repository | ascii_downcase)) and
+              ((.owner.login | ascii_downcase) == $configured_owner)
+            ' <<<"$repository" > /dev/null || {
+              echo "Refusing to publish: GitHub canonical Worker Release repository identity differs from the configured repository or owner" >&2
+              exit 1
+            }
       - name: Record Worker build input identity
         id: build-inputs
         shell: bash
