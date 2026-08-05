@@ -71,8 +71,8 @@ accepted `origin/main` revision:
 
 The entry point fetches `origin/main`, refuses dirty or unaccepted source,
 derives the current `owner/repository`, and requires exactly one open
-`workflow:plan` issue. It builds the accepted `workflow` binary into a temporary
-runtime and invokes one Go Control Plane process. That process generates an
+`workflow:plan` issue. It runs the accepted source through one Go Control Plane
+process. That process generates an
 ephemeral control-plane transport credential, embeds the credential-isolated
 Gateway and bounded reconciliation loop, and verifies authenticated readiness
 before scheduling. Bounded passes are paced at a one-minute default interval,
@@ -91,21 +91,23 @@ beside it under `workspaces` and `codex-state`. Operators may override these
 with `WORKFLOW_DATABASE`, `WORKFLOW_RUNTIME_ROOT`,
 `WORKFLOW_WORKSPACE_ROOT`, and `WORKFLOW_CODEX_STATE_ROOT`. Global concurrency
 defaults to one Worker Run and may be changed with
-`WORKFLOW_MAX_PARALLEL_RUNS`. `WORKFLOW_GITHUB_GATEWAY_COMMAND` is not a
-production setting: the legacy host-agent command adapter is intentionally not
-used because it cannot enforce Run Lease fencing. `WORKFLOW_GIT_BASH` may point
-the PowerShell wrapper at a nonstandard Git Bash installation.
+`WORKFLOW_MAX_PARALLEL_RUNS`; `WORKFLOW_WORKSPACE_RETENTION` controls closed
+Workspace retention. `WORKFLOW_CONFIG` overrides the toolchain baseline path.
+`WORKFLOW_GITHUB_GATEWAY_COMMAND` is not a production setting: the legacy
+host-agent command adapter is intentionally not used because it cannot enforce
+Run Lease fencing. `WORKFLOW_GIT_BASH` may point the PowerShell wrapper at a
+nonstandard Git Bash installation.
 
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,
 tests, documentation checks, lint, Gateway-backed push and pull-request
 updates, CI, and the review-driven revision cycle. `run-ticket` never
 dispatches GitHub mutations itself; it requires the credential-isolated Gateway
-URL and passes it only to the pinned controller. Run `workflow poll-github` as
-the persistent control-plane process; it records durable polling cursors,
-applies retry backoff, reconciles every active ticket pull request, and
-deduplicates newly observed reviews and comments before the owning Ticket
-Session is resumed. `--review-feedback` and `workflow answer-inbox` are
+URL and passes it only to the pinned controller. Within the Control Plane,
+`workflow poll-github` records durable polling cursors, applies retry backoff,
+reconciles every active ticket pull request, and deduplicates newly observed
+reviews and comments before the owning Ticket Session is resumed.
+`--review-feedback` and `workflow answer-inbox` are
 privileged local Control Plane operations: run them only on the trusted Control
 Plane host. `answer-inbox` forwards the resulting inbox projection through the
 Gateway control-plane credential; that transport credential is not the local
