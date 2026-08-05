@@ -3,9 +3,11 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -390,6 +392,26 @@ func TestAPIErrorDistinguishesRateLimitedForbiddenFromCredentialRejection(t *tes
 	}
 	if !(&apiError{StatusCode: http.StatusForbidden}).AuthenticationFailure() {
 		t.Fatal("unqualified forbidden response was not classified as credential rejection")
+	}
+}
+
+func TestRequestBytesPreservesRateLimitMetadata(t *testing.T) {
+	reset := time.Now().Add(time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset, 10))
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL, "token", nil).RequestBytes(context.Background(), "/asset", "application/octet-stream")
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("RequestBytes error = %v, want API error", err)
+	}
+	if apiErr.Message != `{"message":"API rate limit exceeded"}` || apiErr.RetryAt.IsZero() || apiErr.AuthenticationFailure() {
+		t.Fatalf("RequestBytes API error = %#v", apiErr)
 	}
 }
 

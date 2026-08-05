@@ -116,7 +116,7 @@ jobs:
               echo "Worker version already belongs to a different accepted commit" >&2
               exit 1
             }
-            asset_id="$(jq -r '[.assets[]? | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end' <<<"$release")"
+            asset_id="$(jq -r 'if (.assets | length) == 1 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
             test -n "$asset_id" || {
               echo "Existing Worker Release has no unambiguous release manifest" >&2
               exit 1

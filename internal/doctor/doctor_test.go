@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+type authenticationFailureError struct{}
+
+func (authenticationFailureError) Error() string               { return "authentication failed" }
+func (authenticationFailureError) AuthenticationFailure() bool { return true }
+
 func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 	config := validConfig()
 	if err := config.Validate(); err != nil {
@@ -68,6 +73,17 @@ func TestRunnerProducesDeterministicRedactedReport(t *testing.T) {
 	markdown := report.Markdown()
 	if strings.Contains(markdown, "super-secret") || !strings.Contains(markdown, "FAIL") {
 		t.Fatalf("unsafe or incomplete Markdown report:\n%s", markdown)
+	}
+}
+
+func TestReportReturnsTypedAuthenticationFailure(t *testing.T) {
+	failure := authenticationFailureError{}
+	report := Report{Results: []Result{{Status: Fail, Err: failure}}}
+	if !errors.Is(report.AuthenticationFailure(), failure) {
+		t.Fatalf("AuthenticationFailure() = %v, want %v", report.AuthenticationFailure(), failure)
+	}
+	if (Report{Results: []Result{{Status: Fail, Err: errors.New("network unavailable")}}}).AuthenticationFailure() != nil {
+		t.Fatal("AuthenticationFailure() returned a transient failure")
 	}
 }
 

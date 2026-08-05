@@ -156,6 +156,10 @@ func runDoctor(args []string) {
 	}
 	encoded, _ := json.MarshalIndent(report, "", "  ")
 	fmt.Println(string(encoded))
+	if err := report.AuthenticationFailure(); err != nil {
+		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		os.Exit(1)
+	}
 	if !report.Passed() {
 		os.Exit(1)
 	}
@@ -694,13 +698,13 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
+	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+		fail(err)
+	}
 	_, err = admitGatewayCredential(ctx, db, func(token string) error {
 		return requirePublicControlPlaneRepository(ctx, github.NewClient(*githubURL, token, nil), *repository)
 	})
 	if err != nil {
-		fail(err)
-	}
-	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, *repository, 0)

@@ -179,7 +179,7 @@ func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 	}
 	err = githubGET(ctx, c.APIBase, token, "user", &identity)
 	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read Gateway identity: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read Gateway identity: %v", err), Err: err}
 	}
 	if identity.Login != c.Pin.Owner || c.Verification.Owner != c.Pin.Owner {
 		return Result{Status: Fail, Summary: "Gateway Credential owner does not match the verified owner"}
@@ -212,7 +212,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 		DefaultBranch string `json:"default_branch"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository, &repo); err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read integration repository: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration repository: %v", err), Err: err}
 	}
 	if repo.Private || repo.DefaultBranch != c.GitHub.DefaultBranch {
 		return Result{Status: Fail, Summary: fmt.Sprintf("integration repository private=%t default_branch=%s", repo.Private, repo.DefaultBranch)}
@@ -224,7 +224,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	branchPath := "repos/" + c.GitHub.TestRepository + "/git/ref/heads/" + url.PathEscape(c.GitHub.DefaultBranch)
 	if err := githubGET(ctx, c.APIBase, token, branchPath, &branch); err != nil || branch.Object.SHA == "" {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read default branch head: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read default branch head: %v", err), Err: err}
 	}
 	var workflows struct {
 		Workflows []struct {
@@ -233,7 +233,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 		} `json:"workflows"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository+"/actions/workflows", &workflows); err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflows: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflows: %v", err), Err: err}
 	}
 	var workflowID int64
 	for _, workflow := range workflows.Workflows {
@@ -254,7 +254,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	runsPath := fmt.Sprintf("repos/%s/actions/workflows/%d/runs?branch=%s&per_page=20", c.GitHub.TestRepository, workflowID, url.QueryEscape(c.GitHub.DefaultBranch))
 	if err := githubGET(ctx, c.APIBase, token, runsPath, &runs); err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflow runs: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflow runs: %v", err), Err: err}
 	}
 	contractPassed := false
 	for _, run := range runs.WorkflowRuns {
@@ -276,7 +276,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 		SHA string `json:"sha"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.UpstreamRepository+"/git/commits/"+c.NoMistakes.UpstreamCommit, &upstreamCommit); err != nil || upstreamCommit.SHA != c.NoMistakes.UpstreamCommit {
-		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository"}
+		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository", Err: err}
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
@@ -287,7 +287,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
 		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
-		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit"}
+		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit", Err: err}
 	}
 	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
 	assetID := int64(0)
@@ -306,7 +306,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	asset, err := githubapi.NewClient(c.APIBase, token, nil).RequestBytes(ctx,
 		fmt.Sprintf("/repos/%s/releases/assets/%d", c.NoMistakes.ForkRepository, assetID), "application/octet-stream")
 	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("download pinned no-mistakes Linux asset: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("download pinned no-mistakes Linux asset: %v", err), Err: err}
 	}
 	digest := sha256.Sum256(asset)
 	if hex.EncodeToString(digest[:]) != c.NoMistakes.LinuxAMD64SHA256 {
@@ -320,7 +320,7 @@ func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repo
 		Private bool `json:"private"`
 	}
 	if err := githubGET(ctx, apiBase, token, "repos/"+repository, &target); err != nil {
-		return &Result{Status: Fail, Summary: fmt.Sprintf("read %s repository: %v", name, err)}
+		return &Result{Status: Fail, Summary: fmt.Sprintf("read %s repository: %v", name, err), Err: err}
 	}
 	if target.Private {
 		return &Result{Status: Fail, Summary: name + " repository must be public"}

@@ -334,7 +334,8 @@ func (c *Client) RequestBytes(ctx context.Context, path, accept string) ([]byte,
 		return nil, readErr
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Body: strings.TrimSpace(string(data))}
+		detail := strings.TrimSpace(string(data))
+		return nil, &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, detail, time.Now().UTC())}
 	}
 	return data, nil
 }

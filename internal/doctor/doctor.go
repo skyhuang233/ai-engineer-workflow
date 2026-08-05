@@ -173,6 +173,7 @@ type Result struct {
 	Name    string `json:"name"`
 	Status  Status `json:"status"`
 	Summary string `json:"summary"`
+	Err     error  `json:"-"`
 }
 
 type Check interface {
@@ -216,6 +217,16 @@ func (r Report) Passed() bool {
 		}
 	}
 	return true
+}
+
+func (r Report) AuthenticationFailure() error {
+	for _, result := range r.Results {
+		var failure interface{ AuthenticationFailure() bool }
+		if errors.As(result.Err, &failure) && failure.AuthenticationFailure() {
+			return result.Err
+		}
+	}
+	return nil
 }
 
 func (r Report) Markdown() string {
