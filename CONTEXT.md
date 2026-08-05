@@ -44,6 +44,10 @@ _Avoid_: Ticket Agent, GitHub Actions, workflow scheduler
 The narrow boundary that validates a current Run Lease, ticket ownership, and expected remote revision before executing an external repository mutation.
 _Avoid_: General GitHub proxy, agent credential, merge authority
 
+**Gateway Credential（网关凭据）**:
+The owner-wide fine-grained GitHub credential held only by the trusted GitHub Write Gateway to perform ticket-scoped branch, pull-request, issue, and CI operations across repositories admitted by the Control Plane.
+_Avoid_: Worker token, package publisher token, general GitHub credential
+
 **Delivery Cycle（交付周期）**:
 The single long-lived validation and review lifecycle bound to an Executable Ticket until its delivery succeeds or is cancelled.
 _Avoid_: Worker Run, validation run, pull request
@@ -55,6 +59,18 @@ _Avoid_: Delivery Cycle, Worker Run, new pull request
 **Worker Run（执行单元）**:
 A numbered, bounded execution episode in which the Ticket Agent actively works on its Executable Ticket.
 _Avoid_: Ticket Agent, agent session, Docker task
+
+**Worker Image Release（Worker 镜像发布）**:
+An approved, source-keyed immutable version of the workflow platform's execution environment, published only from an owner-accepted commit on `main` when the Worker toolchain changes and consumed by later Worker Runs.
+_Avoid_: Executable Ticket delivery, Candidate Revision, application deployment
+
+**Active Worker Image（生效 Worker 镜像）**:
+The latest Worker Image Release from an owner-accepted `main` commit that passed production doctor checks and is selected for new Worker Runs; existing runs remain pinned to their starting image.
+_Avoid_: Published image, candidate image, mutable latest tag
+
+**Worker Release Manifest（Worker 发布清单）**:
+The machine-readable, sole GitHub Release asset that binds an accepted source commit, build-input identity, and pinned toolchain to the exact published GHCR digest for cross-host recovery and verification.
+_Avoid_: Toolchain source config, local Docker metadata, Active Worker Image state
 
 **Run Lease（运行租约）**:
 A time-bounded, fenced authorization identifying the only Worker Run whose Candidate Revision may currently be accepted for an Executable Ticket.
@@ -71,6 +87,10 @@ _Avoid_: Mandatory change request, bot comment, CI result
 **Merge-Ready（等待合并）**:
 The non-terminal state in which the current proposed revision and its required integration checks have passed and an authorized human reviewer alone may accept it; new feedback or a relevant revision change invalidates the state.
 _Avoid_: Delivered, approved forever, auto-merge
+
+**Owner-Guarded Mode（所有者约束模式）**:
+A repository assurance mode in which GitHub does not enforce required checks or reviews and the sole authorized owner preserves the delivery contract by merging only Merge-Ready revisions.
+_Avoid_: Enforced Mode, branch-protected repository, unsafe mode
 
 **Cancelled（已取消）**:
 The human-authorized outcome that a Delivery Plan or an unmerged delivery will no longer proceed.

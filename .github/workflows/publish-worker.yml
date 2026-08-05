@@ -1,0 +1,270 @@
+name: publish-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/worker/**"
+      - "config/toolchain.json"
+      - ".github/workflows/publish-worker.yml"
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: read
+
+concurrency:
+  group: publish-worker
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Verify owner-merged main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0)' config/toolchain.json)"
+          pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
+          matches="$(jq --arg owner "$owner" --arg source_commit "$GITHUB_SHA" '
+            [.[] | select(
+              (.merged_at != null) and
+              (.merge_commit_sha == $source_commit) and
+              (.base.ref == "main") and
+              ((.merged_by.login | ascii_downcase) == ($owner | ascii_downcase)) and
+              ((.merged_by.type | ascii_downcase) != "bot") and
+              ((.merged_by.login | ascii_downcase | endswith("[bot]") | not))
+            )] | length' <<<"$pulls")"
+          test "$matches" = 1 || {
+            echo "Refusing to publish: main commit lacks an unambiguous non-bot owner merge" >&2
+            exit 1
+          }
+      - name: Read accepted release inputs
+        id: pins
+        shell: bash
+        run: |
+          echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "worker_release_repository=$(jq -r .worker.release_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_upstream_repository=$(jq -r .no_mistakes.upstream_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Verify Worker Release repository boundary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          worker_release_repository="$(jq --exit-status --raw-output '.worker.release_repository | select(type == "string" and length > 0)' config/toolchain.json)"
+          test "$worker_release_repository" = "$GITHUB_REPOSITORY" || {
+            echo "Refusing to publish: configured Worker Release repository differs from this workflow repository" >&2
+            exit 1
+          }
+          gh api "repos/${GITHUB_REPOSITORY}" | jq --exit-status '.private == false' > /dev/null || {
+            echo "Refusing to publish: Worker Release repository must be public" >&2
+            exit 1
+          }
+      - name: Record Worker build input identity
+        id: build-inputs
+        shell: bash
+        run: |
+          deploy_worker_tree="$(git rev-parse "${GITHUB_SHA}:deploy/worker")"
+          publish_worker_workflow_blob="$(git rev-parse "${GITHUB_SHA}:.github/workflows/publish-worker.yml")"
+          identity_json="$(jq --compact-output \
+            --arg deploy_worker_tree "$deploy_worker_tree" \
+            --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
+            '{schema_version:2,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
+            config/toolchain.json)"
+          identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
+          [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "Worker build input identity must be a SHA-256" >&2
+            exit 1
+          }
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "release_identity=worker-v${{ steps.pins.outputs.worker_version }}-$identity" >> "$GITHUB_OUTPUT"
+      - name: Detect Worker release input changes
+        id: changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          required=false
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}:config/toolchain.json" 2>/dev/null; then
+            required=true
+          else
+            git show "${BEFORE_SHA}:config/toolchain.json" |
+              jq --sort-keys '{codex,no_mistakes,worker}' > /tmp/worker-inputs-before.json
+            jq --sort-keys '{codex,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
+            if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
+               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker .github/workflows/publish-worker.yml; then
+              required=true
+            fi
+          fi
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        if: steps.changes.outputs.required == 'true'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        if: steps.changes.outputs.required == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Preserve immutable release identity on reruns
+        id: existing
+        if: steps.changes.outputs.required == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.build-inputs.outputs.release_identity }}"
+          lookup_error="$(mktemp)"
+          if release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$lookup_error")"; then
+            rm "$lookup_error"
+            target="$(jq -r .target_commitish <<<"$release")"
+            test "$target" = "$GITHUB_SHA" || {
+              echo "Worker version already belongs to a different accepted commit" >&2
+              exit 1
+            }
+            asset_id="$(jq -r 'if (.assets | length) == 1 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
+            test -n "$asset_id" || {
+              echo "Existing Worker Release has no unambiguous release manifest" >&2
+              exit 1
+            }
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > worker-release.json
+            jq --exit-status \
+              --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
+              --arg source_commit "$GITHUB_SHA" \
+              --arg image_repository "${{ steps.pins.outputs.image_repository }}" \
+              --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+              --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
+              --arg no_mistakes_upstream_repository "${{ steps.pins.outputs.no_mistakes_upstream_repository }}" \
+              --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+              --arg no_mistakes_fork_repository "${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
+              --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+              --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+              --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
+              '(.schema_version == 2) and
+               (.worker_version == $worker_version) and
+               (.source_commit == $source_commit) and
+               (.image | type == "string") and
+               (.image | startswith($image_repository + "@sha256:")) and
+               (.image | test("^.+@sha256:[0-9a-f]{64}$")) and
+               (.codex_version == $codex_version) and
+               (.no_mistakes_version == $no_mistakes_version) and
+               (.no_mistakes_upstream_repository == $no_mistakes_upstream_repository) and
+               (.no_mistakes_commit == $no_mistakes_commit) and
+               (.no_mistakes_fork_repository == $no_mistakes_fork_repository) and
+               (.no_mistakes_fork_release == $no_mistakes_fork_release) and
+               (.no_mistakes_linux_amd64_sha256 == $no_mistakes_linux_amd64_sha256) and
+               (.build_input_identity == $build_input_identity) and
+               (.github_actions_run_id | type == "number" and . > 0)' \
+              worker-release.json > /dev/null || {
+                echo "Existing Worker Release has an incomplete or invalid release manifest" >&2
+                exit 1
+              }
+            image="$(jq -r .image worker-release.json)"
+            docker buildx imagetools inspect "$image" > /dev/null || {
+              echo "Existing Worker Release image digest does not resolve" >&2
+              exit 1
+            }
+            publisher_workflow_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/publish-worker.yml" --jq .id)"
+            publisher_run_id="$(jq -r .github_actions_run_id worker-release.json)"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${publisher_run_id}" > publisher-run.json
+            jq --exit-status \
+              --arg source_commit "$GITHUB_SHA" \
+              --argjson publisher_workflow_id "$publisher_workflow_id" \
+              '(.head_sha == $source_commit) and
+               (.head_branch == "main") and
+               (.event == "push") and
+               (.status == "completed") and
+               (.conclusion == "success") and
+               (.workflow_id == $publisher_workflow_id)' \
+              publisher-run.json > /dev/null || {
+                echo "Existing Worker Release was not published by the successful fixed publisher workflow" >&2
+                exit 1
+              }
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep --quiet 'HTTP 404' "$lookup_error"; then
+            rm "$lookup_error"
+            image="${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}"
+            image_lookup_error="$(mktemp)"
+            if docker buildx imagetools inspect "$image" > /dev/null 2>"$image_lookup_error"; then
+              rm "$image_lookup_error"
+              echo "Worker image tag already exists without a complete Worker Release" >&2
+              exit 1
+            elif grep --extended-regexp --ignore-case --quiet 'not found|manifest unknown|no such manifest|HTTP 404' "$image_lookup_error"; then
+              rm "$image_lookup_error"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              cat "$image_lookup_error" >&2
+              rm "$image_lookup_error"
+              echo "Unable to determine whether the immutable Worker image tag already exists" >&2
+              exit 1
+            fi
+          else
+            cat "$lookup_error" >&2
+            rm "$lookup_error"
+            echo "Unable to determine whether the immutable Worker Release already exists" >&2
+            exit 1
+          fi
+      - name: Build and publish accepted main commit
+        id: build
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: deploy/worker/Dockerfile
+          push: true
+          tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}
+          build-args: |
+            CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
+            NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
+            NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}
+            NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}
+            NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}
+            NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}
+      - name: Create authoritative Worker Release Manifest
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          jq --null-input \
+            --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg image "${{ steps.pins.outputs.image_repository }}@${IMAGE_DIGEST}" \
+            --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+            --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
+            --arg no_mistakes_upstream_repository "${{ steps.pins.outputs.no_mistakes_upstream_repository }}" \
+            --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --arg no_mistakes_fork_repository "${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
+            --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+            --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+            --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
+            --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
+            '{schema_version:2, worker_version:$worker_version, source_commit:$source_commit,
+              image:$image, codex_version:$codex_version, no_mistakes_version:$no_mistakes_version,
+              no_mistakes_upstream_repository:$no_mistakes_upstream_repository, no_mistakes_commit:$no_mistakes_commit,
+              no_mistakes_fork_repository:$no_mistakes_fork_repository,
+              no_mistakes_fork_release:$no_mistakes_fork_release,
+              no_mistakes_linux_amd64_sha256:$no_mistakes_linux_amd64_sha256,
+              build_input_identity:$build_input_identity, github_actions_run_id:$github_actions_run_id}' \
+            > worker-release.json
+          jq --exit-status . worker-release.json
+      - name: Publish Worker Release Manifest
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: ${{ steps.build-inputs.outputs.release_identity }}
+          target_commitish: ${{ github.sha }}
+          name: Worker ${{ steps.build-inputs.outputs.release_identity }}
+          body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
+          files: worker-release.json

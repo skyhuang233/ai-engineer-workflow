@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "codex": {
     "version": "0.146.0"
   },
@@ -12,8 +12,9 @@
     "linux_amd64_sha256": "a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825"
   },
   "worker": {
-    "image": "ghcr.io/skyhuang233/workflow-worker:0.1.0@sha256:be055179fa2740356baf348ae39213858218b0b09838af278a7f0f8b7ac7f789",
-    "local_build_id": "sha256:4c1ef26cb3a73e8ff0df8919a9df333e75b852f9e65d323baab67d16de5b773c"
+    "version": "0.1.0",
+    "image_repository": "ghcr.io/skyhuang233/workflow-worker",
+    "release_repository": "skyhuang233/workflow"
   },
   "runtime": {
     "max_worker_attempts": 3
@@ -22,26 +23,21 @@
     "test_repository": "skyhuang233/workflow-integration-test",
     "default_branch": "main",
     "required_check": "workflow-contract",
-    "required_review_count": 1,
+    "workflow_path": ".github/workflows/workflow-contract.yml",
     "credential": {
       "kind": "fine-grained-pat",
-      "allowed_repositories": [
-        "skyhuang233/workflow",
-        "skyhuang233/workflow-integration-test"
-      ],
+      "owner": "skyhuang233",
+      "all_repositories": true,
       "permissions": {
         "actions": "read",
         "contents": "write",
         "issues": "write",
         "metadata": "read",
         "pull_requests": "write"
-      },
-      "approved_by": "",
-      "approved_at": "",
-      "fingerprint_sha256": ""
+      }
     }
   },
   "upgrade": {
-    "rule": "Upgrade only through a new verified upstream commit, fork release, asset checksum, rebuilt registry digest, complete doctor run, and committed human-approved report."
+    "rule": "Upgrade only through a verified upstream commit, fork release, asset checksum, accepted main commit, Worker Release Manifest, complete doctor run, and automatic activation for new Worker Runs."
   }
 }

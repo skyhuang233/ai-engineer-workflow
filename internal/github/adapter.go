@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,10 +18,13 @@ import (
 
 const apiVersion = "2022-11-28"
 
+var ErrRepositoryPrivate = errors.New("repository must be public")
+
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
+	BaseURL         string
+	Token           string
+	HTTP            *http.Client
+	RepositoryOwner string
 }
 
 type PullRequestFeedback struct {
@@ -66,7 +70,7 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableReview(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
+			if value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
 				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
 			}
 		}
@@ -91,7 +95,7 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 				return nil, err
 			}
 			for _, value := range comments {
-				if actionableComment(value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
+				if actionableComment(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
 					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
 				}
 			}
@@ -111,19 +115,19 @@ func changedSince(value string, since time.Time) bool {
 	return err != nil || !parsed.Before(since)
 }
 
-func actionableReview(login, accountType, body string) bool {
-	return actionableAuthor(login, accountType) && !strings.Contains(body, "<!-- workflow-idempotency:")
+func actionableReview(owner, login, accountType, body string) bool {
+	return actionableAuthor(owner, login, accountType) && !strings.Contains(body, "<!-- workflow-idempotency:")
 }
 
-func actionableComment(login, accountType, body string) bool {
-	return strings.TrimSpace(body) != "" && actionableReview(login, accountType, body)
+func actionableComment(owner, login, accountType, body string) bool {
+	return strings.TrimSpace(body) != "" && actionableReview(owner, login, accountType, body)
 }
 
-func actionableAuthor(login, accountType string) bool {
+func actionableAuthor(owner, login, accountType string) bool {
 	if strings.EqualFold(accountType, "bot") || strings.HasSuffix(strings.ToLower(login), "[bot]") {
 		return false
 	}
-	return true
+	return strings.TrimSpace(owner) != "" && strings.EqualFold(strings.TrimSpace(login), strings.TrimSpace(owner))
 }
 
 func reviewFeedbackBody(state, body string) string {
@@ -138,23 +142,66 @@ type apiError struct {
 	Path       string
 	StatusCode int
 	Message    string
+	Body       string
 	RetryAt    time.Time
 }
 
 func (e *apiError) Error() string {
-	return fmt.Sprintf("github API %s %s: %s", e.Method, e.Path, e.Message)
+	detail := e.Message
+	if detail == "" {
+		detail = e.Body
+	}
+	return fmt.Sprintf("github API %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, detail)
 }
 
+func (e *apiError) AuthenticationFailure() bool {
+	return e.StatusCode == http.StatusUnauthorized || (e.StatusCode == http.StatusForbidden && e.RetryAt.IsZero())
+}
+
+func (e *apiError) RetryAtTime() time.Time {
+	return e.RetryAt
+}
+
+type APIError = apiError
+
 func NewClient(baseURL, token string, httpClient *http.Client) *Client {
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
 }
 
+func (c *Client) WithRepositoryOwner(owner string) *Client {
+	configured := *c
+	configured.RepositoryOwner = strings.TrimSpace(owner)
+	return &configured
+}
+
+func (c *Client) RequirePublicRepository(ctx context.Context, repository string) error {
+	if err := ValidateRepository(repository); err != nil {
+		return err
+	}
+	var target struct {
+		Private bool `json:"private"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository, &target); err != nil {
+		return fmt.Errorf("verify repository visibility: %w", err)
+	}
+	if target.Private {
+		return fmt.Errorf("%w: %q", ErrRepositoryPrivate, repository)
+	}
+	return nil
+}
+
 const workflowInboxLabel = "workflow:inbox"
 
 func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, questionIDs []string) (map[string]string, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return nil, err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return nil, err
 	}
@@ -178,7 +225,7 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 	}
 	answers := make(map[string]string)
 	for _, comment := range comments {
-		if !actionableAuthor(comment.User.Login, comment.User.Type) {
+		if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
 			continue
 		}
 		for questionID, answer := range parseWorkflowInboxAnswers(comment.Body) {
@@ -191,6 +238,9 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 }
 
 func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -211,6 +261,9 @@ func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, qu
 }
 
 func (c *Client) HasWorkflowInboxProjection(ctx context.Context, repository string, questions []plan.WorkflowQuestion) (bool, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return false, err
+	}
 	inbox, found, err := c.workflowInbox(ctx, repository)
 	if err != nil || !found {
 		return false, err
@@ -225,6 +278,9 @@ func (c *Client) workflowInbox(ctx context.Context, repository string) (plan.Iss
 	}
 	var inboxes []plan.Issue
 	for _, issue := range issues {
+		if !actionableAuthor(c.RepositoryOwner, issue.Author, issue.AuthorType) {
+			continue
+		}
 		for _, label := range issue.Labels {
 			if label == workflowInboxLabel {
 				inboxes = append(inboxes, issue)
@@ -257,6 +313,36 @@ func parseWorkflowInboxAnswers(body string) map[string]string {
 	return answers
 }
 
+func (c *Client) RequestJSON(ctx context.Context, method, path string, body, destination any) error {
+	return c.requestJSON(ctx, method, path, body, destination)
+}
+
+func (c *Client) RequestBytes(ctx context.Context, path, accept string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	response, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, 16<<20))
+	if readErr != nil {
+		return nil, readErr
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		detail := strings.TrimSpace(string(data))
+		return nil, &apiError{Method: http.MethodGet, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, detail, time.Now().UTC())}
+	}
+	return data, nil
+}
+
 // ReadPlan uses GitHub's native sub-issue and blocked-by endpoints. It reads
 // every child before validation so an untyped child is observable as an
 // incomplete publication rather than silently disappearing from the plan.
@@ -264,8 +350,14 @@ func (c *Client) ReadPlan(ctx context.Context, repository string, rootNumber int
 	if err := ValidateRepository(repository); err != nil {
 		return plan.Snapshot{}, err
 	}
+	if strings.TrimSpace(c.RepositoryOwner) == "" {
+		return plan.Snapshot{}, fmt.Errorf("configured repository owner is required to admit a plan")
+	}
 	root, err := c.getIssue(ctx, repository, rootNumber)
 	if err != nil {
+		return plan.Snapshot{}, err
+	}
+	if err := c.requirePlanAuthor(root); err != nil {
 		return plan.Snapshot{}, err
 	}
 	children, err := c.listIssues(ctx, fmt.Sprintf("/repos/%s/issues/%d/sub_issues", repository, rootNumber))
@@ -274,13 +366,28 @@ func (c *Client) ReadPlan(ctx context.Context, repository string, rootNumber int
 	}
 	blockedBy := make(map[int64][]plan.Issue, len(children))
 	for _, child := range children {
+		if err := c.requirePlanAuthor(child); err != nil {
+			return plan.Snapshot{}, err
+		}
 		blockers, err := c.listIssues(ctx, fmt.Sprintf("/repos/%s/issues/%d/dependencies/blocked_by", repository, child.Number))
 		if err != nil {
 			return plan.Snapshot{}, err
 		}
+		for _, blocker := range blockers {
+			if err := c.requirePlanAuthor(blocker); err != nil {
+				return plan.Snapshot{}, err
+			}
+		}
 		blockedBy[child.ID] = blockers
 	}
 	return plan.Snapshot{Repository: repository, Root: root, Children: children, BlockedBy: blockedBy}, nil
+}
+
+func (c *Client) requirePlanAuthor(issue plan.Issue) error {
+	if !actionableAuthor(c.RepositoryOwner, issue.Author, issue.AuthorType) {
+		return fmt.Errorf("plan issue #%d author %q is not the configured repository owner", issue.Number, issue.Author)
+	}
+	return nil
 }
 
 func (c *Client) getIssue(ctx context.Context, repository string, number int64) (plan.Issue, error) {
@@ -322,6 +429,9 @@ func (c *Client) UpdateIssueBody(ctx context.Context, repository string, number 
 }
 
 func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) error {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -332,7 +442,7 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 	if err != nil {
 		return err
 	}
-	status, err := planProjectionStatusComment(comments)
+	status, err := planProjectionStatusComment(comments, c.RepositoryOwner)
 	if err != nil {
 		return err
 	}
@@ -343,6 +453,9 @@ func (c *Client) UpdatePlanProjection(ctx context.Context, repository string, nu
 }
 
 func (c *Client) HasPlanProjection(ctx context.Context, repository string, number int64, projection plan.Projection) (bool, error) {
+	if err := c.requireRepositoryOwner(); err != nil {
+		return false, err
+	}
 	marker := planProjectionMarker(projection)
 	statusComments := 0
 	matched := false
@@ -353,6 +466,9 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 			return false, err
 		}
 		for _, comment := range comments {
+			if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
+				continue
+			}
 			if isLegacyPlanProjectionComment(comment) {
 				return false, fmt.Errorf("legacy workflow projection comment found")
 			}
@@ -372,6 +488,13 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 	}
 }
 
+func (c *Client) requireRepositoryOwner() error {
+	if strings.TrimSpace(c.RepositoryOwner) == "" {
+		return fmt.Errorf("configured repository owner is required for GitHub observations")
+	}
+	return nil
+}
+
 func planProjectionComment(projection plan.Projection) string {
 	content, _ := plan.RenderProjection("", projection)
 	return content + "\n\n" + planProjectionIdentity + "\n" + planProjectionMarker(projection)
@@ -381,9 +504,12 @@ const planProjectionIdentity = "<!-- workflow:control-plane -->"
 
 const planProjectionMarkerPrefix = "workflow-projection:"
 
-func planProjectionStatusComment(comments []commentResponse) (*commentResponse, error) {
+func planProjectionStatusComment(comments []commentResponse, owner string) (*commentResponse, error) {
 	var status *commentResponse
 	for index := range comments {
+		if !actionableAuthor(owner, comments[index].User.Login, comments[index].User.Type) {
+			continue
+		}
 		if isLegacyPlanProjectionComment(comments[index]) {
 			return nil, fmt.Errorf("legacy workflow projection comment found")
 		}
@@ -476,7 +602,8 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
-		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: strings.TrimSpace(string(message)), RetryAt: rateLimitRetryAt(response, time.Now().UTC())}
+		detail := strings.TrimSpace(string(message))
+		return &apiError{Method: method, Path: path, StatusCode: response.StatusCode, Message: detail, Body: detail, RetryAt: rateLimitRetryAt(response, detail, time.Now().UTC())}
 	}
 	if destination == nil {
 		return nil
@@ -484,21 +611,29 @@ func (c *Client) requestJSONWithHeaders(ctx context.Context, method, path string
 	return json.NewDecoder(response.Body).Decode(destination)
 }
 
-func rateLimitRetryAt(response *http.Response, now time.Time) time.Time {
+func rateLimitRetryAt(response *http.Response, detail string, now time.Time) time.Time {
 	if response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusForbidden {
 		return time.Time{}
 	}
 	if retryAfter, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && retryAfter > 0 {
 		return now.Add(time.Duration(retryAfter) * time.Second)
 	}
-	if response.Header.Get("X-RateLimit-Remaining") != "0" {
-		return time.Time{}
+	if response.Header.Get("X-RateLimit-Remaining") == "0" {
+		reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64)
+		if err == nil && reset > 0 {
+			return time.Unix(reset, 0).UTC()
+		}
+		return now.Add(time.Minute)
 	}
-	reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64)
-	if err != nil || reset <= 0 {
-		return time.Time{}
+	if response.StatusCode == http.StatusTooManyRequests || isSecondaryRateLimitMessage(detail) {
+		return now.Add(time.Minute)
 	}
-	return time.Unix(reset, 0).UTC()
+	return time.Time{}
+}
+
+func isSecondaryRateLimitMessage(detail string) bool {
+	message := strings.ToLower(detail)
+	return strings.Contains(message, "secondary rate limit") || strings.Contains(message, "abuse detection mechanism")
 }
 
 type issueResponse struct {
@@ -510,6 +645,12 @@ type issueResponse struct {
 	State     string          `json:"state"`
 	UpdatedAt string          `json:"updated_at"`
 	Labels    []labelResponse `json:"labels"`
+	User      userResponse    `json:"user"`
+}
+
+type userResponse struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
 }
 
 type labelResponse struct {
@@ -521,7 +662,7 @@ func (i issueResponse) issue() plan.Issue {
 	for _, label := range i.Labels {
 		labels = append(labels, label.Name)
 	}
-	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt}
+	return plan.Issue{ID: i.ID, NodeID: i.NodeID, Number: i.Number, Title: i.Title, Body: i.Body, State: i.State, Labels: labels, UpdatedAt: i.UpdatedAt, Author: i.User.Login, AuthorType: i.User.Type}
 }
 
 // ValidateRepository prevents accidental path traversal when a repository is

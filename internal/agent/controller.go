@@ -90,6 +90,10 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if !clean {
 		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
 	}
+	imageDigest, toolVersions, err := c.activeWorkerRuntime(ctx)
+	if err != nil {
+		return Candidate{}, err
+	}
 	schemaPath := c.Workspace.schemaPath(ws.CodexState)
 	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
 		return Candidate{}, fmt.Errorf("write Candidate output schema: %w", err)
@@ -104,7 +108,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	spec := worker.Spec{
 		RunID:   request.Claim.RunID,
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
-		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
+		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: environment,
 		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
 		ExtraHosts:  []string{worker.GatewayHostMapping},
@@ -172,13 +176,13 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
 	}
-	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
+	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, ImageDigest: imageDigest, ToolVersions: toolVersions, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
 	if err != nil {
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	session.AcceptedCommit = commit
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
-	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt); err != nil {
+	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt, imageDigest, toolVersions); err != nil {
 		return candidate, err
 	}
 	return candidate, nil
@@ -215,6 +219,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err := validateLocalRemotes(finalizationCtx, ws.Path); err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
+	imageDigest, toolVersions, err := c.Store.CandidateWorkerRuntime(finalizationCtx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("resolve accepted Candidate runtime: %w", err))
+	}
 	publication := store.CandidatePublication{
 		Repository:         delivery.Repository,
 		Branch:             delivery.Branch,
@@ -224,10 +232,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		Body:               "Retry delivery of the accepted Candidate Revision.",
 	}
 	intent := fmt.Sprintf("Retry delivery of accepted Candidate Revision %s for ticket #%d.", delivery.CandidateCommit, claim.TicketNumber)
-	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent)
+	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent, imageDigest, toolVersions)
 }
 
-func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {
+func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent, imageDigest string, toolVersions map[string]string) error {
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
@@ -254,7 +262,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliverySpec := worker.Spec{
 		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
-		AgentIdentity: session.AgentIdentity, ImageDigest: c.ImageDigest, ToolVersions: c.ToolVersions,
+		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: deliveryEnvironment,
 		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
 		ExtraHosts:  []string{worker.GatewayHostMapping},
@@ -283,6 +291,22 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return err
 	}
 	return nil
+}
+
+func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {
+	activeRelease, err := c.Store.ActiveWorkerRelease(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
+	}
+	var releaseManifest struct {
+		CodexVersion      string `json:"codex_version"`
+		NoMistakesVersion string `json:"no_mistakes_version"`
+	}
+	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
+		releaseManifest.CodexVersion == "" || releaseManifest.NoMistakesVersion == "" {
+		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
+	}
+	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {

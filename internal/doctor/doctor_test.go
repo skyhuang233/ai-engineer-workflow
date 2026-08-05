@@ -2,12 +2,19 @@ package doctor
 
 import (
 	"context"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 )
+
+type authenticationFailureError struct{}
+
+func (authenticationFailureError) Error() string               { return "authentication failed" }
+func (authenticationFailureError) AuthenticationFailure() bool { return true }
 
 func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 	config := validConfig()
@@ -23,9 +30,13 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"upstream commit", func(c *Config) { c.NoMistakes.UpstreamCommit = "main" }},
 		{"fork release", func(c *Config) { c.NoMistakes.ForkRelease = "" }},
 		{"asset checksum", func(c *Config) { c.NoMistakes.LinuxAMD64SHA256 = "latest" }},
-		{"worker image digest", func(c *Config) { c.Worker.Image = "workflow-worker:latest" }},
-		{"private test repository", func(c *Config) { c.GitHub.TestRepository = "" }},
+		{"worker version", func(c *Config) { c.Worker.Version = "" }},
+		{"worker image repository", func(c *Config) { c.Worker.ImageRepository = "latest" }},
+		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
+		{"integration repository", func(c *Config) { c.GitHub.TestRepository = "" }},
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
+		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
+		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -64,6 +75,17 @@ func TestRunnerProducesDeterministicRedactedReport(t *testing.T) {
 	markdown := report.Markdown()
 	if strings.Contains(markdown, "super-secret") || !strings.Contains(markdown, "FAIL") {
 		t.Fatalf("unsafe or incomplete Markdown report:\n%s", markdown)
+	}
+}
+
+func TestReportReturnsTypedAuthenticationFailure(t *testing.T) {
+	failure := authenticationFailureError{}
+	report := Report{Results: []Result{{Status: Fail, Err: failure}}}
+	if !errors.Is(report.AuthenticationFailure(), failure) {
+		t.Fatalf("AuthenticationFailure() = %v, want %v", report.AuthenticationFailure(), failure)
+	}
+	if (Report{Results: []Result{{Status: Fail, Err: errors.New("network unavailable")}}}).AuthenticationFailure() != nil {
+		t.Fatal("AuthenticationFailure() returned a transient failure")
 	}
 }
 
@@ -108,7 +130,7 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 			Command:      []string{"no-mistakes", "--version"},
 			Tool:         "no-mistakes",
 			ExactVersion: "v1.41.2",
-			ExactCommit:  "867d64d",
+			ExactCommit:  "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
 		},
 	}
 	if result := check.Run(context.Background()); result.Status != Fail {
@@ -116,22 +138,74 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 	}
 }
 
-func TestCommandCheckRejectsVersionAndCommitPrefixCollisions(t *testing.T) {
+func TestCommandCheckMatchesEmbeddedNoMistakesCommit(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
 	check := CommandCheck{
 		CheckName: "no-mistakes",
 		Executor: fakeExecutor{outputs: map[string]string{
-			"no-mistakes --version": "no-mistakes version v1.41.20 (867d64d0) 2026-07-24T06:16:02Z",
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
 		}},
-		Version: CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: "867d64d"},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfo(commit),
+		ExecutablePath: "no-mistakes",
+	}
+	if result := check.Run(context.Background()); result.Status != Pass {
+		t.Fatalf("Run() = %#v, want exact-commit success", result)
+	}
+}
+
+func TestCommandCheckRejectsNoMistakesCommitPrefixCollision(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
+	collision := "867d64d9c2df89f3f204ad1f5528e5bf7b460cab"
+	check := CommandCheck{
+		CheckName: "no-mistakes",
+		Executor: fakeExecutor{outputs: map[string]string{
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
+		}},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfo(collision),
+		ExecutablePath: "no-mistakes",
 	}
 	if result := check.Run(context.Background()); result.Status != Fail {
-		t.Fatalf("Run() = %#v, want exact-version failure", result)
+		t.Fatalf("Run() = %#v, want commit mismatch failure", result)
+	}
+}
+
+func TestCommandCheckRejectsModifiedNoMistakesBuild(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
+	check := CommandCheck{
+		CheckName: "no-mistakes",
+		Executor: fakeExecutor{outputs: map[string]string{
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
+		}},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfoWithModified(commit, "true"),
+		ExecutablePath: "no-mistakes",
+	}
+	if result := check.Run(context.Background()); result.Status != Fail {
+		t.Fatalf("Run() = %#v, want modified-build failure", result)
+	}
+}
+
+func fakeNoMistakesBuildInfo(commit string) func(string) (*buildinfo.BuildInfo, error) {
+	return fakeNoMistakesBuildInfoWithModified(commit, "false")
+}
+
+func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (*buildinfo.BuildInfo, error) {
+	return func(string) (*buildinfo.BuildInfo, error) {
+		return &buildinfo.BuildInfo{
+			Path: "github.com/kunchenguid/no-mistakes/cmd/no-mistakes",
+			Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: commit},
+				{Key: "vcs.modified", Value: modified},
+			},
+		}, nil
 	}
 }
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Codex:         ToolPin{Version: "0.146.0"},
 		NoMistakes: NoMistakesPin{
 			Version:            "v1.41.2",
@@ -142,19 +216,24 @@ func validConfig() Config {
 			LinuxAMD64SHA256:   "a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825",
 		},
 		Worker: WorkerPin{
-			Image:        "workflow-worker:0.1.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			LocalBuildID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			Version:           "0.1.0",
+			ImageRepository:   "ghcr.io/skyhuang233/workflow-worker",
+			ReleaseRepository: "skyhuang233/workflow",
 		},
 		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
-			TestRepository:      "skyhuang233/workflow-integration-test",
-			DefaultBranch:       "main",
-			RequiredCheck:       "workflow-contract",
-			RequiredReviewCount: 1,
+			TestRepository: "skyhuang233/workflow-integration-test",
+			DefaultBranch:  "main",
+			RequiredCheck:  "workflow-contract",
+			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
-				Kind:                "fine-grained-pat",
-				AllowedRepositories: []string{"skyhuang233/workflow", "skyhuang233/workflow-integration-test"},
-				Permissions:         map[string]string{"contents": "write", "pull_requests": "write"},
+				Kind:            "fine-grained-pat",
+				Owner:           "skyhuang233",
+				AllRepositories: true,
+				Permissions: map[string]string{
+					"actions": "read", "contents": "write", "issues": "write",
+					"metadata": "read", "pull_requests": "write",
+				},
 			},
 		},
 		Upgrade: UpgradePolicy{Rule: "Upgrade only after compatibility and integration tests pass."},
@@ -172,19 +251,6 @@ func TestCodexResumeCheckUsesReturnedSessionID(t *testing.T) {
 	}
 	if got := strings.Join(executor.commands[1], " "); !strings.Contains(got, "resume") || !strings.Contains(got, "session-7") {
 		t.Fatalf("resume command = %q", got)
-	}
-}
-
-func TestGitHubCheckRequiresContractRunForCurrentDefaultHead(t *testing.T) {
-	config := validConfig()
-	executor := fakeExecutor{outputs: map[string]string{
-		"gh api repos/skyhuang233/workflow-integration-test":                                                                                          `{"private":true,"default_branch":"main"}`,
-		"gh api repos/skyhuang233/workflow-integration-test/branches/main":                                                                            `{"commit":{"sha":"current"}}`,
-		"gh run list -R skyhuang233/workflow-integration-test --workflow workflow-contract --branch main --limit 20 --json status,conclusion,headSha": `[{"status":"completed","conclusion":"success","headSha":"old"}]`,
-	}}
-	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Executor: executor}).Run(context.Background())
-	if result.Status != Fail || !strings.Contains(result.Summary, "current default-branch revision") {
-		t.Fatalf("GitHub check = %#v, want stale-run failure", result)
 	}
 }
 

@@ -5,28 +5,51 @@
 
 - Codex CLI is pinned to an exact package version.
 - `no-mistakes` is pinned to an upstream release, verified commit, fork
-  repository, fork release, and Linux release-asset checksum.
-- The Worker image is pinned to a registry manifest digest and is built from a
-  base image digest. The separately recorded local build ID is only for
-  pre-publication host probes; registry resolution is an independent mandatory
-  check.
-- The dedicated GitHub integration repository and its required status check
-  and human review count are explicit.
-- The Gateway fine-grained PAT or GitHub App is declared with a private
-  repository allowlist and exact permissions. A human must fill
-  `approved_by`, `approved_at`, and the SHA-256 fingerprint of the credential
-  only after comparing those declarations with GitHub's credential settings.
-  The fingerprint binds the attestation to the active secret without recording
-  the secret itself.
+  repository, fork release, and Linux release-asset checksum. Doctor reads the
+  installed executable's full immutable Go `vcs.revision` build metadata, so
+  its abbreviated human-readable version output is not used as provenance.
+- The Worker source inputs name a version and GHCR repository. The exact
+  registry digest is recorded only after an accepted main commit is published
+  in its source-keyed `worker-release.json` GitHub Release asset.
+- The dedicated GitHub integration repository and its required workflow path
+  are explicit and public. Branch protection is not a prerequisite: the
+  repository owner retains merge authority.
+- The Gateway uses one fine-grained PAT for all owner repositories with exactly
+  metadata/actions read and contents/issues/pull-requests write. The secret
+  exists only in Windows Credential Manager and Control Plane memory. SQLite
+  records only its SHA-256 fingerprint and successful live-contract evidence.
+  GitHub does not expose an API that proves a fine-grained PAT has no additional
+  permissions; selecting exactly this configuration is the owner's declaration,
+  while the live contract machine-verifies every required positive capability.
+
+Provision or rotate the Gateway Credential. This hidden-input command performs
+real, idempotent writes in the dedicated integration repository and cleans up
+its temporary branch, issue, and PR. During replacement, the durable Gateway
+rotation pauses new writes and safely recovers an expired claim before the live
+contract runs; a failed replacement leaves writes paused. A Gateway that starts
+without its verified credential likewise persists the pause and projects one
+recovery request to each affected repository Workflow Inbox:
+
+```powershell
+go run ./cmd/workflow credential provision `
+  --config config/toolchain.json `
+  --database C:\ProgramData\workflow\workflow.db
+```
 
 Run the complete target-host contract with:
 
 ```powershell
 go run ./cmd/workflow doctor `
   --config config/toolchain.json `
-  --database C:\tmp\workflow-doctor.db `
+  --workflow-repository skyhuang233/workflow `
+  --database C:\ProgramData\workflow\workflow.db `
   --report docs/operations/doctor-report.md
 ```
+
+`--workflow-repository` is the independently supplied repository that contains
+the publisher workflow. Doctor requires it to exactly match
+`worker.release_repository`, verifies that repository is public, and then uses
+only that repository for the release, source, workflow-run, and manifest checks.
 
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,
@@ -37,15 +60,34 @@ URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
 applies retry backoff, reconciles every active ticket pull request, and
 deduplicates newly observed reviews and comments before the owning Ticket
-Session is resumed. `--review-feedback` uses that same durable queue for manual
-routing. `workflow reconcile-delivered` checks merged pull requests
+Session is resumed. `--review-feedback` and `workflow answer-inbox` are
+privileged local Control Plane operations: run them only on the trusted Control
+Plane host. `answer-inbox` forwards the resulting inbox projection through the
+Gateway control-plane credential; that transport credential is not the local
+operator authorization boundary. They use the same durable queue for manual
+routing and decisions. `workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 
 The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
-registry. The report must be reviewed before filling the credential
-attestation fields.
+registry. The Release Manifest's exact digest must resolve from GHCR and pass
+the Docker contract. Doctor may activate the latest owner-accepted manifest
+even after unrelated `main` commits, but only while every pinned toolchain
+input remains current and the deterministic build-input identity still matches
+both its source commit and current `main`. That identity covers the
+`deploy/worker` Git tree, the pinned `publish-worker` workflow blob, and the
+Worker toolchain inputs consumed by the build. The Worker tree includes an
+immutable Debian snapshot and exact direct APT package versions, which are also
+recorded as image labels for build provenance. Release and image tags contain
+the declared Worker version and this identity, allowing an input change to
+produce a new immutable release without a manual version bump. The manifest
+must be the sole asset for that exact source-keyed Worker release and must be published by the fixed
+`publish-worker` push workflow after an unambiguous non-bot merge by the
+configured owner. A successful complete run atomically makes that digest the
+Active Worker Image for new Worker Runs; existing runs remain pinned to their
+recorded image. After a production activation, save the redacted doctor report
+and record its result in Issue #7.
 
 ## Upgrade rule
 
@@ -54,11 +96,11 @@ Never edit only one version string. A toolchain upgrade is accepted only after:
 1. recording the new upstream release and full verified commit;
 2. publishing a new immutable fork release;
 3. verifying release-asset checksums before use;
-4. rebuilding and publishing the Worker image under a new version;
-5. replacing the image reference with the registry-reported digest;
-6. running unit, Docker, Codex resume, SQLite, Gateway, and dedicated GitHub
-   contract checks; and
-7. committing a fresh redacted `workflow doctor` report.
+4. building and testing on the PR without publishing;
+5. having the owner accept and merge the PR to main;
+6. letting GitHub Actions publish the image and authoritative Release Manifest;
+7. running unit, Docker, Codex resume, SQLite, Gateway, and dedicated GitHub
+   contract checks, which activates the verified digest for new Worker Runs.
 
 Floating tags such as `latest`, floating branches such as `main`, and
 unversioned local executables are not production inputs.

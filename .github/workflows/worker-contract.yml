@@ -1,0 +1,70 @@
+name: worker-contract
+
+on:
+  pull_request:
+    paths:
+      - "deploy/worker/**"
+      - "config/toolchain.json"
+      - ".github/workflows/worker-contract.yml"
+      - ".github/workflows/publish-worker.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Read accepted tool versions
+        id: pins
+        shell: bash
+        run: |
+          echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Build without publishing
+        run: |
+          docker build \
+            --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
+            --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
+            --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --build-arg "NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
+            --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
+            --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+            --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" \
+            --file deploy/worker/Dockerfile .
+      - name: Verify Worker contract
+        shell: bash
+        run: |
+          codex_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" codex --version)"
+          if [[ "$codex_output" =~ ^codex-cli[[:space:]]+([^[:space:]]+)$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.codex_version }}"
+          else
+            echo "Codex emitted an unrecognized version string: $codex_output" >&2
+            exit 1
+          fi
+          no_mistakes_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" no-mistakes --version)"
+          if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.no_mistakes_version }}"
+            reported_no_mistakes_commit="${BASH_REMATCH[2]}"
+          else
+            echo "no-mistakes emitted an unrecognized version string: $no_mistakes_output" >&2
+            exit 1
+          fi
+          worker_container="$(docker create "workflow-worker:${{ steps.pins.outputs.worker_version }}")"
+          trap 'docker rm --force "$worker_container" >/dev/null' EXIT
+          worker_binary="$RUNNER_TEMP/no-mistakes"
+          docker cp "$worker_container:/usr/local/bin/no-mistakes" "$worker_binary"
+          mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
+          test "${#embedded_no_mistakes_commits[@]}" -eq 1
+          embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+          mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
+          test "${#embedded_no_mistakes_modified[@]}" -eq 1
+          test "${embedded_no_mistakes_modified[0]}" = false
+          test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"

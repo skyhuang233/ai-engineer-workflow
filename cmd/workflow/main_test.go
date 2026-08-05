@@ -3,14 +3,190 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/credential"
+	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestShouldPauseGatewayForCredential(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "missing", err: credential.ErrNotFound, want: true},
+		{name: "rejected", err: fmt.Errorf("%w: fingerprint mismatch", delivery.ErrGatewayCredentialRejected), want: true},
+		{name: "transient store error", err: errors.New("database temporarily unavailable")},
+		{name: "cancelled", err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldPauseGatewayForCredential(test.err); got != test.want {
+				t.Fatalf("should pause = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
+	err := gatewayCredentialVerificationError(store.ErrNotFound)
+	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("missing verification error = %v, want rejected credential", err)
+	}
+	if !shouldPauseGatewayForCredential(err) {
+		t.Fatal("missing verification credential error did not pause Gateway writes")
+	}
+}
+
+func TestGatewayCredentialVerificationReadFailureIsRetryable(t *testing.T) {
+	err := gatewayCredentialVerificationError(errors.New("database temporarily unavailable"))
+	if errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("verification read failure = %v, want retryable error", err)
+	}
+	if shouldPauseGatewayForCredential(err) {
+		t.Fatal("verification read failure paused Gateway writes")
+	}
+}
+
+func TestPersistGatewayCredentialPauseCreatesLocalRecoveryInbox(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	credentialErr := fmt.Errorf("load credential: %w", credential.ErrNotFound)
+	if err := persistGatewayCredentialPause(ctx, db, credentialErr, now); !errors.Is(err, credential.ErrNotFound) {
+		t.Fatalf("credential pause error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || !paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+	inbox, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
+	if err != nil || inbox.State != "open" {
+		t.Fatalf("credential recovery inbox = %#v, %v", inbox, err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("credential recovery questions = %#v, %v", questions, err)
+	}
+}
+
+func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	transient := errors.New("Credential Manager temporarily unavailable")
+	if err := persistGatewayCredentialPause(ctx, db, transient, time.Now().UTC()); !errors.Is(err, transient) {
+		t.Fatalf("transient credential error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+}
+
+func TestPersistGatewayCredentialAdmissionErrorPausesForRejectedGitHubCredential(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	pollErr := fmt.Errorf("repository admission: %w", &github.APIError{StatusCode: http.StatusUnauthorized})
+	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("poll credential error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || !paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+	inbox, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
+	if err != nil || inbox.State != "open" {
+		t.Fatalf("credential recovery inbox = %#v, %v", inbox, err)
+	}
+}
+
+func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	retryAt := time.Date(2026, 8, 4, 0, 1, 0, 0, time.UTC)
+	pollErr := &github.APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
+	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, time.Now().UTC()); !errors.Is(err, pollErr) {
+		t.Fatalf("rate limited poll error = %v", err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+}
+
+func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"private":true}`))
+	}))
+	defer server.Close()
+	err := requirePublicControlPlaneRepository(context.Background(), github.NewClient(server.URL, "", server.Client()), "owner/repo")
+	if err == nil || !strings.Contains(err.Error(), "must be public") {
+		t.Fatalf("private repository admission error = %v", err)
+	}
+}
 
 func TestAcquireTicketClaimReplacesExpiredWorker(t *testing.T) {
 	ctx := context.Background()

@@ -226,6 +226,7 @@ func createClaim(t *testing.T, ctx context.Context, root string) (*store.Store, 
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
+	activateTestWorker(t, ctx, db)
 	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
@@ -259,6 +260,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
+	activateTestWorker(t, ctx, db)
 	claim, err := db.ClaimReady(ctx, store.ClaimRequest{
 		VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1,
 		LeaseTTL: time.Minute, Now: time.Now().UTC(),
@@ -297,6 +299,9 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	}
 	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != "" {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
+	}
+	if first.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("worker did not use Active Worker Image: %#v", first.specs[0])
 	}
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
@@ -404,6 +409,15 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending delivery claims = %#v, %v", pending, err)
 	}
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version:        "0.2.0",
+		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
+		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","no_mistakes_version":"v2.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	retryRuntime := &fakeRuntime{}
 	controller.Runtime = retryRuntime
 	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
@@ -411,6 +425,9 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	}
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
+	}
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("retried delivery image = %q, want accepted Candidate image", retryRuntime.specs[0].ImageDigest)
 	}
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
@@ -614,6 +631,19 @@ func codexOutput(sessionID, summary string) []byte {
 
 func candidateRequest(claim store.TicketClaim, source, branch, prompt string) agent.RunRequest {
 	return agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: "owner/repo", Branch: branch, ExpectRemoteAbsent: true, Title: claim.TicketTitle}}
+}
+
+func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
+	t.Helper()
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version:        "0.1.0",
+		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","no_mistakes_version":"v1.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func initRepository(t *testing.T) string {

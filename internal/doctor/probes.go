@@ -3,16 +3,19 @@ package doctor
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/credential"
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -42,7 +45,7 @@ func (c SQLiteCheck) Run(ctx context.Context) Result {
 }
 
 type DockerCheck struct {
-	Worker WorkerPin
+	Manifest WorkerReleaseManifest
 }
 
 func (DockerCheck) Name() string { return "Docker Worker contract" }
@@ -53,10 +56,9 @@ func (c DockerCheck) Run(ctx context.Context) Result {
 	if err != nil || strings.TrimSpace(string(info)) != "linux/x86_64" {
 		return Result{Status: Fail, Summary: fmt.Sprintf("Docker Engine must be linux/x86_64: %v (%s)", err, strings.TrimSpace(string(info)))}
 	}
-	localImageID := c.Worker.LocalBuildID
-	imageID, err := executor.Run(ctx, []string{"docker", "image", "inspect", localImageID, "--format", "{{.Id}}"})
-	if err != nil || strings.TrimSpace(string(imageID)) != localImageID {
-		return Result{Status: Fail, Summary: fmt.Sprintf("local Worker image does not match pin: %v (%s)", err, strings.TrimSpace(string(imageID)))}
+	image := c.Manifest.Image
+	if output, err := executor.Run(ctx, []string{"docker", "pull", image}); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("pull exact Worker digest: %v (%s)", err, strings.TrimSpace(string(output)))}
 	}
 
 	root, err := os.MkdirTemp("", "workflow-doctor-*")
@@ -110,7 +112,7 @@ env | cut -d= -f1`
 		"--env", "CODEX_HOME=/codex-state",
 		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN=" + token,
 		"--env", fmt.Sprintf("WORKFLOW_GATEWAY_PROBE_PORT=%d", port),
-		localImageID, "sh", "-ceu", script,
+		image, "sh", "-ceu", script,
 	})
 	text := string(output)
 	if err != nil {
@@ -125,7 +127,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", "0.146.0", "v1.41.2"}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, c.Manifest.NoMistakesVersion}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
@@ -149,143 +151,185 @@ func (c WorkerRegistryCheck) Run(ctx context.Context) Result {
 }
 
 type GitHubCredentialCheck struct {
-	Pin GitHubCredentialPin
+	Pin                   GitHubCredentialPin
+	IntegrationRepository string
+	Credentials           credential.Store
+	Verification          store.GatewayCredentialVerification
+	APIBase               string
 }
 
-func (GitHubCredentialCheck) Name() string { return "GitHub credential scope" }
+func (GitHubCredentialCheck) Name() string { return "Gateway Credential contract" }
 
 func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
-	if strings.TrimSpace(c.Pin.ApprovedBy) == "" || strings.TrimSpace(c.Pin.ApprovedAt) == "" ||
-		!sha256Pattern.MatchString(c.Pin.FingerprintSHA256) {
-		return Result{Status: Fail, Summary: "least-privilege credential has not been human-attested"}
+	if c.Credentials == nil || !sha256Pattern.MatchString(c.Verification.FingerprintSHA256) {
+		return Result{Status: Fail, Summary: "Gateway Credential has not completed its live write contract"}
 	}
-	executor := OSExecutor{}
-	token, err := executor.Run(ctx, []string{"gh", "auth", "token"})
+	token, err := c.Credentials.Get(ctx, credential.GatewayTarget)
 	if err != nil {
-		return Result{Status: Fail, Summary: "cannot read active credential for fingerprint verification"}
+		return Result{Status: Fail, Summary: "Gateway Credential is unavailable in Windows Credential Manager"}
 	}
-	if credentialFingerprint(string(token)) != c.Pin.FingerprintSHA256 {
-		return Result{Status: Fail, Summary: "active credential does not match the human-attested fingerprint"}
+	if credential.Fingerprint(token) != c.Verification.FingerprintSHA256 {
+		return Result{Status: Fail, Summary: "Gateway Credential differs from the live-contract verification"}
 	}
-	if c.Pin.Kind == "fine-grained-pat" {
-		if !strings.HasPrefix(strings.TrimSpace(string(token)), "github_pat_") {
-			return Result{Status: Fail, Summary: "active credential is not the attested fine-grained PAT"}
-		}
+	if !strings.HasPrefix(strings.TrimSpace(token), "github_pat_") {
+		return Result{Status: Fail, Summary: "Gateway Credential is not a fine-grained PAT"}
 	}
-	output, err := executor.Run(ctx, []string{"gh", "api", "--paginate", "user/repos?per_page=100&affiliation=owner,collaborator,organization_member"})
+	var identity struct {
+		Login string `json:"login"`
+	}
+	err = githubGET(ctx, c.APIBase, token, "user", &identity)
 	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("enumerate credential repository access: %v", err)}
+		return Result{Status: Fail, Summary: fmt.Sprintf("read Gateway identity: %v", err), Err: err}
 	}
-	var repositories []struct {
-		FullName string `json:"full_name"`
-		Private  bool   `json:"private"`
+	if identity.Login != c.Pin.Owner || c.Verification.Owner != c.Pin.Owner {
+		return Result{Status: Fail, Summary: "Gateway Credential owner does not match the verified owner"}
 	}
-	if err := json.Unmarshal(output, &repositories); err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("decode credential repository access: %v", err)}
+	if c.Verification.IntegrationRepository != c.IntegrationRepository {
+		return Result{Status: Fail, Summary: "Gateway Credential verification does not match the configured integration repository"}
 	}
-	allowed := make(map[string]bool, len(c.Pin.AllowedRepositories))
-	for _, repository := range c.Pin.AllowedRepositories {
-		allowed[repository] = true
-	}
-	for _, repository := range repositories {
-		if repository.Private && !allowed[repository.FullName] {
-			return Result{Status: Fail, Summary: "credential can access a private repository outside its declared allowlist"}
-		}
-	}
-	return Result{Status: Pass, Summary: fmt.Sprintf("%s restricted to %d declared repositories; permissions human-attested", c.Pin.Kind, len(allowed))}
+	return Result{Status: Pass, Summary: "Credential Manager secret matches the verified fine-grained PAT, owner, and integration repository"}
 }
 
 type GitHubCheck struct {
-	GitHub     GitHubPin
-	NoMistakes NoMistakesPin
-	Executor   Executor
+	GitHub      GitHubPin
+	NoMistakes  NoMistakesPin
+	Credentials credential.Store
+	APIBase     string
 }
 
-func (GitHubCheck) Name() string { return "GitHub protected integration contract" }
+func (GitHubCheck) Name() string { return "GitHub Owner-Guarded integration contract" }
 
 func (c GitHubCheck) Run(ctx context.Context) Result {
-	executor := c.Executor
-	if executor == nil {
-		executor = OSExecutor{}
+	if c.Credentials == nil {
+		return Result{Status: Fail, Summary: "Gateway Credential store is unavailable"}
 	}
-	repository, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository})
+	token, err := c.Credentials.Get(ctx, credential.GatewayTarget)
 	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read private test repository: %v (%s)", err, strings.TrimSpace(string(repository)))}
+		return Result{Status: Fail, Summary: "Gateway Credential is unavailable"}
 	}
 	var repo struct {
 		Private       bool   `json:"private"`
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := json.Unmarshal(repository, &repo); err != nil {
-		return Result{Status: Fail, Summary: err.Error()}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository, &repo); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration repository: %v", err), Err: err}
 	}
-	if !repo.Private || repo.DefaultBranch != c.GitHub.DefaultBranch {
-		return Result{Status: Fail, Summary: fmt.Sprintf("repository private=%t default_branch=%s", repo.Private, repo.DefaultBranch)}
+	if repo.Private || repo.DefaultBranch != c.GitHub.DefaultBranch {
+		return Result{Status: Fail, Summary: fmt.Sprintf("integration repository private=%t default_branch=%s", repo.Private, repo.DefaultBranch)}
 	}
-	branch, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository + "/branches/" + c.GitHub.DefaultBranch})
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read default branch head: %v (%s)", err, strings.TrimSpace(string(branch)))}
-	}
-	var branchResponse struct {
-		Commit struct {
+	var branch struct {
+		Object struct {
 			SHA string `json:"sha"`
-		} `json:"commit"`
+		} `json:"object"`
 	}
-	if json.Unmarshal(branch, &branchResponse) != nil || branchResponse.Commit.SHA == "" {
-		return Result{Status: Fail, Summary: "default branch did not report a head SHA"}
+	branchPath := "repos/" + c.GitHub.TestRepository + "/git/ref/heads/" + url.PathEscape(c.GitHub.DefaultBranch)
+	if err := githubGET(ctx, c.APIBase, token, branchPath, &branch); err != nil || branch.Object.SHA == "" {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read default branch head: %v", err), Err: err}
 	}
-	runs, err := executor.Run(ctx, []string{"gh", "run", "list", "-R", c.GitHub.TestRepository, "--workflow", "workflow-contract", "--branch", c.GitHub.DefaultBranch, "--limit", "20", "--json", "status,conclusion,headSha"})
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("list required workflow runs: %v (%s)", err, strings.TrimSpace(string(runs)))}
+	var workflows struct {
+		Workflows []struct {
+			ID   int64  `json:"id"`
+			Path string `json:"path"`
+		} `json:"workflows"`
 	}
-	var workflowRuns []struct {
-		Status     string `json:"status"`
-		Conclusion string `json:"conclusion"`
-		HeadSHA    string `json:"headSha"`
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository+"/actions/workflows", &workflows); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflows: %v", err), Err: err}
 	}
-	if json.Unmarshal(runs, &workflowRuns) != nil {
-		return Result{Status: Fail, Summary: "required workflow runs were not valid JSON"}
+	var workflowID int64
+	for _, workflow := range workflows.Workflows {
+		if workflow.Path == c.GitHub.WorkflowPath {
+			workflowID = workflow.ID
+			break
+		}
+	}
+	if workflowID == 0 {
+		return Result{Status: Fail, Summary: "integration workflow at the configured path is missing"}
+	}
+	var runs struct {
+		WorkflowRuns []struct {
+			HeadSHA    string `json:"head_sha"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"workflow_runs"`
+	}
+	runsPath := fmt.Sprintf("repos/%s/actions/workflows/%d/runs?branch=%s&per_page=20", c.GitHub.TestRepository, workflowID, url.QueryEscape(c.GitHub.DefaultBranch))
+	if err := githubGET(ctx, c.APIBase, token, runsPath, &runs); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read integration workflow runs: %v", err), Err: err}
 	}
 	contractPassed := false
-	for _, run := range workflowRuns {
-		if run.HeadSHA == branchResponse.Commit.SHA && run.Status == "completed" && run.Conclusion == "success" {
+	for _, run := range runs.WorkflowRuns {
+		if run.HeadSHA == branch.Object.SHA && run.Status == "completed" && run.Conclusion == "success" {
 			contractPassed = true
 			break
 		}
 	}
 	if !contractPassed {
-		return Result{Status: Fail, Summary: "required workflow has not succeeded for the current default-branch revision"}
+		return Result{Status: Fail, Summary: "integration workflow has not succeeded for the current default-branch revision"}
 	}
-	protection, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.GitHub.TestRepository + "/branches/" + c.GitHub.DefaultBranch + "/protection"})
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("branch protection unavailable: %v (%s)", err, strings.TrimSpace(string(protection)))}
+	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.UpstreamRepository, "no-mistakes upstream"); result != nil {
+		return *result
 	}
-	var rules struct {
-		RequiredStatusChecks struct {
-			Contexts []string `json:"contexts"`
-		} `json:"required_status_checks"`
-		RequiredPullRequestReviews struct {
-			RequiredApprovingReviewCount int `json:"required_approving_review_count"`
-		} `json:"required_pull_request_reviews"`
+	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.ForkRepository, "no-mistakes fork"); result != nil {
+		return *result
 	}
-	if err := json.Unmarshal(protection, &rules); err != nil {
-		return Result{Status: Fail, Summary: err.Error()}
+	var upstreamCommit struct {
+		SHA string `json:"sha"`
 	}
-	if !contains(rules.RequiredStatusChecks.Contexts, c.GitHub.RequiredCheck) ||
-		rules.RequiredPullRequestReviews.RequiredApprovingReviewCount < c.GitHub.RequiredReviewCount {
-		return Result{Status: Fail, Summary: "branch protection does not require the pinned check and human approval"}
-	}
-	release, err := executor.Run(ctx, []string{"gh", "api", "repos/" + c.NoMistakes.ForkRepository + "/releases/tags/" + c.NoMistakes.ForkRelease})
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("fork release is not pinned to upstream commit: %v", err)}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.UpstreamRepository+"/git/commits/"+c.NoMistakes.UpstreamCommit, &upstreamCommit); err != nil || upstreamCommit.SHA != c.NoMistakes.UpstreamCommit {
+		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository", Err: err}
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
+		Assets          []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"assets"`
 	}
-	if json.Unmarshal(release, &forkRelease) != nil || forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
-		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit"}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
+		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
+		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit", Err: err}
 	}
-	return Result{Status: Pass, Summary: "private test repository, successful required check, human-review protection, and pinned fork release verified"}
+	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
+	assetID := int64(0)
+	for _, asset := range forkRelease.Assets {
+		if asset.Name != assetName {
+			continue
+		}
+		if assetID != 0 {
+			return Result{Status: Fail, Summary: "fork release has multiple pinned no-mistakes Linux assets"}
+		}
+		assetID = asset.ID
+	}
+	if assetID == 0 {
+		return Result{Status: Fail, Summary: "fork release is missing the pinned no-mistakes Linux asset"}
+	}
+	asset, err := githubapi.NewClient(c.APIBase, token, nil).RequestBytes(ctx,
+		fmt.Sprintf("/repos/%s/releases/assets/%d", c.NoMistakes.ForkRepository, assetID), "application/octet-stream")
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("download pinned no-mistakes Linux asset: %v", err), Err: err}
+	}
+	digest := sha256.Sum256(asset)
+	if hex.EncodeToString(digest[:]) != c.NoMistakes.LinuxAMD64SHA256 {
+		return Result{Status: Fail, Summary: "pinned no-mistakes Linux asset checksum does not match"}
+	}
+	return Result{Status: Pass, Summary: "integration workflow, pinned fork release, and Linux asset checksum verified; owner-only merge remains the governance boundary"}
+}
+
+func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repository, name string) *Result {
+	var target struct {
+		Private bool `json:"private"`
+	}
+	if err := githubGET(ctx, apiBase, token, "repos/"+repository, &target); err != nil {
+		return &Result{Status: Fail, Summary: fmt.Sprintf("read %s repository: %v", name, err), Err: err}
+	}
+	if target.Private {
+		return &Result{Status: Fail, Summary: name + " repository must be public"}
+	}
+	return nil
+}
+
+func githubGET(ctx context.Context, apiBase, token, path string, destination any) error {
+	return githubapi.NewClient(apiBase, token, nil).RequestJSON(ctx, http.MethodGet, "/"+path, nil, destination)
 }
 
 func randomToken() (string, error) {
@@ -294,13 +338,4 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(value), nil
-}
-
-func contains(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
 }

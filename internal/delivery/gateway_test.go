@@ -9,18 +9,31 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
 type fakeRemote struct {
-	observations []delivery.Observation
-	observeErrs  []error
-	applyErr     error
-	applyCalls   int
-	observeCalls int
-	requests     []store.DeliveryRequest
+	observations  []delivery.Observation
+	observeErrs   []error
+	applyErr      error
+	applyCalls    int
+	observeCalls  int
+	requests      []store.DeliveryRequest
+	credentialErr error
 }
+
+type completionFailingStore struct {
+	*store.Store
+	err error
+}
+
+func (s completionFailingStore) CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error {
+	return s.err
+}
+
+func (f *fakeRemote) CredentialAvailable(context.Context) error { return f.credentialErr }
 
 func (f *fakeRemote) Observe(_ context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	f.observeCalls++
@@ -90,6 +103,100 @@ func TestGatewayPreservesWorkflowQuestionContext(t *testing.T) {
 	}
 }
 
+func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Now: func() time.Time { return now }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now, 1)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, keys[0])
+	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil {
+		t.Fatalf("credential recovery outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now, 1)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
+	}
+	rotation, err := db.BeginGatewayCredentialRotation(ctx, "operator", "replace credential", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, rotation, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, keys[0]); err != nil {
+		t.Fatal(err)
+	}
+	remote := gateway.Remote.(*fakeRemote)
+	if len(remote.requests) != 0 {
+		t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+	}
+}
+
+func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, claim.VersionID, claim.TicketID, now); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryProjectInbox, Repository: "owner/repo",
+		WorkflowQuestions: []plan.WorkflowQuestion{{ID: "stale"}}, InboxProjectionVersion: "superseded",
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, stale.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 0 {
+		t.Fatalf("stale projection reached remote: %#v", remote.requests)
+	}
+	if err := gateway.Dispatch(ctx, current.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 1 || len(remote.requests[0].WorkflowQuestions) == 0 {
+		t.Fatalf("current projection = %#v", remote.requests)
+	}
+	for _, question := range remote.requests[0].WorkflowQuestions {
+		if question.ID == "stale" {
+			t.Fatalf("current projection retained stale question: %#v", remote.requests)
+		}
+	}
+}
+
 type deadlineRemote struct {
 	deadlineSeen bool
 }
@@ -109,6 +216,16 @@ type blockingRemote struct {
 	release chan struct{}
 }
 
+type advancingRemote struct {
+	fakeRemote
+	advance func()
+}
+
+func (r *advancingRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	r.advance()
+	return r.fakeRemote.Apply(ctx, request)
+}
+
 func (r *blockingRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
 	return delivery.Observation{RemoteHead: "base", RemoteExists: true}, nil
 }
@@ -117,6 +234,18 @@ func (r *blockingRemote) Apply(context.Context, store.DeliveryRequest) (delivery
 	close(r.entered)
 	<-r.release
 	return delivery.Observation{Applied: true, RemoteHead: "accepted", RemoteExists: true}, nil
+}
+
+type credentialBarrierRemote struct {
+	fakeRemote
+	credentialEntered chan struct{}
+	releaseCredential chan struct{}
+}
+
+func (r *credentialBarrierRemote) CredentialAvailable(context.Context) error {
+	close(r.credentialEntered)
+	<-r.releaseCredential
+	return nil
 }
 
 func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
@@ -164,6 +293,203 @@ func TestOutboxCompletionIsFencedAndRetriesBecomeNeedsAttention(t *testing.T) {
 	}
 	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("projection after retry exhaustion = %#v", projection)
+	}
+}
+
+func TestMissingCredentialPausesBeforeAnyRemoteCall(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{credentialErr: delivery.ErrGatewayCredentialRejected}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatal("missing Gateway Credential reached the remote")
+	}
+	if _, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending {
+		t.Fatalf("outbox after unavailable credential = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayRequeuesTransientCredentialSourceFailure(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	remote := &fakeRemote{credentialErr: errors.New("credential manager temporarily unavailable")}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("transient credential failure returned nil")
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway pause = %t, %v", paused, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.NextAttemptAt == nil {
+		t.Fatalf("transient credential outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayDefersRateLimitedWriteUntilGitHubRetryTime(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	retryAfter := now.Add(7 * time.Minute)
+	remote := &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}}, applyErr: &githubapi.APIError{Method: "POST", Path: "/repos/owner/repo", StatusCode: 403, RetryAt: retryAfter}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("rate-limited delivery returned nil")
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway pause = %t, %v", paused, err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.NextAttemptAt == nil || !outbox.NextAttemptAt.Equal(retryAfter) {
+		t.Fatalf("rate-limited outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestCredentialBindingFollowsDurableDispatchAdmission(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	remote := &credentialBarrierRemote{
+		fakeRemote:        fakeRemote{observations: []delivery.Observation{{RemoteHead: "base", RemoteExists: true}}},
+		credentialEntered: make(chan struct{}),
+		releaseCredential: make(chan struct{}),
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan error, 1)
+	go func() { dispatched <- gateway.Dispatch(ctx, queued.IdempotencyKey) }()
+	select {
+	case <-remote.credentialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch did not reach credential binding")
+	}
+	quiesced := make(chan error, 1)
+	go func() { quiesced <- db.WaitForGatewayWritesQuiesced(ctx) }()
+	select {
+	case err := <-quiesced:
+		t.Fatalf("rotation could bypass credential-binding dispatch: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(remote.releaseCredential)
+	if err := <-dispatched; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-quiesced; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGatewayRequeuesControlPlaneClaimAfterCancellationBeforeRenewal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	calls := 0
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time {
+		calls++
+		if calls == 4 {
+			cancel()
+		}
+		return now
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("cancelled control-plane dispatch returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(context.Background(), queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || outbox.ClaimToken != "" {
+		t.Fatalf("cancelled control-plane outbox = %#v, %v", outbox, err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := gateway.Dispatch(context.Background(), queued.IdempotencyKey); err != nil {
+		t.Fatalf("recovered control-plane dispatch = %v", err)
+	}
+}
+
+func TestGatewayRequeuesUncertainControlPlaneClaimAfterLostLease(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	remote := &advancingRemote{
+		fakeRemote: fakeRemote{observations: []delivery.Observation{{}, {Applied: true, RemoteHead: "accepted", RemoteExists: true}}},
+		advance:    func() { now = now.Add(2 * time.Hour) },
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("lost control-plane lease returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("lost-lease control-plane outbox = %#v, %v", outbox, err)
+	}
+	now = now.Add(2 * time.Second)
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatalf("recovered lost-lease control-plane dispatch = %v", err)
+	}
+	outbox, err = db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxSucceeded {
+		t.Fatalf("reconciled lost-lease control-plane outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayRequeuesClaimWhenCompletionFinalizationFails(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: completionFailingStore{Store: db, err: errors.New("completion store temporarily unavailable")}, Remote: &fakeRemote{observations: []delivery.Observation{{RemoteHead: "base"}}}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, candidatePush(claim, "base", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+		t.Fatal("dispatch with an unfinalizable delivery returned nil error")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain || outbox.ClaimToken != "" {
+		t.Fatalf("completion failure outbox = %#v, %v", outbox, err)
 	}
 }
 
@@ -323,6 +649,60 @@ func TestGatewayBoundsUncertainReconciliation(t *testing.T) {
 	}
 	if projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("projection after exhausted reconciliation = %#v", projection)
+	}
+}
+
+func TestGatewayDerivesRepositoryFromLeasedTicket(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	queued, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	}, time.Date(2026, 7, 31, 0, 10, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Request.Repository != "owner/repo" {
+		t.Fatalf("repository = %q, want ticket-owned repository", queued.Request.Repository)
+	}
+}
+
+func TestRejectedCredentialPausesAllGatewayWritesAndCreatesOneInboxItem(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	remote := &fakeRemote{
+		applyErr:     &githubapi.APIError{Method: "POST", Path: "/repos/owner/repo", StatusCode: 401, Body: "Bad credentials"},
+		observations: []delivery.Observation{{RemoteHead: "base"}},
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time {
+		return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	}}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken,
+		LeaseGeneration: claim.LeaseGeneration, CommitSHA: "accepted", ExpectedRemoteHead: "base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	item, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
+	if err != nil || item.State != "open" {
+		t.Fatalf("inbox item = %#v, %v", item, err)
+	}
+	applyCalls := remote.applyCalls
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, delivery.ErrGatewayWritesPaused) {
+		t.Fatalf("paused dispatch error = %v", err)
+	}
+	if remote.applyCalls != applyCalls {
+		t.Fatal("paused Gateway performed another remote write")
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != store.OutboxPending {
+		t.Fatalf("preserved outbox = %#v, %v", outbox, err)
 	}
 }
 

@@ -4,7 +4,7 @@ package doctor
 
 import (
 	"context"
-	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,8 +39,9 @@ type NoMistakesPin struct {
 }
 
 type WorkerPin struct {
-	Image        string `json:"image"`
-	LocalBuildID string `json:"local_build_id"`
+	Version           string `json:"version"`
+	ImageRepository   string `json:"image_repository"`
+	ReleaseRepository string `json:"release_repository"`
 }
 
 type RuntimePolicy struct {
@@ -48,20 +49,18 @@ type RuntimePolicy struct {
 }
 
 type GitHubPin struct {
-	TestRepository      string              `json:"test_repository"`
-	DefaultBranch       string              `json:"default_branch"`
-	RequiredCheck       string              `json:"required_check"`
-	RequiredReviewCount int                 `json:"required_review_count"`
-	Credential          GitHubCredentialPin `json:"credential"`
+	TestRepository string              `json:"test_repository"`
+	DefaultBranch  string              `json:"default_branch"`
+	RequiredCheck  string              `json:"required_check"`
+	WorkflowPath   string              `json:"workflow_path"`
+	Credential     GitHubCredentialPin `json:"credential"`
 }
 
 type GitHubCredentialPin struct {
-	Kind                string            `json:"kind"`
-	AllowedRepositories []string          `json:"allowed_repositories"`
-	Permissions         map[string]string `json:"permissions"`
-	ApprovedBy          string            `json:"approved_by"`
-	ApprovedAt          string            `json:"approved_at"`
-	FingerprintSHA256   string            `json:"fingerprint_sha256"`
+	Kind            string            `json:"kind"`
+	Owner           string            `json:"owner"`
+	AllRepositories bool              `json:"all_repositories"`
+	Permissions     map[string]string `json:"permissions"`
 }
 
 type UpgradePolicy struct {
@@ -79,10 +78,12 @@ type Config struct {
 }
 
 var (
-	shaPattern    = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	imagePattern  = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
-	repoPattern   = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	shaPattern      = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	imagePattern    = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+	repoPattern     = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	versionPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	workflowPattern = regexp.MustCompile(`^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$`)
 )
 
 func LoadConfig(path string) (Config, error) {
@@ -104,7 +105,7 @@ func LoadConfig(path string) (Config, error) {
 
 func (c Config) Validate() error {
 	switch {
-	case c.SchemaVersion != 1:
+	case c.SchemaVersion != 2:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
@@ -120,10 +121,14 @@ func (c Config) Validate() error {
 		return errors.New("no-mistakes fork release is required")
 	case !sha256Pattern.MatchString(c.NoMistakes.LinuxAMD64SHA256):
 		return errors.New("no-mistakes Linux asset checksum must be SHA-256")
-	case !imagePattern.MatchString(c.Worker.Image):
-		return errors.New("worker image must use an immutable sha256 digest")
-	case !strings.HasPrefix(c.Worker.LocalBuildID, "sha256:") || !sha256Pattern.MatchString(strings.TrimPrefix(c.Worker.LocalBuildID, "sha256:")):
-		return errors.New("worker local build ID must be SHA-256")
+	case !versionPattern.MatchString(c.Worker.Version):
+		return errors.New("worker version must be a path-safe version")
+	case len(c.Worker.Version) > 55:
+		return errors.New("worker version is too long for a source-keyed image tag")
+	case !strings.HasPrefix(c.Worker.ImageRepository, "ghcr.io/") || strings.Contains(c.Worker.ImageRepository, "@"):
+		return errors.New("worker image repository must be an unpinned GHCR repository")
+	case !repoPattern.MatchString(c.Worker.ReleaseRepository):
+		return errors.New("worker release repository must be owner/name")
 	case c.Runtime.MaxWorkerAttempts < 1:
 		return errors.New("runtime max worker attempts must be positive")
 	case !repoPattern.MatchString(c.GitHub.TestRepository):
@@ -132,14 +137,16 @@ func (c Config) Validate() error {
 		return errors.New("GitHub default branch is required")
 	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
 		return errors.New("GitHub required check is required")
-	case c.GitHub.RequiredReviewCount < 1:
-		return errors.New("at least one human review is required")
-	case c.GitHub.Credential.Kind != "fine-grained-pat" && c.GitHub.Credential.Kind != "github-app":
-		return errors.New("GitHub credential must be a fine-grained PAT or GitHub App")
-	case len(c.GitHub.Credential.AllowedRepositories) == 0:
-		return errors.New("GitHub credential repository allowlist is required")
-	case len(c.GitHub.Credential.Permissions) == 0:
-		return errors.New("GitHub credential permission declaration is required")
+	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
+		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
+	case c.GitHub.Credential.Kind != "fine-grained-pat":
+		return errors.New("Gateway Credential must be a fine-grained PAT")
+	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
+		return errors.New("Gateway Credential owner is required")
+	case !c.GitHub.Credential.AllRepositories:
+		return errors.New("Gateway Credential must cover all repositories")
+	case !validGatewayPermissions(c.GitHub.Credential.Permissions):
+		return errors.New("Gateway Credential permissions must match the Gateway contract")
 	case strings.TrimSpace(c.Upgrade.Rule) == "":
 		return errors.New("toolchain upgrade rule is required")
 	default:
@@ -147,10 +154,27 @@ func (c Config) Validate() error {
 	}
 }
 
+func validGatewayPermissions(actual map[string]string) bool {
+	expected := map[string]string{
+		"actions": "read", "contents": "write", "issues": "write",
+		"metadata": "read", "pull_requests": "write",
+	}
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name, access := range expected {
+		if actual[name] != access {
+			return false
+		}
+	}
+	return true
+}
+
 type Result struct {
 	Name    string `json:"name"`
 	Status  Status `json:"status"`
 	Summary string `json:"summary"`
+	Err     error  `json:"-"`
 }
 
 type Check interface {
@@ -194,6 +218,16 @@ func (r Report) Passed() bool {
 		}
 	}
 	return true
+}
+
+func (r Report) AuthenticationFailure() error {
+	for _, result := range r.Results {
+		var failure interface{ AuthenticationFailure() bool }
+		if errors.As(result.Err, &failure) && failure.AuthenticationFailure() {
+			return result.Err
+		}
+	}
+	return nil
 }
 
 func (r Report) Markdown() string {
@@ -249,10 +283,12 @@ type CommandExpectation struct {
 }
 
 type CommandCheck struct {
-	CheckName    string
-	Executor     Executor
-	Version      CommandExpectation
-	Capabilities []CommandExpectation
+	CheckName      string
+	Executor       Executor
+	Version        CommandExpectation
+	Capabilities   []CommandExpectation
+	BuildInfo      func(string) (*buildinfo.BuildInfo, error)
+	ExecutablePath string
 }
 
 type CodexResumeCheck struct {
@@ -297,11 +333,6 @@ func (c CodexResumeCheck) Run(ctx context.Context) Result {
 	return Result{Status: Pass, Summary: "persistent session ID created and resumed successfully"}
 }
 
-func credentialFingerprint(token string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
-	return fmt.Sprintf("%x", sum)
-}
-
 func jsonEventString(output []byte, eventType, field string) string {
 	for _, line := range strings.Split(string(output), "\n") {
 		var event map[string]any
@@ -329,7 +360,18 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	if version != c.Version.ExactVersion || commit != c.Version.ExactCommit {
+	if version != c.Version.ExactVersion {
+		return Result{Status: Fail, Summary: fmt.Sprintf("%s reports version %q commit %q, want %q %q", c.Version.Tool, version, commit, c.Version.ExactVersion, c.Version.ExactCommit)}
+	}
+	if c.Version.Tool == "no-mistakes" {
+		embeddedCommit, err := c.noMistakesBuildCommit(c.Version.Command[0])
+		if err != nil {
+			return Result{Status: Fail, Summary: err.Error()}
+		}
+		if embeddedCommit != c.Version.ExactCommit || !strings.HasPrefix(embeddedCommit, commit) {
+			return Result{Status: Fail, Summary: fmt.Sprintf("%s reports commit %q with embedded commit %q, want %q", c.Version.Tool, commit, embeddedCommit, c.Version.ExactCommit)}
+		}
+	} else if commit != c.Version.ExactCommit {
 		return Result{Status: Fail, Summary: fmt.Sprintf("%s reports version %q commit %q, want %q %q", c.Version.Tool, version, commit, c.Version.ExactVersion, c.Version.ExactCommit)}
 	}
 	for _, expectation := range c.Capabilities {
@@ -345,6 +387,41 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 		}
 	}
 	return Result{Status: Pass, Summary: trimmed}
+}
+
+func (c CommandCheck) noMistakesBuildCommit(command string) (string, error) {
+	readBuildInfo := c.BuildInfo
+	if readBuildInfo == nil {
+		readBuildInfo = buildinfo.ReadFile
+	}
+	path := c.ExecutablePath
+	if path == "" {
+		var err error
+		path, err = exec.LookPath(command)
+		if err != nil {
+			return "", fmt.Errorf("locate no-mistakes executable: %w", err)
+		}
+	}
+	info, err := readBuildInfo(path)
+	if err != nil {
+		return "", fmt.Errorf("read no-mistakes build metadata: %w", err)
+	}
+	if info.Path != "github.com/kunchenguid/no-mistakes/cmd/no-mistakes" {
+		return "", fmt.Errorf("no-mistakes executable has unexpected build path %q", info.Path)
+	}
+	var commit, modified string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			commit = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if !shaPattern.MatchString(commit) || modified != "false" {
+		return "", errors.New("no-mistakes executable lacks an immutable full VCS revision")
+	}
+	return commit, nil
 }
 
 var (

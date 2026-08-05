@@ -38,24 +38,25 @@ var (
 // The gateway derives all authoritative ownership fields from RunID and the
 // current Run Lease before this request can reach an external writer.
 type DeliveryRequest struct {
-	Operation          DeliveryOperation       `json:"operation"`
-	RunID              string                  `json:"run_id"`
-	LeaseToken         string                  `json:"lease_token"`
-	LeaseGeneration    int64                   `json:"lease_generation"`
-	Repository         string                  `json:"repository"`
-	RootNumber         int64                   `json:"root_number,omitempty"`
-	Branch             string                  `json:"branch,omitempty"`
-	PullRequestNumber  int64                   `json:"pull_request_number,omitempty"`
-	CommitSHA          string                  `json:"commit_sha,omitempty"`
-	ExpectedRemoteHead string                  `json:"expected_remote_head,omitempty"`
-	ExpectRemoteAbsent bool                    `json:"expect_remote_absent,omitempty"`
-	Title              string                  `json:"title,omitempty"`
-	Body               string                  `json:"body,omitempty"`
-	Evidence           string                  `json:"evidence,omitempty"`
-	PlanProjection     *plan.Projection        `json:"plan_projection,omitempty"`
-	WorkflowQuestions  []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
-	Label              string                  `json:"label,omitempty"`
-	IdempotencyKey     string                  `json:"idempotency_key,omitempty"`
+	Operation              DeliveryOperation       `json:"operation"`
+	RunID                  string                  `json:"run_id"`
+	LeaseToken             string                  `json:"lease_token"`
+	LeaseGeneration        int64                   `json:"lease_generation"`
+	Repository             string                  `json:"repository"`
+	RootNumber             int64                   `json:"root_number,omitempty"`
+	Branch                 string                  `json:"branch,omitempty"`
+	PullRequestNumber      int64                   `json:"pull_request_number,omitempty"`
+	CommitSHA              string                  `json:"commit_sha,omitempty"`
+	ExpectedRemoteHead     string                  `json:"expected_remote_head,omitempty"`
+	ExpectRemoteAbsent     bool                    `json:"expect_remote_absent,omitempty"`
+	Title                  string                  `json:"title,omitempty"`
+	Body                   string                  `json:"body,omitempty"`
+	Evidence               string                  `json:"evidence,omitempty"`
+	PlanProjection         *plan.Projection        `json:"plan_projection,omitempty"`
+	WorkflowQuestions      []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
+	InboxProjectionVersion string                  `json:"inbox_projection_version,omitempty"`
+	Label                  string                  `json:"label,omitempty"`
+	IdempotencyKey         string                  `json:"idempotency_key,omitempty"`
 }
 
 type DeliveryTarget struct {
@@ -154,14 +155,24 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
+	outbox, err := s.enqueueDeliveryTx(ctx, tx, request, now)
+	if err != nil {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return DeliveryOutbox{}, commitErr
+		}
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
+}
 
+func (s *Store) enqueueDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryOutbox, error) {
 	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now)
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now); auditErr != nil {
 			return DeliveryOutbox{}, auditErr
-		}
-		if commitErr := tx.Commit(); commitErr != nil {
-			return DeliveryOutbox{}, commitErr
 		}
 		return DeliveryOutbox{}, err
 	}
@@ -217,9 +228,6 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 			}
 			existing.NextAttemptAt = &value
 		}
-		if err := tx.Commit(); err != nil {
-			return DeliveryOutbox{}, err
-		}
 		return existing, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -243,9 +251,6 @@ VALUES (?, ?, ?, ?, 0, '', ?, ?, ?)`, key, normalized.Operation, string(encoded)
 		return DeliveryOutbox{}, err
 	}
 	if err := insertDeliveryAuditTx(ctx, tx, normalized, "accepted", "queued in durable outbox", now); err != nil {
-		return DeliveryOutbox{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	return DeliveryOutbox{ID: id, IdempotencyKey: key, Request: normalized, State: OutboxPending, CreatedAt: now, UpdatedAt: now}, nil
@@ -433,6 +438,20 @@ func (s *Store) RecordPullRequestChecksETag(ctx context.Context, versionID strin
 }
 
 func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Time) (DeliveryOutbox, error) {
+	if err := s.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return s.claimDeliveryOutbox(ctx, key, "legacy-gateway-dispatcher", now)
+}
+
+func (s *Store) ClaimDeliveryOutboxForDispatcher(ctx context.Context, key, dispatcherToken string, now time.Time) (DeliveryOutbox, error) {
+	if dispatcherToken == "" {
+		return DeliveryOutbox{}, errors.New("Gateway dispatcher token is required")
+	}
+	return s.claimDeliveryOutbox(ctx, key, dispatcherToken, now)
+}
+
+func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken string, now time.Time) (DeliveryOutbox, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if now.IsZero() {
@@ -445,10 +464,18 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
-	var state, updatedText, nextAttemptText, raw, previousClaimToken string
+	var writesPaused int
+	var pauseReason string
+	if err := tx.QueryRowContext(ctx, `SELECT writes_paused, reason FROM gateway_runtime WHERE singleton = 1`).Scan(&writesPaused, &pauseReason); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if writesPaused != 0 {
+		return DeliveryOutbox{}, fmt.Errorf("%w: %s", ErrGatewayWritesPaused, pauseReason)
+	}
+	var state, updatedText, nextAttemptText, raw, previousClaimToken, previousDispatcherToken string
 	var attempts int
 	var uncertain int
-	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json, claim_token, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw, &previousClaimToken, &uncertain); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT state, updated_at, attempts, next_attempt_at, request_json, claim_token, dispatcher_token, uncertain FROM delivery_outbox WHERE idempotency_key = ?`, key).Scan(&state, &updatedText, &attempts, &nextAttemptText, &raw, &previousClaimToken, &previousDispatcherToken, &uncertain); errors.Is(err, sql.ErrNoRows) {
 		return DeliveryOutbox{}, ErrNotFound
 	} else if err != nil {
 		return DeliveryOutbox{}, err
@@ -460,31 +487,12 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 		return s.DeliveryOutbox(ctx, key)
 	}
 	if state == OutboxProcessing {
-		var request DeliveryRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			return DeliveryOutbox{}, err
+		recoverable, recoverErr := deliveryOutboxClaimRecoverableTx(ctx, tx, raw, updatedText, previousDispatcherToken, now)
+		if recoverErr != nil {
+			return DeliveryOutbox{}, recoverErr
 		}
-		if request.RunID == "" {
-			updatedAt, parseErr := time.Parse(time.RFC3339Nano, updatedText)
-			if parseErr != nil {
-				return DeliveryOutbox{}, parseErr
-			}
-			if updatedAt.After(now.Add(-time.Minute)) {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
-		} else {
-			var expiresText string
-			err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
-			if err != nil {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
-			expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
-			if parseErr != nil {
-				return DeliveryOutbox{}, parseErr
-			}
-			if expiresAt.After(now) {
-				return DeliveryOutbox{}, ErrDeliveryInProgress
-			}
+		if !recoverable {
+			return DeliveryOutbox{}, ErrDeliveryInProgress
 		}
 	}
 	if state == OutboxPending && nextAttemptText != "" {
@@ -517,7 +525,29 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + 1, claim_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ?) OR (state = ? AND claim_token = ?))`, OutboxProcessing, claimToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, OutboxProcessing, previousClaimToken)
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	claimedDispatcherToken := ""
+	if request.RunID == "" {
+		var activeDispatcherToken, expiresText string
+		if err := tx.QueryRowContext(ctx, `SELECT dispatcher_token, dispatcher_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeDispatcherToken, &expiresText); err != nil {
+			return DeliveryOutbox{}, err
+		}
+		if activeDispatcherToken != dispatcherToken || expiresText == "" {
+			return DeliveryOutbox{}, ErrDeliveryInProgress
+		}
+		expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+		if parseErr != nil {
+			return DeliveryOutbox{}, parseErr
+		}
+		if !expiresAt.After(now) {
+			return DeliveryOutbox{}, ErrDeliveryInProgress
+		}
+		claimedDispatcherToken = dispatcherToken
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + 1, claim_token = ?, dispatcher_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ? AND dispatcher_token = ?) OR (state = ? AND claim_token = ? AND dispatcher_token = ?))`, OutboxProcessing, claimToken, claimedDispatcherToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, previousDispatcherToken, OutboxProcessing, previousClaimToken, previousDispatcherToken)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -532,15 +562,61 @@ func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Ti
 	return claimed, err
 }
 
+func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, updatedText, dispatcherToken string, now time.Time) (bool, error) {
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return false, err
+	}
+	if request.RunID == "" {
+		if dispatcherToken == "" {
+			return false, nil
+		}
+		var activeDispatcherToken, expiresText string
+		err := tx.QueryRowContext(ctx, `SELECT dispatcher_token, dispatcher_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeDispatcherToken, &expiresText)
+		if err != nil {
+			return false, err
+		}
+		if activeDispatcherToken != dispatcherToken || expiresText == "" {
+			return true, nil
+		}
+		expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
+		if parseErr != nil {
+			return false, parseErr
+		}
+		return !expiresAt.After(now), nil
+	}
+	var expiresText string
+	err := tx.QueryRowContext(ctx, `SELECT expires_at FROM run_leases WHERE lease_token = ? AND run_id = ? AND generation = ?`, request.LeaseToken, request.RunID, request.LeaseGeneration).Scan(&expiresText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return false, err
+	}
+	return !expiresAt.After(now), nil
+}
+
 func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true, time.Time{})
 }
 
 func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now)
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true, time.Time{})
 }
 
-func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time) error {
+func (s *Store) RequeueDeliveryOutboxClaim(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false, time.Time{})
+}
+
+func (s *Store) DeferDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, retryAt, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, true, retryAt)
+}
+
+func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool, retryAt time.Time) error {
 	if state != OutboxPending && state != OutboxSucceeded && state != OutboxRejected {
 		return ErrInvalidClaim
 	}
@@ -558,21 +634,26 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	}
 	defer tx.Rollback()
 	var attempts int
-	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT attempts, request_json FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&attempts, &raw); errors.Is(err, sql.ErrNoRows) {
+	var raw, dispatcherToken string
+	if err := tx.QueryRowContext(ctx, `SELECT attempts, request_json, dispatcher_token FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&attempts, &raw, &dispatcherToken); errors.Is(err, sql.ErrNoRows) {
 		return ErrFencingConflict
 	} else if err != nil {
 		return err
+	}
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return err
+	}
+	if requireDispatcher {
+		if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
+			return err
+		}
 	}
 	completed := ""
 	nextAttempt := formatTimestamp(now)
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
 		if state == OutboxRejected {
-			var request DeliveryRequest
-			if err := json.Unmarshal([]byte(raw), &request); err != nil {
-				return err
-			}
 			if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
 				if err := markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 					return err
@@ -583,15 +664,14 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
-		var request DeliveryRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			return err
-		}
 		if err := markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 			return err
 		}
 	} else {
 		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(attempts-1))))
+		if retryAt.After(now) {
+			nextAttempt = formatTimestamp(retryAt.UTC())
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', next_attempt_at = ?, updated_at = ?, completed_at = CASE WHEN ? = '' THEN completed_at ELSE ? END, uncertain = ? WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, state, lastError, nextAttempt, formatTimestamp(now), completed, completed, boolInt(uncertain), key, OutboxProcessing, claimToken)
 	if err != nil {
@@ -618,14 +698,17 @@ func (s *Store) CompleteDeliveryOutbox(ctx context.Context, key, claimToken stri
 		return err
 	}
 	defer tx.Rollback()
-	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT request_json FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&raw); errors.Is(err, sql.ErrNoRows) {
+	var raw, dispatcherToken string
+	if err := tx.QueryRowContext(ctx, `SELECT request_json, dispatcher_token FROM delivery_outbox WHERE idempotency_key = ? AND state = ? AND claim_token = ?`, key, OutboxProcessing, claimToken).Scan(&raw, &dispatcherToken); errors.Is(err, sql.ErrNoRows) {
 		return ErrFencingConflict
 	} else if err != nil {
 		return err
 	}
 	var request DeliveryRequest
 	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return err
+	}
+	if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
 		return err
 	}
 	if deliveryResult.PullRequestNumber != 0 && request.Operation == DeliveryUpsertPR {
@@ -647,6 +730,30 @@ AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryRe
 		return ErrFencingConflict
 	}
 	return tx.Commit()
+}
+
+func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, dispatcherToken string, now time.Time) error {
+	if request.RunID != "" {
+		return nil
+	}
+	if dispatcherToken == "" {
+		return ErrFencingConflict
+	}
+	var activeToken, expiresText string
+	if err := tx.QueryRowContext(ctx, `SELECT dispatcher_token, dispatcher_expires_at FROM gateway_runtime WHERE singleton = 1`).Scan(&activeToken, &expiresText); err != nil {
+		return err
+	}
+	if activeToken != dispatcherToken || expiresText == "" {
+		return ErrFencingConflict
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(now) {
+		return ErrFencingConflict
+	}
+	return nil
 }
 
 func markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, reason string, now time.Time) error {
@@ -746,6 +853,15 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
+		var admitted int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND (`+currentActivePlanPredicate+` OR ? = 1) LIMIT 1`, request.Repository, boolInt(request.WorkflowQuestions != nil)).Scan(&admitted)
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
+		}
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
 		return DeliveryTarget{Repository: request.Repository}, request, nil
 	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
@@ -775,8 +891,8 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		}
 		return DeliveryTarget{VersionID: versionID, Repository: request.Repository, RootNumber: request.RootNumber}, request, nil
 	}
-	if request.RunID == "" || request.LeaseToken == "" || request.LeaseGeneration <= 0 || request.Repository == "" {
-		return DeliveryTarget{}, request, fmt.Errorf("%w: run lease and repository are required", ErrDeliveryRejected)
+	if request.RunID == "" || request.LeaseToken == "" || request.LeaseGeneration <= 0 {
+		return DeliveryTarget{}, request, fmt.Errorf("%w: run lease is required", ErrDeliveryRejected)
 	}
 	switch request.Operation {
 	case DeliveryPushCandidate, DeliveryUpsertPR, DeliveryReplyEvidence, DeliveryProjectPlan, DeliveryAddIssueLabel:
@@ -811,9 +927,10 @@ AND `+currentActiveUnfrozenPlanPredicate,
 		return DeliveryTarget{}, request, fmt.Errorf("%w: lease is expired", ErrDeliveryRejected)
 	}
 	target.LeaseExpiresAt = expiresAt
-	if request.Repository != target.Repository {
+	if request.Repository != "" && request.Repository != target.Repository {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: repository does not belong to ticket", ErrDeliveryRejected)
 	}
+	request.Repository = target.Repository
 	if request.Branch != "" && request.Branch != target.Branch {
 		return DeliveryTarget{}, request, fmt.Errorf("%w: branch does not belong to ticket", ErrDeliveryRejected)
 	}

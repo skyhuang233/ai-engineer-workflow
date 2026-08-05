@@ -103,6 +103,8 @@ type CandidateRevision struct {
 	CodexSessionID   string
 	CommitSHA        string
 	StructuredOutput []byte
+	ImageDigest      string
+	ToolVersions     map[string]string
 	Now              time.Time
 	Publication      CandidatePublication
 }
@@ -470,6 +472,26 @@ func (s *Store) AcceptCandidateForDelivery(ctx context.Context, candidate Candid
 	return s.acceptCandidate(ctx, candidate, deliveryLeaseTTL)
 }
 
+func (s *Store) CandidateWorkerRuntime(ctx context.Context, versionID string, issueID int64) (string, map[string]string, error) {
+	var imageDigest, toolVersionsJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT c.image_digest, c.tool_versions_json
+FROM ticket_sessions s
+JOIN candidate_revisions c ON c.run_id = s.accepted_candidate_run_id
+WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).
+		Scan(&imageDigest, &toolVersionsJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, ErrNotFound
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	var toolVersions map[string]string
+	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || toolVersions["codex"] == "" || toolVersions["no-mistakes"] == "" {
+		return "", nil, ErrInvalidClaim
+	}
+	return imageDigest, toolVersions, nil
+}
+
 func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision, deliveryLeaseTTL time.Duration) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -478,6 +500,10 @@ func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision
 	}
 	if candidateoutput.Validate(candidate.StructuredOutput) != nil {
 		return TicketClaim{}, ErrInvalidClaim
+	}
+	toolVersions, err := json.Marshal(candidate.ToolVersions)
+	if err != nil {
+		return TicketClaim{}, err
 	}
 	if candidate.Now.IsZero() {
 		candidate.Now = time.Now().UTC()
@@ -510,7 +536,7 @@ SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = 
 	WHERE json_extract(request_json, '$.run_id') = ? AND state IN (?, ?)`, OutboxRejected, "candidate accepted before delivery controller admission", now, now, candidate.RunID, OutboxPending, OutboxProcessing); err != nil {
 		return TicketClaim{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, created_at) VALUES (?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, image_digest, tool_versions_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), candidate.ImageDigest, string(toolVersions), now); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded', finished_at = ? WHERE run_id = ? AND state = ?`, now, candidate.RunID, RunRunning); err != nil {
@@ -519,7 +545,7 @@ SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = 
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, candidate.RunID, candidate.LeaseToken, LeaseActive); err != nil {
 		return TicketClaim{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, consecutive_failures = 0, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, now, sessionID, candidate.CodexSessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, accepted_candidate_run_id = ?, consecutive_failures = 0, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, candidate.RunID, now, sessionID, candidate.CodexSessionID); err != nil {
 		return TicketClaim{}, err
 	}
 	remoteHead := candidate.Publication.ExpectedRemoteHead

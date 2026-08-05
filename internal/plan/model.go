@@ -31,15 +31,17 @@ var (
 // Issue is the read model needed to activate a Delivery Plan. IDs, rather
 // than issue numbers, are used as graph keys because they are immutable.
 type Issue struct {
-	ID        int64
-	NodeID    string
-	Number    int64
-	Title     string
-	Body      string
-	State     string
-	Labels    []string
-	UpdatedAt string
-	Delivered bool
+	ID         int64
+	NodeID     string
+	Number     int64
+	Title      string
+	Body       string
+	State      string
+	Labels     []string
+	UpdatedAt  string
+	Delivered  bool
+	Author     string
+	AuthorType string
 }
 
 func (i Issue) HasLabel(label string) bool {

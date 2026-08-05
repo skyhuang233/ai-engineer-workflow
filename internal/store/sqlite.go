@@ -19,20 +19,21 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 24
+	latestSchemaVersion = 30
 )
 
 var (
-	ErrVersionConflict    = errors.New("plan has already been activated with a different version")
-	ErrNotFound           = errors.New("plan not found")
-	ErrFencingConflict    = errors.New("fencing conflict: ticket is already owned")
-	ErrNoReadyTickets     = errors.New("no ready tickets")
-	ErrCapacity           = errors.New("run capacity is full")
-	ErrNotReady           = errors.New("ticket is not ready")
-	ErrInvalidClaim       = errors.New("invalid ticket claim")
-	ErrDeliveryInProgress = errors.New("delivery outbox item is already being processed")
-	ErrWorkerLaunched     = errors.New("worker run has already been launched")
-	ErrNeedsAttention     = errors.New("workflow needs attention")
+	ErrVersionConflict     = errors.New("plan has already been activated with a different version")
+	ErrNotFound            = errors.New("plan not found")
+	ErrFencingConflict     = errors.New("fencing conflict: ticket is already owned")
+	ErrNoReadyTickets      = errors.New("no ready tickets")
+	ErrCapacity            = errors.New("run capacity is full")
+	ErrNotReady            = errors.New("ticket is not ready")
+	ErrInvalidClaim        = errors.New("invalid ticket claim")
+	ErrDeliveryInProgress  = errors.New("delivery outbox item is already being processed")
+	ErrGatewayWritesPaused = errors.New("gateway writes are paused")
+	ErrWorkerLaunched      = errors.New("worker run has already been launched")
+	ErrNeedsAttention      = errors.New("workflow needs attention")
 )
 
 const (
@@ -637,6 +638,7 @@ SELECT question_id, repository, version_id, issue_id, kind, 1, prompt, state, an
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (23, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
+		applied = 23
 	}
 	if applied < 24 {
 		statements := []string{
@@ -662,6 +664,154 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (24, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+		applied = 24
+	}
+	if applied < 25 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS worker_releases (
+    image_digest TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    source_commit TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS active_worker_image (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    image_digest TEXT NOT NULL REFERENCES worker_releases(image_digest)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 25: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (25, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+		applied = 25
+	}
+	if applied < 26 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS gateway_credential_verifications (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    fingerprint_sha256 TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    integration_repository TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 26: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (26, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+		applied = 26
+	}
+	if applied < 27 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS gateway_runtime (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    writes_paused INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS workflow_inbox (
+    item_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'resolved')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 27: %w", err)
+			}
+		}
+		timestamp := formatTimestamp(time.Now())
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO gateway_runtime(singleton, writes_paused, reason, updated_at) VALUES (1, 0, '', ?)`, timestamp); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (27, ?)", timestamp); err != nil {
+			return err
+		}
+		applied = 27
+	}
+	if applied < 28 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "candidate_revisions", name: "image_digest", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "candidate_revisions", name: "tool_versions_json", definition: "TEXT NOT NULL DEFAULT '{}'"},
+			{table: "ticket_sessions", name: "accepted_candidate_run_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 28: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 28: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (28, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 29 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "gateway_runtime", name: "dispatcher_token", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "gateway_runtime", name: "dispatcher_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "delivery_outbox", name: "dispatcher_token", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 29: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 29: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (29, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 30 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "gateway_runtime", name: "rotation_owner", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "gateway_runtime", name: "rotation_generation", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{table: "gateway_runtime", name: "rotation_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 30: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+column.table+" ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 30: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (30, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
