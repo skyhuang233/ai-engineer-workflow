@@ -46,6 +46,10 @@ func (p Poller) Poll(ctx context.Context, repository string) (PollResult, error)
 	return p.PollWith(ctx, repository, nil)
 }
 
+func (p Poller) RecordFailure(ctx context.Context, repository string, cause error) (PollResult, error) {
+	return p.recordFailure(ctx, repository, p.now(), cause)
+}
+
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
 	if p.Store == nil || p.Client == nil {
 		return PollResult{}, fmt.Errorf("GitHub poller dependencies are incomplete")

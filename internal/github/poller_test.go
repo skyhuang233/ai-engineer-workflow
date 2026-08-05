@@ -42,6 +42,28 @@ func TestRecordFailurePersistsAfterParentCancellation(t *testing.T) {
 	}
 }
 
+func TestRecordFailureDefersRateLimitedAdmission(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Minute)
+	_, err = (Poller{Store: db, Now: func() time.Time { return now }}).RecordFailure(ctx, "owner/repo", &apiError{StatusCode: 403, RetryAt: retryAt})
+	if err == nil {
+		t.Fatal("rate-limited admission failure returned nil")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NextAttemptAt.Equal(retryAt) || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("cursor = %#v", cursor)
+	}
+}
+
 func TestPollSkipsInboxWhileRateLimited(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

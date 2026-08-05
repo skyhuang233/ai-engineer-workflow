@@ -541,16 +541,24 @@ func runPollGitHub(args []string) {
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
+		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		var client *github.Client
 		_, err := admitGatewayCredential(ctx, db, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requirePublicControlPlaneRepository(ctx, client, *repository)
 		})
 		if err != nil {
+			if shouldPauseGatewayForCredential(err) {
+				fmt.Fprintln(os.Stderr, err)
+				return err
+			}
+			_, err = poller.RecordFailure(ctx, *repository, err)
+			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
-		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
-		poller := github.Poller{Store: db, Client: client, LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+		poller.Client = client
+		poller.LaunchReview = launcher
 		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
@@ -684,12 +692,9 @@ func runAnswerInbox(args []string) {
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	questionID := flags.String("question", "", "stable Workflow Inbox question ID")
 	answer := flags.String("answer", "", "human decision")
-	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
-	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
-	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *questionID == "" || *answer == "" || *gatewayURL == "" {
-		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, answer, and Gateway URL")
+	if *repository == "" || *questionID == "" || *answer == "" {
+		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, and answer")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
@@ -698,24 +703,7 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
-		fail(err)
-	}
-	_, err = admitGatewayCredential(ctx, db, func(token string) error {
-		return requirePublicControlPlaneRepository(ctx, github.NewClient(*githubURL, token, nil), *repository)
-	})
-	if err != nil {
-		fail(err)
-	}
-	questions, err := db.OpenWorkflowQuestions(ctx, *repository, 0)
-	if err != nil {
-		fail(err)
-	}
-	projected := make([]plan.WorkflowQuestion, 0, len(questions))
-	for _, open := range questions {
-		projected = append(projected, plan.WorkflowQuestion{ID: open.ID, Prompt: open.Prompt, Repository: open.Repository, PlanNumber: open.RootNumber, TicketNumber: open.TicketNumber, PullRequest: open.PullRequest, Commit: open.Commit, Finding: open.Kind, Diagnostics: open.Diagnostics, Evidence: open.Evidence})
-	}
-	if err := (delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}).ProjectWorkflowInbox(ctx, *repository, projected); err != nil {
+	if _, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 }

@@ -221,6 +221,46 @@ func TestWorkflowInboxProjectionRequiresActiveDeliveryPlan(t *testing.T) {
 	}
 }
 
+func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	activateWorkflowInboxPlan(t, ctx, db, "owner/repository")
+	var versionID string
+	if err := db.db.QueryRowContext(ctx, `SELECT current_version_id FROM plans WHERE repository = ?`, "owner/repository").Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, "owner/repository", versionID, 2, "needs_attention", "retry the ticket", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repository", 0)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	outbox, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, "owner/repository", questions[0].ID, "retry", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	question, err := db.WorkflowQuestion(ctx, "owner/repository", questions[0].ID)
+	if err != nil || question.State != "answered" || question.Answer != "retry" {
+		t.Fatalf("question = %#v, %v", question, err)
+	}
+	if outbox.State != OutboxPending || outbox.Request.Operation != DeliveryProjectInbox || outbox.Request.WorkflowQuestions == nil || len(outbox.Request.WorkflowQuestions) != 0 {
+		t.Fatalf("outbox = %#v", outbox)
+	}
+}
+
 func activateWorkflowInboxPlan(t *testing.T, ctx context.Context, db *Store, repository string) {
 	t.Helper()
 	snapshot := plan.Snapshot{

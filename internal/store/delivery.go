@@ -154,14 +154,24 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
+	outbox, err := s.enqueueDeliveryTx(ctx, tx, request, now)
+	if err != nil {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return DeliveryOutbox{}, commitErr
+		}
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
+}
 
+func (s *Store) enqueueDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryOutbox, error) {
 	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now)
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now); auditErr != nil {
 			return DeliveryOutbox{}, auditErr
-		}
-		if commitErr := tx.Commit(); commitErr != nil {
-			return DeliveryOutbox{}, commitErr
 		}
 		return DeliveryOutbox{}, err
 	}
@@ -217,9 +227,6 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 			}
 			existing.NextAttemptAt = &value
 		}
-		if err := tx.Commit(); err != nil {
-			return DeliveryOutbox{}, err
-		}
 		return existing, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -243,9 +250,6 @@ VALUES (?, ?, ?, ?, 0, '', ?, ?, ?)`, key, normalized.Operation, string(encoded)
 		return DeliveryOutbox{}, err
 	}
 	if err := insertDeliveryAuditTx(ctx, tx, normalized, "accepted", "queued in durable outbox", now); err != nil {
-		return DeliveryOutbox{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	return DeliveryOutbox{ID: id, IdempotencyKey: key, Request: normalized, State: OutboxPending, CreatedAt: now, UpdatedAt: now}, nil
@@ -849,7 +853,8 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
 		var admitted int
-		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND (`+currentActivePlanPredicate+` OR ? = 1) LIMIT 1`, request.Repository, boolInt(request.WorkflowQuestions != nil)).Scan(&admitted)
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
 		}

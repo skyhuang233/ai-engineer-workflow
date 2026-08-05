@@ -41,7 +41,15 @@ type replacementReference struct {
 }
 
 func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
+	return openWorkflowQuestions(ctx, s.db, repository, rootNumber)
+}
+
+type workflowQuestionQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func openWorkflowQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
+	rows, err := querier.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
 COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
 FROM workflow_questions q
 JOIN plan_versions v ON v.version_id = q.version_id
@@ -251,9 +259,51 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 		return err
 	}
 	defer tx.Rollback()
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time) (DeliveryOutbox, error) {
+	if repository == "" || questionID == "" || answer == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	defer tx.Rollback()
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	questions, err := openWorkflowQuestions(ctx, tx, repository, 0)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	projected := make([]plan.WorkflowQuestion, 0, len(questions))
+	for _, question := range questions {
+		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
+	}
+	outbox, err := s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, WorkflowQuestions: projected}, now)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
+}
+
+func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time) error {
 	var kind, versionID, state, priorAnswer string
 	var issueID int64
-	err = tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
+	err := tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -262,7 +312,7 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 	}
 	if state != "open" {
 		if kind == "closed_unmerged_impact" && state == "answered" && priorAnswer == answer {
-			return tx.Commit()
+			return nil
 		}
 		return ErrNotFound
 	}
@@ -350,7 +400,7 @@ WHERE t.poll_question_id = ? AND t.version_id = ?`, questionID, versionID)
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
