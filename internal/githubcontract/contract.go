@@ -120,7 +120,7 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 		return fmt.Errorf("verify label update permission: %w", labelErr)
 	}
 	if _, err := v.call(ctx, token, http.MethodPost, fmt.Sprintf("repos/%s/issues/%d/labels", repository, issue.Number),
-		map[string][]string{"labels": {"workflow-contract"}}, &struct{}{}); err != nil {
+		map[string][]string{"labels": {"workflow-contract"}}, nil); err != nil {
 		return fmt.Errorf("verify label application permission: %w", err)
 	}
 

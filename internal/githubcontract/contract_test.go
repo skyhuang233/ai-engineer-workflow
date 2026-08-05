@@ -38,6 +38,8 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 			_, _ = w.Write([]byte(`{"number":12}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls"):
 			_, _ = w.Write([]byte(`{"number":13}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues/12/labels"):
+			_, _ = w.Write([]byte(`[{"name":"workflow-credential-contract"}]`))
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/"):
 			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
 		default:
