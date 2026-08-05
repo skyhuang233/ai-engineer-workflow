@@ -283,6 +283,10 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if err != nil || recovered.CommitSHA != candidate.Commit {
 		t.Fatalf("recovered candidate = %#v, err=%v", recovered, err)
 	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil || session.AcceptedCandidateRunID != claim.RunID {
+		t.Fatalf("persisted Revision Round = %#v, err=%v", session, err)
+	}
 	if keys, err := db.DueDeliveryOutboxKeys(ctx, time.Now().UTC(), 8); err != nil || len(keys) != 0 {
 		t.Fatalf("candidate acceptance queued delivery commands: keys=%#v, err=%v", keys, err)
 	}
@@ -306,6 +310,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
 	}
+	assertWorkflowDeliveryEnvironment(t, first.specs[1], claim.SessionID, claim.RunID, first.specs[1].RunID)
 	if first.specs[1].Environment["NO_MISTAKES_GATEWAY_URL"] != "http://gateway.test" {
 		t.Fatalf("Delivery Controller Gateway URL = %#v", first.specs[1].Environment)
 	}
@@ -331,6 +336,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if len(second.specs) != 2 || strings.Join(second.specs[1].Command, " ") != "no-mistakes axi run --intent address the review feedback" {
 		t.Fatalf("review worker specs = %#v", second.specs)
 	}
+	assertWorkflowDeliveryEnvironment(t, second.specs[1], claim.SessionID, revision.RunID, second.specs[1].RunID)
 	if command := second.specs[0].Command; len(command) != 9 || command[0] != "codex" || command[1] != "exec" || command[2] != "resume" || command[3] != "--json" || command[4] != "--output-schema" || command[6] != "--skip-git-repo-check" || command[7] != "codex-session-1" || command[8] != "address the review feedback" {
 		t.Fatalf("resumed Codex command = %#v", command)
 	}
@@ -429,9 +435,17 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("retried delivery image = %q, want accepted Candidate image", retryRuntime.specs[0].ImageDigest)
 	}
+	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, claim.RunID, pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
+	}
+}
+
+func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryCycle, revisionRound, correlationID string) {
+	t.Helper()
+	if spec.Environment["NO_MISTAKES_WORKFLOW_MODE"] != "true" || spec.Environment["NO_MISTAKES_DELIVERY_CYCLE"] != deliveryCycle || spec.Environment["NO_MISTAKES_REVISION_ROUND"] != revisionRound || spec.Environment["NO_MISTAKES_CORRELATION_ID"] != correlationID {
+		t.Fatalf("Delivery Controller workflow correlation environment = %#v", spec.Environment)
 	}
 }
 

@@ -80,6 +80,14 @@ routing and decisions. `workflow reconcile-delivered` checks merged pull request
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 
+The workflow adapter enables the fork's workflow mode only for those Delivery
+Controller runs. It uses the Ticket Session ID as the stable correlation key
+for that Delivery Cycle, the accepted Candidate Revision's Worker Run ID as
+the Revision Round key, and the delivery-lease Run ID as the unique
+per-invocation correlation ID. The same identifiers are retained when a
+Delivery Controller run is recovered, while ordinary standalone `no-mistakes`
+usage receives none of this workflow-specific configuration.
+
 The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
 registry. The Release Manifest's exact digest must resolve from GHCR and pass

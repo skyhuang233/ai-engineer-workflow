@@ -181,6 +181,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
 	}
 	session.AcceptedCommit = commit
+	session.AcceptedCandidateRunID = request.Claim.RunID
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
 	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt, imageDigest, toolVersions); err != nil {
 		return candidate, err
@@ -205,7 +206,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" {
+	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
 	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, Branch: session.Branch}
@@ -240,13 +241,19 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
 	}
+	if session.SessionID == "" || session.AcceptedCandidateRunID == "" {
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Delivery Cycle or Revision Round is incomplete"))
+	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
+		"NO_MISTAKES_WORKFLOW_MODE":        "true",
 		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
+		"NO_MISTAKES_REVISION_ROUND":       session.AcceptedCandidateRunID,
+		"NO_MISTAKES_CORRELATION_ID":       deliveryClaim.RunID,
 		"NO_MISTAKES_RUN_ID":               deliveryClaim.RunID,
 		"NO_MISTAKES_LEASE_TOKEN":          deliveryClaim.LeaseToken,
 		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(deliveryClaim.LeaseGeneration),

@@ -15,16 +15,17 @@ import (
 var ErrSessionConflict = errors.New("ticket session identity conflict")
 
 type TicketSession struct {
-	SessionID            string
-	VersionID            string
-	TicketID             int64
-	AgentIdentity        string
-	CodexSessionID       string
-	WorkspacePath        string
-	CodexStatePath       string
-	Branch               string
-	AcceptedCommit       string
-	WorkspaceReclaimedAt time.Time
+	SessionID              string
+	VersionID              string
+	TicketID               int64
+	AgentIdentity          string
+	CodexSessionID         string
+	WorkspacePath          string
+	CodexStatePath         string
+	Branch                 string
+	AcceptedCommit         string
+	AcceptedCandidateRunID string
+	WorkspaceReclaimedAt   time.Time
 }
 
 func (s *Store) ClosedSessionsForWorkspaceCleanup(ctx context.Context, retention time.Duration, now time.Time) ([]TicketSession, error) {
@@ -208,7 +209,7 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 		}
 	}
 	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
-s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit,
+s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit, s.accepted_candidate_run_id,
 l.lease_token, l.generation, l.expires_at
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
@@ -226,6 +227,7 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 		var expiresAt string
 		if err := rows.Scan(&run.Claim.RunID, &run.Kind, &run.Claim.VersionID, &run.Claim.TicketID, &run.Claim.TicketNumber, &run.Claim.TicketTitle, &run.Claim.Owner, &run.Claim.SessionID,
 			&run.Session.AgentIdentity, &run.Session.CodexSessionID, &run.Session.WorkspacePath, &run.Session.CodexStatePath, &run.Session.Branch, &run.Session.AcceptedCommit,
+			&run.Session.AcceptedCandidateRunID,
 			&run.Claim.LeaseToken, &run.Claim.LeaseGeneration, &expiresAt); err != nil {
 			return nil, err
 		}
@@ -301,11 +303,11 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 
 func (s *Store) TicketSession(ctx context.Context, versionID string, ticketID int64) (TicketSession, error) {
 	var session TicketSession
-	err := s.db.QueryRowContext(ctx, `SELECT session_id, version_id, issue_id, agent_identity, codex_session_id, workspace_path, codex_state_path, branch, accepted_commit
+	err := s.db.QueryRowContext(ctx, `SELECT session_id, version_id, issue_id, agent_identity, codex_session_id, workspace_path, codex_state_path, branch, accepted_commit, accepted_candidate_run_id
 FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, ticketID).Scan(
 		&session.SessionID, &session.VersionID, &session.TicketID, &session.AgentIdentity,
 		&session.CodexSessionID, &session.WorkspacePath, &session.CodexStatePath,
-		&session.Branch, &session.AcceptedCommit)
+		&session.Branch, &session.AcceptedCommit, &session.AcceptedCandidateRunID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketSession{}, ErrNotFound
 	}
@@ -358,9 +360,9 @@ func (s *Store) BindAgent(ctx context.Context, binding AgentBinding) (TicketSess
 		return TicketSession{}, err
 	}
 	var session TicketSession
-	err = tx.QueryRowContext(ctx, `SELECT session_id, version_id, issue_id, agent_identity, codex_session_id, workspace_path, codex_state_path, branch, accepted_commit FROM ticket_sessions WHERE session_id = ?`, binding.SessionID).Scan(
+	err = tx.QueryRowContext(ctx, `SELECT session_id, version_id, issue_id, agent_identity, codex_session_id, workspace_path, codex_state_path, branch, accepted_commit, accepted_candidate_run_id FROM ticket_sessions WHERE session_id = ?`, binding.SessionID).Scan(
 		&session.SessionID, &session.VersionID, &session.TicketID, &session.AgentIdentity, &session.CodexSessionID,
-		&session.WorkspacePath, &session.CodexStatePath, &session.Branch, &session.AcceptedCommit)
+		&session.WorkspacePath, &session.CodexStatePath, &session.Branch, &session.AcceptedCommit, &session.AcceptedCandidateRunID)
 	if err != nil {
 		return TicketSession{}, err
 	}
