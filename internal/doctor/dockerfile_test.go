@@ -21,6 +21,8 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 	for _, required := range []string{
 		"DEBIAN_SNAPSHOT=20260713T000000Z",
 		"https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}",
+		"apt-get update -o Acquire::Check-Valid-Until=false -o Acquire::https::Verify-Peer=false",
+		"apt-get install --yes --no-install-recommends -o Acquire::https::Verify-Peer=false ca-certificates=20230311+deb12u1",
 		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 gh=2.23.0+dfsg1-1 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2\"",
 		"io.workflow.debian.snapshot",
 		"io.workflow.apt.packages",
