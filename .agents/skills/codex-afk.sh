@@ -21,7 +21,7 @@ source "$COMMON_FILE"
 
 cd "$PROJECT_ROOT"
 gh_afk_require_tools
-for required in go curl od tr; do
+for required in go; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Required command not found on PATH: $required" >&2
     exit 1
@@ -56,14 +56,9 @@ state_root="${WORKFLOW_CODEX_STATE_ROOT:-$runtime_root/codex-state}"
 config_path="${WORKFLOW_CONFIG:-$PROJECT_ROOT/config/toolchain.json}"
 max_parallel_runs="${WORKFLOW_MAX_PARALLEL_RUNS:-1}"
 workspace_retention="${WORKFLOW_WORKSPACE_RETENTION:-168h}"
-gateway_start_timeout="${WORKFLOW_GATEWAY_START_TIMEOUT_SECONDS:-30}"
 
 if ! [[ "$max_parallel_runs" =~ ^[1-9][0-9]*$ ]]; then
   echo "WORKFLOW_MAX_PARALLEL_RUNS must be a positive integer." >&2
-  exit 2
-fi
-if ! [[ "$gateway_start_timeout" =~ ^[1-9][0-9]*$ ]]; then
-  echo "WORKFLOW_GATEWAY_START_TIMEOUT_SECONDS must be a positive integer." >&2
   exit 2
 fi
 if [ ! -f "$config_path" ]; then
@@ -97,95 +92,19 @@ if ! [[ "$plan_root" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 mkdir -p "$(dirname "$database")" "$workspace_root" "$state_root"
-runtime_dir="$(mktemp -d)"
-ready_file="$runtime_dir/gateway.ready"
-gateway_stdout="$runtime_dir/gateway.stdout.log"
-gateway_stderr="$runtime_dir/gateway.stderr.log"
-workflow_binary="$runtime_dir/workflow"
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) workflow_binary="$runtime_dir/workflow.exe" ;;
-esac
-gateway_pid=""
-
-cleanup() {
-  local status="$?"
-  trap - EXIT
-  if [ -n "$gateway_pid" ]; then
-    if kill -0 "$gateway_pid" 2>/dev/null; then
-      kill "$gateway_pid" 2>/dev/null || true
-    fi
-    wait "$gateway_pid" 2>/dev/null || true
-  fi
-  rm -rf "$runtime_dir"
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-go build -o "$workflow_binary" ./cmd/workflow
-control_token="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
-if [ "${#control_token}" -ne 64 ]; then
-  echo "Failed to generate the ephemeral Gateway control token." >&2
-  exit 1
-fi
-export WORKFLOW_GATEWAY_CONTROL_TOKEN="$control_token"
 unset WORKFLOW_GITHUB_GATEWAY_COMMAND || true
 
-"$workflow_binary" gateway \
-  --config "$config_path" \
-  --database "$database" \
-  --listen 127.0.0.1:0 \
-  --ready-file "$ready_file" \
-  >"$gateway_stdout" 2>"$gateway_stderr" &
-gateway_pid="$!"
-
-ready_attempts=$((gateway_start_timeout * 10))
-for ((attempt=1; attempt<=ready_attempts; attempt++)); do
-  if [ -s "$ready_file" ]; then
-    break
-  fi
-  if ! kill -0 "$gateway_pid" 2>/dev/null; then
-    cat "$gateway_stdout" >&2 || true
-    cat "$gateway_stderr" >&2 || true
-    echo "GitHub Write Gateway exited before becoming ready." >&2
-    exit 1
-  fi
-  sleep 0.1
-done
-if [ ! -s "$ready_file" ]; then
-  cat "$gateway_stdout" >&2 || true
-  cat "$gateway_stderr" >&2 || true
-  echo "GitHub Write Gateway did not become ready within ${gateway_start_timeout}s." >&2
-  exit 1
-fi
-gateway_url="$(gh_afk_strip_cr "$(cat "$ready_file")")"
-if ! curl --fail --silent --show-error \
-  --header "X-Workflow-Control-Token: $control_token" \
-  --output /dev/null \
-  "$gateway_url/healthz"; then
-  echo "GitHub Write Gateway readiness probe failed." >&2
-  exit 1
-fi
-
 echo "Using production Control Plane for $repository plan #$plan_root."
-echo "Gateway: $gateway_url"
 echo "Maximum parallel Worker Runs: $max_parallel_runs"
 
-for ((iteration=1; iteration<=ITERATIONS; iteration++)); do
-  echo ""
-  echo "===== Codex AFK control-plane pass $iteration / $ITERATIONS ====="
-  echo ""
-  "$workflow_binary" poll-github \
-    --once \
-    --repository "$repository" \
-    --root "$plan_root" \
-    --source "$PROJECT_ROOT" \
-    --workspace-root "$workspace_root" \
-    --state-root "$state_root" \
-    --gateway-url "$gateway_url" \
-    --max-parallel-runs "$max_parallel_runs" \
-    --workspace-retention "$workspace_retention" \
-    --config "$config_path" \
-    --database "$database"
-done
+go run ./cmd/workflow afk \
+  --iterations "$ITERATIONS" \
+  --repository "$repository" \
+  --root "$plan_root" \
+  --source "$PROJECT_ROOT" \
+  --workspace-root "$workspace_root" \
+  --state-root "$state_root" \
+  --max-parallel-runs "$max_parallel_runs" \
+  --workspace-retention "$workspace_retention" \
+  --config "$config_path" \
+  --database "$database"

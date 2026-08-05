@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +55,8 @@ func main() {
 		runTicket(os.Args[2:])
 	case "gateway":
 		runGateway(os.Args[2:])
+	case "afk":
+		runAFK(os.Args[2:])
 	case "poll-github":
 		runPollGitHub(os.Args[2:])
 	case "reconcile-delivered":
@@ -74,6 +75,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow credential provision [--config path] [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
+	fmt.Fprintln(os.Stderr, "  workflow afk [options]")
 	fmt.Fprintln(os.Stderr, "  workflow poll-github [options]")
 	fmt.Fprintln(os.Stderr, "  workflow reconcile-delivered [options]")
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
@@ -478,7 +480,13 @@ func runReconcileDelivered(args []string) {
 }
 
 func runPollGitHub(args []string) {
-	flags := flag.NewFlagSet("poll-github", flag.ExitOnError)
+	if err := executePollGitHub(args); err != nil {
+		fail(err)
+	}
+}
+
+func executePollGitHub(args []string) error {
+	flags := flag.NewFlagSet("poll-github", flag.ContinueOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
@@ -489,22 +497,27 @@ func runPollGitHub(args []string) {
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	workspaceRetention := flags.Duration("workspace-retention", 7*24*time.Hour, "retention period before closed Ticket Workspaces are reclaimed")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
+	workerGatewayURL := flags.String("worker-gateway-url", "", "Gateway URL reachable from Docker Workers (defaults to gateway-url)")
 	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
-	_ = flags.Parse(args)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *workerGatewayURL == "" {
+		*workerGatewayURL = *gatewayURL
+	}
 	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
-		os.Exit(2)
+		return errors.New("poll-github requires repository, approved plan root, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 	}
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
-		fail(err)
+		return err
 	}
 	db, err := store.Open(context.Background(), *databasePath)
 	if err != nil {
-		fail(err)
+		return err
 	}
 	defer db.Close()
 	var workers sync.WaitGroup
@@ -513,7 +526,7 @@ func runPollGitHub(args []string) {
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
-			err := runClaimWorker(workerCtx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
+			err := runClaimWorker(workerCtx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *workerGatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
 				if *once {
@@ -546,7 +559,7 @@ func runPollGitHub(args []string) {
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
-		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
+		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *workerGatewayURL}
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
@@ -637,9 +650,9 @@ func runPollGitHub(args []string) {
 		pollErr = errors.Join(pollErr, workerError)
 		workerErrorMu.Unlock()
 		if pollErr != nil {
-			fail(pollErr)
+			return pollErr
 		}
-		return
+		return nil
 	}
 	for {
 		_ = poll()
@@ -732,7 +745,6 @@ func runGateway(args []string) {
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
-	readyFile := flags.String("ready-file", "", "write the bound Gateway URL after the listener is ready")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
@@ -786,51 +798,12 @@ func runGateway(args []string) {
 		_ = db.Close()
 		fail(err)
 	}
-	if err := writeGatewayReadyFile(*readyFile, listener.Addr().String()); err != nil {
-		_ = listener.Close()
-		_ = db.Close()
-		fail(err)
-	}
-	if *readyFile != "" {
-		defer os.Remove(*readyFile)
-	}
 	server := &http.Server{Handler: delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: *controlToken})}
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		_ = db.Close()
 		fail(err)
 	}
 	_ = db.Close()
-}
-
-func writeGatewayReadyFile(path, address string) error {
-	if path == "" {
-		return nil
-	}
-	if strings.TrimSpace(address) == "" {
-		return errors.New("Gateway bound address is required")
-	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".workflow-gateway-ready-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := file.Name()
-	defer func() {
-		_ = file.Close()
-		_ = os.Remove(temporaryPath)
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(file, "http://%s\n", address); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	return nil
 }
 
 func gatewayCredential(ctx context.Context) (string, error) {

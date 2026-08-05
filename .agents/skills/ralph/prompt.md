@@ -81,16 +81,19 @@ Gateway.
 
 When the task is complete:
 
-1. Add a GitHub issue comment summarizing the change, verification, and any
-   follow-up suggestions.
-2. Remove the `in-progress` label.
-3. Close the GitHub Issue.
+1. Return a completion summary containing the change, verification, commit,
+   and any follow-up suggestions.
+2. Report the intended terminal issue state as `completed`.
+3. Leave all comments, labels, issue closure, pushes, and pull requests to the
+   Delivery Controller and fenced Gateway.
 
 When the task is not complete:
 
-1. Add a GitHub issue comment with what was done and what remains.
-2. Remove the `in-progress` label.
-3. Add `blocked` or `needs-info` when appropriate.
+1. Return a progress summary containing what was done and what remains.
+2. Report the intended issue state as `blocked` or `needs-info` and include the
+   concrete reason.
+3. Leave all comments and label transitions to the Delivery Controller and
+   fenced Gateway.
 
 Do not move or edit local issue files.
 

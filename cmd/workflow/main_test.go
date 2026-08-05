@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -19,17 +18,16 @@ import (
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
-func TestGatewayReadyFilePublishesTheBoundLoopbackURL(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gateway.ready")
-	if err := writeGatewayReadyFile(path, "127.0.0.1:43123"); err != nil {
-		t.Fatal(err)
-	}
-	contents, err := os.ReadFile(path)
+func TestGatewayEndpointsSeparateHostAndWorkerNetworkNamespaces(t *testing.T) {
+	hostURL, workerURL, err := gatewayEndpoints("0.0.0.0:43123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(contents), "http://127.0.0.1:43123\n"; got != want {
-		t.Fatalf("ready file = %q, want %q", got, want)
+	if got, want := hostURL, "http://127.0.0.1:43123"; got != want {
+		t.Fatalf("host Gateway URL = %q, want %q", got, want)
+	}
+	if got, want := workerURL, "http://host.docker.internal:43123"; got != want {
+		t.Fatalf("Worker Gateway URL = %q, want %q", got, want)
 	}
 }
 

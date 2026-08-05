@@ -72,13 +72,14 @@ accepted `origin/main` revision:
 The entry point fetches `origin/main`, refuses dirty or unaccepted source,
 derives the current `owner/repository`, and requires exactly one open
 `workflow:plan` issue. It builds the accepted `workflow` binary into a temporary
-runtime directory, generates an ephemeral control-plane transport credential,
-starts the credential-isolated Gateway on a random loopback port, verifies its
-authenticated readiness endpoint, and performs the requested number of
-`poll-github --once` reconciliation passes. The Gateway and temporary binary
-are stopped and removed when the bounded run ends. Ticket work is dispatched
-through Run Leases to Docker Workers; the Worker receives the Gateway URL but
-neither the control-plane transport credential nor the GitHub PAT.
+runtime and invokes one Go Control Plane process. That process generates an
+ephemeral control-plane transport credential, embeds the credential-isolated
+Gateway and bounded reconciliation loop, and verifies authenticated readiness
+before scheduling. The host modules use the loopback endpoint while Docker
+Workers use the same listener through `host.docker.internal`; neither the
+control-plane transport credential nor the GitHub PAT enters a Worker. The
+Gateway, scheduler, durable state, and Worker supervision therefore remain one
+modular-monolith process for the entire bounded run.
 
 The default durable database is `%ProgramData%\workflow\workflow.db`, matching
 credential provisioning and Doctor. Ticket Workspaces and Codex state live

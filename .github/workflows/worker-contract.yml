@@ -6,6 +6,9 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - ".agents/skills/codex-afk.sh"
+      - ".agents/skills/codex-afk_test.sh"
+      - ".agents/skills/github-afk-common.sh"
       - "deploy/worker/**"
       - "config/toolchain.json"
       - ".github/workflows/worker-contract.yml"
@@ -21,6 +24,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Test Control Plane
         run: go test ./...
+      - name: Test AFK Control Plane entrypoint
+        shell: bash
+        run: bash .agents/skills/codex-afk_test.sh
       - name: Read accepted tool versions
         id: pins
         shell: bash

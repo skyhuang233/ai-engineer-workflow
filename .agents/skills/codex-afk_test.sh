@@ -7,7 +7,6 @@ test_afk_entrypoint_runs_the_fenced_control_plane() (
   local sandbox
   local bin_dir
   local call_log
-  local workflow_stub
   local output
   local status
 
@@ -15,7 +14,6 @@ test_afk_entrypoint_runs_the_fenced_control_plane() (
   trap 'rm -rf "$sandbox"' EXIT
   bin_dir="$sandbox/bin"
   call_log="$sandbox/calls.log"
-  workflow_stub="$sandbox/workflow-stub"
   mkdir -p "$bin_dir"
 
   cat > "$bin_dir/git" <<'EOF'
@@ -41,50 +39,13 @@ case "$1 $2" in
 esac
 EOF
 
-  cat > "$workflow_stub" <<'EOF'
+  cat > "$bin_dir/go" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+test "$1 $2" = "run ./cmd/workflow"
+shift 2
 printf '%s\n' "$*" >> "$AFK_TEST_CALL_LOG"
-case "$1" in
-  gateway)
-    shift
-    ready_file=""
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --ready-file) ready_file="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    test -n "$ready_file"
-    printf '%s\n' 'http://127.0.0.1:43123' > "$ready_file"
-    trap 'printf "%s\n" gateway-stopped >> "$AFK_TEST_CALL_LOG"; exit 0' TERM INT
-    while :; do sleep 1; done
-    ;;
-  poll-github)
-    exit 0
-    ;;
-  *)
-    echo "unexpected workflow command: $*" >&2
-    exit 91
-    ;;
-esac
-EOF
-
-  cat > "$bin_dir/go" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-test "\$1" = build
-shift
-output=""
-while [ "\$#" -gt 0 ]; do
-  case "\$1" in
-    -o) output="\$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-test -n "\$output"
-cp '$workflow_stub' "\$output"
-chmod +x "\$output"
+test "$1" = afk
 EOF
 
   cat > "$bin_dir/codex" <<'EOF'
@@ -93,20 +54,13 @@ echo 'legacy host Codex execution must not run' >&2
 exit 92
 EOF
 
-  cat > "$bin_dir/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'curl %s\n' "$*" >> "$AFK_TEST_CALL_LOG"
-EOF
-
-  chmod +x "$bin_dir/git" "$bin_dir/gh" "$bin_dir/go" "$bin_dir/codex" "$bin_dir/curl" "$workflow_stub"
+  chmod +x "$bin_dir/git" "$bin_dir/gh" "$bin_dir/go" "$bin_dir/codex"
 
   export PATH="$bin_dir:$PATH"
   export AFK_TEST_CALL_LOG="$call_log"
   export WORKFLOW_DATABASE="$sandbox/workflow.db"
   export WORKFLOW_RUNTIME_ROOT="$sandbox/runtime"
   export WORKFLOW_MAX_PARALLEL_RUNS=3
-  export WORKFLOW_GATEWAY_START_TIMEOUT_SECONDS=5
 
   set +e
   output="$($SCRIPT_DIR/codex-afk.sh 2 2>&1)"
@@ -118,35 +72,20 @@ EOF
     return 1
   fi
 
-  if [ "$(grep -c '^poll-github ' "$call_log")" -ne 2 ]; then
+  if [ "$(grep -c '^afk ' "$call_log")" -ne 1 ]; then
     printf '%s\n' "$output" >&2
     cat "$call_log" >&2
-    echo "expected exactly two bounded poll-github passes" >&2
+    echo "expected exactly one in-process Control Plane invocation" >&2
     return 1
   fi
-  if ! grep -Eq '^gateway .*--listen 127\.0\.0\.1:0 .*--ready-file ' "$call_log"; then
+  if ! grep -Eq '^afk .*--iterations 2 .*--repository owner/repo .*--root 2 ' "$call_log"; then
     cat "$call_log" >&2
-    echo "expected an ephemeral credential-isolated Gateway" >&2
+    echo "expected AFK to receive the bounded iterations, repository, and plan root" >&2
     return 1
   fi
-  if ! grep -Eq '^poll-github .*--once .*--repository owner/repo .*--root 2 ' "$call_log"; then
-    cat "$call_log" >&2
-    echo "expected poll-github to receive the discovered repository and plan root" >&2
-    return 1
-  fi
-  if ! grep -Eq '^poll-github .*--gateway-url http://127\.0\.0\.1:43123 ' "$call_log"; then
-    cat "$call_log" >&2
-    echo "expected poll-github to use the ready Gateway URL" >&2
-    return 1
-  fi
-  if ! grep -Eq '^poll-github .*--max-parallel-runs 3 ' "$call_log"; then
+  if ! grep -Eq '^afk .*--max-parallel-runs 3 ' "$call_log"; then
     cat "$call_log" >&2
     echo "expected the configured global parallelism limit" >&2
-    return 1
-  fi
-  if ! grep -Fxq 'gateway-stopped' "$call_log"; then
-    cat "$call_log" >&2
-    echo "expected the bounded AFK entrypoint to stop its Gateway" >&2
     return 1
   fi
   if grep -Fq 'WORKFLOW_GITHUB_GATEWAY_COMMAND' <<<"$output"; then
