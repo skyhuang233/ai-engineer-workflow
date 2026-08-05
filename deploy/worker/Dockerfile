@@ -18,7 +18,7 @@ LABEL io.workflow.debian.snapshot="${DEBIAN_SNAPSHOT}"
 LABEL io.workflow.apt.packages="${APT_PACKAGES}"
 
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
-    && printf '%s\n' "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" > /etc/apt/sources.list \
+    && printf '%s\n' "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" > /etc/apt/sources.list \
     && apt-get update -o Acquire::Check-Valid-Until=false \
     && apt-get install --yes --no-install-recommends ${APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/*

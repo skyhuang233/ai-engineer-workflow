@@ -171,13 +171,33 @@ func TestCommandCheckRejectsNoMistakesCommitPrefixCollision(t *testing.T) {
 	}
 }
 
+func TestCommandCheckRejectsModifiedNoMistakesBuild(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
+	check := CommandCheck{
+		CheckName: "no-mistakes",
+		Executor: fakeExecutor{outputs: map[string]string{
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
+		}},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfoWithModified(commit, "true"),
+		ExecutablePath: "no-mistakes",
+	}
+	if result := check.Run(context.Background()); result.Status != Fail {
+		t.Fatalf("Run() = %#v, want modified-build failure", result)
+	}
+}
+
 func fakeNoMistakesBuildInfo(commit string) func(string) (*buildinfo.BuildInfo, error) {
+	return fakeNoMistakesBuildInfoWithModified(commit, "false")
+}
+
+func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (*buildinfo.BuildInfo, error) {
 	return func(string) (*buildinfo.BuildInfo, error) {
 		return &buildinfo.BuildInfo{
 			Path: "github.com/kunchenguid/no-mistakes/cmd/no-mistakes",
 			Settings: []debug.BuildSetting{
 				{Key: "vcs.revision", Value: commit},
-				{Key: "vcs.modified", Value: "false"},
+				{Key: "vcs.modified", Value: modified},
 			},
 		}, nil
 	}

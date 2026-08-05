@@ -331,7 +331,7 @@ func TestRequirePublicRepositoryRejectsPrivateRepositories(t *testing.T) {
 		t.Fatalf("public repository: %v", err)
 	}
 	private = true
-	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err == nil || !strings.Contains(err.Error(), "must be public") {
+	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err == nil || !errors.Is(err, ErrRepositoryPrivate) {
 		t.Fatalf("private repository error = %v", err)
 	}
 }

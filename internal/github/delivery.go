@@ -137,6 +137,9 @@ func (r *DeliveryRemote) Apply(ctx context.Context, request store.DeliveryReques
 	if client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
+	if err := requirePublicRepository(ctx, client, request.Repository); err != nil {
+		return delivery.Observation{}, err
+	}
 	switch request.Operation {
 	case store.DeliveryPushCandidate:
 		pusher, err := r.pusher(ctx, request, client.Token)
@@ -221,8 +224,14 @@ func (r *DeliveryRemote) pusher(ctx context.Context, request store.DeliveryReque
 }
 
 func requirePublicRepository(ctx context.Context, client *Client, repository string) error {
-	if err := client.RequirePublicRepository(ctx, repository); err != nil {
+	if err := ValidateRepository(repository); err != nil {
 		return fmt.Errorf("%w: %w", store.ErrDeliveryRejected, err)
+	}
+	if err := client.RequirePublicRepository(ctx, repository); err != nil {
+		if errors.Is(err, ErrRepositoryPrivate) {
+			return fmt.Errorf("%w: %w", store.ErrDeliveryRejected, err)
+		}
+		return err
 	}
 	return nil
 }

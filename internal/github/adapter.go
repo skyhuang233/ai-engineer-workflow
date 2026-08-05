@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 )
 
 const apiVersion = "2022-11-28"
+
+var ErrRepositoryPrivate = errors.New("repository must be public")
 
 type Client struct {
 	BaseURL         string
@@ -188,7 +191,7 @@ func (c *Client) RequirePublicRepository(ctx context.Context, repository string)
 		return fmt.Errorf("verify repository visibility: %w", err)
 	}
 	if target.Private {
-		return fmt.Errorf("repository %q must be public", repository)
+		return fmt.Errorf("%w: %q", ErrRepositoryPrivate, repository)
 	}
 	return nil
 }

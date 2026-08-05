@@ -20,7 +20,7 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 	contents := string(dockerfile)
 	for _, required := range []string{
 		"DEBIAN_SNAPSHOT=20260713T000000Z",
-		"snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}",
+		"https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}",
 		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 gh=2.23.0+dfsg1-1 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2\"",
 		"io.workflow.debian.snapshot",
 		"io.workflow.apt.packages",
@@ -29,6 +29,29 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("Worker Dockerfile omits immutable provenance input %q", required)
+		}
+	}
+	if strings.Contains(contents, "http://snapshot.debian.org") {
+		t.Fatal("Worker Dockerfile uses an insecure Debian snapshot transport")
+	}
+}
+
+func TestWorkerContractRequiresCleanNoMistakesBuild(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	contents, err := os.ReadFile(filepath.Join(filepath.Dir(file), "..", "..", ".github", "workflows", "worker-contract.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"vcs\\.revision",
+		"vcs\\.modified",
+		"test \"${embedded_no_mistakes_modified[0]}\" = false",
+	} {
+		if !strings.Contains(string(contents), required) {
+			t.Fatalf("Worker contract omits immutable no-mistakes build check %q", required)
 		}
 	}
 }

@@ -64,4 +64,7 @@ jobs:
           test "${#embedded_no_mistakes_commits[@]}" -eq 1
           embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
           test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+          mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
+          test "${#embedded_no_mistakes_modified[@]}" -eq 1
+          test "${embedded_no_mistakes_modified[0]}" = false
           test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"
