@@ -53,6 +53,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	}
 	workflowID := int64(77)
 	mergedBy := "skyhuang233"
+	fullPullRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -87,7 +88,10 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		case "/repos/skyhuang233/workflow/actions/workflows/publish-worker.yml":
 			_, _ = w.Write([]byte(`{"id":77,"path":".github/workflows/publish-worker.yml","state":"active"}`))
 		case "/repos/skyhuang233/workflow/commits/" + sourceSHA + "/pulls":
-			_, _ = w.Write([]byte(`[{"merged_at":"2026-08-01T00:00:00Z","merge_commit_sha":"` + sourceSHA + `","base":{"ref":"main"},"merged_by":{"login":"` + mergedBy + `","type":"User"}}]`))
+			_, _ = w.Write([]byte(`[{"number":17,"merged_at":"2026-08-01T00:00:00Z","merge_commit_sha":"` + sourceSHA + `","base":{"ref":"main"},"merged_by":null}]`))
+		case "/repos/skyhuang233/workflow/pulls/17":
+			fullPullRequested = true
+			_, _ = w.Write([]byte(`{"merged_at":"2026-08-01T00:00:00Z","merge_commit_sha":"` + sourceSHA + `","base":{"ref":"main"},"merged_by":{"login":"` + mergedBy + `","type":"User"}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -100,6 +104,9 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	}
 	if got.SourceCommit != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || string(raw) != manifest {
 		t.Fatalf("fetch = %#v, %s", got, raw)
+	}
+	if !fullPullRequested {
+		t.Fatal("fetch did not load the full merged pull request")
 	}
 	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-release.json"}]`
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {

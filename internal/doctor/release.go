@@ -59,6 +59,27 @@ type ReleaseFetcher struct {
 	WorkflowRepository string
 }
 
+type releasePullSummary struct {
+	Number         int64  `json:"number"`
+	MergedAt       string `json:"merged_at"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	Base           struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+type releasePull struct {
+	MergedAt       string `json:"merged_at"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	Base           struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+	MergedBy struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"merged_by"`
+}
+
 func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkerReleaseManifest, []byte, error) {
 	if !repoPattern.MatchString(f.WorkflowRepository) {
 		return WorkerReleaseManifest{}, nil, errors.New("workflow repository must be an owner/name")
@@ -155,28 +176,26 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 		workflow.Path != ".github/workflows/publish-worker.yml" || workflow.State != "active" {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release was not produced by a successful main push workflow")
 	}
-	var pulls []struct {
-		MergedAt       string `json:"merged_at"`
-		MergeCommitSHA string `json:"merge_commit_sha"`
-		Base           struct {
-			Ref string `json:"ref"`
-		} `json:"base"`
-		MergedBy struct {
-			Login string `json:"login"`
-			Type  string `json:"type"`
-		} `json:"merged_by"`
-	}
+	var pulls []releasePullSummary
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+config.Worker.ReleaseRepository+"/commits/"+manifest.SourceCommit+"/pulls", nil, &pulls); err != nil {
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker Release merge provenance: %w", err)
 	}
-	matched := 0
+	matched := make([]releasePullSummary, 0, 1)
 	for _, pull := range pulls {
-		if pull.MergedAt != "" && pull.MergeCommitSHA == manifest.SourceCommit && pull.Base.Ref == "main" &&
-			strings.EqualFold(pull.MergedBy.Login, config.GitHub.Credential.Owner) && !strings.EqualFold(pull.MergedBy.Type, "bot") && !strings.HasSuffix(strings.ToLower(pull.MergedBy.Login), "[bot]") {
-			matched++
+		if pull.MergedAt != "" && pull.MergeCommitSHA == manifest.SourceCommit && pull.Base.Ref == "main" {
+			matched = append(matched, pull)
 		}
 	}
-	if matched != 1 {
+	if len(matched) != 1 || matched[0].Number <= 0 {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker Release source commit lacks an unambiguous owner-merged pull request")
+	}
+	var pull releasePull
+	pullPath := fmt.Sprintf("/repos/%s/pulls/%d", config.Worker.ReleaseRepository, matched[0].Number)
+	if err := client.RequestJSON(ctx, http.MethodGet, pullPath, nil, &pull); err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("read Worker Release merge provenance pull request: %w", err)
+	}
+	if pull.MergedAt == "" || pull.MergeCommitSHA != manifest.SourceCommit || pull.Base.Ref != "main" ||
+		!strings.EqualFold(pull.MergedBy.Login, config.GitHub.Credential.Owner) || !strings.EqualFold(pull.MergedBy.Type, "user") || strings.HasSuffix(strings.ToLower(pull.MergedBy.Login), "[bot]") {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release source commit lacks an unambiguous owner-merged pull request")
 	}
 	return manifest, raw, nil
