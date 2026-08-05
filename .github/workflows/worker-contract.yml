@@ -3,6 +3,9 @@ name: worker-contract
 on:
   pull_request:
     paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
       - "deploy/worker/**"
       - "config/toolchain.json"
       - ".github/workflows/worker-contract.yml"
@@ -16,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Test Control Plane
+        run: go test ./...
       - name: Read accepted tool versions
         id: pins
         shell: bash

@@ -14,7 +14,12 @@
 - The dedicated GitHub integration repository and its required workflow path
   are explicit. The repository may be public or private, but its owner must
   match the configured Gateway Credential owner. Branch protection is not a
-  prerequisite: that owner retains sole merge authority.
+  prerequisite: that owner retains sole merge authority. Its deployable
+  workflow verifies only the live GitHub repository contract and does not
+  require a copy of the Control Plane source tree. It can be manually rerun
+  with `workflow_dispatch` after a visibility change. Control Plane tests
+  remain in this repository's `worker-contract` CI, which runs for all Go
+  source and module changes.
 - Set the integration repository's `WORKFLOW_INTEGRATION_REPOSITORY` and
   `WORKFLOW_GATEWAY_CREDENTIAL_OWNER` Actions variables to those configured
   values. Its contract workflow fails closed unless the variables, runner

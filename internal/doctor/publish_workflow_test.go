@@ -68,15 +68,7 @@ func TestPublishWorkflowLoadsFullPullBeforeOwnerAdmission(t *testing.T) {
 }
 
 func TestIntegrationWorkflowAdmitsOwnerGuardedPrivateRepository(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test source")
-	}
-	workflow, err := os.ReadFile(filepath.Join(filepath.Dir(file), "..", "..", "deploy", "github", "workflow-contract.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(workflow)
+	text := readWorkflow(t, "deploy", "github", "workflow-contract.yml")
 	if strings.Contains(text, ".private == false") || strings.Contains(text, "public Owner-Guarded") {
 		t.Fatal("integration workflow rejects an owner-controlled private repository")
 	}
@@ -88,4 +80,46 @@ func TestIntegrationWorkflowAdmitsOwnerGuardedPrivateRepository(t *testing.T) {
 		!strings.Contains(text, `(.default_branch | length > 0)`) {
 		t.Fatal("integration workflow does not verify its owner-controlled repository identity")
 	}
+}
+
+func TestIntegrationWorkflowRunsWithoutControlPlaneSourceTree(t *testing.T) {
+	text := readWorkflow(t, "deploy", "github", "workflow-contract.yml")
+	if strings.Contains(text, "uses:") || strings.Count(text, "\n      - name:") != 1 ||
+		!strings.Contains(text, "- name: Verify the Owner-Guarded repository contract") {
+		t.Fatal("dedicated integration workflow contains steps outside its standalone GitHub contract")
+	}
+	for _, forbidden := range []string{"actions/checkout", "actions/setup-go", "go test ", "go run "} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("dedicated integration workflow depends on Control Plane source via %q", forbidden)
+		}
+	}
+}
+
+func TestIntegrationWorkflowSupportsPostVisibilityDispatch(t *testing.T) {
+	text := readWorkflow(t, "deploy", "github", "workflow-contract.yml")
+	if !strings.Contains(text, "workflow_dispatch:") {
+		t.Fatal("dedicated integration workflow cannot be rerun after a visibility change")
+	}
+}
+
+func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
+	text := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
+	for _, required := range []string{`- "**/*.go"`, `- "go.mod"`, `- "go.sum"`, "go test ./..."} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("worker-contract does not preserve Control Plane test coverage: missing %q", required)
+		}
+	}
+}
+
+func readWorkflow(t *testing.T, path ...string) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	workflow, err := os.ReadFile(filepath.Join(append([]string{filepath.Dir(file), "..", ".."}, path...)...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(workflow)
 }
