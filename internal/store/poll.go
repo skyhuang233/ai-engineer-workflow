@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +44,18 @@ type replacementReference struct {
 
 func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
 	return openWorkflowQuestions(ctx, s.db, repository, rootNumber)
+}
+
+func (s *Store) WorkflowInboxProjection(ctx context.Context, repository string) ([]WorkflowQuestion, string, error) {
+	questions, err := s.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		return nil, "", err
+	}
+	version, err := workflowInboxProjectionVersion(questions)
+	if err != nil {
+		return nil, "", err
+	}
+	return questions, version, nil
 }
 
 type workflowQuestionQuerier interface {
@@ -282,15 +296,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
 		return DeliveryOutbox{}, err
 	}
-	questions, err := openWorkflowQuestions(ctx, tx, repository, 0)
-	if err != nil {
-		return DeliveryOutbox{}, err
-	}
-	projected := make([]plan.WorkflowQuestion, 0, len(questions))
-	for _, question := range questions {
-		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
-	}
-	outbox, err := s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, WorkflowQuestions: projected}, now)
+	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -298,6 +304,55 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 		return DeliveryOutbox{}, err
 	}
 	return outbox, nil
+}
+
+func (s *Store) QueueWorkflowInboxProjection(ctx context.Context, repository string, now time.Time) (DeliveryOutbox, error) {
+	if repository == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	defer tx.Rollback()
+	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
+}
+
+func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
+	questions, err := openWorkflowQuestions(ctx, tx, repository, 0)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	version, err := workflowInboxProjectionVersion(questions)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, InboxProjectionVersion: version}, now)
+}
+
+func workflowInboxProjectionVersion(questions []WorkflowQuestion) (string, error) {
+	projected := make([]plan.WorkflowQuestion, 0, len(questions))
+	for _, question := range questions {
+		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
+	}
+	encoded, err := json.Marshal(projected)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time) error {

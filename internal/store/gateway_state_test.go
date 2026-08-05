@@ -256,7 +256,7 @@ func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
 	if err != nil || question.State != "answered" || question.Answer != "retry" {
 		t.Fatalf("question = %#v, %v", question, err)
 	}
-	if outbox.State != OutboxPending || outbox.Request.Operation != DeliveryProjectInbox || outbox.Request.WorkflowQuestions == nil || len(outbox.Request.WorkflowQuestions) != 0 {
+	if outbox.State != OutboxPending || outbox.Request.Operation != DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil || outbox.Request.InboxProjectionVersion == "" {
 		t.Fatalf("outbox = %#v", outbox)
 	}
 }

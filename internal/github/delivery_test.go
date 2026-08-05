@@ -263,6 +263,39 @@ func TestDeliveryRemoteRejectsPrivateRepository(t *testing.T) {
 	}
 }
 
+func TestDeliveryRemotePreservesVisibilityAdmissionAPIError(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		status      int
+		headers     map[string]string
+		wantAuth    bool
+		wantRetryAt bool
+	}{
+		{name: "authentication", status: http.StatusUnauthorized, wantAuth: true},
+		{name: "rate limit", status: http.StatusForbidden, headers: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1785715260"}, wantRetryAt: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for key, value := range test.headers {
+					w.Header().Set(key, value)
+				}
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(`{"message":"denied"}`))
+			}))
+			defer server.Close()
+			remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+			_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
+			if !errors.Is(err, store.ErrDeliveryRejected) {
+				t.Fatalf("admission error = %v", err)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.AuthenticationFailure() != test.wantAuth || (!apiErr.RetryAt.IsZero()) != test.wantRetryAt {
+				t.Fatalf("admission API error = %#v", apiErr)
+			}
+		})
+	}
+}
+
 func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {

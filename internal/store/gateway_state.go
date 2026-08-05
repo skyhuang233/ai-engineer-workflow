@@ -153,6 +153,10 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredent
 		return err
 	}
 	defer tx.Rollback()
+	repositories, err := workflowQuestionRepositoriesTx(ctx, tx, gatewayCredentialQuestionKind)
+	if err != nil {
+		return err
+	}
 	timestamp := now.Format(time.RFC3339Nano)
 	result, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 0, reason = '', rotation_owner = '', rotation_expires_at = '', updated_at = ? WHERE singleton = 1 AND rotation_owner = ? AND rotation_generation = ? AND rotation_expires_at > ?`, timestamp, rotation.Owner, rotation.Generation, timestamp)
 	if err != nil {
@@ -167,7 +171,29 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredent
 	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = 'credential restored', answered_at = ? WHERE kind = ? AND state = 'open'`, timestamp, gatewayCredentialQuestionKind); err != nil {
 		return err
 	}
+	for _, repository := range repositories {
+		if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+func workflowQuestionRepositoriesTx(ctx context.Context, tx *sql.Tx, kind string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT repository FROM workflow_questions WHERE kind = ? AND state = 'open' ORDER BY repository`, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var repositories []string
+	for rows.Next() {
+		var repository string
+		if err := rows.Scan(&repository); err != nil {
+			return nil, err
+		}
+		repositories = append(repositories, repository)
+	}
+	return repositories, rows.Err()
 }
 
 func ensureGatewayCredentialQuestionsTx(ctx context.Context, tx *sql.Tx, reason string, now time.Time) error {
@@ -208,20 +234,19 @@ WHERE `+currentActivePlanPredicate)
 }
 
 func (s *Store) GatewayCredentialAttentionRepositories(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT repository FROM workflow_questions WHERE kind = ? AND state = 'open' ORDER BY repository`, gatewayCredentialQuestionKind)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var repositories []string
-	for rows.Next() {
-		var repository string
-		if err := rows.Scan(&repository); err != nil {
-			return nil, err
-		}
-		repositories = append(repositories, repository)
+	defer tx.Rollback()
+	repositories, err := workflowQuestionRepositoriesTx(ctx, tx, gatewayCredentialQuestionKind)
+	if err != nil {
+		return nil, err
 	}
-	return repositories, rows.Err()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return repositories, nil
 }
 
 func (s *Store) GatewayWritesPaused(ctx context.Context) (bool, string, error) {

@@ -222,7 +222,7 @@ func (r *DeliveryRemote) pusher(ctx context.Context, request store.DeliveryReque
 
 func requirePublicRepository(ctx context.Context, client *Client, repository string) error {
 	if err := client.RequirePublicRepository(ctx, repository); err != nil {
-		return fmt.Errorf("%w: %v", store.ErrDeliveryRejected, err)
+		return fmt.Errorf("%w: %w", store.ErrDeliveryRejected, err)
 	}
 	return nil
 }

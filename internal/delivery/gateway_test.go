@@ -152,8 +152,48 @@ func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := gateway.Remote.(*fakeRemote)
-	if len(remote.requests) == 0 || len(remote.requests[0].WorkflowQuestions) != 0 {
+	if len(remote.requests) != 0 {
 		t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+	}
+}
+
+func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, claim.VersionID, claim.TicketID, now); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryProjectInbox, Repository: "owner/repo",
+		WorkflowQuestions: []plan.WorkflowQuestion{{ID: "stale"}}, InboxProjectionVersion: "superseded",
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, stale.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 0 {
+		t.Fatalf("stale projection reached remote: %#v", remote.requests)
+	}
+	if err := gateway.Dispatch(ctx, current.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 1 || len(remote.requests[0].WorkflowQuestions) == 0 {
+		t.Fatalf("current projection = %#v", remote.requests)
+	}
+	for _, question := range remote.requests[0].WorkflowQuestions {
+		if question.ID == "stale" {
+			t.Fatalf("current projection retained stale question: %#v", remote.requests)
+		}
 	}
 }
 

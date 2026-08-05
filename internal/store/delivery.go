@@ -38,24 +38,25 @@ var (
 // The gateway derives all authoritative ownership fields from RunID and the
 // current Run Lease before this request can reach an external writer.
 type DeliveryRequest struct {
-	Operation          DeliveryOperation       `json:"operation"`
-	RunID              string                  `json:"run_id"`
-	LeaseToken         string                  `json:"lease_token"`
-	LeaseGeneration    int64                   `json:"lease_generation"`
-	Repository         string                  `json:"repository"`
-	RootNumber         int64                   `json:"root_number,omitempty"`
-	Branch             string                  `json:"branch,omitempty"`
-	PullRequestNumber  int64                   `json:"pull_request_number,omitempty"`
-	CommitSHA          string                  `json:"commit_sha,omitempty"`
-	ExpectedRemoteHead string                  `json:"expected_remote_head,omitempty"`
-	ExpectRemoteAbsent bool                    `json:"expect_remote_absent,omitempty"`
-	Title              string                  `json:"title,omitempty"`
-	Body               string                  `json:"body,omitempty"`
-	Evidence           string                  `json:"evidence,omitempty"`
-	PlanProjection     *plan.Projection        `json:"plan_projection,omitempty"`
-	WorkflowQuestions  []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
-	Label              string                  `json:"label,omitempty"`
-	IdempotencyKey     string                  `json:"idempotency_key,omitempty"`
+	Operation              DeliveryOperation       `json:"operation"`
+	RunID                  string                  `json:"run_id"`
+	LeaseToken             string                  `json:"lease_token"`
+	LeaseGeneration        int64                   `json:"lease_generation"`
+	Repository             string                  `json:"repository"`
+	RootNumber             int64                   `json:"root_number,omitempty"`
+	Branch                 string                  `json:"branch,omitempty"`
+	PullRequestNumber      int64                   `json:"pull_request_number,omitempty"`
+	CommitSHA              string                  `json:"commit_sha,omitempty"`
+	ExpectedRemoteHead     string                  `json:"expected_remote_head,omitempty"`
+	ExpectRemoteAbsent     bool                    `json:"expect_remote_absent,omitempty"`
+	Title                  string                  `json:"title,omitempty"`
+	Body                   string                  `json:"body,omitempty"`
+	Evidence               string                  `json:"evidence,omitempty"`
+	PlanProjection         *plan.Projection        `json:"plan_projection,omitempty"`
+	WorkflowQuestions      []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
+	InboxProjectionVersion string                  `json:"inbox_projection_version,omitempty"`
+	Label                  string                  `json:"label,omitempty"`
+	IdempotencyKey         string                  `json:"idempotency_key,omitempty"`
 }
 
 type DeliveryTarget struct {

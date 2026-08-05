@@ -57,7 +57,8 @@ type gatewayStore interface {
 	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
 	ExecuteDelivery(context.Context, store.DeliveryRequest, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
-	OpenWorkflowQuestions(context.Context, string, int64) ([]store.WorkflowQuestion, error)
+	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
+	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
 	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
 	GatewayCredentialAttentionRepositories(context.Context) ([]string, error)
@@ -170,10 +171,13 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				return store.DeliveryResult{}, projectionErr
 			}
 			request.PlanProjection = &projection
-		} else if request.Operation == store.DeliveryProjectInbox && request.WorkflowQuestions == nil {
-			questions, questionsErr := g.Store.OpenWorkflowQuestions(operationCtx, request.Repository, 0)
+		} else if request.Operation == store.DeliveryProjectInbox {
+			questions, version, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
 			if questionsErr != nil {
 				return store.DeliveryResult{}, questionsErr
+			}
+			if request.InboxProjectionVersion != "" && request.InboxProjectionVersion != version {
+				return store.DeliveryResult{}, nil
 			}
 			request.WorkflowQuestions = make([]plan.WorkflowQuestion, 0, len(questions))
 			for _, question := range questions {
@@ -285,7 +289,7 @@ func (g Gateway) QueueGatewayCredentialInboxProjections(ctx context.Context) err
 		return err
 	}
 	for _, repository := range repositories {
-		if _, err := g.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository}); err != nil {
+		if _, err := g.Store.QueueWorkflowInboxProjection(ctx, repository, g.now()); err != nil {
 			return err
 		}
 	}
