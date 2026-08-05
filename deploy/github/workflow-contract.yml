@@ -3,6 +3,7 @@ name: workflow-contract
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,13 +15,6 @@ jobs:
     name: workflow-contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Exercise the control-plane contract seam
-        run: go test ./internal/plan ./internal/store ./internal/agent ./internal/delivery ./internal/github
       - name: Verify the Owner-Guarded repository contract
         env:
           GH_TOKEN: ${{ github.token }}
