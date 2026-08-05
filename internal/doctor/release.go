@@ -54,11 +54,18 @@ type resolvedWorkerBuildInputs struct {
 }
 
 type ReleaseFetcher struct {
-	APIBase string
-	HTTP    *http.Client
+	APIBase            string
+	HTTP               *http.Client
+	WorkflowRepository string
 }
 
 func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkerReleaseManifest, []byte, error) {
+	if !repoPattern.MatchString(f.WorkflowRepository) {
+		return WorkerReleaseManifest{}, nil, errors.New("workflow repository must be an owner/name")
+	}
+	if config.Worker.ReleaseRepository != f.WorkflowRepository {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository must match the workflow repository")
+	}
 	client := githubapi.NewClient(f.APIBase, token, f.HTTP)
 	var repository struct {
 		Private bool `json:"private"`

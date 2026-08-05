@@ -68,7 +68,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  workflow doctor [--config path] [--database path] [--report path]")
+	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow credential provision [--config path] [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
@@ -82,7 +82,12 @@ func runDoctor(args []string) {
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	reportPath := flags.String("report", "", "optional Markdown report path")
+	workflowRepository := flags.String("workflow-repository", "", "GitHub repository containing the Worker publisher workflow")
 	_ = flags.Parse(args)
+	if *workflowRepository == "" {
+		fmt.Fprintln(os.Stderr, "doctor requires workflow-repository")
+		os.Exit(2)
+	}
 
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
@@ -108,7 +113,8 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	manifest, manifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	releaseFetcher := doctor.ReleaseFetcher{WorkflowRepository: *workflowRepository}
+	manifest, manifestJSON, err := releaseFetcher.Fetch(context.Background(), config, secret)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
@@ -170,7 +176,7 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, activeErr)
 		os.Exit(1)
 	}
-	currentManifest, currentManifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	currentManifest, currentManifestJSON, err := releaseFetcher.Fetch(context.Background(), config, secret)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)

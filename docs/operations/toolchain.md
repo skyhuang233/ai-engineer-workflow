@@ -41,9 +41,15 @@ Run the complete target-host contract with:
 ```powershell
 go run ./cmd/workflow doctor `
   --config config/toolchain.json `
+  --workflow-repository skyhuang233/workflow `
   --database C:\ProgramData\workflow\workflow.db `
   --report docs/operations/doctor-report.md
 ```
+
+`--workflow-repository` is the independently supplied repository that contains
+the publisher workflow. Doctor requires it to exactly match
+`worker.release_repository`, verifies that repository is public, and then uses
+only that repository for the release, source, workflow-run, and manifest checks.
 
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,

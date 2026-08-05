@@ -93,7 +93,8 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	got, raw, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test")
+	fetcher := ReleaseFetcher{APIBase: server.URL, HTTP: server.Client(), WorkflowRepository: config.Worker.ReleaseRepository}
+	got, raw, err := fetcher.Fetch(context.Background(), config, "github_pat_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,31 +102,46 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		t.Fatalf("fetch = %#v, %s", got, raw)
 	}
 	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-release.json"}]`
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a release with duplicate worker-release.json assets")
 	}
 	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"unexpected-asset.txt"}]`
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a release with an asset other than worker-release.json")
 	}
 	assets = `[{"id":9,"name":"worker-release.json"}]`
 	workflowID = 88
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest attributed to an unrelated successful workflow")
 	}
 	workflowID = 77
 	mergedBy = "workflow[bot]"
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a bot-merged release")
 	}
 	mergedBy = "skyhuang233"
 	private = true
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a private Worker Release repository")
 	}
 	private = false
 	currentWorkerTree = strings.Repeat("d", 40)
-	if _, _, err := (ReleaseFetcher{APIBase: server.URL, HTTP: server.Client()}).Fetch(context.Background(), config, "github_pat_test"); err == nil {
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest after the current Worker build context changed")
+	}
+}
+
+func TestReleaseFetcherRejectsAnUnboundWorkflowRepository(t *testing.T) {
+	config := validConfig()
+	fetcher := ReleaseFetcher{WorkflowRepository: config.Worker.ReleaseRepository}
+	config.Worker.ReleaseRepository = "other/workflow"
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("accepted mismatched workflow repository: %v", err)
+	}
+
+	fetcher.WorkflowRepository = ""
+	config.Worker.ReleaseRepository = validConfig().Worker.ReleaseRepository
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil || !strings.Contains(err.Error(), "workflow repository") {
+		t.Fatalf("accepted an absent workflow repository: %v", err)
 	}
 }
