@@ -44,6 +44,7 @@ type controlPlaneRuntime interface {
 type pollGitHubAdapters struct {
 	AdmitCredential gatewayCredentialAdmitter
 	Runtime         controlPlaneRuntime
+	Store           *store.Store
 }
 
 func (c admittedCredential) Get(context.Context, string) (string, error) {
@@ -540,11 +541,15 @@ func executePollGitHubWithAdapters(args []string, adapters pollGitHubAdapters) e
 	if err != nil {
 		return err
 	}
-	db, err := store.Open(context.Background(), *databasePath)
-	if err != nil {
-		return err
+	db := adapters.Store
+	if db == nil {
+		var err error
+		db, err = store.Open(context.Background(), *databasePath)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
 	}
-	defer db.Close()
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex

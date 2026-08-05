@@ -43,17 +43,35 @@ if [ "$source_head" != "$accepted_head" ]; then
 fi
 
 database="${WORKFLOW_DATABASE:-}"
-if [ -z "$database" ]; then
+if [ -n "$database" ]; then
+  database="$(gh_afk_to_bash_path "$database")"
+else
   if [ -n "${PROGRAMDATA:-}" ]; then
     database="$(gh_afk_to_bash_path "$PROGRAMDATA")/workflow/workflow.db"
   else
     database="$PROJECT_ROOT/.workflow/workflow.db"
   fi
 fi
-runtime_root="${WORKFLOW_RUNTIME_ROOT:-$(dirname "$database")}"
-workspace_root="${WORKFLOW_WORKSPACE_ROOT:-$runtime_root/workspaces}"
-state_root="${WORKFLOW_CODEX_STATE_ROOT:-$runtime_root/codex-state}"
+runtime_root="${WORKFLOW_RUNTIME_ROOT:-}"
+if [ -n "$runtime_root" ]; then
+  runtime_root="$(gh_afk_to_bash_path "$runtime_root")"
+else
+  runtime_root="$(dirname "$database")"
+fi
+workspace_root="${WORKFLOW_WORKSPACE_ROOT:-}"
+if [ -n "$workspace_root" ]; then
+  workspace_root="$(gh_afk_to_bash_path "$workspace_root")"
+else
+  workspace_root="$runtime_root/workspaces"
+fi
+state_root="${WORKFLOW_CODEX_STATE_ROOT:-}"
+if [ -n "$state_root" ]; then
+  state_root="$(gh_afk_to_bash_path "$state_root")"
+else
+  state_root="$runtime_root/codex-state"
+fi
 config_path="${WORKFLOW_CONFIG:-$PROJECT_ROOT/config/toolchain.json}"
+config_path="$(gh_afk_to_bash_path "$config_path")"
 max_parallel_runs="${WORKFLOW_MAX_PARALLEL_RUNS:-1}"
 workspace_retention="${WORKFLOW_WORKSPACE_RETENTION:-168h}"
 poll_interval="${WORKFLOW_POLL_INTERVAL:-1m}"

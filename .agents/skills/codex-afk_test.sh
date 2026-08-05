@@ -48,18 +48,24 @@ printf '%s\n' "$*" >> "$AFK_TEST_CALL_LOG"
 test "$1" = afk
 EOF
 
+  cat > "$bin_dir/mkdir" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = -p
+EOF
+
   cat > "$bin_dir/codex" <<'EOF'
 #!/usr/bin/env bash
 echo 'legacy host Codex execution must not run' >&2
 exit 92
 EOF
 
-  chmod +x "$bin_dir/git" "$bin_dir/gh" "$bin_dir/go" "$bin_dir/codex"
+  chmod +x "$bin_dir/git" "$bin_dir/gh" "$bin_dir/go" "$bin_dir/mkdir" "$bin_dir/codex"
 
   export PATH="$bin_dir:$PATH"
   export AFK_TEST_CALL_LOG="$call_log"
-  export WORKFLOW_DATABASE="$sandbox/workflow.db"
-  export WORKFLOW_RUNTIME_ROOT="$sandbox/runtime"
+  export WORKFLOW_DATABASE='C:\ProgramData\workflow\workflow.db'
+  unset WORKFLOW_RUNTIME_ROOT WORKFLOW_WORKSPACE_ROOT WORKFLOW_CODEX_STATE_ROOT
   export WORKFLOW_MAX_PARALLEL_RUNS=3
   export WORKFLOW_POLL_INTERVAL=7s
 
@@ -92,6 +98,11 @@ EOF
   if ! grep -Eq '^afk .*--poll-interval 7s ' "$call_log"; then
     cat "$call_log" >&2
     echo "expected the configured persistent polling cadence" >&2
+    return 1
+  fi
+  if ! grep -Eq '^afk .*--workspace-root /c/ProgramData/workflow/workspaces .*--state-root /c/ProgramData/workflow/codex-state .*--database /c/ProgramData/workflow/workflow\.db$' "$call_log"; then
+    cat "$call_log" >&2
+    echo "expected Windows runtime paths to be normalized before derivation" >&2
     return 1
   fi
   if grep -Fq 'WORKFLOW_GITHUB_GATEWAY_COMMAND' <<<"$output"; then

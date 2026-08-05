@@ -75,9 +75,13 @@ func executeAFKWithDependencies(args []string, dependencies afkDependencies) err
 	if err != nil {
 		return err
 	}
+	database, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		return err
+	}
 	gateway, err := startEmbeddedGateway(context.Background(), embeddedGatewayOptions{
 		ConfigPath:       *configPath,
-		DatabasePath:     *databasePath,
+		Database:         database,
 		Listen:           "0.0.0.0:0",
 		ControlToken:     token,
 		GitHubURL:        *githubURL,
@@ -87,6 +91,7 @@ func executeAFKWithDependencies(args []string, dependencies afkDependencies) err
 		Remote:           dependencies.GatewayRemote,
 	})
 	if err != nil {
+		_ = database.Close()
 		return err
 	}
 
@@ -109,7 +114,7 @@ func executeAFKWithDependencies(args []string, dependencies afkDependencies) err
 			"--config", *configPath,
 			"--database", *databasePath,
 			"--github-url", *githubURL,
-		}, pollGitHubAdapters{AdmitCredential: admitCredential, Runtime: dependencies.Runtime})
+		}, pollGitHubAdapters{AdmitCredential: admitCredential, Runtime: dependencies.Runtime, Store: database})
 		if err != nil {
 			return errors.Join(fmt.Errorf("control-plane pass %d: %w", iteration, err), gateway.Close())
 		}
@@ -122,7 +127,7 @@ func executeAFKWithDependencies(args []string, dependencies afkDependencies) err
 
 type embeddedGatewayOptions struct {
 	ConfigPath       string
-	DatabasePath     string
+	Database         *store.Store
 	Listen           string
 	ControlToken     string
 	GitHubURL        string
@@ -133,17 +138,14 @@ type embeddedGatewayOptions struct {
 }
 
 func startEmbeddedGateway(parent context.Context, options embeddedGatewayOptions) (*embeddedGateway, error) {
-	if options.Listen == "" || options.ControlToken == "" || options.RecoveryInterval <= 0 {
-		return nil, errors.New("embedded Gateway requires listen address, control credential, and recovery interval")
+	if options.Listen == "" || options.ControlToken == "" || options.RecoveryInterval <= 0 || options.Database == nil {
+		return nil, errors.New("embedded Gateway requires a Store, listen address, control credential, and recovery interval")
 	}
 	config, err := doctor.LoadConfig(options.ConfigPath)
 	if err != nil {
 		return nil, err
 	}
-	database, err := store.Open(parent, options.DatabasePath)
-	if err != nil {
-		return nil, err
-	}
+	database := options.Database
 	admitCredential := options.AdmitCredential
 	if admitCredential == nil {
 		admitCredential = admitGatewayCredential
@@ -162,28 +164,23 @@ func startEmbeddedGateway(parent context.Context, options embeddedGatewayOptions
 	}
 	gateway, err := delivery.NewGateway(database, remote)
 	if err != nil {
-		_ = database.Close()
 		return nil, err
 	}
 	if _, err := credentialSource(parent); shouldPauseGatewayForCredential(err) {
 		if pauseErr := database.PauseGatewayWrites(parent, "Gateway Credential is unavailable; replace and verify it to resume writes", time.Now().UTC()); pauseErr != nil {
-			_ = database.Close()
 			return nil, pauseErr
 		}
 	}
 	if err := gateway.QueueGatewayCredentialInboxProjections(parent); err != nil {
-		_ = database.Close()
 		return nil, err
 	}
 	listener, err := net.Listen("tcp", options.Listen)
 	if err != nil {
-		_ = database.Close()
 		return nil, err
 	}
 	hostURL, workerURL, err := gatewayEndpoints(listener.Addr().String())
 	if err != nil {
 		_ = listener.Close()
-		_ = database.Close()
 		return nil, err
 	}
 
