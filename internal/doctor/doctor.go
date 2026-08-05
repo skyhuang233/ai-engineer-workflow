@@ -4,6 +4,7 @@ package doctor
 
 import (
 	"context"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -282,10 +283,12 @@ type CommandExpectation struct {
 }
 
 type CommandCheck struct {
-	CheckName    string
-	Executor     Executor
-	Version      CommandExpectation
-	Capabilities []CommandExpectation
+	CheckName      string
+	Executor       Executor
+	Version        CommandExpectation
+	Capabilities   []CommandExpectation
+	BuildInfo      func(string) (*buildinfo.BuildInfo, error)
+	ExecutablePath string
 }
 
 type CodexResumeCheck struct {
@@ -357,7 +360,18 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	if version != c.Version.ExactVersion || commit != c.Version.ExactCommit {
+	if version != c.Version.ExactVersion {
+		return Result{Status: Fail, Summary: fmt.Sprintf("%s reports version %q commit %q, want %q %q", c.Version.Tool, version, commit, c.Version.ExactVersion, c.Version.ExactCommit)}
+	}
+	if c.Version.Tool == "no-mistakes" {
+		embeddedCommit, err := c.noMistakesBuildCommit(c.Version.Command[0])
+		if err != nil {
+			return Result{Status: Fail, Summary: err.Error()}
+		}
+		if embeddedCommit != c.Version.ExactCommit || !strings.HasPrefix(embeddedCommit, commit) {
+			return Result{Status: Fail, Summary: fmt.Sprintf("%s reports commit %q with embedded commit %q, want %q", c.Version.Tool, commit, embeddedCommit, c.Version.ExactCommit)}
+		}
+	} else if commit != c.Version.ExactCommit {
 		return Result{Status: Fail, Summary: fmt.Sprintf("%s reports version %q commit %q, want %q %q", c.Version.Tool, version, commit, c.Version.ExactVersion, c.Version.ExactCommit)}
 	}
 	for _, expectation := range c.Capabilities {
@@ -375,9 +389,44 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 	return Result{Status: Pass, Summary: trimmed}
 }
 
+func (c CommandCheck) noMistakesBuildCommit(command string) (string, error) {
+	readBuildInfo := c.BuildInfo
+	if readBuildInfo == nil {
+		readBuildInfo = buildinfo.ReadFile
+	}
+	path := c.ExecutablePath
+	if path == "" {
+		var err error
+		path, err = exec.LookPath(command)
+		if err != nil {
+			return "", fmt.Errorf("locate no-mistakes executable: %w", err)
+		}
+	}
+	info, err := readBuildInfo(path)
+	if err != nil {
+		return "", fmt.Errorf("read no-mistakes build metadata: %w", err)
+	}
+	if info.Path != "github.com/kunchenguid/no-mistakes/cmd/no-mistakes" {
+		return "", fmt.Errorf("no-mistakes executable has unexpected build path %q", info.Path)
+	}
+	var commit, modified string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			commit = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if !shaPattern.MatchString(commit) || modified != "false" {
+		return "", errors.New("no-mistakes executable lacks an immutable full VCS revision")
+	}
+	return commit, nil
+}
+
 var (
 	codexVersionPattern      = regexp.MustCompile(`^codex-cli[[:space:]]+([^[:space:]]+)$`)
-	noMistakesVersionPattern = regexp.MustCompile(`^no-mistakes version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{40})\)([[:space:]].*)?$`)
+	noMistakesVersionPattern = regexp.MustCompile(`^no-mistakes version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$`)
 )
 
 func parseCommandVersion(tool, output string) (string, string, error) {

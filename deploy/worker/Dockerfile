@@ -32,17 +32,6 @@ RUN curl --fail --show-error --location \
     && echo "${NO_MISTAKES_SHA256}  /tmp/no-mistakes.tar.gz" | sha256sum --check --strict \
     && tar --extract --gzip --file /tmp/no-mistakes.tar.gz --directory /usr/local/bin \
     && rm /tmp/no-mistakes.tar.gz \
-    && mkdir -p /usr/local/libexec \
-    && mv /usr/local/bin/no-mistakes /usr/local/libexec/no-mistakes \
-    && printf '%s\n' '#!/bin/sh' \
-      'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then' \
-      "  version=\$(/usr/local/libexec/no-mistakes --version | sed -n 's/^no-mistakes version \\([^ ]*\\) ([0-9a-f]\\{7,40\\}).*$/\\1/p')" \
-      '  test -n "$version"' \
-      "  printf 'no-mistakes version %s (%s)\\n' \"\$version\" \"${NO_MISTAKES_UPSTREAM_COMMIT}\"" \
-      'else' \
-      '  exec /usr/local/libexec/no-mistakes "$@"' \
-      'fi' > /usr/local/bin/no-mistakes \
-    && chmod +x /usr/local/bin/no-mistakes \
     && no-mistakes --version
 
 WORKDIR /workspace

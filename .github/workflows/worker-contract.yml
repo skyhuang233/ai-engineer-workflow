@@ -49,10 +49,19 @@ jobs:
             exit 1
           fi
           no_mistakes_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" no-mistakes --version)"
-          if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{40})\)([[:space:]].*)?$ ]]; then
+          if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.no_mistakes_version }}"
-            test "${BASH_REMATCH[2]}" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+            reported_no_mistakes_commit="${BASH_REMATCH[2]}"
           else
             echo "no-mistakes emitted an unrecognized version string: $no_mistakes_output" >&2
             exit 1
           fi
+          worker_container="$(docker create "workflow-worker:${{ steps.pins.outputs.worker_version }}")"
+          trap 'docker rm --force "$worker_container" >/dev/null' EXIT
+          worker_binary="$RUNNER_TEMP/no-mistakes"
+          docker cp "$worker_container:/usr/local/bin/no-mistakes" "$worker_binary"
+          mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
+          test "${#embedded_no_mistakes_commits[@]}" -eq 1
+          embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+          test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"

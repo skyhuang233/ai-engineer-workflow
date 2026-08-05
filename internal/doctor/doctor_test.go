@@ -2,8 +2,10 @@ package doctor
 
 import (
 	"context"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -136,22 +138,48 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 	}
 }
 
-func TestCommandCheckRejectsCommitPrefixCollision(t *testing.T) {
+func TestCommandCheckMatchesEmbeddedNoMistakesCommit(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
 	check := CommandCheck{
 		CheckName: "no-mistakes",
 		Executor: fakeExecutor{outputs: map[string]string{
-			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d9c2df89f3f204ad1f5528e5bf7b460cab) 2026-07-24T06:16:02Z",
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
 		}},
-		Version: CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfo(commit),
+		ExecutablePath: "no-mistakes",
 	}
-	if result := check.Run(context.Background()); result.Status != Fail {
-		t.Fatalf("Run() = %#v, want exact-commit failure", result)
+	if result := check.Run(context.Background()); result.Status != Pass {
+		t.Fatalf("Run() = %#v, want exact-commit success", result)
 	}
 }
 
-func TestNoMistakesVersionParserRequiresFullCommit(t *testing.T) {
-	if _, _, err := parseCommandVersion("no-mistakes", "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z"); err == nil {
-		t.Fatal("parseCommandVersion accepted an abbreviated no-mistakes commit")
+func TestCommandCheckRejectsNoMistakesCommitPrefixCollision(t *testing.T) {
+	commit := "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"
+	collision := "867d64d9c2df89f3f204ad1f5528e5bf7b460cab"
+	check := CommandCheck{
+		CheckName: "no-mistakes",
+		Executor: fakeExecutor{outputs: map[string]string{
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z",
+		}},
+		Version:        CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: commit},
+		BuildInfo:      fakeNoMistakesBuildInfo(collision),
+		ExecutablePath: "no-mistakes",
+	}
+	if result := check.Run(context.Background()); result.Status != Fail {
+		t.Fatalf("Run() = %#v, want commit mismatch failure", result)
+	}
+}
+
+func fakeNoMistakesBuildInfo(commit string) func(string) (*buildinfo.BuildInfo, error) {
+	return func(string) (*buildinfo.BuildInfo, error) {
+		return &buildinfo.BuildInfo{
+			Path: "github.com/kunchenguid/no-mistakes/cmd/no-mistakes",
+			Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: commit},
+				{Key: "vcs.modified", Value: "false"},
+			},
+		}, nil
 	}
 }
 

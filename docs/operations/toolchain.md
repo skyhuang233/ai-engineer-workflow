@@ -5,7 +5,9 @@
 
 - Codex CLI is pinned to an exact package version.
 - `no-mistakes` is pinned to an upstream release, verified commit, fork
-  repository, fork release, and Linux release-asset checksum.
+  repository, fork release, and Linux release-asset checksum. Doctor reads the
+  installed executable's full immutable Go `vcs.revision` build metadata, so
+  its abbreviated human-readable version output is not used as provenance.
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
