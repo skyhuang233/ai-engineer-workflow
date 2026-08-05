@@ -12,8 +12,9 @@
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
 - The dedicated GitHub integration repository and its required workflow path
-  are explicit and public. Branch protection is not a prerequisite: the
-  repository owner retains merge authority.
+  are explicit. The repository may be public or private, but its owner must
+  match the configured Gateway Credential owner. Branch protection is not a
+  prerequisite: that owner retains sole merge authority.
 - The Gateway uses one fine-grained PAT for all owner repositories with exactly
   metadata/actions read and contents/issues/pull-requests write. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite
@@ -48,8 +49,9 @@ go run ./cmd/workflow doctor `
 
 `--workflow-repository` is the independently supplied repository that contains
 the publisher workflow. Doctor requires it to exactly match
-`worker.release_repository`, verifies that repository is public, and then uses
-only that repository for the release, source, workflow-run, and manifest checks.
+`worker.release_repository`, verifies that repository belongs to the configured
+owner, and then uses only that repository for the release, source, workflow-run,
+and manifest checks. Public and private repositories follow the same checks.
 
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,

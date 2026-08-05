@@ -89,7 +89,7 @@ The non-terminal state in which the current proposed revision and its required i
 _Avoid_: Delivered, approved forever, auto-merge
 
 **Owner-Guarded Mode（所有者约束模式）**:
-A repository assurance mode in which GitHub does not enforce required checks or reviews and the sole authorized owner preserves the delivery contract by merging only Merge-Ready revisions.
+A visibility-neutral repository assurance mode for public or private repositories in which GitHub does not enforce required checks or reviews and the sole authorized owner preserves the delivery contract by merging only Merge-Ready revisions.
 _Avoid_: Enforced Mode, branch-protected repository, unsafe mode
 
 **Cancelled（已取消）**:

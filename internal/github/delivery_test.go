@@ -82,14 +82,14 @@ func TestDeliveryRemoteOnlyClassifiesMissingCredentialAsRejected(t *testing.T) {
 func TestDeliveryRemoteSupportsAtomicFirstPushExpectation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
 	pusher := &recordingPusher{}
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()), Pusher: pusher}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), Pusher: pusher}
 	request := store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "candidate", ExpectRemoteAbsent: true}
 	observation, err := remote.Observe(context.Background(), request)
 	if err != nil || observation.RemoteExists {
@@ -107,7 +107,7 @@ func TestDeliveryRemoteWritesPlanProjectionAsStatusComment(t *testing.T) {
 	var comment string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/10/comments" {
@@ -142,7 +142,7 @@ func TestDeliveryRemoteReappliesActiveLabelWithoutTrustingObservation(t *testing
 	labelWrites := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/10/labels" {
@@ -172,7 +172,7 @@ func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		if strings.Contains(r.URL.Path, "/git/ref/") {
@@ -203,7 +203,7 @@ func TestDeliveryRemotePaginatesEvidenceReconciliation(t *testing.T) {
 func TestDeliveryRemoteIgnoresNonOwnerEvidenceMarker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/ticket-1" {
@@ -235,12 +235,12 @@ func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/repos/owner/repo" {
-				_, _ = w.Write([]byte(`{"private":false}`))
+				_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 				return
 			}
 			_ = json.NewEncoder(w).Encode(pull)
 		}))
-		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 		_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", PullRequestNumber: 7, CommitSHA: "candidate"})
 		server.Close()
 		if err == nil {
@@ -249,48 +249,47 @@ func TestDeliveryRemoteRejectsClosedOrNonMainMappedPullRequest(t *testing.T) {
 	}
 }
 
-func TestDeliveryRemoteRejectsPrivateRepository(t *testing.T) {
+func TestDeliveryRemoteAcceptsPrivateOwnerGuardedRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":true}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":true}`))
 			return
 		}
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
-	_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
-	if !errors.Is(err, store.ErrDeliveryRejected) {
-		t.Fatalf("private repository error = %v", err)
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
+	if _, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"}); err != nil {
+		t.Fatalf("private repository observation = %v", err)
 	}
 }
 
-func TestDeliveryRemoteRechecksRepositoryVisibilityBeforeApply(t *testing.T) {
+func TestDeliveryRemoteRechecksPrivateRepositoryAccessBeforeApply(t *testing.T) {
 	private := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_ = json.NewEncoder(w).Encode(map[string]bool{"private": private})
+			_ = json.NewEncoder(w).Encode(map[string]any{"full_name": "owner/repo", "owner": map[string]string{"login": "owner"}, "private": private})
 			return
 		}
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
 	pusher := &recordingPusher{}
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()), Pusher: pusher}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), Pusher: pusher}
 	request := store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "candidate", ExpectRemoteAbsent: true}
 	if _, err := remote.Observe(context.Background(), request); err != nil {
 		t.Fatalf("observe public repository: %v", err)
 	}
 	private = true
-	if _, err := remote.Apply(context.Background(), request); !errors.Is(err, store.ErrDeliveryRejected) {
-		t.Fatalf("apply private repository error = %v", err)
+	if _, err := remote.Apply(context.Background(), request); err != nil {
+		t.Fatalf("apply private repository = %v", err)
 	}
-	if pusher.calls != 0 {
-		t.Fatalf("push calls = %d, want 0", pusher.calls)
+	if pusher.calls != 1 {
+		t.Fatalf("push calls = %d, want 1", pusher.calls)
 	}
 }
 
-func TestDeliveryRemoteApplyPreservesVisibilityAdmissionAPIError(t *testing.T) {
+func TestDeliveryRemoteApplyPreservesRepositoryAdmissionAPIError(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		status      int
@@ -310,7 +309,7 @@ func TestDeliveryRemoteApplyPreservesVisibilityAdmissionAPIError(t *testing.T) {
 				_, _ = w.Write([]byte(`{"message":"denied"}`))
 			}))
 			defer server.Close()
-			remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+			remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 			_, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
 			if errors.Is(err, store.ErrDeliveryRejected) {
 				t.Fatalf("admission error was permanently rejected: %v", err)
@@ -323,7 +322,7 @@ func TestDeliveryRemoteApplyPreservesVisibilityAdmissionAPIError(t *testing.T) {
 	}
 }
 
-func TestDeliveryRemotePreservesVisibilityAdmissionAPIError(t *testing.T) {
+func TestDeliveryRemotePreservesRepositoryAdmissionAPIError(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		status      int
@@ -343,7 +342,7 @@ func TestDeliveryRemotePreservesVisibilityAdmissionAPIError(t *testing.T) {
 				_, _ = w.Write([]byte(`{"message":"denied"}`))
 			}))
 			defer server.Close()
-			remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+			remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 			_, err := remote.Observe(context.Background(), store.DeliveryRequest{Operation: store.DeliveryPushCandidate, Repository: "owner/repo"})
 			if errors.Is(err, store.ErrDeliveryRejected) {
 				t.Fatalf("admission error was permanently rejected: %v", err)
@@ -359,7 +358,7 @@ func TestDeliveryRemotePreservesVisibilityAdmissionAPIError(t *testing.T) {
 func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-			_, _ = w.Write([]byte(`{"private":false}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 			return
 		}
 		switch {
@@ -374,7 +373,7 @@ func TestDeliveryRemoteRejectsPullRequestWhoseHeadChangedDuringApply(t *testing.
 		}
 	}))
 	defer server.Close()
-	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+	remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 	_, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
 	if err == nil || !errors.Is(err, store.ErrDeliveryRejected) {
 		t.Fatalf("head-change error = %v", err)
@@ -389,7 +388,7 @@ func TestDeliveryRemoteRejectsInvalidPullRequestReturnedByApply(t *testing.T) {
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo" {
-				_, _ = w.Write([]byte(`{"private":false}`))
+				_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":false}`))
 				return
 			}
 			switch r.Method {
@@ -401,7 +400,7 @@ func TestDeliveryRemoteRejectsInvalidPullRequestReturnedByApply(t *testing.T) {
 				http.NotFound(w, r)
 			}
 		}))
-		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client())}
+		remote := DeliveryRemote{Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")}
 		_, err := remote.Apply(context.Background(), store.DeliveryRequest{Operation: store.DeliveryUpsertPR, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectedRemoteHead: "accepted", Title: "ticket"})
 		server.Close()
 		if !errors.Is(err, store.ErrDeliveryRejected) {

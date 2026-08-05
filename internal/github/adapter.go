@@ -18,13 +18,22 @@ import (
 
 const apiVersion = "2022-11-28"
 
-var ErrRepositoryPrivate = errors.New("repository must be public")
+var ErrRepositoryOwnerMismatch = errors.New("repository owner does not match configured owner")
 
 type Client struct {
 	BaseURL         string
 	Token           string
 	HTTP            *http.Client
 	RepositoryOwner string
+}
+
+type RepositoryMetadata struct {
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+	Private       bool   `json:"private"`
+	Owner         struct {
+		Login string `json:"login"`
+	} `json:"owner"`
 }
 
 type PullRequestFeedback struct {
@@ -180,18 +189,38 @@ func (c *Client) WithRepositoryOwner(owner string) *Client {
 	return &configured
 }
 
-func (c *Client) RequirePublicRepository(ctx context.Context, repository string) error {
+func (c *Client) RequireOwnerGuardedRepository(ctx context.Context, repository string) error {
+	if err := ValidateOwnerGuardedRepositoryName(repository, c.RepositoryOwner); err != nil {
+		return err
+	}
+	var metadata RepositoryMetadata
+	if err := c.getJSON(ctx, "/repos/"+repository, &metadata); err != nil {
+		return fmt.Errorf("verify Owner-Guarded repository access: %w", err)
+	}
+	return metadata.ValidateOwnerGuarded(repository, c.RepositoryOwner)
+}
+
+func ValidateOwnerGuardedRepositoryName(repository, owner string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
-	var target struct {
-		Private bool `json:"private"`
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return fmt.Errorf("configured repository owner is required for GitHub observations")
 	}
-	if err := c.getJSON(ctx, "/repos/"+repository, &target); err != nil {
-		return fmt.Errorf("verify repository visibility: %w", err)
+	repositoryOwner := strings.SplitN(repository, "/", 2)[0]
+	if !strings.EqualFold(repositoryOwner, owner) {
+		return fmt.Errorf("%w: repository owner %q, configured owner %q", ErrRepositoryOwnerMismatch, repositoryOwner, owner)
 	}
-	if target.Private {
-		return fmt.Errorf("%w: %q", ErrRepositoryPrivate, repository)
+	return nil
+}
+
+func (m RepositoryMetadata) ValidateOwnerGuarded(repository, owner string) error {
+	if err := ValidateOwnerGuardedRepositoryName(repository, owner); err != nil {
+		return err
+	}
+	if !strings.EqualFold(m.FullName, repository) || !strings.EqualFold(m.Owner.Login, strings.TrimSpace(owner)) {
+		return fmt.Errorf("%w: canonical repository %q owned by %q, configured repository %q owned by %q", ErrRepositoryOwnerMismatch, m.FullName, m.Owner.Login, repository, owner)
 	}
 	return nil
 }

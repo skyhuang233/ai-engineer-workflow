@@ -54,11 +54,13 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	workflowID := int64(77)
 	mergedBy := "skyhuang233"
 	fullPullRequested := false
+	repositoryMetadataRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/repos/skyhuang233/workflow":
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"private":%t}`, private)))
+			repositoryMetadataRequested = true
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"full_name":"skyhuang233/workflow","owner":{"login":"skyhuang233"},"private":%t}`, private)))
 		case "/repos/skyhuang233/workflow/releases/tags/" + workerReleaseTag(config.Worker.Version, buildInputIdentity):
 			_, _ = w.Write([]byte(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":` + assets + `}`))
 		case "/repos/skyhuang233/workflow/releases/assets/9":
@@ -128,8 +130,12 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	}
 	mergedBy = "skyhuang233"
 	private = true
-	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
-		t.Fatal("accepted a private Worker Release repository")
+	repositoryMetadataRequested = false
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err != nil {
+		t.Fatalf("private Worker Release repository: %v", err)
+	}
+	if !repositoryMetadataRequested {
+		t.Fatal("private Worker Release repository metadata was not admitted")
 	}
 	private = false
 	currentWorkerTree = strings.Repeat("d", 40)

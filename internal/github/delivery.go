@@ -71,7 +71,7 @@ func (r *DeliveryRemote) Observe(ctx context.Context, request store.DeliveryRequ
 	if client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
-	if err := requirePublicRepository(ctx, client, request.Repository); err != nil {
+	if err := requireOwnerGuardedRepository(ctx, client, request.Repository); err != nil {
 		return delivery.Observation{}, err
 	}
 	if request.Operation == store.DeliveryProjectPlan || request.Operation == store.DeliveryProjectInbox || request.Operation == store.DeliveryAddIssueLabel {
@@ -137,7 +137,7 @@ func (r *DeliveryRemote) Apply(ctx context.Context, request store.DeliveryReques
 	if client == nil {
 		return delivery.Observation{}, fmt.Errorf("GitHub client is missing")
 	}
-	if err := requirePublicRepository(ctx, client, request.Repository); err != nil {
+	if err := requireOwnerGuardedRepository(ctx, client, request.Repository); err != nil {
 		return delivery.Observation{}, err
 	}
 	switch request.Operation {
@@ -223,12 +223,12 @@ func (r *DeliveryRemote) pusher(ctx context.Context, request store.DeliveryReque
 	return WorkspacePusher{WorkspacePath: workspace, Token: token, PushURL: r.PushURL}, nil
 }
 
-func requirePublicRepository(ctx context.Context, client *Client, repository string) error {
+func requireOwnerGuardedRepository(ctx context.Context, client *Client, repository string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return fmt.Errorf("%w: %w", store.ErrDeliveryRejected, err)
 	}
-	if err := client.RequirePublicRepository(ctx, repository); err != nil {
-		if errors.Is(err, ErrRepositoryPrivate) {
+	if err := client.RequireOwnerGuardedRepository(ctx, repository); err != nil {
+		if errors.Is(err, ErrRepositoryOwnerMismatch) {
 			return fmt.Errorf("%w: %w", store.ErrDeliveryRejected, err)
 		}
 		return err

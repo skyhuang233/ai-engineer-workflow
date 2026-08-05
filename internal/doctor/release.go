@@ -87,15 +87,16 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if config.Worker.ReleaseRepository != f.WorkflowRepository {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository must match the workflow repository")
 	}
+	if err := githubapi.ValidateOwnerGuardedRepositoryName(config.Worker.ReleaseRepository, config.GitHub.Credential.Owner); err != nil {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository owner must match the configured owner")
+	}
 	client := githubapi.NewClient(f.APIBase, token, f.HTTP)
-	var repository struct {
-		Private bool `json:"private"`
-	}
+	var repository githubapi.RepositoryMetadata
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+config.Worker.ReleaseRepository, nil, &repository); err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker Release repository visibility: %w", err)
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker Release repository access: %w", err)
 	}
-	if repository.Private {
-		return WorkerReleaseManifest{}, nil, errors.New("Worker Release repository must be public")
+	if err := repository.ValidateOwnerGuarded(config.Worker.ReleaseRepository, config.GitHub.Credential.Owner); err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Worker Release repository owner: %w", err)
 	}
 	currentInputs, err := resolveWorkerBuildInputs(ctx, client, config.Worker.ReleaseRepository, "main")
 	if err != nil {

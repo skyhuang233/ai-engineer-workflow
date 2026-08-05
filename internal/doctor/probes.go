@@ -207,15 +207,15 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return Result{Status: Fail, Summary: "Gateway Credential is unavailable"}
 	}
-	var repo struct {
-		Private       bool   `json:"private"`
-		DefaultBranch string `json:"default_branch"`
-	}
+	var repo githubapi.RepositoryMetadata
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository, &repo); err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("read integration repository: %v", err), Err: err}
 	}
-	if repo.Private || repo.DefaultBranch != c.GitHub.DefaultBranch {
-		return Result{Status: Fail, Summary: fmt.Sprintf("integration repository private=%t default_branch=%s", repo.Private, repo.DefaultBranch)}
+	if err := repo.ValidateOwnerGuarded(c.GitHub.TestRepository, c.GitHub.Credential.Owner); err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("integration repository admission: %v", err), Err: err}
+	}
+	if repo.DefaultBranch != c.GitHub.DefaultBranch {
+		return Result{Status: Fail, Summary: fmt.Sprintf("integration repository default_branch=%s", repo.DefaultBranch)}
 	}
 	var branch struct {
 		Object struct {

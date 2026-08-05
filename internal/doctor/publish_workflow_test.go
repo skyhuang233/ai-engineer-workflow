@@ -30,8 +30,11 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 		t.Fatal("publisher workflow does not validate the Worker identity with Bash syntax")
 	}
 	if !strings.Contains(string(workflow), "test \"$worker_release_repository\" = \"$GITHUB_REPOSITORY\"") ||
-		!strings.Contains(string(workflow), "gh api \"repos/${GITHUB_REPOSITORY}\" | jq --exit-status '.private == false'") {
-		t.Fatal("publisher workflow does not enforce a public same-repository release boundary")
+		!strings.Contains(string(workflow), "test \"$configured_owner\" = \"${GITHUB_REPOSITORY_OWNER,,}\"") {
+		t.Fatal("publisher workflow does not enforce an owner-controlled same-repository release boundary")
+	}
+	if strings.Contains(string(workflow), ".private == false") || strings.Contains(string(workflow), "must be public") {
+		t.Fatal("publisher workflow rejects an owner-controlled private release repository")
 	}
 	if !strings.Contains(string(workflow), "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}") {
 		t.Fatal("publisher workflow does not pass the complete no-mistakes commit to the Worker build")
@@ -56,5 +59,23 @@ func TestPublishWorkflowLoadsFullPullBeforeOwnerAdmission(t *testing.T) {
 	}
 	if !strings.Contains(text, `((.merged_by.type? // "") | ascii_downcase) == "user"`) {
 		t.Fatal("publisher workflow does not require a non-bot user from the full pull request")
+	}
+}
+
+func TestIntegrationWorkflowAdmitsOwnerGuardedPrivateRepository(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	workflow, err := os.ReadFile(filepath.Join(filepath.Dir(file), "..", "..", "deploy", "github", "workflow-contract.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(workflow)
+	if strings.Contains(text, ".private == false") || strings.Contains(text, "public Owner-Guarded") {
+		t.Fatal("integration workflow rejects an owner-controlled private repository")
+	}
+	if !strings.Contains(text, `.full_name == env.GITHUB_REPOSITORY`) || !strings.Contains(text, `.owner.login | ascii_downcase`) || !strings.Contains(text, `(.default_branch | length > 0)`) {
+		t.Fatal("integration workflow does not verify its owner-controlled repository identity")
 	}
 }

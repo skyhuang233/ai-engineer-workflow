@@ -317,22 +317,54 @@ func TestValidateRepository(t *testing.T) {
 	}
 }
 
-func TestRequirePublicRepositoryRejectsPrivateRepositories(t *testing.T) {
+func TestRequireOwnerGuardedRepositoryAcceptsPublicAndPrivateRepositories(t *testing.T) {
 	private := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]bool{"private": private})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"full_name": "owner/repo",
+			"owner":     map[string]string{"login": "owner"},
+			"private":   private,
+		})
 	}))
 	defer server.Close()
-	client := NewClient(server.URL, "", server.Client())
-	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err != nil {
+	client := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")
+	if err := client.RequireOwnerGuardedRepository(context.Background(), "owner/repo"); err != nil {
 		t.Fatalf("public repository: %v", err)
 	}
 	private = true
-	if err := client.RequirePublicRepository(context.Background(), "owner/repo"); err == nil || !errors.Is(err, ErrRepositoryPrivate) {
-		t.Fatalf("private repository error = %v", err)
+	if err := client.RequireOwnerGuardedRepository(context.Background(), "owner/repo"); err != nil {
+		t.Fatalf("private repository: %v", err)
+	}
+}
+
+func TestRequireOwnerGuardedRepositoryRejectsCanonicalRepositoryOwnedByAnotherAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"full_name": "collaborator/repo",
+			"owner":     map[string]string{"login": "collaborator"},
+			"private":   true,
+		})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")
+	err := client.RequireOwnerGuardedRepository(context.Background(), "owner/repo")
+	if !errors.Is(err, ErrRepositoryOwnerMismatch) {
+		t.Fatalf("canonical repository owner admission error = %v", err)
+	}
+}
+
+func TestRequireOwnerGuardedRepositoryRejectsAnotherOwnerBeforeCallingGitHub(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected GitHub call = %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner")
+	err := client.RequireOwnerGuardedRepository(context.Background(), "collaborator/repo")
+	if !errors.Is(err, ErrRepositoryOwnerMismatch) {
+		t.Fatalf("repository owner admission error = %v", err)
 	}
 }
 

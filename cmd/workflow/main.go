@@ -107,7 +107,7 @@ func runDoctor(args []string) {
 	}
 	secret, err := admitGatewayCredential(context.Background(), database, func(token string) error {
 		client := github.NewClient("", token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-		return requirePublicControlPlaneRepository(context.Background(), client, config.GitHub.TestRepository)
+		return requireOwnerGuardedControlPlaneRepository(context.Background(), client, config.GitHub.TestRepository)
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -331,8 +331,12 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	client := github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
+	var client *github.Client
+	_, err = admitGatewayCredential(ctx, db, func(token string) error {
+		client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+		return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
+	})
+	if err != nil {
 		fail(err)
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
@@ -459,7 +463,7 @@ func runReconcileDelivered(args []string) {
 	var client *github.Client
 	_, err = admitGatewayCredential(ctx, db, func(token string) error {
 		client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-		return requirePublicControlPlaneRepository(ctx, client, *repository)
+		return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 	})
 	if err != nil {
 		fail(err)
@@ -552,7 +556,7 @@ func runPollGitHub(args []string) {
 		var client *github.Client
 		_, err := admitGatewayCredential(ctx, db, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-			return requirePublicControlPlaneRepository(ctx, client, *repository)
+			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
 		if err != nil {
 			if shouldPauseGatewayForCredential(err) {
@@ -714,8 +718,8 @@ func runAnswerInbox(args []string) {
 	}
 }
 
-func requirePublicControlPlaneRepository(ctx context.Context, client *github.Client, repository string) error {
-	if err := client.RequirePublicRepository(ctx, repository); err != nil {
+func requireOwnerGuardedControlPlaneRepository(ctx context.Context, client *github.Client, repository string) error {
+	if err := client.RequireOwnerGuardedRepository(ctx, repository); err != nil {
 		return fmt.Errorf("control-plane repository admission: %w", err)
 	}
 	return nil
