@@ -80,15 +80,15 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	if identity.Login != owner {
 		return fmt.Errorf("credential owner %q does not match %q", identity.Login, owner)
 	}
-	var repo struct {
-		DefaultBranch string `json:"default_branch"`
-		Private       bool   `json:"private"`
+	if err := githubapi.ValidateOwnerGuardedRepositoryName(repository, owner); err != nil {
+		return err
 	}
+	var repo githubapi.RepositoryMetadata
 	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository, nil, &repo); err != nil {
 		return fmt.Errorf("verify repository metadata: %w", err)
 	}
-	if repo.Private {
-		return errors.New("integration repository must be public")
+	if err := repo.ValidateOwnerGuarded(repository, owner); err != nil {
+		return err
 	}
 	if _, err := v.call(ctx, token, http.MethodGet, "repos/"+repository+"/actions/workflows", nil, &struct{}{}); err != nil {
 		return fmt.Errorf("verify Actions read permission: %w", err)

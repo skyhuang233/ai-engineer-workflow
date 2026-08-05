@@ -73,14 +73,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           worker_release_repository="$(jq --exit-status --raw-output '.worker.release_repository | select(type == "string" and length > 0)' config/toolchain.json)"
+          configured_owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0) | ascii_downcase' config/toolchain.json)"
           test "$worker_release_repository" = "$GITHUB_REPOSITORY" || {
             echo "Refusing to publish: configured Worker Release repository differs from this workflow repository" >&2
             exit 1
           }
-          gh api "repos/${GITHUB_REPOSITORY}" | jq --exit-status '.private == false' > /dev/null || {
-            echo "Refusing to publish: Worker Release repository must be public" >&2
+          test "$configured_owner" = "${GITHUB_REPOSITORY_OWNER,,}" || {
+            echo "Refusing to publish: Worker Release repository owner differs from the configured owner" >&2
             exit 1
           }
+          repository="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          jq --exit-status \
+            --arg worker_release_repository "$worker_release_repository" \
+            --arg configured_owner "$configured_owner" '
+              ((.full_name | ascii_downcase) == ($worker_release_repository | ascii_downcase)) and
+              ((.owner.login | ascii_downcase) == $configured_owner)
+            ' <<<"$repository" > /dev/null || {
+              echo "Refusing to publish: GitHub canonical Worker Release repository identity differs from the configured repository or owner" >&2
+              exit 1
+            }
       - name: Record Worker build input identity
         id: build-inputs
         shell: bash

@@ -1,10 +1,10 @@
 ---
-status: superseded by ADR-0032
+status: superseded by ADR-0038
 ---
 
 # Historical private-repository exception
 
-This exception is retired. The production baseline requires public repositories under ADR-0032; the owner remains the only human authorized to merge accepted pull requests.
+ADR-0032 retired this exception in favor of a public-only baseline. ADR-0038 later replaced both decisions with one visibility-neutral Owner-Guarded baseline; the owner remains the only human authorized to merge accepted pull requests.
 
 ## Consequences
 

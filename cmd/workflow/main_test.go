@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,17 +172,17 @@ func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *test
 	}
 }
 
-func TestRequirePublicControlPlaneRepositoryRejectsPrivateRepository(t *testing.T) {
+func TestRequireOwnerGuardedControlPlaneRepositoryAcceptsPrivateRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/owner/repo" {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte(`{"private":true}`))
+		_, _ = w.Write([]byte(`{"full_name":"owner/repo","owner":{"login":"owner"},"private":true}`))
 	}))
 	defer server.Close()
-	err := requirePublicControlPlaneRepository(context.Background(), github.NewClient(server.URL, "", server.Client()), "owner/repo")
-	if err == nil || !strings.Contains(err.Error(), "must be public") {
+	err := requireOwnerGuardedControlPlaneRepository(context.Background(), github.NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), "owner/repo")
+	if err != nil {
 		t.Fatalf("private repository admission error = %v", err)
 	}
 }

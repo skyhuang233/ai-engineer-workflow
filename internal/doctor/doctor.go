@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 )
 
 const Redacted = "[REDACTED]"
@@ -143,6 +145,10 @@ func (c Config) Validate() error {
 		return errors.New("Gateway Credential must be a fine-grained PAT")
 	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
 		return errors.New("Gateway Credential owner is required")
+	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
+		return errors.New("worker release repository owner must match the Gateway Credential owner")
+	case !repositoryOwnedBy(c.GitHub.TestRepository, c.GitHub.Credential.Owner):
+		return errors.New("GitHub test repository owner must match the Gateway Credential owner")
 	case !c.GitHub.Credential.AllRepositories:
 		return errors.New("Gateway Credential must cover all repositories")
 	case !validGatewayPermissions(c.GitHub.Credential.Permissions):
@@ -152,6 +158,10 @@ func (c Config) Validate() error {
 	default:
 		return nil
 	}
+}
+
+func repositoryOwnedBy(repository, owner string) bool {
+	return githubapi.ValidateOwnerGuardedRepositoryName(repository, owner) == nil
 }
 
 func validGatewayPermissions(actual map[string]string) bool {

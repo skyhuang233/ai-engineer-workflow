@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
+func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -25,7 +25,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case r.URL.Path == "/repos/owner/integration":
-			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main","private":true}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls"):
 			_, _ = w.Write([]byte(`[]`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues"):
@@ -82,7 +82,34 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestVerifyRejectsPrivateIntegrationRepositoryBeforeMutations(t *testing.T) {
+func TestVerifyRejectsCanonicalRepositoryOwnedByAnotherAccountBeforeMutations(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"owner"}`))
+		case "/repos/owner/integration":
+			_, _ = w.Write([]byte(`{"full_name":"collaborator/integration","owner":{"login":"collaborator"},"default_branch":"main","private":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
+		context.Background(), "github_pat_test", "owner", "owner/integration",
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match configured owner") {
+		t.Fatalf("canonical repository owner admission error = %v", err)
+	}
+	if got := strings.Join(calls, "\n"); strings.Contains(got, "POST ") || strings.Contains(got, "PUT ") || strings.Contains(got, "PATCH ") || strings.Contains(got, "DELETE ") {
+		t.Fatalf("canonical owner mismatch mutated repository:\n%s", got)
+	}
+}
+
+func TestVerifyRejectsRepositoryOwnedByAnotherAccountBeforeMutations(t *testing.T) {
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Method+" "+r.URL.Path)
@@ -99,10 +126,10 @@ func TestVerifyRejectsPrivateIntegrationRepositoryBeforeMutations(t *testing.T) 
 	defer server.Close()
 
 	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
-		context.Background(), "github_pat_test", "owner", "owner/integration",
+		context.Background(), "github_pat_test", "owner", "collaborator/integration",
 	)
-	if err == nil || !strings.Contains(err.Error(), "must be public") {
-		t.Fatalf("private integration repository error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "does not match configured owner") {
+		t.Fatalf("repository owner admission error = %v", err)
 	}
 	if got := strings.Join(calls, "\n"); strings.Contains(got, "POST ") || strings.Contains(got, "PUT ") || strings.Contains(got, "PATCH ") || strings.Contains(got, "DELETE ") {
 		t.Fatalf("private integration repository was mutated:\n%s", got)
@@ -118,7 +145,7 @@ func TestVerifyRefusesToDeleteAChangedTemporaryBranch(t *testing.T) {
 		case "/user":
 			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case "/repos/owner/integration":
-			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main"}`))
 		case "/repos/owner/integration/git/ref/heads/workflow-credential-contract-0123456789abcdef01234567":
 			_, _ = w.Write([]byte(`{"object":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`))
 		default:
