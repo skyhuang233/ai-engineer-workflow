@@ -81,7 +81,7 @@ An immutable revision and its verification evidence proposed by a Worker Run for
 _Avoid_: Pull request, final result, agent push
 
 **Review Feedback（评审反馈）**:
-A deduplicated review or delivery conversation written by a human collaborator and routed to the accountable Ticket Agent for interpretation.
+A deduplicated review or delivery conversation written by the configured owner and routed to the accountable Ticket Agent for interpretation.
 _Avoid_: Mandatory change request, bot comment, CI result
 
 **Merge-Ready（等待合并）**:
