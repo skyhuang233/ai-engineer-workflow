@@ -72,11 +72,12 @@ files or tool artifacts.
 
 # GITHUB ISSUE UPDATE
 
-GitHub writes are restricted to the GitHub Write Gateway. Do not invoke `gh`,
-`git push`, `curl`, or any other direct GitHub write command for comments,
-labels, issue closure, pull requests, or pushes. Submit every requested issue
-update through `WORKFLOW_GITHUB_GATEWAY_COMMAND`; if it is unavailable, stop
-and report the update as blocked.
+GitHub writes are owned by the Control Plane and its credential-isolated
+GitHub Write Gateway. Do not invoke `gh`, `git push`, `curl`, or any other
+direct GitHub write command for comments, labels, issue closure, pull requests,
+or pushes. Return local evidence to the Delivery Controller; the Control Plane
+projects issue state and publishes accepted revisions through the fenced
+Gateway.
 
 When the task is complete:
 

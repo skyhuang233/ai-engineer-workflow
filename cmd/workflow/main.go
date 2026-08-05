@@ -9,8 +9,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -730,6 +732,7 @@ func runGateway(args []string) {
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	listen := flags.String("listen", "", "Gateway listen address")
+	readyFile := flags.String("ready-file", "", "write the bound Gateway URL after the listener is ready")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
@@ -778,12 +781,56 @@ func runGateway(args []string) {
 			time.Sleep(*outboxInterval)
 		}
 	}()
-	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: *controlToken})}
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		_ = db.Close()
+		fail(err)
+	}
+	if err := writeGatewayReadyFile(*readyFile, listener.Addr().String()); err != nil {
+		_ = listener.Close()
+		_ = db.Close()
+		fail(err)
+	}
+	if *readyFile != "" {
+		defer os.Remove(*readyFile)
+	}
+	server := &http.Server{Handler: delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: *controlToken})}
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		_ = db.Close()
 		fail(err)
 	}
 	_ = db.Close()
+}
+
+func writeGatewayReadyFile(path, address string) error {
+	if path == "" {
+		return nil
+	}
+	if strings.TrimSpace(address) == "" {
+		return errors.New("Gateway bound address is required")
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".workflow-gateway-ready-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := file.Name()
+	defer func() {
+		_ = file.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(file, "http://%s\n", address); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func gatewayCredential(ctx context.Context) (string, error) {

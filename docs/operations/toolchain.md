@@ -62,6 +62,34 @@ the publisher workflow. Doctor requires it to exactly match
 owner, and then uses only that repository for the release, source, workflow-run,
 and manifest checks. Public and private repositories follow the same checks.
 
+Start a bounded production Control Plane run from a clean checkout at the
+accepted `origin/main` revision:
+
+```powershell
+.\.agents\skills\codex-afk.ps1 100
+```
+
+The entry point fetches `origin/main`, refuses dirty or unaccepted source,
+derives the current `owner/repository`, and requires exactly one open
+`workflow:plan` issue. It builds the accepted `workflow` binary into a temporary
+runtime directory, generates an ephemeral control-plane transport credential,
+starts the credential-isolated Gateway on a random loopback port, verifies its
+authenticated readiness endpoint, and performs the requested number of
+`poll-github --once` reconciliation passes. The Gateway and temporary binary
+are stopped and removed when the bounded run ends. Ticket work is dispatched
+through Run Leases to Docker Workers; the Worker receives the Gateway URL but
+neither the control-plane transport credential nor the GitHub PAT.
+
+The default durable database is `%ProgramData%\workflow\workflow.db`, matching
+credential provisioning and Doctor. Ticket Workspaces and Codex state live
+beside it under `workspaces` and `codex-state`. Operators may override these
+with `WORKFLOW_DATABASE`, `WORKFLOW_RUNTIME_ROOT`,
+`WORKFLOW_WORKSPACE_ROOT`, and `WORKFLOW_CODEX_STATE_ROOT`. Global concurrency
+defaults to one Worker Run and may be changed with
+`WORKFLOW_MAX_PARALLEL_RUNS`. `WORKFLOW_GITHUB_GATEWAY_COMMAND` is not a
+production setting: the legacy host-agent command adapter is intentionally not
+used because it cannot enforce Run Lease fencing.
+
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,
 tests, documentation checks, lint, Gateway-backed push and pull-request

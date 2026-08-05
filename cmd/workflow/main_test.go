@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -17,6 +18,20 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestGatewayReadyFilePublishesTheBoundLoopbackURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.ready")
+	if err := writeGatewayReadyFile(path, "127.0.0.1:43123"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(contents), "http://127.0.0.1:43123\n"; got != want {
+		t.Fatalf("ready file = %q, want %q", got, want)
+	}
+}
 
 func TestShouldPauseGatewayForCredential(t *testing.T) {
 	for _, test := range []struct {

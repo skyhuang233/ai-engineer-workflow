@@ -80,6 +80,14 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 		option = options[0]
 	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/healthz" {
+			if option.ControlPlaneToken == "" || request.Header.Get(controlPlaneTokenHeader) != option.ControlPlaneToken {
+				http.Error(writer, "control-plane authentication failed", http.StatusForbidden)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if request.Method != http.MethodPost || request.URL.Path != "/v1/deliveries" {
 			http.NotFound(writer, request)
 			return
