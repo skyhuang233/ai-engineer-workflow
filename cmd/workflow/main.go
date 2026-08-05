@@ -135,7 +135,7 @@ func runDoctor(args []string) {
 				Command:      []string{"no-mistakes", "--version"},
 				Tool:         "no-mistakes",
 				ExactVersion: config.NoMistakes.Version,
-				ExactCommit:  config.NoMistakes.UpstreamCommit[:7],
+				ExactCommit:  config.NoMistakes.UpstreamCommit,
 			},
 		},
 		doctor.CodexResumeCheck{Executor: doctor.OSExecutor{}},

@@ -58,6 +58,20 @@ jobs:
           echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Verify Worker Release repository boundary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          worker_release_repository="$(jq --exit-status --raw-output '.worker.release_repository | select(type == "string" and length > 0)' config/toolchain.json)"
+          test "$worker_release_repository" = "$GITHUB_REPOSITORY" || {
+            echo "Refusing to publish: configured Worker Release repository differs from this workflow repository" >&2
+            exit 1
+          }
+          gh api "repos/${GITHUB_REPOSITORY}" | jq --exit-status '.private == false' > /dev/null || {
+            echo "Refusing to publish: Worker Release repository must be public" >&2
+            exit 1
+          }
       - name: Record Worker build input identity
         id: build-inputs
         shell: bash
@@ -70,7 +84,10 @@ jobs:
             '{schema_version:2,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
             config/toolchain.json)"
           identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
-          test "$identity" =~ ^[0-9a-f]{64}$
+          [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "Worker build input identity must be a SHA-256" >&2
+            exit 1
+          }
           echo "identity=$identity" >> "$GITHUB_OUTPUT"
           echo "release_identity=worker-v${{ steps.pins.outputs.worker_version }}-$identity" >> "$GITHUB_OUTPUT"
       - name: Detect Worker release input changes
@@ -210,6 +227,7 @@ jobs:
           build-args: |
             CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
             NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
+            NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}
             NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}
             NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}
             NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}

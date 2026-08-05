@@ -128,7 +128,7 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 			Command:      []string{"no-mistakes", "--version"},
 			Tool:         "no-mistakes",
 			ExactVersion: "v1.41.2",
-			ExactCommit:  "867d64d",
+			ExactCommit:  "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
 		},
 	}
 	if result := check.Run(context.Background()); result.Status != Fail {
@@ -136,16 +136,22 @@ func TestCommandCheckFailsClosedWithoutExecutable(t *testing.T) {
 	}
 }
 
-func TestCommandCheckRejectsVersionAndCommitPrefixCollisions(t *testing.T) {
+func TestCommandCheckRejectsCommitPrefixCollision(t *testing.T) {
 	check := CommandCheck{
 		CheckName: "no-mistakes",
 		Executor: fakeExecutor{outputs: map[string]string{
-			"no-mistakes --version": "no-mistakes version v1.41.20 (867d64d0) 2026-07-24T06:16:02Z",
+			"no-mistakes --version": "no-mistakes version v1.41.2 (867d64d9c2df89f3f204ad1f5528e5bf7b460cab) 2026-07-24T06:16:02Z",
 		}},
-		Version: CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: "867d64d"},
+		Version: CommandExpectation{Command: []string{"no-mistakes", "--version"}, Tool: "no-mistakes", ExactVersion: "v1.41.2", ExactCommit: "867d64d9c2df89f3f204ad1f5528e5bf7b460caa"},
 	}
 	if result := check.Run(context.Background()); result.Status != Fail {
-		t.Fatalf("Run() = %#v, want exact-version failure", result)
+		t.Fatalf("Run() = %#v, want exact-commit failure", result)
+	}
+}
+
+func TestNoMistakesVersionParserRequiresFullCommit(t *testing.T) {
+	if _, _, err := parseCommandVersion("no-mistakes", "no-mistakes version v1.41.2 (867d64d) 2026-07-24T06:16:02Z"); err == nil {
+		t.Fatal("parseCommandVersion accepted an abbreviated no-mistakes commit")
 	}
 }
 

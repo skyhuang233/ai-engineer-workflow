@@ -69,7 +69,9 @@ even after unrelated `main` commits, but only while every pinned toolchain
 input remains current and the deterministic build-input identity still matches
 both its source commit and current `main`. That identity covers the
 `deploy/worker` Git tree, the pinned `publish-worker` workflow blob, and the
-Worker toolchain inputs consumed by the build. Release and image tags contain
+Worker toolchain inputs consumed by the build. The Worker tree includes an
+immutable Debian snapshot and exact direct APT package versions, which are also
+recorded as image labels for build provenance. Release and image tags contain
 the declared Worker version and this identity, allowing an input change to
 produce a new immutable release without a manual version bump. The manifest
 must be the sole asset for that exact source-keyed Worker release and must be published by the fixed

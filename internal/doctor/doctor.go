@@ -377,7 +377,7 @@ func (c CommandCheck) Run(ctx context.Context) Result {
 
 var (
 	codexVersionPattern      = regexp.MustCompile(`^codex-cli[[:space:]]+([^[:space:]]+)$`)
-	noMistakesVersionPattern = regexp.MustCompile(`^no-mistakes version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$`)
+	noMistakesVersionPattern = regexp.MustCompile(`^no-mistakes version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{40})\)([[:space:]].*)?$`)
 )
 
 func parseCommandVersion(tool, output string) (string, string, error) {
