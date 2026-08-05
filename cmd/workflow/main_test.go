@@ -117,7 +117,7 @@ func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testin
 	}
 }
 
-func TestPersistGatewayPollErrorPausesForRejectedGitHubCredential(t *testing.T) {
+func TestPersistGatewayCredentialAdmissionErrorPausesForRejectedGitHubCredential(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -142,7 +142,7 @@ func TestPersistGatewayPollErrorPausesForRejectedGitHubCredential(t *testing.T) 
 	}
 	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
 	pollErr := fmt.Errorf("repository admission: %w", &github.APIError{StatusCode: http.StatusUnauthorized})
-	if err := persistGatewayPollError(ctx, db, pollErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("poll credential error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)
@@ -155,7 +155,7 @@ func TestPersistGatewayPollErrorPausesForRejectedGitHubCredential(t *testing.T) 
 	}
 }
 
-func TestPersistGatewayPollErrorLeavesRateLimitsRetryable(t *testing.T) {
+func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -164,7 +164,7 @@ func TestPersistGatewayPollErrorLeavesRateLimitsRetryable(t *testing.T) {
 	defer db.Close()
 	retryAt := time.Date(2026, 8, 4, 0, 1, 0, 0, time.UTC)
 	pollErr := &github.APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
-	if err := persistGatewayPollError(ctx, db, pollErr, time.Now().UTC()); !errors.Is(err, pollErr) {
+	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, time.Now().UTC()); !errors.Is(err, pollErr) {
 		t.Fatalf("rate limited poll error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)

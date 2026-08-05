@@ -30,6 +30,16 @@ import (
 
 const defaultControlPlaneDatabase = "workflow.db"
 
+type admittedCredential string
+
+func (c admittedCredential) Get(context.Context, string) (string, error) {
+	return string(c), nil
+}
+
+func (admittedCredential) Set(context.Context, string, string) error {
+	return errors.New("admitted credentials cannot be replaced")
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -84,19 +94,26 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	defer database.Close()
 	verification, verificationErr := database.GatewayCredentialVerification(context.Background())
-	_ = database.Close()
-	if verificationErr != nil && verificationErr != store.ErrNotFound {
+	if verificationErr != nil && !errors.Is(verificationErr, store.ErrNotFound) {
 		fmt.Fprintln(os.Stderr, verificationErr)
 		os.Exit(1)
 	}
-	credentialStore := credential.NewStore()
-	secret, _ := credentialStore.Get(context.Background(), credential.GatewayTarget)
-	manifest, manifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	secret, err := admitGatewayCredential(context.Background(), database, func(token string) error {
+		client := github.NewClient("", token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+		return requirePublicControlPlaneRepository(context.Background(), client, config.GitHub.TestRepository)
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	manifest, manifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		os.Exit(1)
+	}
+	admittedCredentials := admittedCredential(secret)
 	runner := doctor.Runner{Checks: []doctor.Check{
 		doctor.CommandCheck{
 			CheckName: "Codex CLI",
@@ -125,8 +142,8 @@ func runDoctor(args []string) {
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},
 		doctor.WorkerRegistryCheck{Image: manifest.Image},
-		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: credentialStore, Verification: verification},
-		doctor.GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentialStore},
+		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: admittedCredentials, Verification: verification},
+		doctor.GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: admittedCredentials},
 	}, Secrets: []string{secret}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -142,12 +159,6 @@ func runDoctor(args []string) {
 	if !report.Passed() {
 		os.Exit(1)
 	}
-	database, err = store.Open(context.Background(), *databasePath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer database.Close()
 	expectedActiveImage := ""
 	if active, activeErr := database.ActiveWorkerRelease(context.Background()); activeErr == nil {
 		expectedActiveImage = active.ImageReference
@@ -157,7 +168,7 @@ func runDoctor(args []string) {
 	}
 	currentManifest, currentManifestJSON, err := (doctor.ReleaseFetcher{}).Fetch(context.Background(), config, secret)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
 	}
 	if currentManifest != manifest || string(currentManifestJSON) != string(manifestJSON) {
@@ -430,22 +441,22 @@ func runReconcileDelivered(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	token, err := gatewayCredential(ctx)
-	if err != nil {
-		fail(err)
-	}
-	client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-	if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
-		fail(err)
-	}
 	db, err := store.Open(ctx, *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
-	marked, err := (github.DeliveredReconciler{Store: db, Client: client}).Reconcile(ctx, *repository)
+	var client *github.Client
+	_, err = admitGatewayCredential(ctx, db, func(token string) error {
+		client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+		return requirePublicControlPlaneRepository(ctx, client, *repository)
+	})
 	if err != nil {
 		fail(err)
+	}
+	marked, err := (github.DeliveredReconciler{Store: db, Client: client}).Reconcile(ctx, *repository)
+	if err != nil {
+		fail(persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC()))
 	}
 	fmt.Println(marked)
 }
@@ -526,13 +537,13 @@ func runPollGitHub(args []string) {
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		token, err := verifiedGatewayCredential(ctx, db)
+		var client *github.Client
+		_, err := admitGatewayCredential(ctx, db, func(token string) error {
+			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+			return requirePublicControlPlaneRepository(ctx, client, *repository)
+		})
 		if err != nil {
-			return persistGatewayCredentialPause(ctx, db, err, time.Now().UTC())
-		}
-		client := github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-		if err := requirePublicControlPlaneRepository(ctx, client, *repository); err != nil {
-			return persistGatewayPollError(ctx, db, err, time.Now().UTC())
+			return err
 		}
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		poller := github.Poller{Store: db, Client: client, LaunchReview: launcher, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
@@ -584,7 +595,7 @@ func runPollGitHub(args []string) {
 			}
 		})
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
-			err = persistGatewayPollError(ctx, db, err, time.Now().UTC())
+			err = persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC())
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
@@ -683,11 +694,10 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	token, err := verifiedGatewayCredential(ctx, db)
+	_, err = admitGatewayCredential(ctx, db, func(token string) error {
+		return requirePublicControlPlaneRepository(ctx, github.NewClient(*githubURL, token, nil), *repository)
+	})
 	if err != nil {
-		fail(err)
-	}
-	if err := requirePublicControlPlaneRepository(ctx, github.NewClient(*githubURL, token, nil), *repository); err != nil {
 		fail(err)
 	}
 	if err := db.AnswerWorkflowQuestion(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
@@ -737,7 +747,7 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	credentialSource := func(ctx context.Context) (string, error) {
-		return verifiedGatewayCredential(ctx, db)
+		return admitGatewayCredential(ctx, db, nil)
 	}
 	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
 	gateway, err := delivery.NewGateway(db, remote)
@@ -822,12 +832,23 @@ func persistGatewayCredentialPause(ctx context.Context, database *store.Store, c
 	return credentialErr
 }
 
-func persistGatewayPollError(ctx context.Context, database *store.Store, pollErr error, now time.Time) error {
-	var authenticationFailure interface{ AuthenticationFailure() bool }
-	if errors.As(pollErr, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
-		pollErr = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, pollErr)
+func admitGatewayCredential(ctx context.Context, database *store.Store, authenticate func(string) error) (string, error) {
+	token, err := verifiedGatewayCredential(ctx, database)
+	if err == nil && authenticate != nil {
+		err = authenticate(token)
 	}
-	return persistGatewayCredentialPause(ctx, database, pollErr, now)
+	if err != nil {
+		return "", persistGatewayCredentialAdmissionError(ctx, database, err, time.Now().UTC())
+	}
+	return token, nil
+}
+
+func persistGatewayCredentialAdmissionError(ctx context.Context, database *store.Store, admissionErr error, now time.Time) error {
+	var authenticationFailure interface{ AuthenticationFailure() bool }
+	if errors.As(admissionErr, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
+		admissionErr = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
+	}
+	return persistGatewayCredentialPause(ctx, database, admissionErr, now)
 }
 
 func fail(err error) {
