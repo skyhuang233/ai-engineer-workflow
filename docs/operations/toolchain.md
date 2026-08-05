@@ -75,11 +75,15 @@ derives the current `owner/repository`, and requires exactly one open
 runtime and invokes one Go Control Plane process. That process generates an
 ephemeral control-plane transport credential, embeds the credential-isolated
 Gateway and bounded reconciliation loop, and verifies authenticated readiness
-before scheduling. The host modules use the loopback endpoint while Docker
-Workers use the same listener through `host.docker.internal`; neither the
-control-plane transport credential nor the GitHub PAT enters a Worker. The
-Gateway, scheduler, durable state, and Worker supervision therefore remain one
-modular-monolith process for the entire bounded run.
+before scheduling. Bounded passes are paced at a one-minute default interval,
+so Waiting Review and HITL feedback do not consume the entire pass budget in a
+tight loop; `WORKFLOW_POLL_INTERVAL` may override that cadence. The durable
+Ticket Session remains resumable in a later bounded invocation if an operator
+stops the process before merge. The host modules use the loopback endpoint
+while Docker Workers use the same listener through `host.docker.internal`;
+neither the control-plane transport credential nor the GitHub PAT enters a
+Worker. The Gateway, scheduler, durable state, and Worker supervision therefore
+remain one modular-monolith process for the entire bounded run.
 
 The default durable database is `%ProgramData%\workflow\workflow.db`, matching
 credential provisioning and Doctor. Ticket Workspaces and Codex state live

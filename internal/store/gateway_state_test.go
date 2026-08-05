@@ -215,6 +215,13 @@ func TestWorkflowInboxProjectionRequiresActiveDeliveryPlan(t *testing.T) {
 	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/unplanned"}, time.Now().UTC()); !errors.Is(err, ErrDeliveryRejected) {
 		t.Fatalf("unplanned inbox projection error = %v, want delivery rejection", err)
 	}
+	version, err := WorkflowInboxProjectionVersion(make([]plan.WorkflowQuestion, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/bootstrap", InboxProjectionVersion: version}, time.Now().UTC()); err != nil {
+		t.Fatalf("explicit bootstrap inbox projection error = %v", err)
+	}
 	activateWorkflowInboxPlan(t, ctx, db, "owner/admitted")
 	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/admitted"}, time.Now().UTC()); err != nil {
 		t.Fatalf("active-plan inbox projection error = %v", err)

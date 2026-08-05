@@ -83,15 +83,16 @@ When the task is complete:
 
 1. Return a completion summary containing the change, verification, commit,
    and any follow-up suggestions.
-2. Report the intended terminal issue state as `completed`.
+2. Report the Candidate outcome as `candidate-ready`; do not infer the Ticket
+   lifecycle state from local implementation completion.
 3. Leave all comments, labels, issue closure, pushes, and pull requests to the
    Delivery Controller and fenced Gateway.
 
 When the task is not complete:
 
 1. Return a progress summary containing what was done and what remains.
-2. Report the intended issue state as `blocked` or `needs-info` and include the
-   concrete reason.
+2. Report the Candidate outcome as `candidate-blocked` or `needs-info` and
+   include the concrete reason; do not infer a terminal Ticket state.
 3. Leave all comments and label transitions to the Delivery Controller and
    fenced Gateway.
 

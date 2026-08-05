@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +20,49 @@ import (
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/worker"
 )
+
+type controlPlaneSeamRemote struct{ applications atomic.Int64 }
+
+func (*controlPlaneSeamRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	return delivery.Observation{}, nil
+}
+
+func (r *controlPlaneSeamRemote) Apply(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	r.applications.Add(1)
+	return delivery.Observation{Applied: true}, nil
+}
+
+type controlPlaneSeamRuntime struct{}
+
+func (*controlPlaneSeamRuntime) Run(_ context.Context, spec worker.Spec) (worker.Result, error) {
+	if spec.Command[0] == "no-mistakes" {
+		output := []byte("run:\n  id: seam-delivery\n  status: completed\noutcome: checks-passed\n")
+		return worker.Result{Output: output, Stdout: output, ContainerID: "seam-delivery-container"}, nil
+	}
+	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "candidate.txt"), []byte("candidate\n"), 0o644); err != nil {
+		return worker.Result{}, err
+	}
+	for _, arguments := range [][]string{{"add", "candidate.txt"}, {"commit", "-m", "candidate"}} {
+		command := exec.Command("git", arguments...)
+		command.Dir = spec.WorkspacePath
+		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Seam", "GIT_AUTHOR_EMAIL=seam@example.com", "GIT_COMMITTER_NAME=Seam", "GIT_COMMITTER_EMAIL=seam@example.com")
+		if output, err := command.CombinedOutput(); err != nil {
+			return worker.Result{}, fmt.Errorf("git %v: %w (%s)", arguments, err, output)
+		}
+	}
+	structured, _ := json.Marshal(map[string]any{"summary": "seam candidate", "checks": []map[string]string{{"command": "seam", "outcome": "passed"}}})
+	message, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(structured)}})
+	output := []byte(`{"type":"thread.started","thread_id":"seam-session"}` + "\n" + string(message))
+	return worker.Result{Output: output, Stdout: output, ContainerID: "seam-worker-container"}, nil
+}
+
+func (*controlPlaneSeamRuntime) ContainerRunning(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (*controlPlaneSeamRuntime) Unsafe(context.Context) (bool, error) { return false, nil }
 
 func TestGatewayEndpointsSeparateHostAndWorkerNetworkNamespaces(t *testing.T) {
 	hostURL, workerURL, err := gatewayEndpoints("0.0.0.0:43123")
@@ -29,6 +75,116 @@ func TestGatewayEndpointsSeparateHostAndWorkerNetworkNamespaces(t *testing.T) {
 	if got, want := workerURL, "http://host.docker.internal:43123"; got != want {
 		t.Fatalf("Worker Gateway URL = %q, want %q", got, want)
 	}
+}
+
+func TestAFKRunsTheWholeControlPlaneSeamWithRealSQLite(t *testing.T) {
+	const repository = "skyhuang233/control-plane-seam"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/" + repository:
+			fmt.Fprint(writer, `{"full_name":"skyhuang233/control-plane-seam","default_branch":"main","private":true,"owner":{"login":"skyhuang233"}}`)
+		case "/repos/" + repository + "/issues/10":
+			fmt.Fprint(writer, `{"id":100,"node_id":"PLAN","number":10,"title":"Plan","body":"","state":"open","updated_at":"2026-08-05T00:00:00Z","labels":[{"name":"workflow:plan"}],"user":{"login":"skyhuang233","type":"User"}}`)
+		case "/repos/" + repository + "/issues/10/sub_issues":
+			fmt.Fprint(writer, `[{"id":101,"node_id":"TICKET","number":11,"title":"Seam ticket","body":"","state":"open","updated_at":"2026-08-05T00:00:00Z","labels":[{"name":"workflow:ticket"}],"user":{"login":"skyhuang233","type":"User"}}]`)
+		case "/repos/" + repository + "/issues/11/dependencies/blocked_by":
+			fmt.Fprint(writer, `[]`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "workflow.db")
+	source := initControlPlaneSeamRepository(t, root)
+	bootstrap, err := store.Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bootstrap.ActivateWorkerRelease(context.Background(), store.WorkerRelease{
+		Version: "0.1.0", SourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","no_mistakes_version":"v1.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bootstrap.Close(); err != nil {
+		t.Fatal(err)
+	}
+	remote := &controlPlaneSeamRemote{}
+	runtime := &controlPlaneSeamRuntime{}
+	admit := func(ctx context.Context, _ *store.Store, verify func(string) error) (string, error) {
+		const token = "seam-token"
+		if verify != nil {
+			if err := verify(token); err != nil {
+				return "", err
+			}
+		}
+		return token, nil
+	}
+	err = executeAFKWithDependencies([]string{
+		"--iterations", "1",
+		"--repository", repository,
+		"--root", "10",
+		"--source", source,
+		"--workspace-root", filepath.Join(root, "workspaces"),
+		"--state-root", filepath.Join(root, "codex-state"),
+		"--database", databasePath,
+		"--config", filepath.Join("..", "..", "config", "toolchain.json"),
+		"--github-url", server.URL,
+	}, afkDependencies{AdmitCredential: admit, GatewayRemote: remote, Runtime: runtime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.applications.Load() == 0 {
+		t.Fatal("whole seam did not project through the embedded Gateway")
+	}
+
+	database, err := store.Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.GitHubPollCursor(context.Background(), repository); err != nil {
+		t.Fatalf("durable poll cursor was not committed: %v", err)
+	}
+	if _, err := database.SchedulerRoot(context.Background(), repository, 10, time.Now().UTC()); err != nil {
+		t.Fatalf("activated plan was not durably recoverable: %v", err)
+	}
+	version, err := database.CurrentVersion(context.Background(), repository, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.TicketSession(context.Background(), version.ID, 101)
+	if err != nil || session.CodexSessionID != "seam-session" || session.AcceptedCommit == "" {
+		t.Fatalf("durable Ticket Session = %#v, %v", session, err)
+	}
+}
+
+func initControlPlaneSeamRepository(t *testing.T, root string) string {
+	t.Helper()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(arguments ...string) {
+		command := exec.Command("git", arguments...)
+		command.Dir = source
+		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Seam", "GIT_AUTHOR_EMAIL=seam@example.com", "GIT_COMMITTER_NAME=Seam", "GIT_COMMITTER_EMAIL=seam@example.com")
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", arguments, err, output)
+		}
+	}
+	run("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md")
+	run("commit", "-m", "base")
+	return source
 }
 
 func TestShouldPauseGatewayForCredential(t *testing.T) {

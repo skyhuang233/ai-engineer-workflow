@@ -33,6 +33,19 @@ const defaultControlPlaneDatabase = "workflow.db"
 
 type admittedCredential string
 
+type gatewayCredentialAdmitter func(context.Context, *store.Store, func(string) error) (string, error)
+
+type controlPlaneRuntime interface {
+	worker.Runtime
+	worker.ContainerInspector
+	scheduler.HostPressureInspector
+}
+
+type pollGitHubAdapters struct {
+	AdmitCredential gatewayCredentialAdmitter
+	Runtime         controlPlaneRuntime
+}
+
 func (c admittedCredential) Get(context.Context, string) (string, error) {
 	return string(c), nil
 }
@@ -486,6 +499,10 @@ func runPollGitHub(args []string) {
 }
 
 func executePollGitHub(args []string) error {
+	return executePollGitHubWithAdapters(args, pollGitHubAdapters{})
+}
+
+func executePollGitHubWithAdapters(args []string, adapters pollGitHubAdapters) error {
 	flags := flag.NewFlagSet("poll-github", flag.ContinueOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
@@ -508,6 +525,14 @@ func executePollGitHub(args []string) error {
 	if *workerGatewayURL == "" {
 		*workerGatewayURL = *gatewayURL
 	}
+	admitCredential := adapters.AdmitCredential
+	if admitCredential == nil {
+		admitCredential = admitGatewayCredential
+	}
+	runtime := adapters.Runtime
+	if runtime == nil {
+		runtime = worker.DockerRuntime{}
+	}
 	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
 		return errors.New("poll-github requires repository, approved plan root, workspace configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 	}
@@ -526,7 +551,7 @@ func executePollGitHub(args []string) error {
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
-			err := runClaimWorker(workerCtx, db, config, *repository, *source, *workspaceRoot, *stateRoot, *workerGatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
+			err := runClaimWorker(workerCtx, db, config, runtime, *repository, *source, *workspaceRoot, *stateRoot, *workerGatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
 				if *once {
@@ -559,7 +584,7 @@ func executePollGitHub(args []string) error {
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
-		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: *workerGatewayURL}
+		controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}, Runtime: runtime, GatewayURL: *workerGatewayURL}
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
@@ -569,7 +594,7 @@ func executePollGitHub(args []string) error {
 		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		var client *github.Client
-		_, err := admitGatewayCredential(ctx, db, func(token string) error {
+		_, err := admitCredential(ctx, db, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
@@ -598,7 +623,7 @@ func executePollGitHub(args []string) error {
 				return err
 			}
 			workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime}
 			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
 				return err
 			}
@@ -673,8 +698,8 @@ func nextPollDelay(db *store.Store, repository string, interval time.Duration, r
 	return interval
 }
 
-func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, repository, source, workspaceRoot, stateRoot, gatewayURL string, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: workspaceRoot, CodexStateRoot: stateRoot}, Runtime: worker.DockerRuntime{}, GatewayURL: gatewayURL}
+func runClaimWorker(ctx context.Context, db *store.Store, config doctor.Config, runtime worker.Runtime, repository, source, workspaceRoot, stateRoot, gatewayURL string, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: workspaceRoot, CodexStateRoot: stateRoot}, Runtime: runtime, GatewayURL: gatewayURL}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: repository, Branch: branch, ExpectedRemoteHead: expectedHead, ExpectRemoteAbsent: expectAbsent, Title: claim.TicketTitle}})
 	return err
 }

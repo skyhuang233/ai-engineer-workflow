@@ -36,6 +36,16 @@ func runAFK(args []string) {
 }
 
 func executeAFK(args []string) error {
+	return executeAFKWithDependencies(args, afkDependencies{})
+}
+
+type afkDependencies struct {
+	AdmitCredential gatewayCredentialAdmitter
+	GatewayRemote   delivery.Remote
+	Runtime         controlPlaneRuntime
+}
+
+func executeAFKWithDependencies(args []string, dependencies afkDependencies) error {
 	flags := flag.NewFlagSet("afk", flag.ContinueOnError)
 	iterations := flags.Int("iterations", 100, "number of bounded reconciliation passes")
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
@@ -48,12 +58,17 @@ func executeAFK(args []string) error {
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	workspaceRetention := flags.Duration("workspace-retention", 7*24*time.Hour, "retention period before closed Ticket Workspaces are reclaimed")
+	pollInterval := flags.Duration("poll-interval", time.Minute, "delay between bounded reconciliation passes")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *iterations <= 0 || *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *workspaceRetention <= 0 || *maxParallelRuns <= 0 {
+	if *iterations <= 0 || *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *workspaceRetention <= 0 || *pollInterval <= 0 || *maxParallelRuns <= 0 {
 		return errors.New("afk requires positive iterations, repository, approved plan root, workspace configuration, retention, and parallelism")
+	}
+	admitCredential := dependencies.AdmitCredential
+	if admitCredential == nil {
+		admitCredential = admitGatewayCredential
 	}
 
 	token, err := newControlPlaneToken()
@@ -68,6 +83,8 @@ func executeAFK(args []string) error {
 		GitHubURL:        *githubURL,
 		PushURL:          *pushURL,
 		RecoveryInterval: time.Second,
+		AdmitCredential:  admitCredential,
+		Remote:           dependencies.GatewayRemote,
 	})
 	if err != nil {
 		return err
@@ -77,7 +94,7 @@ func executeAFK(args []string) error {
 	fmt.Printf("Gateway Worker endpoint: %s\n", gateway.workerURL)
 	for iteration := 1; iteration <= *iterations; iteration++ {
 		fmt.Printf("\n===== Codex AFK control-plane pass %d / %d =====\n\n", iteration, *iterations)
-		err := executePollGitHub([]string{
+		err := executePollGitHubWithAdapters([]string{
 			"--once",
 			"--repository", *repository,
 			"--root", strconv.FormatInt(*rootNumber, 10),
@@ -92,9 +109,12 @@ func executeAFK(args []string) error {
 			"--config", *configPath,
 			"--database", *databasePath,
 			"--github-url", *githubURL,
-		})
+		}, pollGitHubAdapters{AdmitCredential: admitCredential, Runtime: dependencies.Runtime})
 		if err != nil {
 			return errors.Join(fmt.Errorf("control-plane pass %d: %w", iteration, err), gateway.Close())
+		}
+		if iteration < *iterations {
+			time.Sleep(*pollInterval)
 		}
 	}
 	return gateway.Close()
@@ -108,6 +128,8 @@ type embeddedGatewayOptions struct {
 	GitHubURL        string
 	PushURL          string
 	RecoveryInterval time.Duration
+	AdmitCredential  gatewayCredentialAdmitter
+	Remote           delivery.Remote
 }
 
 func startEmbeddedGateway(parent context.Context, options embeddedGatewayOptions) (*embeddedGateway, error) {
@@ -122,14 +144,21 @@ func startEmbeddedGateway(parent context.Context, options embeddedGatewayOptions
 	if err != nil {
 		return nil, err
 	}
-	credentialSource := func(ctx context.Context) (string, error) {
-		return admitGatewayCredential(ctx, database, nil)
+	admitCredential := options.AdmitCredential
+	if admitCredential == nil {
+		admitCredential = admitGatewayCredential
 	}
-	remote := &github.DeliveryRemote{
-		Client:           github.NewClient(options.GitHubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner),
-		Store:            database,
-		PushURL:          options.PushURL,
-		CredentialSource: credentialSource,
+	credentialSource := func(ctx context.Context) (string, error) {
+		return admitCredential(ctx, database, nil)
+	}
+	remote := options.Remote
+	if remote == nil {
+		remote = &github.DeliveryRemote{
+			Client:           github.NewClient(options.GitHubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner),
+			Store:            database,
+			PushURL:          options.PushURL,
+			CredentialSource: credentialSource,
+		}
 	}
 	gateway, err := delivery.NewGateway(database, remote)
 	if err != nil {

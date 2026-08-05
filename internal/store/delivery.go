@@ -853,14 +853,16 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
-		var admitted int
-		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND (`+currentActivePlanPredicate+` OR ? = 1) LIMIT 1`, request.Repository, boolInt(request.WorkflowQuestions != nil)).Scan(&admitted)
-		if errors.Is(err, sql.ErrNoRows) {
-			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
-		}
-		if err != nil {
-			return DeliveryTarget{}, request, err
+		if request.WorkflowQuestions == nil && request.InboxProjectionVersion == "" {
+			var admitted int
+			err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
+			if errors.Is(err, sql.ErrNoRows) {
+				return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
+			}
+			if err != nil {
+				return DeliveryTarget{}, request, err
+			}
 		}
 		return DeliveryTarget{Repository: request.Repository}, request, nil
 	}

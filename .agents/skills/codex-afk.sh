@@ -56,6 +56,7 @@ state_root="${WORKFLOW_CODEX_STATE_ROOT:-$runtime_root/codex-state}"
 config_path="${WORKFLOW_CONFIG:-$PROJECT_ROOT/config/toolchain.json}"
 max_parallel_runs="${WORKFLOW_MAX_PARALLEL_RUNS:-1}"
 workspace_retention="${WORKFLOW_WORKSPACE_RETENTION:-168h}"
+poll_interval="${WORKFLOW_POLL_INTERVAL:-1m}"
 
 if ! [[ "$max_parallel_runs" =~ ^[1-9][0-9]*$ ]]; then
   echo "WORKFLOW_MAX_PARALLEL_RUNS must be a positive integer." >&2
@@ -106,5 +107,6 @@ go run ./cmd/workflow afk \
   --state-root "$state_root" \
   --max-parallel-runs "$max_parallel_runs" \
   --workspace-retention "$workspace_retention" \
+  --poll-interval "$poll_interval" \
   --config "$config_path" \
   --database "$database"

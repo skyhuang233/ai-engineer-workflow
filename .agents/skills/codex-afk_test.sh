@@ -61,6 +61,7 @@ EOF
   export WORKFLOW_DATABASE="$sandbox/workflow.db"
   export WORKFLOW_RUNTIME_ROOT="$sandbox/runtime"
   export WORKFLOW_MAX_PARALLEL_RUNS=3
+  export WORKFLOW_POLL_INTERVAL=7s
 
   set +e
   output="$($SCRIPT_DIR/codex-afk.sh 2 2>&1)"
@@ -88,12 +89,30 @@ EOF
     echo "expected the configured global parallelism limit" >&2
     return 1
   fi
+  if ! grep -Eq '^afk .*--poll-interval 7s ' "$call_log"; then
+    cat "$call_log" >&2
+    echo "expected the configured persistent polling cadence" >&2
+    return 1
+  fi
   if grep -Fq 'WORKFLOW_GITHUB_GATEWAY_COMMAND' <<<"$output"; then
     printf '%s\n' "$output" >&2
     echo "legacy Gateway-command bootstrap must not be required" >&2
     return 1
   fi
 )
+
+test_powershell_entrypoint_forwards_the_bounded_run() {
+  local entrypoint="$SCRIPT_DIR/codex-afk.ps1"
+  if [ ! -f "$entrypoint" ]; then
+    echo "PowerShell AFK entrypoint is missing" >&2
+    return 1
+  fi
+  if ! grep -Fq '[Parameter(Mandatory = $true, Position = 0)]' "$entrypoint" ||
+     ! grep -Fq './codex-afk.sh $Iterations' "$entrypoint"; then
+    echo "PowerShell AFK entrypoint no longer validates and forwards Iterations" >&2
+    return 1
+  fi
+}
 
 test_afk_entrypoint_refuses_unaccepted_source() (
   local sandbox
@@ -152,4 +171,5 @@ EOF
 
 test_afk_entrypoint_runs_the_fenced_control_plane
 test_afk_entrypoint_refuses_unaccepted_source
+test_powershell_entrypoint_forwards_the_bounded_run
 echo "codex-afk tests passed"

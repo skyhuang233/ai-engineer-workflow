@@ -41,7 +41,11 @@ func (p HTTPProjector) ProjectPlan(ctx context.Context, repository string, rootN
 }
 
 func (p HTTPProjector) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
-	return p.deliver(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: questions})
+	version, err := store.WorkflowInboxProjectionVersion(questions)
+	if err != nil {
+		return err
+	}
+	return p.deliver(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: repository, WorkflowQuestions: questions, InboxProjectionVersion: version})
 }
 
 func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryRequest) error {

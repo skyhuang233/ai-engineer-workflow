@@ -347,7 +347,11 @@ func workflowInboxProjectionVersion(questions []WorkflowQuestion) (string, error
 	for _, question := range questions {
 		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
 	}
-	encoded, err := json.Marshal(projected)
+	return WorkflowInboxProjectionVersion(projected)
+}
+
+func WorkflowInboxProjectionVersion(questions []plan.WorkflowQuestion) (string, error) {
+	encoded, err := json.Marshal(questions)
 	if err != nil {
 		return "", err
 	}
