@@ -93,7 +93,8 @@ with `WORKFLOW_DATABASE`, `WORKFLOW_RUNTIME_ROOT`,
 defaults to one Worker Run and may be changed with
 `WORKFLOW_MAX_PARALLEL_RUNS`. `WORKFLOW_GITHUB_GATEWAY_COMMAND` is not a
 production setting: the legacy host-agent command adapter is intentionally not
-used because it cannot enforce Run Lease fencing.
+used because it cannot enforce Run Lease fencing. `WORKFLOW_GIT_BASH` may point
+the PowerShell wrapper at a nonstandard Git Bash installation.
 
 `workflow run-ticket` starts the pinned `no-mistakes` Delivery Controller in a
 Docker Worker without GitHub credentials. The controller owns rebase, review,

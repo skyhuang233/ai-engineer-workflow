@@ -8,6 +8,7 @@ on:
       - "go.sum"
       - ".agents/skills/codex-afk.sh"
       - ".agents/skills/codex-afk.ps1"
+      - ".agents/skills/codex-afk-ps1_test.ps1"
       - ".agents/skills/codex-afk_test.sh"
       - ".agents/skills/github-afk-common.sh"
       - "deploy/worker/**"
@@ -19,6 +20,14 @@ permissions:
   contents: read
 
 jobs:
+  powershell-entrypoint-contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Test PowerShell AFK entrypoint
+        shell: pwsh
+        run: .\.agents\skills\codex-afk-ps1_test.ps1
+
   build-and-test:
     runs-on: ubuntu-latest
     steps:

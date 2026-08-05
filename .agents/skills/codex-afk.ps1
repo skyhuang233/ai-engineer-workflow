@@ -5,6 +5,13 @@ param(
 )
 
 function Resolve-GitBash {
+  if ($env:WORKFLOW_GIT_BASH) {
+    if (Test-Path -LiteralPath $env:WORKFLOW_GIT_BASH) {
+      return (Resolve-Path -LiteralPath $env:WORKFLOW_GIT_BASH).ProviderPath
+    }
+    throw "Configured Git Bash not found: $($env:WORKFLOW_GIT_BASH)"
+  }
+
   $candidates = New-Object System.Collections.Generic.List[string]
   $gitCommand = Get-Command git -ErrorAction SilentlyContinue
 
