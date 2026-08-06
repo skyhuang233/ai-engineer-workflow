@@ -20,6 +20,58 @@ func (p *countingInboxProjector) ProjectWorkflowInbox(context.Context, string, [
 	return nil
 }
 
+type activePlanInboxProjector struct {
+	store *store.Store
+	now   time.Time
+	calls int
+}
+
+func (p *activePlanInboxProjector) ProjectWorkflowInbox(ctx context.Context, repository string, _ []plan.WorkflowQuestion) error {
+	p.calls++
+	_, err := p.store.EnqueueDelivery(ctx, store.DeliveryRequest{
+		Operation:  store.DeliveryProjectInbox,
+		Repository: repository,
+	}, p.now)
+	return err
+}
+
+func TestPollRunsControlPassBeforeWorkflowInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	projector := &activePlanInboxProjector{store: db, now: now}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+	}).PollWith(ctx, "owner/repo", func(context.Context) error {
+		snapshot := plan.Snapshot{
+			Repository: "owner/repo",
+			Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+			Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+		}
+		fingerprint, err := snapshot.Fingerprint()
+		if err != nil {
+			return err
+		}
+		version, err := db.BeginActivation(ctx, snapshot, fingerprint, "cold-start")
+		if err != nil {
+			return err
+		}
+		return db.MarkActive(ctx, version.ID)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projector.calls != 1 {
+		t.Fatalf("inbox projector calls = %d, want 1", projector.calls)
+	}
+}
+
 func TestRecordFailurePersistsAfterParentCancellation(t *testing.T) {
 	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
