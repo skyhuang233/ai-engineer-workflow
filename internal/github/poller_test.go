@@ -221,6 +221,73 @@ func TestPollRunsControlPassBeforeWorkflowInboxProjection(t *testing.T) {
 	}
 }
 
+func TestPollSkipsInboxAndGitHubWorkWithoutPollablePlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	versionID := activatePollerPlan(t, ctx, db, "owner/repo")
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	projector := &countingInboxProjector{}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		Now:            func() time.Time { return time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC) },
+	}).Poll(ctx, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projector.calls != 0 {
+		t.Fatalf("inbox projector calls = %d, want 0", projector.calls)
+	}
+}
+
+func TestPollStoreFailureDoesNotConsumeRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, "DROP TABLE ticket_deliveries"); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: &countingInboxProjector{},
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if err == nil || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("store failure = %v, want retryable local error", err)
+	}
+	cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
+	if cursorErr != nil {
+		t.Fatal(cursorErr)
+	}
+	if cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+		t.Fatalf("store failure consumed retry budget: %#v", cursor)
+	}
+}
+
 func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -672,7 +739,7 @@ func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *tes
 	}
 }
 
-func TestActiveClaimedBootstrapRecoveryRestartProjectsHumanRecovery(t *testing.T) {
+func TestActiveClaimedBootstrapRecoveryResumesWithoutRepeatingBootstrap(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	repository := "owner/repo"
@@ -716,14 +783,14 @@ func TestActiveClaimedBootstrapRecoveryRestartProjectsHumanRecovery(t *testing.T
 		bootstrapRuns++
 		return nil
 	}, nil)
-	if !errors.Is(err, store.ErrNeedsAttention) {
-		t.Fatalf("restarted active poll = %v, want needs attention", err)
+	if err != nil {
+		t.Fatalf("restarted active poll = %v", err)
 	}
 	if bootstrapRuns != 0 {
 		t.Fatalf("bootstrap runs after active restart = %d, want 0", bootstrapRuns)
 	}
 	if projector.calls != 1 {
-		t.Fatalf("human recovery projections = %d, want 1", projector.calls)
+		t.Fatalf("inbox projections = %d, want 1", projector.calls)
 	}
 	questions, err := restarted.OpenWorkflowQuestions(ctx, repository, 0)
 	if err != nil {
@@ -736,15 +803,15 @@ func TestActiveClaimedBootstrapRecoveryRestartProjectsHumanRecovery(t *testing.T
 			break
 		}
 	}
-	if !pollFailureVisible {
-		t.Fatalf("human recovery questions = %#v", questions)
+	if pollFailureVisible {
+		t.Fatalf("unexpected human recovery questions = %#v", questions)
 	}
 	cursor, err := restarted.GitHubPollCursor(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.RecoveryState == store.GitHubPollRecoveryAvailable {
-		t.Fatalf("recovery state = %q, must remain consumed", cursor.RecoveryState)
+	if cursor.ConsecutiveFailures != 0 || cursor.RecoveryState != store.GitHubPollRecoveryCompleted {
+		t.Fatalf("recovery cursor = %#v, want completed with reset budget", cursor)
 	}
 }
 

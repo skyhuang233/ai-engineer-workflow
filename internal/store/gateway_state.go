@@ -30,14 +30,14 @@ type WorkflowInboxItem struct {
 }
 
 func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.Time) error {
-	return s.pauseGatewayWrites(ctx, "", "", reason, now)
+	return s.pauseGatewayWrites(ctx, "", "", reason, now, time.Time{})
 }
 
-func (s *Store) PauseGatewayWritesForGitHubPoll(ctx context.Context, repository, leaseToken, reason string, now time.Time) error {
-	return s.pauseGatewayWrites(ctx, repository, leaseToken, reason, now)
+func (s *Store) PauseGatewayWritesForGitHubPoll(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
+	return s.pauseGatewayWrites(ctx, repository, leaseToken, reason, now, leaseNow)
 }
 
-func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, reason string, now time.Time) error {
+func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
 	if reason == "" {
 		return errors.New("Gateway pause reason is required")
 	}
@@ -48,7 +48,7 @@ func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, 
 	}
 	defer tx.Rollback()
 	if leaseToken != "" {
-		if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, now); err != nil {
+		if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 			return err
 		}
 	}

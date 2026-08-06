@@ -79,6 +79,74 @@ func TestGitHubPollLeaseAtomicallyFencesRepositoryReadiness(t *testing.T) {
 	}
 }
 
+func TestGitHubPollLeaseRejectsMutationAfterExpiry(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(30*time.Second), GitHubPollFailureRetryable, "", "lease", now.Add(2*time.Minute))
+	if !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("expired lease mutation = %v, want fencing conflict", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("expired lease persisted failures = %d", cursor.ConsecutiveFailures)
+	}
+}
+
+func TestPollTerminalTransitionIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER fail_poll_attention BEFORE UPDATE OF state ON ticket_runtime
+WHEN NEW.state = 'needs_attention' BEGIN SELECT RAISE(ABORT, 'injected attention failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx, snapshot.Repository, now); err == nil {
+		t.Fatal("terminal transition succeeded despite injected failure")
+	}
+	if _, err := db.GitHubPollCursor(ctx, snapshot.Repository); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("terminal cursor survived rollback: %v", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 0 {
+		t.Fatalf("recovery questions survived rollback: %#v", questions)
+	}
+}
+
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
