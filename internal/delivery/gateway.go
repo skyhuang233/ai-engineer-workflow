@@ -55,7 +55,7 @@ type gatewayStore interface {
 	EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error)
 	EnsureGatewayDispatcher(context.Context, string, time.Time) error
 	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
-	ExecuteDelivery(context.Context, store.DeliveryRequest, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
+	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
 	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
@@ -164,7 +164,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 		return err
 	}
-	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
 		if request.Operation == store.DeliveryProjectPlan {
 			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
 			if projectionErr != nil {

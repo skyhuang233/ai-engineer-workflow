@@ -215,9 +215,74 @@ func TestWorkflowInboxProjectionRequiresActiveDeliveryPlan(t *testing.T) {
 	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/unplanned"}, time.Now().UTC()); !errors.Is(err, ErrDeliveryRejected) {
 		t.Fatalf("unplanned inbox projection error = %v, want delivery rejection", err)
 	}
+	projectingSnapshot := plan.Snapshot{
+		Repository: "owner/projecting",
+		Root:       plan.Issue{ID: 11, Number: 11, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 12, Number: 12, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := projectingSnapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BeginActivation(ctx, projectingSnapshot, fingerprint, "projecting-inbox"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{
+		Operation: DeliveryProjectInbox, Repository: projectingSnapshot.Repository,
+		WorkflowQuestions: []plan.WorkflowQuestion{{ID: "payload-must-not-authorize"}},
+	}, time.Now().UTC()); !errors.Is(err, ErrNoActiveDeliveryPlan) {
+		t.Fatalf("projecting-plan inbox projection error = %v, want no active delivery plan", err)
+	}
 	activateWorkflowInboxPlan(t, ctx, db, "owner/admitted")
 	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/admitted"}, time.Now().UTC()); err != nil {
 		t.Fatalf("active-plan inbox projection error = %v", err)
+	}
+}
+
+func TestAdmittedWorkflowInboxReplayUsesPersistedClaimFence(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	activateWorkflowInboxPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{
+		Operation: DeliveryProjectInbox, Repository: repository,
+		WorkflowQuestions: []plan.WorkflowQuestion{{ID: "admitted"}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versionID string
+	if err := db.db.QueryRowContext(ctx, "SELECT current_version_id FROM plans WHERE repository = ?", repository).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE plan_versions SET state = ? WHERE version_id = ?", StateProjecting, versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE plans SET state = ? WHERE repository = ?", StateProjecting, repository); err != nil {
+		t.Fatal(err)
+	}
+	applyCalls := 0
+	apply := func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		applyCalls++
+		return DeliveryResult{}, nil
+	}
+	if _, err := db.ExecuteDelivery(ctx, claim.Request, "wrong-claim", func() time.Time { return now }, apply); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("unfenced admitted replay error = %v, want fencing conflict", err)
+	}
+	if _, err := db.ExecuteDelivery(ctx, claim.Request, claim.ClaimToken, func() time.Time { return now }, apply); err != nil {
+		t.Fatalf("fenced admitted replay = %v", err)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("admitted replay apply calls = %d, want 1", applyCalls)
 	}
 }
 

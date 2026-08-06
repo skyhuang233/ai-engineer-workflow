@@ -170,7 +170,7 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 }
 
 func (s *Store) enqueueDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryOutbox, error) {
-	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now)
+	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now, "")
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now); auditErr != nil {
 			return DeliveryOutbox{}, auditErr
@@ -268,7 +268,7 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 		return DeliveryTarget{}, err
 	}
 	defer tx.Rollback()
-	target, _, err := loadDeliveryTargetTx(ctx, tx, request, now.UTC())
+	target, _, err := loadDeliveryTargetTx(ctx, tx, request, now.UTC(), "")
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now.UTC()); auditErr != nil {
 			return DeliveryTarget{}, auditErr
@@ -284,7 +284,7 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 	return target, nil
 }
 
-func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, now func() time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
+func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, claimToken string, now func() time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
 	if apply == nil {
 		return DeliveryResult{}, ErrInvalidClaim
 	}
@@ -299,7 +299,7 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, no
 		return DeliveryResult{}, err
 	}
 	defer tx.Rollback()
-	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, validatedAt)
+	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, validatedAt, claimToken)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
@@ -849,14 +849,37 @@ func (s *Store) RecordDeliveryAudit(ctx context.Context, request DeliveryRequest
 	return execErr
 }
 
-func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryTarget, DeliveryRequest, error) {
+func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time, admittedClaimToken string) (DeliveryTarget, DeliveryRequest, error) {
 	if request.Operation == DeliveryProjectInbox && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
+		persistedAdmission := false
+		if admittedClaimToken != "" {
+			key, keyErr := deliveryKey(request)
+			if keyErr != nil {
+				return DeliveryTarget{}, request, keyErr
+			}
+			if request.IdempotencyKey != key {
+				return DeliveryTarget{}, request, ErrFencingConflict
+			}
+			var admitted int
+			err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox
+WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LIMIT 1`, request.IdempotencyKey, DeliveryProjectInbox, OutboxProcessing, admittedClaimToken).Scan(&admitted)
+			if errors.Is(err, sql.ErrNoRows) {
+				return DeliveryTarget{}, request, ErrFencingConflict
+			}
+			if err != nil {
+				return DeliveryTarget{}, request, err
+			}
+			persistedAdmission = true
+		}
 		var admitted int
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND (`+currentActivePlanPredicate+` OR ? = 1) LIMIT 1`, request.Repository, boolInt(request.WorkflowQuestions != nil)).Scan(&admitted)
+WHERE p.repository = ? AND `+currentWorkflowInboxPlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
+		if errors.Is(err, sql.ErrNoRows) && persistedAdmission {
+			err = nil
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}

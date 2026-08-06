@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,14 @@ type countingInboxProjector struct {
 func (p *countingInboxProjector) ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error {
 	p.calls++
 	return nil
+}
+
+type errorInboxProjector struct {
+	err error
+}
+
+func (p errorInboxProjector) ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error {
+	return p.err
 }
 
 type activePlanInboxProjector struct {
@@ -615,6 +624,125 @@ func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *tes
 	}
 	if cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
 		t.Fatalf("recovery state = %q, want claimed", cursor.RecoveryState)
+	}
+}
+
+func TestActiveClaimedBootstrapRecoveryRestartProjectsHumanRecovery(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activatePollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	claimed, err := db.ClaimGitHubPollBootstrapRecovery(ctx, repository, 1, failedAt.Add(time.Second))
+	if err != nil || !claimed {
+		db.Close()
+		t.Fatalf("claim = %t, %v", claimed, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	now := failedAt.Add(time.Minute)
+	projector := &activePlanInboxProjector{store: restarted, now: now}
+	bootstrapRuns := 0
+	_, err = (Poller{
+		Store:          restarted,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		bootstrapRuns++
+		return nil
+	}, nil)
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("restarted active poll = %v, want needs attention", err)
+	}
+	if bootstrapRuns != 0 {
+		t.Fatalf("bootstrap runs after active restart = %d, want 0", bootstrapRuns)
+	}
+	if projector.calls != 1 {
+		t.Fatalf("human recovery projections = %d, want 1", projector.calls)
+	}
+	questions, err := restarted.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollFailureVisible := false
+	for _, question := range questions {
+		if question.Kind == "poll_failure" {
+			pollFailureVisible = true
+			break
+		}
+	}
+	if !pollFailureVisible {
+		t.Fatalf("human recovery questions = %#v", questions)
+	}
+	cursor, err := restarted.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.RecoveryState == store.GitHubPollRecoveryAvailable {
+		t.Fatalf("recovery state = %q, must remain consumed", cursor.RecoveryState)
+	}
+}
+
+func TestInboxConflictClassificationReadFailurePreservesCauseAndConsumesRecovery(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, "DROP TABLE plan_terminal_states"); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gatewayErr := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan, Message: "no active delivery plan"}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: errorInboxProjector{err: gatewayErr},
+		MaxFailures:    2,
+		Now:            func() time.Time { return failedAt.Add(time.Minute) },
+	}).Poll(ctx, repository)
+	if !errors.Is(err, store.ErrNeedsAttention) || !errors.Is(err, gatewayErr) {
+		t.Fatalf("classification read failure = %v, want gateway cause and needs attention", err)
+	}
+	if !strings.Contains(err.Error(), "plan_terminal_states") {
+		t.Fatalf("classification database cause missing from %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailureUnrecoverable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+		t.Fatalf("cursor provenance = %q/%q, want unrecoverable/consumed", cursor.FailureKind, cursor.RecoveryState)
 	}
 }
 

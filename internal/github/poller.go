@@ -90,7 +90,7 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 				return PollResult{}, p.terminalFailure(ctx, repository, now, activeErr)
 			}
 			if active || bootstrap == nil || cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryAvailable {
-				return PollResult{}, store.ErrNeedsAttention
+				return PollResult{}, p.finishExhaustedFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap recovery is unavailable"))
 			}
 			claimed, claimErr := p.Store.ClaimGitHubPollBootstrapRecovery(ctx, repository, p.maxFailures(), now)
 			if claimErr != nil {
@@ -132,7 +132,11 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 		}
 	}
 	if err := p.projectWorkflowInbox(ctx, repository); err != nil {
-		return p.recordFailureWithKind(ctx, repository, now, p.inboxProjectionFailureKind(ctx, repository, err), err)
+		failureKind, classificationErr := p.inboxProjectionFailureKind(ctx, repository, err)
+		if classificationErr != nil {
+			return PollResult{}, p.terminalFailure(ctx, repository, now, err, classificationErr)
+		}
+		return p.recordFailureWithKind(ctx, repository, now, failureKind, err)
 	}
 	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
@@ -312,16 +316,19 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
-func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository string, cause error) store.GitHubPollFailureKind {
+func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository string, cause error) (store.GitHubPollFailureKind, error) {
 	var gatewayError *delivery.HTTPError
 	if !errors.As(cause, &gatewayError) || gatewayError.StatusCode != 409 || gatewayError.Code != delivery.ErrorCodeNoActiveDeliveryPlan {
-		return ""
+		return "", nil
 	}
 	active, err := p.Store.HasActiveDeliveryPlan(ctx, repository)
-	if err != nil || active {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return store.GitHubPollFailurePreActivationInboxConflict
+	if active {
+		return "", nil
+	}
+	return store.GitHubPollFailurePreActivationInboxConflict, nil
 }
 
 func workflowQuestionProjection(question store.WorkflowQuestion) plan.WorkflowQuestion {
