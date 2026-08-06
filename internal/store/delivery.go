@@ -55,6 +55,7 @@ type DeliveryRequest struct {
 	Evidence               string                  `json:"evidence,omitempty"`
 	PlanProjection         *plan.Projection        `json:"plan_projection,omitempty"`
 	WorkflowQuestions      []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
+	InboxPlanVersionID     string                  `json:"inbox_plan_version_id,omitempty"`
 	InboxProjectionVersion string                  `json:"inbox_projection_version,omitempty"`
 	Label                  string                  `json:"label,omitempty"`
 	IdempotencyKey         string                  `json:"idempotency_key,omitempty"`
@@ -872,16 +873,20 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 				return DeliveryTarget{}, request, err
 			}
 		}
-		var admitted int
-		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
+		var activeVersionID string
+		err := tx.QueryRowContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&activeVersionID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}
 		if err != nil {
 			return DeliveryTarget{}, request, err
 		}
-		return DeliveryTarget{Repository: request.Repository}, request, nil
+		if request.InboxPlanVersionID != "" && request.InboxPlanVersionID != activeVersionID {
+			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
+		}
+		request.InboxPlanVersionID = activeVersionID
+		return DeliveryTarget{VersionID: activeVersionID, Repository: request.Repository}, request, nil
 	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber <= 0 || request.PlanProjection == nil || request.PlanProjection.VersionID == "" {

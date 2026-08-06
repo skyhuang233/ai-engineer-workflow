@@ -110,13 +110,13 @@ type GitHubPollRecoveryState string
 type GitHubPollBootstrapRecoveryDisposition string
 
 const (
-	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind   = "pre_activation_inbox_conflict"
-	GitHubPollFailureRetryable                  GitHubPollFailureKind   = "retryable"
-	GitHubPollFailureUnrecoverable              GitHubPollFailureKind   = "unrecoverable"
-	GitHubPollRecoveryAvailable                 GitHubPollRecoveryState = "available"
-	GitHubPollRecoveryClaimed                   GitHubPollRecoveryState = "claimed"
-	GitHubPollRecoveryCompleted                 GitHubPollRecoveryState = "completed"
-	GitHubPollRecoveryConsumed                  GitHubPollRecoveryState = "consumed"
+	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind                  = "pre_activation_inbox_conflict"
+	GitHubPollFailureRetryable                  GitHubPollFailureKind                  = "retryable"
+	GitHubPollFailureUnrecoverable              GitHubPollFailureKind                  = "unrecoverable"
+	GitHubPollRecoveryAvailable                 GitHubPollRecoveryState                = "available"
+	GitHubPollRecoveryClaimed                   GitHubPollRecoveryState                = "claimed"
+	GitHubPollRecoveryCompleted                 GitHubPollRecoveryState                = "completed"
+	GitHubPollRecoveryConsumed                  GitHubPollRecoveryState                = "consumed"
 	GitHubPollBootstrapRecoveryUnavailable      GitHubPollBootstrapRecoveryDisposition = "unavailable"
 	GitHubPollBootstrapRecoveryActive           GitHubPollBootstrapRecoveryDisposition = "active"
 	GitHubPollBootstrapRecoveryProjecting       GitHubPollBootstrapRecoveryDisposition = "projecting"
@@ -165,16 +165,21 @@ func scanGitHubPollCursor(row githubPollCursorScanner) (GitHubPollCursor, error)
 }
 
 func (s *Store) HasActiveDeliveryPlan(ctx context.Context, repository string) (bool, error) {
-	var active int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&active)
+	_, active, err := s.ActiveDeliveryPlanVersion(ctx, repository)
+	return active, err
+}
+
+func (s *Store) ActiveDeliveryPlanVersion(ctx context.Context, repository string) (string, bool, error) {
+	var versionID string
+	err := s.db.QueryRowContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&versionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return true, nil
+	return versionID, true, nil
 }
 
 func (s *Store) HasProjectingDeliveryPlan(ctx context.Context, repository string) (bool, error) {
@@ -821,12 +826,27 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	answerErr := s.AnswerWorkflowQuestionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
+	return errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
+}
+
+func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) error {
+	if repository == "" || questionID == "" || answer == "" {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -841,12 +861,21 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 	} else {
 		now = now.UTC()
 	}
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	outbox, answerErr := s.answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
+	return outbox, errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
+}
+
+func (s *Store) answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) (DeliveryOutbox, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
-	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	outbox, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now)
@@ -874,6 +903,30 @@ func (s *Store) QueueWorkflowInboxProjection(ctx context.Context, repository str
 	}
 	defer tx.Rollback()
 	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
+}
+
+func (s *Store) QueueWorkflowInboxProjectionIfActive(ctx context.Context, repository string, now time.Time) (DeliveryOutbox, error) {
+	if repository == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	defer tx.Rollback()
+	outbox, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -921,7 +974,7 @@ func workflowInboxProjectionVersion(questions []WorkflowQuestion) (string, error
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time) error {
+func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) error {
 	var kind, versionID, state, priorAnswer string
 	var issueID int64
 	err := tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
@@ -936,6 +989,9 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 			return nil
 		}
 		return ErrNotFound
+	}
+	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
+		return err
 	}
 	if kind == "closed_unmerged_impact" {
 		var decision closedPlanDecision

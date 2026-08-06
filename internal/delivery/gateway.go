@@ -17,6 +17,7 @@ import (
 var (
 	ErrGatewayCredentialRejected = errors.New("Gateway Credential was rejected")
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
+	ErrGatewayStore              = errors.New("Gateway persistence is temporarily unavailable")
 )
 
 const (
@@ -58,8 +59,9 @@ type gatewayStore interface {
 	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
 	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
-	HasActiveDeliveryPlan(context.Context, string) (bool, error)
+	ActiveDeliveryPlanVersion(context.Context, string) (string, bool, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
+	QueueWorkflowInboxProjectionIfActive(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
 	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
 	GatewayCredentialAttentionRepositories(context.Context) ([]string, error)
@@ -113,7 +115,11 @@ func (g Gateway) Submit(ctx context.Context, request store.DeliveryRequest) (sto
 	if g.Store == nil {
 		return store.DeliveryOutbox{}, errors.New("delivery gateway store is missing")
 	}
-	return g.Store.EnqueueDelivery(ctx, request, g.now())
+	outbox, err := g.Store.EnqueueDelivery(ctx, request, g.now())
+	if err != nil && !errors.Is(err, store.ErrDeliveryRejected) && !errors.Is(err, store.ErrInvalidClaim) && !errors.Is(err, store.ErrFencingConflict) {
+		return store.DeliveryOutbox{}, errors.Join(ErrGatewayStore, err)
+	}
+	return outbox, err
 }
 
 // Dispatch claims one outbox item and executes it. An external error remains
@@ -159,14 +165,14 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 	}
 	if outbox.Request.Operation == store.DeliveryProjectInbox {
-		active, activeErr := g.Store.HasActiveDeliveryPlan(operationCtx, outbox.Request.Repository)
+		activeVersionID, active, activeErr := g.Store.ActiveDeliveryPlanVersion(operationCtx, outbox.Request.Repository)
 		if activeErr != nil {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(activeErr, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
 			}
-			return errors.Join(activeErr, g.requeueClaim(outbox, activeErr, outbox.ReconcileOnly))
+			return errors.Join(ErrGatewayStore, activeErr, g.requeueClaim(outbox, activeErr, outbox.ReconcileOnly))
 		}
-		if !active {
+		if !active || outbox.Request.InboxPlanVersionID == "" || outbox.Request.InboxPlanVersionID != activeVersionID {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(store.ErrNoActiveDeliveryPlan, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
 			}
@@ -184,13 +190,13 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if request.Operation == store.DeliveryProjectPlan {
 			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
 			if projectionErr != nil {
-				return store.DeliveryResult{}, projectionErr
+				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, projectionErr)
 			}
 			request.PlanProjection = &projection
 		} else if request.Operation == store.DeliveryProjectInbox {
 			questions, version, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
 			if questionsErr != nil {
-				return store.DeliveryResult{}, questionsErr
+				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, questionsErr)
 			}
 			if request.InboxProjectionVersion != "" && request.InboxProjectionVersion != version {
 				return store.DeliveryResult{}, nil
@@ -305,7 +311,7 @@ func (g Gateway) QueueGatewayCredentialInboxProjections(ctx context.Context) err
 		return err
 	}
 	for _, repository := range repositories {
-		if _, err := g.Store.QueueWorkflowInboxProjection(ctx, repository, g.now()); err != nil {
+		if _, err := g.Store.QueueWorkflowInboxProjectionIfActive(ctx, repository, g.now()); err != nil {
 			return err
 		}
 	}

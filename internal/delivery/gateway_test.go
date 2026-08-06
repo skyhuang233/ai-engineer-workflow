@@ -3,6 +3,8 @@ package delivery_test
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +29,15 @@ type fakeRemote struct {
 type completionFailingStore struct {
 	*store.Store
 	err error
+}
+
+type enqueueFailingStore struct {
+	*store.Store
+	err error
+}
+
+func (s enqueueFailingStore) EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error) {
+	return store.DeliveryOutbox{}, s.err
 }
 
 func (s completionFailingStore) CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error {
@@ -125,6 +136,44 @@ func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
 	}
 }
 
+func TestGatewayCredentialInboxQueueIgnoresInactiveRepositories(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Now: func() time.Time { return now.Add(time.Second) }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatalf("queue inactive credential Inbox = %v", err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Second), 10)
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("inactive credential Inbox keys = %#v, %v", keys, err)
+	}
+}
+
+func TestGatewayStoreFailureHasStructuredHTTPClassification(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gateway := delivery.Gateway{Store: enqueueFailingStore{Store: db, err: errors.New("sqlite is busy")}, Remote: &fakeRemote{}}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err = (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusInternalServerError || httpErr.Code != delivery.ErrorCodeRetryableStore || !httpErr.PollStoreFailure() {
+		t.Fatalf("Gateway store HTTP error = %#v, %v", httpErr, err)
+	}
+}
+
 func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)
@@ -216,6 +265,57 @@ func TestGatewayRejectsClaimedInboxWhenCurrentPlanCompletes(t *testing.T) {
 	}
 	if remote.observeCalls != 0 || remote.applyCalls != 0 {
 		t.Fatalf("inactive Inbox reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
+func TestRejectedInactiveInboxKeyDoesNotPoisonReplacementPlan(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Request.InboxPlanVersionID != claim.VersionID {
+		t.Fatalf("first Inbox plan version = %q, want %q", first.Request.InboxPlanVersionID, claim.VersionID)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("inactive first dispatch = %v", err)
+	}
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}, UpdatedAt: "replacement"},
+		Children:   []plan.Issue{{ID: 2, Number: 12, Title: "replacement", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.BeginActivation(ctx, snapshot, fingerprint, "replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.IdempotencyKey == first.IdempotencyKey || second.Request.InboxPlanVersionID != replacement.ID {
+		t.Fatalf("replacement Inbox = %#v; first key=%q", second, first.IdempotencyKey)
+	}
+	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
+		t.Fatalf("replacement Inbox dispatch = %v", err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("replacement Inbox apply calls = %d, want 1", remote.applyCalls)
 	}
 }
 

@@ -49,6 +49,19 @@ func (p *failOnceInboxProjector) ProjectWorkflowInbox(context.Context, string, [
 	return nil
 }
 
+type completingConflictInboxProjector struct {
+	store     *store.Store
+	versionID string
+	ticketID  int64
+}
+
+func (p completingConflictInboxProjector) ProjectWorkflowInbox(ctx context.Context, _ string, _ []plan.WorkflowQuestion) error {
+	if err := p.store.MarkTicketDelivered(ctx, p.versionID, p.ticketID); err != nil {
+		return err
+	}
+	return &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan, Message: "plan completed during dispatch"}
+}
+
 type activePlanInboxProjector struct {
 	store *store.Store
 	now   time.Time
@@ -1265,28 +1278,122 @@ func TestCompletedOrAbsentPlanInboxConflictIsNotBootstrapEligible(t *testing.T) 
 	}
 	defer db.Close()
 	cause := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
-	kind, _, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/repo", "", cause)
+	kind, _, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/repo", "", cause)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kind != "" {
-		t.Fatalf("absent-plan failure kind = %q, want retryable", kind)
+	if kind != "" || !ignored {
+		t.Fatalf("absent-plan failure kind = %q ignored=%t, want ignored", kind, ignored)
 	}
 	completedVersion := activatePollerPlan(t, ctx, db, "owner/completed")
 	if err := db.MarkTicketDelivered(ctx, completedVersion, 2); err != nil {
 		t.Fatal(err)
 	}
-	kind, _, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/completed", completedVersion, cause)
-	if err != nil || kind != "" {
-		t.Fatalf("completed-plan failure kind = %q, %v; want retryable", kind, err)
+	kind, _, ignored, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/completed", completedVersion, cause)
+	if err != nil || kind != "" || !ignored {
+		t.Fatalf("completed-plan failure kind = %q ignored=%t, %v; want ignored", kind, ignored, err)
 	}
 	projectingVersionID := beginProjectingPollerPlan(t, ctx, db, "owner/projecting")
-	kind, provenance, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/projecting", projectingVersionID, cause)
+	kind, provenance, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/projecting", projectingVersionID, cause)
 	if err != nil || kind != store.GitHubPollFailurePreActivationInboxConflict {
 		t.Fatalf("projecting-plan failure kind = %q, %v", kind, err)
 	}
 	if provenance != projectingVersionID {
 		t.Fatalf("projecting-plan provenance = %q, want %q", provenance, projectingVersionID)
+	}
+	if ignored {
+		t.Fatal("projecting-plan conflict was ignored")
+	}
+}
+
+func TestActivePlanCompletionRaceDoesNotConsumePollFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	versionID := activatePollerPlan(t, ctx, db, repository)
+	now := time.Now().UTC()
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: completingConflictInboxProjector{store: db, versionID: versionID, ticketID: 2},
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if err != nil {
+		t.Fatalf("completion race poll = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+		t.Fatalf("completion race cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestGatewayStoreProjectionFailureDoesNotConsumePollFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Now().UTC()
+	gatewayStoreErr := &delivery.HTTPError{StatusCode: http.StatusInternalServerError, Code: delivery.ErrorCodeRetryableStore, Message: "database temporarily unavailable"}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: errorInboxProjector{err: gatewayStoreErr},
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if !errors.Is(err, gatewayStoreErr) {
+		t.Fatalf("Gateway store poll error = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+		t.Fatalf("Gateway store cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestPrepareAdmissionResolvesBoundRecoveryBeforeRateLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Now().UTC().Add(-time.Minute)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, versionID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := poller.PrepareAdmission(leaseCtx, repository); err != nil {
+		t.Fatal(err)
+	}
+	rateLimit := &APIError{StatusCode: http.StatusForbidden, RetryAt: now.Add(time.Minute)}
+	if _, err := poller.RecordAdmissionFailure(leaseCtx, repository, rateLimit); !errors.Is(err, rateLimit) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("rate-limited admission = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.RecoveryPlanVersionID != "" {
+		t.Fatalf("post-admission cursor = %#v, %v", cursor, err)
 	}
 }
 

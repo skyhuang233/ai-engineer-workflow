@@ -19,7 +19,10 @@ const controlPlaneTokenHeader = "X-Workflow-Control-Token"
 
 const errorCodeHeader = "X-Workflow-Error-Code"
 
-const ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
+const (
+	ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
+	ErrorCodeRetryableStore       = "retryable_store"
+)
 
 type HTTPError struct {
 	StatusCode int
@@ -29,6 +32,10 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("control-plane gateway returned %d: %s", e.StatusCode, e.Message)
+}
+
+func (e *HTTPError) PollStoreFailure() bool {
+	return e.Code == ErrorCodeRetryableStore
 }
 
 type HTTPOptions struct {
@@ -130,12 +137,15 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 			}
 			if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
 				writer.Header().Set(errorCodeHeader, ErrorCodeNoActiveDeliveryPlan)
+			} else if errors.Is(err, ErrGatewayStore) || store.IsDatabaseError(err) {
+				writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
 			}
 			http.Error(writer, err.Error(), status)
 			return
 		}
 		outbox, err = gateway.Store.DeliveryOutbox(request.Context(), outbox.IdempotencyKey)
 		if err != nil {
+			writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}

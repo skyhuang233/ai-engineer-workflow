@@ -57,7 +57,11 @@ func wrapPollStoreError(err error) error {
 
 func isPollStoreError(err error) bool {
 	var storeErr pollStoreError
-	return errors.As(err, &storeErr) || store.IsDatabaseError(err)
+	var markedStoreErr interface{ PollStoreFailure() bool }
+	var gatewayError *delivery.HTTPError
+	return errors.As(err, &storeErr) || store.IsDatabaseError(err) ||
+		errors.As(err, &markedStoreErr) && markedStoreErr.PollStoreFailure() ||
+		errors.As(err, &gatewayError) && gatewayError.Code == delivery.ErrorCodeRetryableStore
 }
 
 type Poller struct {
@@ -120,6 +124,62 @@ func (p Poller) Ready(ctx context.Context, repository string) error {
 		}
 	}
 	return p.readyAt(ctx, repository, p.now())
+}
+
+// PrepareAdmission resolves exhausted, version-bound bootstrap recovery while
+// the repository poll lease is held. This prevents a later credential or
+// GitHub admission error from being charged to a plan that has already become
+// active, completed, or been replaced.
+func (p Poller) PrepareAdmission(ctx context.Context, repository string) error {
+	if p.Store == nil {
+		return fmt.Errorf("GitHub poller store is unavailable")
+	}
+	leaseToken, ok := p.pollLeaseToken(ctx, repository)
+	if !ok {
+		return store.ErrFencingConflict
+	}
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if cursor.ConsecutiveFailures < p.maxFailures() || cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict ||
+		cursor.RecoveryState != store.GitHubPollRecoveryAvailable && cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
+		return nil
+	}
+	_, err = p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), p.now(), leaseToken, p.now())
+	return err
+}
+
+// RecordAdmissionFailure preserves an exhausted recovery-bound cursor while
+// its exact projecting plan still owns the recovery claim. Credential
+// rejection remains exceptional because it must pause all Gateway writes.
+func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, cause error) (PollResult, error) {
+	if _, leased := p.pollLeaseToken(ctx, repository); !leased {
+		leaseCtx, release, err := p.AcquireLease(ctx, repository)
+		if err != nil {
+			return PollResult{}, errors.Join(cause, err)
+		}
+		result, recordErr := p.RecordAdmissionFailure(leaseCtx, repository, cause)
+		return result, errors.Join(recordErr, release())
+	}
+	if isPollStoreError(cause) {
+		return PollResult{}, cause
+	}
+	if isPollCredentialFailure(cause) {
+		return p.recordFailure(ctx, repository, p.now(), cause)
+	}
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return PollResult{}, errors.Join(cause, err)
+	}
+	if err == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
+		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
+		return PollResult{}, cause
+	}
+	return p.recordFailure(ctx, repository, p.now(), cause)
 }
 
 // AcquireLease admits one repository poll atomically with its NextAttemptAt
@@ -325,7 +385,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if err := p.renewPollLease(ctx, repository); err != nil {
 		return PollResult{}, err
 	}
-	active, err := p.Store.HasActiveDeliveryPlan(ctx, repository)
+	activeVersionID, active, err := p.Store.ActiveDeliveryPlanVersion(ctx, repository)
 	if err != nil {
 		return PollResult{}, err
 	}
@@ -335,6 +395,10 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	}
 	if !singleProjectingPlan {
 		recoveryCandidateVersionID = ""
+	}
+	attemptedPlanVersionID := activeVersionID
+	if attemptedPlanVersionID == "" {
+		attemptedPlanVersionID = recoveryCandidateVersionID
 	}
 	if !active && !singleProjectingPlan {
 		if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
@@ -346,9 +410,15 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		if isPollStoreError(err) {
 			return PollResult{}, err
 		}
-		failureKind, recoveryPlanVersionID, classificationErr := p.inboxProjectionFailureKind(ctx, repository, recoveryCandidateVersionID, err)
+		failureKind, recoveryPlanVersionID, ignoreFailure, classificationErr := p.inboxProjectionFailureKind(ctx, repository, attemptedPlanVersionID, err)
 		if classificationErr != nil {
 			return PollResult{}, errors.Join(err, classificationErr)
+		}
+		if ignoreFailure {
+			if successErr := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); successErr != nil {
+				return PollResult{}, successErr
+			}
+			return PollResult{}, nil
 		}
 		return p.recordFailureWithKind(ctx, repository, now, failureKind, recoveryPlanVersionID, err)
 	}
@@ -641,7 +711,11 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 	}
 	for _, question := range questions {
 		if answer, ok := answers[question.ID]; ok {
-			if err := p.Store.AnswerWorkflowQuestion(ctx, repository, question.ID, answer, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
+			leaseToken, leased := p.pollLeaseToken(ctx, repository)
+			if !leased {
+				return wrapPollStoreError(store.ErrFencingConflict)
+			}
+			if err := p.Store.AnswerWorkflowQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return wrapPollStoreError(err)
 			}
 		}
@@ -664,22 +738,29 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
-func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository, candidateVersionID string, cause error) (store.GitHubPollFailureKind, string, error) {
+func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository, attemptedVersionID string, cause error) (store.GitHubPollFailureKind, string, bool, error) {
 	var gatewayError *delivery.HTTPError
 	if !errors.As(cause, &gatewayError) || gatewayError.StatusCode != 409 || gatewayError.Code != delivery.ErrorCodeNoActiveDeliveryPlan {
-		return "", "", nil
+		return "", "", false, nil
 	}
-	if candidateVersionID == "" {
-		return "", "", nil
-	}
-	versionID, projecting, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
+	activeVersionID, active, err := p.Store.ActiveDeliveryPlanVersion(ctx, repository)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	if !projecting || versionID != candidateVersionID {
-		return "", "", nil
+	projectingVersionID, projecting, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
+	if err != nil {
+		return "", "", false, err
 	}
-	return store.GitHubPollFailurePreActivationInboxConflict, candidateVersionID, nil
+	if attemptedVersionID != "" && projecting && projectingVersionID == attemptedVersionID {
+		return store.GitHubPollFailurePreActivationInboxConflict, attemptedVersionID, false, nil
+	}
+	if attemptedVersionID != "" && (!active || activeVersionID != attemptedVersionID) && (!projecting || projectingVersionID != attemptedVersionID) {
+		return "", "", true, nil
+	}
+	if attemptedVersionID == "" && !active && !projecting {
+		return "", "", true, nil
+	}
+	return "", "", false, nil
 }
 
 func workflowQuestionProjection(question store.WorkflowQuestion) plan.WorkflowQuestion {

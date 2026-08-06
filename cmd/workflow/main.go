@@ -565,6 +565,9 @@ func runPollGitHub(args []string) {
 		defer func() {
 			resultErr = errors.Join(resultErr, releasePollLease())
 		}()
+		if err := poller.PrepareAdmission(ctx, *repository); err != nil {
+			return err
+		}
 		var client *github.Client
 		_, err = admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
@@ -847,8 +850,16 @@ func gatewayCredentialVerificationError(err error) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("%w: Gateway Credential has no persisted verification", delivery.ErrGatewayCredentialRejected)
 	}
-	return fmt.Errorf("read Gateway Credential verification: %w", err)
+	return gatewayCredentialVerificationStoreError{err: fmt.Errorf("read Gateway Credential verification: %w", err)}
 }
+
+type gatewayCredentialVerificationStoreError struct {
+	err error
+}
+
+func (e gatewayCredentialVerificationStoreError) Error() string          { return e.err.Error() }
+func (e gatewayCredentialVerificationStoreError) Unwrap() error          { return e.err }
+func (e gatewayCredentialVerificationStoreError) PollStoreFailure() bool { return true }
 
 func shouldPauseGatewayForCredential(err error) bool {
 	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
@@ -858,7 +869,7 @@ func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repos
 	if shouldPauseGatewayForCredential(admissionErr) && !errors.Is(admissionErr, delivery.ErrGatewayCredentialRejected) {
 		admissionErr = fmt.Errorf("%w: Gateway Credential is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
 	}
-	_, err := poller.RecordFailure(ctx, repository, admissionErr)
+	_, err := poller.RecordAdmissionFailure(ctx, repository, admissionErr)
 	return err
 }
 

@@ -689,6 +689,60 @@ func TestPollFailureAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T
 	}
 }
 
+func TestWorkflowQuestionAnswerCannotRaceRepositoryPollLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pollFailure WorkflowQuestion
+	for _, question := range questions {
+		if question.Kind == "poll_failure" {
+			pollFailure = question
+		}
+	}
+	if pollFailure.ID == "" {
+		t.Fatal("poll failure question was not created")
+	}
+	if err := db.AcquireGitHubPollLease(ctx, snapshot.Repository, "active-poller", now.Add(time.Second), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(2*time.Second)); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("concurrent answer = %v, want fencing conflict", err)
+	}
+	question, err := db.WorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID)
+	if err != nil || question.State != "open" {
+		t.Fatalf("question after fenced answer = %#v, %v", question, err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, snapshot.Repository, "active-poller", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(3*time.Second)); err != nil {
+		t.Fatalf("answer after lease release = %v", err)
+	}
+}
+
 func TestRecoveredDeliveryWaitsForGlobalCapacity(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
