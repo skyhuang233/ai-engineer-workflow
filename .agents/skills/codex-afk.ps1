@@ -15,14 +15,14 @@ $ErrorActionPreference = 'Stop'
 function Invoke-Native {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$Command,
+    [string]$Executable,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Arguments
   )
 
-  & $Command @Arguments
+  & $Executable @Arguments
   if ($LASTEXITCODE -ne 0) {
-    throw "$Command exited with status $LASTEXITCODE"
+    throw "$Executable exited with status $LASTEXITCODE"
   }
 }
 
@@ -159,8 +159,8 @@ try {
     Write-Output ''
 
     Assert-SourceCheckout $projectRoot
-    Invoke-Native git -C $projectRoot fetch --prune origin main
-    Invoke-Native git -C $projectRoot merge --ff-only origin/main
+    Invoke-Native -Executable git -Arguments @('-C', $projectRoot, 'fetch', '--prune', 'origin', 'main')
+    Invoke-Native -Executable git -Arguments @('-C', $projectRoot, 'merge', '--ff-only', 'origin/main')
     Assert-SourceCheckout $projectRoot
     $mainCommit = (& git -C $projectRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($mainCommit)) {
@@ -172,7 +172,7 @@ try {
       $gatewayProcess = $null
       Push-Location $projectRoot
       try {
-        Invoke-Native go build -trimpath -o $binaryPath ./cmd/workflow
+        Invoke-Native -Executable go -Arguments @('build', '-trimpath', '-o', $binaryPath, './cmd/workflow')
       }
       finally {
         Pop-Location
