@@ -895,6 +895,23 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		} else {
 			request.InboxPlanVersionID = ""
 		}
+		questions, err := openWorkflowQuestions(ctx, tx, request.Repository, 0, true)
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
+		request.WorkflowQuestions = make([]plan.WorkflowQuestion, 0, len(questions))
+		for _, question := range questions {
+			request.WorkflowQuestions = append(request.WorkflowQuestions, plan.WorkflowQuestion{
+				ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
+				PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
+				PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind,
+				Diagnostics: question.Diagnostics, Evidence: question.Evidence,
+			})
+		}
+		request.InboxProjectionVersion, err = workflowInboxProjectionVersion(questions)
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
 		return DeliveryTarget{VersionID: activeVersionIDs[0], Repository: request.Repository}, request, nil
 	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {

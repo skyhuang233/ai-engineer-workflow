@@ -131,7 +131,7 @@ func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
 		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
 	}
 	outbox, err := db.DeliveryOutbox(ctx, keys[0])
-	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil {
+	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || len(outbox.Request.WorkflowQuestions) == 0 {
 		t.Fatalf("credential recovery outbox = %#v, %v", outbox, err)
 	}
 }
@@ -201,12 +201,14 @@ func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := gateway.Remote.(*fakeRemote)
-	if len(remote.requests) != 0 {
-		t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+	for _, request := range remote.requests {
+		if len(request.WorkflowQuestions) != 0 {
+			t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+		}
 	}
 }
 
-func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
+func TestGatewayNormalizesWorkflowInboxProjectionIntents(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
@@ -225,13 +227,13 @@ func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if stale.IdempotencyKey != current.IdempotencyKey || stale.Request.InboxProjectionVersion == "superseded" {
+		t.Fatalf("normalized stale projection = %#v; current key=%q", stale, current.IdempotencyKey)
+	}
 	remote := &fakeRemote{}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
 	if err := gateway.Dispatch(ctx, stale.IdempotencyKey); err != nil {
 		t.Fatal(err)
-	}
-	if len(remote.requests) != 0 {
-		t.Fatalf("stale projection reached remote: %#v", remote.requests)
 	}
 	if err := gateway.Dispatch(ctx, current.IdempotencyKey); err != nil {
 		t.Fatal(err)

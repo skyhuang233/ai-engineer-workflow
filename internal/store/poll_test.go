@@ -245,6 +245,75 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	}
 }
 
+func TestAnswerWorkflowQuestionRejectsSupersededPlanVersion(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, "needs_attention", "stale question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	tx, err = db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cancelPlanTx(ctx, tx, version.ID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	replacementSnapshot := plan.Snapshot{
+		Repository: snapshot.Repository,
+		Root:       plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 201, Number: 21, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	replacementFingerprint, err := replacementSnapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.BeginActivation(ctx, replacementSnapshot, replacementFingerprint, "revision-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(time.Second)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("superseded question answer = %v, want not found", err)
+	}
+	question, err := db.WorkflowQuestion(ctx, snapshot.Repository, questions[0].ID)
+	if err != nil || question.State != "open" || question.Answer != "" {
+		t.Fatalf("superseded question changed = %#v, %v", question, err)
+	}
+}
+
 func TestReplacementRetiresClosedTicketAndPersistsApproval(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

@@ -1321,7 +1321,7 @@ func TestCompletedOrAbsentPlanInboxConflictIsNotBootstrapEligible(t *testing.T) 
 	}
 	defer db.Close()
 	cause := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
-	kind, _, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/repo", "", cause)
+	kind, _, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/repo", nil, "", cause)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1332,12 +1332,12 @@ func TestCompletedOrAbsentPlanInboxConflictIsNotBootstrapEligible(t *testing.T) 
 	if err := db.MarkTicketDelivered(ctx, completedVersion, 2); err != nil {
 		t.Fatal(err)
 	}
-	kind, _, ignored, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/completed", completedVersion, cause)
+	kind, _, ignored, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/completed", []string{completedVersion}, "", cause)
 	if err != nil || kind != "" || !ignored {
 		t.Fatalf("completed-plan failure kind = %q ignored=%t, %v; want ignored", kind, ignored, err)
 	}
 	projectingVersionID := beginProjectingPollerPlan(t, ctx, db, "owner/projecting")
-	kind, provenance, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/projecting", projectingVersionID, cause)
+	kind, provenance, ignored, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/projecting", nil, projectingVersionID, cause)
 	if err != nil || kind != store.GitHubPollFailurePreActivationInboxConflict {
 		t.Fatalf("projecting-plan failure kind = %q, %v", kind, err)
 	}
@@ -1371,6 +1371,35 @@ func TestActivePlanCompletionRaceDoesNotConsumePollFailureBudget(t *testing.T) {
 	cursor, err := db.GitHubPollCursor(ctx, repository)
 	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
 		t.Fatalf("completion race cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestMultipleActivePlanCompletionRaceDoesNotConsumePollFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	completedVersionID := beginProjectingPollerPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	if err := db.MarkActive(ctx, completedVersionID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: completingConflictInboxProjector{store: db, versionID: completedVersionID, ticketID: 12},
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if err != nil {
+		t.Fatalf("multiple-plan completion race poll = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+		t.Fatalf("multiple-plan completion race cursor = %#v, %v", cursor, err)
 	}
 }
 
@@ -1490,7 +1519,7 @@ func TestPermanentAdmissionFailureTerminalizesExhaustedRecovery(t *testing.T) {
 	defer db.Close()
 	repository := "owner/repo"
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
-	beginProjectingPollerPlan(t, ctx, db, repository)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
 	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
 		t.Fatal(err)
 	}
@@ -1518,6 +1547,19 @@ func TestPermanentAdmissionFailureTerminalizesExhaustedRecovery(t *testing.T) {
 	}
 	if cursor.FailureKind != store.GitHubPollFailureUnrecoverable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
 		t.Fatalf("terminal admission cursor = %#v", cursor)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		if question.VersionID == versionID && question.Kind == "poll_failure" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("projecting recovery Plan has no poll failure question: %#v", questions)
 	}
 }
 

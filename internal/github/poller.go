@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
@@ -371,7 +372,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if err := p.renewPollLease(ctx, repository); err != nil {
 		return PollResult{}, err
 	}
-	activeVersionID, active, err := p.Store.ActiveDeliveryPlanVersion(ctx, repository)
+	attemptedActiveVersionIDs, err := p.Store.ActiveDeliveryPlanVersions(ctx, repository)
 	if err != nil {
 		return PollResult{}, err
 	}
@@ -382,11 +383,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if !singleProjectingPlan {
 		recoveryCandidateVersionID = ""
 	}
-	attemptedPlanVersionID := activeVersionID
-	if attemptedPlanVersionID == "" {
-		attemptedPlanVersionID = recoveryCandidateVersionID
-	}
-	if !active && !singleProjectingPlan {
+	if len(attemptedActiveVersionIDs) == 0 && !singleProjectingPlan {
 		if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
 			return PollResult{}, err
 		}
@@ -396,7 +393,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		if isPollStoreError(err) {
 			return PollResult{}, err
 		}
-		failureKind, recoveryPlanVersionID, ignoreFailure, classificationErr := p.inboxProjectionFailureKind(ctx, repository, attemptedPlanVersionID, err)
+		failureKind, recoveryPlanVersionID, ignoreFailure, classificationErr := p.inboxProjectionFailureKind(ctx, repository, attemptedActiveVersionIDs, recoveryCandidateVersionID, err)
 		if classificationErr != nil {
 			return PollResult{}, errors.Join(err, classificationErr)
 		}
@@ -713,7 +710,7 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	if p.InboxProjector == nil {
 		return nil
 	}
-	questions, err := p.Store.OpenWorkflowQuestions(ctx, repository, 0)
+	questions, err := p.Store.ActiveWorkflowQuestions(ctx, repository)
 	if err != nil {
 		return wrapPollStoreError(err)
 	}
@@ -724,29 +721,29 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
-func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository, attemptedVersionID string, cause error) (store.GitHubPollFailureKind, string, bool, error) {
+func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository string, attemptedActiveVersionIDs []string, recoveryCandidateVersionID string, cause error) (store.GitHubPollFailureKind, string, bool, error) {
 	var gatewayError *delivery.HTTPError
 	if !errors.As(cause, &gatewayError) || gatewayError.StatusCode != 409 || gatewayError.Code != delivery.ErrorCodeNoActiveDeliveryPlan {
 		return "", "", false, nil
 	}
-	activeVersionID, active, err := p.Store.ActiveDeliveryPlanVersion(ctx, repository)
+	activeVersionIDs, err := p.Store.ActiveDeliveryPlanVersions(ctx, repository)
 	if err != nil {
 		return "", "", false, err
 	}
-	projectingVersionID, projecting, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
+	if len(attemptedActiveVersionIDs) > 0 {
+		return "", "", !slices.Equal(attemptedActiveVersionIDs, activeVersionIDs), nil
+	}
+	if recoveryCandidateVersionID == "" {
+		return "", "", true, nil
+	}
+	projecting, err := p.Store.IsProjectingDeliveryPlanVersion(ctx, repository, recoveryCandidateVersionID)
 	if err != nil {
 		return "", "", false, err
 	}
-	if attemptedVersionID != "" && projecting && projectingVersionID == attemptedVersionID {
-		return store.GitHubPollFailurePreActivationInboxConflict, attemptedVersionID, false, nil
-	}
-	if attemptedVersionID != "" && (!active || activeVersionID != attemptedVersionID) && (!projecting || projectingVersionID != attemptedVersionID) {
+	if !projecting {
 		return "", "", true, nil
 	}
-	if attemptedVersionID == "" && !active && !projecting {
-		return "", "", true, nil
-	}
-	return "", "", false, nil
+	return store.GitHubPollFailurePreActivationInboxConflict, recoveryCandidateVersionID, false, nil
 }
 
 func workflowQuestionProjection(question store.WorkflowQuestion) plan.WorkflowQuestion {

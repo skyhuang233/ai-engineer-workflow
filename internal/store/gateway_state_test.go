@@ -356,6 +356,52 @@ func TestWorkflowInboxProjectionFencesCompleteActivePlanSet(t *testing.T) {
 	}
 }
 
+func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	activeVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	inactiveVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, activeVersionID, 2, "active", "active question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, inactiveVersionID, 12, "inactive", "inactive question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, inactiveVersionID, 12); err != nil {
+		t.Fatal(err)
+	}
+	allQuestions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil || len(allQuestions) != 2 {
+		t.Fatalf("all questions = %#v, %v", allQuestions, err)
+	}
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{
+		Operation: DeliveryProjectInbox, Repository: repository,
+		WorkflowQuestions: []plan.WorkflowQuestion{{ID: allQuestions[0].ID}, {ID: allQuestions[1].ID}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued.Request.WorkflowQuestions) != 1 || queued.Request.WorkflowQuestions[0].Finding != "active" {
+		t.Fatalf("persisted Inbox projection = %#v", queued.Request.WorkflowQuestions)
+	}
+	if queued.Request.InboxProjectionVersion == "" {
+		t.Fatal("persisted Inbox projection version is empty")
+	}
+}
+
 func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -391,7 +437,7 @@ func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
 	if err != nil || question.State != "answered" || question.Answer != "retry" {
 		t.Fatalf("question = %#v, %v", question, err)
 	}
-	if outbox.State != OutboxPending || outbox.Request.Operation != DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil || outbox.Request.InboxProjectionVersion == "" {
+	if outbox.State != OutboxPending || outbox.Request.Operation != DeliveryProjectInbox || len(outbox.Request.WorkflowQuestions) != 0 || outbox.Request.InboxProjectionVersion == "" {
 		t.Fatalf("outbox = %#v", outbox)
 	}
 }

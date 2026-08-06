@@ -781,7 +781,7 @@ func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, reposito
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, now); err != nil {
+	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, "", now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -810,17 +810,30 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLea
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, now); err != nil {
+	var recoveryPlanVersionID string
+	err = tx.QueryRowContext(ctx, `SELECT CASE
+WHEN failure_kind = ? AND recovery_state IN (?, ?) THEN recovery_plan_version_id
+ELSE '' END
+FROM github_poll_cursors WHERE repository = ?`, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, repository).Scan(&recoveryPlanVersionID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, now); err != nil {
+	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
+		return err
+	}
+	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, now); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) error {
-	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id WHERE p.repository = ? AND `+currentActiveUnfrozenPlanPredicate, repository)
+func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
+    v.version_id = ? AND p.state = ? AND v.state = ?
+    AND NOT EXISTS (SELECT 1 FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id)
+    AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id)
+)) ORDER BY v.version_id`, repository, recoveryPlanVersionID, StateProjecting, StateProjecting)
 	if err != nil {
 		return err
 	}
@@ -1077,6 +1090,16 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 	}
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+    WHERE p.repository = ? AND v.version_id = ? AND `+currentActivePlanPredicate+`
+)`, repository, versionID).Scan(&active); err != nil {
+		return err
+	}
+	if active == 0 {
+		return ErrNotFound
 	}
 	if kind == "closed_unmerged_impact" {
 		var decision closedPlanDecision
