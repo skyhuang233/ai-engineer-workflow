@@ -104,6 +104,30 @@ func TestGitHubPollLeaseRejectsMutationAfterExpiry(t *testing.T) {
 	}
 }
 
+func TestUnleasedGitHubPollMutationCannotBypassActiveLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-owner", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordGitHubPollFailure(ctx, repository, now); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("unleased mutation error = %v, want fencing conflict", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("unleased mutation persisted %d failures", cursor.ConsecutiveFailures)
+	}
+}
+
 func TestPollTerminalTransitionIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -135,8 +159,12 @@ WHEN NEW.state = 'needs_attention' BEGIN SELECT RAISE(ABORT, 'injected attention
 	if err := db.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx, snapshot.Repository, now); err == nil {
 		t.Fatal("terminal transition succeeded despite injected failure")
 	}
-	if _, err := db.GitHubPollCursor(ctx, snapshot.Repository); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("terminal cursor survived rollback: %v", err)
+	cursor, err := db.GitHubPollCursor(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != "" {
+		t.Fatalf("terminal state survived rollback: %#v", cursor)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
 	if err != nil {
@@ -205,8 +233,12 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	if err != nil || question.State != "open" {
 		t.Fatalf("invalid answer changed question = %#v, %v", question, err)
 	}
-	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, `{"action":"cancel-plan"}`, now); err != nil {
+	outbox, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, snapshot.Repository, questions[0].ID, `{"action":"cancel-plan"}`, now)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if outbox.IdempotencyKey != "" {
+		t.Fatalf("cancelled plan queued Inbox projection = %#v", outbox)
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Second)}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("cancelled plan claim = %v, want not ready", err)

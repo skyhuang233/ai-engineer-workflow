@@ -107,6 +107,7 @@ func (c GitHubPollCursor) NeedsAttention() bool {
 
 type GitHubPollFailureKind string
 type GitHubPollRecoveryState string
+type GitHubPollBootstrapRecoveryDisposition string
 
 const (
 	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind   = "pre_activation_inbox_conflict"
@@ -116,6 +117,10 @@ const (
 	GitHubPollRecoveryClaimed                   GitHubPollRecoveryState = "claimed"
 	GitHubPollRecoveryCompleted                 GitHubPollRecoveryState = "completed"
 	GitHubPollRecoveryConsumed                  GitHubPollRecoveryState = "consumed"
+	GitHubPollBootstrapRecoveryUnavailable      GitHubPollBootstrapRecoveryDisposition = "unavailable"
+	GitHubPollBootstrapRecoveryActive           GitHubPollBootstrapRecoveryDisposition = "active"
+	GitHubPollBootstrapRecoveryProjecting       GitHubPollBootstrapRecoveryDisposition = "projecting"
+	GitHubPollBootstrapRecoveryStale            GitHubPollBootstrapRecoveryDisposition = "stale"
 )
 
 func (s *Store) GitHubPollCursor(ctx context.Context, repository string) (GitHubPollCursor, error) {
@@ -192,7 +197,7 @@ AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.
 
 func requireGitHubPollLeaseTx(ctx context.Context, tx *sql.Tx, repository, token string, leaseNow time.Time) error {
 	if token == "" {
-		return nil
+		return ErrFencingConflict
 	}
 	if leaseNow.IsZero() {
 		return ErrFencingConflict
@@ -210,6 +215,42 @@ WHERE repository = ? AND lease_token = ? AND lease_expires_at > ?`, repository, 
 		return ErrFencingConflict
 	}
 	return nil
+}
+
+func (s *Store) acquireGitHubPollMutationLease(ctx context.Context, repository string) (string, time.Time, error) {
+	if repository == "" {
+		return "", time.Time{}, ErrInvalidClaim
+	}
+	token, err := randomID("github-poll-mutation-")
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	now := time.Now().UTC()
+	timestamp := formatTimestamp(now)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, next_attempt_at, updated_at)
+VALUES (?, ?, ?) ON CONFLICT(repository) DO NOTHING`, repository, timestamp, timestamp); err != nil {
+		return "", time.Time{}, err
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET lease_token = ?, lease_expires_at = ?, updated_at = ?
+WHERE repository = ? AND (lease_token = '' OR lease_expires_at <= ?)`, token, formatTimestamp(now.Add(30*time.Second)), timestamp, repository, timestamp)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if updated != 1 {
+		return "", time.Time{}, ErrFencingConflict
+	}
+	return token, now, nil
+}
+
+func (s *Store) releaseGitHubPollMutationLease(ctx context.Context, repository, token string) error {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return s.ReleaseGitHubPollLease(releaseCtx, repository, token, time.Now().UTC())
 }
 
 // AcquireGitHubPollLease atomically combines readiness admission with exclusive
@@ -286,7 +327,12 @@ WHERE repository = ? AND lease_token = ?`, formatTimestamp(now), repository, tok
 }
 
 func (s *Store) ClaimGitHubPollBootstrapRecovery(ctx context.Context, repository string, minimumFailures int, now time.Time) (bool, error) {
-	return s.ClaimGitHubPollBootstrapRecoveryLeased(ctx, repository, minimumFailures, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return false, err
+	}
+	claimed, claimErr := s.ClaimGitHubPollBootstrapRecoveryLeased(ctx, repository, minimumFailures, now, token, leaseNow)
+	return claimed, errors.Join(claimErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) ClaimGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository string, minimumFailures int, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
@@ -331,8 +377,86 @@ AND EXISTS (
 	return updated == 1, nil
 }
 
+func (s *Store) ResolveGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository string, minimumFailures int, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollBootstrapRecoveryDisposition, error) {
+	if minimumFailures < 1 {
+		return GitHubPollBootstrapRecoveryUnavailable, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	defer tx.Rollback()
+	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	var failures int
+	var failureKind GitHubPollFailureKind
+	var recoveryState GitHubPollRecoveryState
+	var versionID string
+	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id
+FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &failureKind, &recoveryState, &versionID)
+	if err != nil {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	if failures < minimumFailures || failureKind != GitHubPollFailurePreActivationInboxConflict || versionID == "" || recoveryState != GitHubPollRecoveryAvailable && recoveryState != GitHubPollRecoveryClaimed {
+		return GitHubPollBootstrapRecoveryUnavailable, nil
+	}
+	var planState, versionState string
+	var terminal, completed int
+	err = tx.QueryRowContext(ctx, `SELECT p.state, v.state,
+EXISTS (SELECT 1 FROM plan_terminal_states state WHERE state.version_id = v.version_id),
+EXISTS (SELECT 1 FROM completed_plan_versions state WHERE state.version_id = v.version_id)
+FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND v.version_id = ?`, repository, versionID).Scan(&planState, &versionState, &terminal, &completed)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	disposition := GitHubPollBootstrapRecoveryStale
+	if err == nil && terminal == 0 && completed == 0 {
+		switch {
+		case planState == StateActive && versionState == StateActive:
+			disposition = GitHubPollBootstrapRecoveryActive
+		case planState == StateProjecting && versionState == StateProjecting:
+			disposition = GitHubPollBootstrapRecoveryProjecting
+		}
+	}
+	switch disposition {
+	case GitHubPollBootstrapRecoveryActive:
+		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = '', recovery_state = ?, next_attempt_at = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id = ?`,
+			GitHubPollRecoveryCompleted, formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
+	case GitHubPollBootstrapRecoveryProjecting:
+		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors SET recovery_state = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id = ?`,
+			GitHubPollRecoveryClaimed, formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
+	case GitHubPollBootstrapRecoveryStale:
+		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id = ?`,
+			GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
+	}
+	if err != nil {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GitHubPollBootstrapRecoveryUnavailable, err
+	}
+	return disposition, nil
+}
+
 func (s *Store) RecoverGitHubPollAfterBootstrap(ctx context.Context, repository string, now time.Time) (bool, error) {
-	return s.RecoverGitHubPollAfterBootstrapLeased(ctx, repository, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return false, err
+	}
+	recovered, recoverErr := s.RecoverGitHubPollAfterBootstrapLeased(ctx, repository, now, token, leaseNow)
+	return recovered, errors.Join(recoverErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) RecoverGitHubPollAfterBootstrapLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
@@ -373,7 +497,12 @@ AND EXISTS (
 }
 
 func (s *Store) ConsumeGitHubPollBootstrapEligibility(ctx context.Context, repository string, now time.Time) error {
-	return s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, "", time.Time{}, false)
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	consumeErr := s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, token, leaseNow, false)
+	return errors.Join(consumeErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) ConsumeGitHubPollBootstrapEligibilityLeased(ctx context.Context, repository, leaseToken string, now, leaseNow time.Time) error {
@@ -414,7 +543,12 @@ WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?)`, GitHubP
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverable(ctx context.Context, repository string, now time.Time) error {
-	return s.MarkGitHubPollFailureUnrecoverableLeased(ctx, repository, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	markErr := s.MarkGitHubPollFailureUnrecoverableLeased(ctx, repository, now, token, leaseNow)
+	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
@@ -445,7 +579,12 @@ ON CONFLICT(repository) DO UPDATE SET failure_kind = excluded.failure_kind, reco
 }
 
 func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time, fullReconcile bool) error {
-	return s.RecordGitHubPollSuccessLeased(ctx, repository, now, fullReconcile, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	recordErr := s.RecordGitHubPollSuccessLeased(ctx, repository, now, fullReconcile, token, leaseNow)
+	return errors.Join(recordErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) RecordGitHubPollSuccessLeased(ctx context.Context, repository string, now time.Time, fullReconcile bool, leaseToken string, leaseNow time.Time) error {
@@ -484,7 +623,12 @@ func (s *Store) DeferGitHubPoll(ctx context.Context, repository string, retryAt,
 }
 
 func (s *Store) DeferGitHubPollWithCursor(ctx context.Context, repository string, retryAt, now time.Time) (GitHubPollCursor, error) {
-	return s.DeferGitHubPollWithCursorLeased(ctx, repository, retryAt, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
+	cursor, deferErr := s.DeferGitHubPollWithCursorLeased(ctx, repository, retryAt, now, token, leaseNow)
+	return cursor, errors.Join(deferErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) DeferGitHubPollWithCursorLeased(ctx context.Context, repository string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
@@ -507,9 +651,9 @@ func (s *Store) DeferGitHubPollWithCursorLeased(ctx context.Context, repository 
 	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
 VALUES (?, 0, ?, ?, '', ?, ?)
 ON CONFLICT(repository) DO UPDATE SET
-failure_kind = CASE WHEN github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.failure_kind END,
-recovery_state = CASE WHEN github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.recovery_state END,
-recovery_plan_version_id = CASE WHEN github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN '' ELSE github_poll_cursors.recovery_plan_version_id END,
+failure_kind = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.failure_kind END,
+recovery_state = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.recovery_state END,
+recovery_plan_version_id = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN '' ELSE github_poll_cursors.recovery_plan_version_id END,
 next_attempt_at = CASE WHEN github_poll_cursors.next_attempt_at > excluded.next_attempt_at THEN github_poll_cursors.next_attempt_at ELSE excluded.next_attempt_at END,
 updated_at = excluded.updated_at
 RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`, repository, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(retryAt), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollFailureRetryable, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollRecoveryConsumed, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
@@ -523,7 +667,12 @@ RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failu
 }
 
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
-	return s.MarkRepositoryNeedsAttentionLeased(ctx, repository, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	markErr := s.MarkRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow)
+	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
@@ -547,7 +696,12 @@ func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, reposito
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
-	return s.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, now, "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
+	markErr := s.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow)
+	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
@@ -695,7 +849,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now); err != nil {
 		return DeliveryOutbox{}, err
 	}
-	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
+	outbox, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -739,6 +893,19 @@ func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, 
 		return DeliveryOutbox{}, err
 	}
 	return s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, InboxProjectionVersion: version}, now)
+}
+
+func (s *Store) queueWorkflowInboxProjectionIfActiveTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
+	var active int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DeliveryOutbox{}, nil
+	}
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 }
 
 func workflowInboxProjectionVersion(questions []WorkflowQuestion) (string, error) {
@@ -1122,22 +1289,31 @@ func (s *Store) RecordGitHubPollFailure(ctx context.Context, repository string, 
 }
 
 func (s *Store) RecordGitHubPollFailureWithKind(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind) error {
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return err
+	}
 	recoveryPlanVersionID := ""
 	if kind == GitHubPollFailurePreActivationInboxConflict {
 		versionID, projecting, err := s.ProjectingDeliveryPlanVersion(ctx, repository)
 		if err != nil {
-			return err
+			return errors.Join(err, s.releaseGitHubPollMutationLease(ctx, repository, token))
 		}
 		if projecting {
 			recoveryPlanVersionID = versionID
 		}
 	}
-	_, err := s.AdvanceGitHubPollFailureLeased(ctx, repository, now, kind, recoveryPlanVersionID, "", time.Time{})
-	return err
+	_, recordErr := s.AdvanceGitHubPollFailureLeased(ctx, repository, now, kind, recoveryPlanVersionID, token, leaseNow)
+	return errors.Join(recordErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) AdvanceGitHubPollFailure(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind) (GitHubPollCursor, error) {
-	return s.AdvanceGitHubPollFailureLeased(ctx, repository, now, kind, "", "", time.Time{})
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
+	cursor, recordErr := s.AdvanceGitHubPollFailureLeased(ctx, repository, now, kind, "", token, leaseNow)
+	return cursor, errors.Join(recordErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {

@@ -185,7 +185,7 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredent
 		return err
 	}
 	for _, repository := range repositories {
-		if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now); err != nil {
+		if _, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now); err != nil {
 			return err
 		}
 	}

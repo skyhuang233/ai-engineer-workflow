@@ -472,11 +472,18 @@ func TestRecordFailureInvalidatesBootstrapProvenanceAfterSecondaryInboxError(t *
 	projector := &recordingInboxProjector{delegate: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "wrong-token"}}
 	preActivationConflict := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
 
-	_, err = (Poller{
+	poller := Poller{
 		Store:          db,
 		InboxProjector: projector,
 		MaxFailures:    1,
-	}).recordFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, "", preActivationConflict)
+		Now:            func() time.Time { return now },
+	}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = poller.recordFailureWithKind(leaseCtx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, "", preActivationConflict)
+	err = errors.Join(err, release())
 	if !errors.Is(err, store.ErrNeedsAttention) {
 		t.Fatalf("record failure = %v, want needs attention", err)
 	}
@@ -700,7 +707,7 @@ func TestPollCursorReadFailureDoesNotTerminalizeRecovery(t *testing.T) {
 	}
 }
 
-func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *testing.T) {
+func TestClaimedBootstrapRecoveryResumesExactVersionAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	repository := "owner/repo"
@@ -709,7 +716,7 @@ func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	beginProjectingPollerPlan(t, ctx, db, repository)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
 	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -735,20 +742,20 @@ func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *tes
 		Now:         func() time.Time { return failedAt.Add(time.Minute) },
 	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
 		bootstrapRuns++
-		return nil
+		return restarted.MarkActive(ctx, versionID)
 	}, nil)
-	if !errors.Is(err, store.ErrNeedsAttention) {
-		t.Fatalf("restarted poll = %v, want needs attention", err)
+	if err != nil {
+		t.Fatalf("restarted poll = %v", err)
 	}
-	if bootstrapRuns != 0 {
-		t.Fatalf("bootstrap runs after restart = %d, want 0", bootstrapRuns)
+	if bootstrapRuns != 1 {
+		t.Fatalf("bootstrap runs after restart = %d, want 1", bootstrapRuns)
 	}
 	cursor, err := restarted.GitHubPollCursor(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
-		t.Fatalf("recovery state = %q/%q, want terminal consumed", cursor.FailureKind, cursor.RecoveryState)
+	if cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryCompleted || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("recovery state = %#v, want completed", cursor)
 	}
 }
 
@@ -825,6 +832,116 @@ func TestActiveClaimedBootstrapRecoveryResumesWithoutRepeatingBootstrap(t *testi
 	}
 	if cursor.ConsecutiveFailures != 0 || cursor.RecoveryState != store.GitHubPollRecoveryCompleted {
 		t.Fatalf("recovery cursor = %#v, want completed with reset budget", cursor)
+	}
+}
+
+func TestAvailableBootstrapRecoveryCompletesForBoundActivePlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Now().UTC().Add(-time.Minute)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, versionID); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapRuns := 0
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: &countingInboxProjector{},
+		MaxFailures:    1,
+		Now:            func() time.Time { return failedAt.Add(time.Minute) },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		bootstrapRuns++
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("bound active recovery = %v", err)
+	}
+	if bootstrapRuns != 0 {
+		t.Fatalf("bootstrap runs = %d, want 0", bootstrapRuns)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryCompleted {
+		t.Fatalf("bound active cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestStaleClaimedRecoveryPreservesReplacementWorker(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Now().UTC().Add(-time.Minute)
+	originVersionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := db.ClaimGitHubPollBootstrapRecovery(ctx, repository, 1, failedAt.Add(time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("claim = %t, %v", claimed, err)
+	}
+	if err := db.MarkActive(ctx, originVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, originVersionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	replacement := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 10, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 20, Number: 20, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := replacement.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementVersion, err := db.BeginActivation(ctx, replacement, fingerprint, "replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, replacementVersion.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := failedAt.Add(time.Minute)
+	worker, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: replacementVersion.ID, TicketID: 20, Owner: "worker", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapRuns := 0
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: &countingInboxProjector{},
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		bootstrapRuns++
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("stale recovery poll = %v", err)
+	}
+	if bootstrapRuns != 0 {
+		t.Fatalf("stale bootstrap runs = %d, want 0", bootstrapRuns)
+	}
+	current, err := db.CurrentClaim(ctx, replacementVersion.ID, 20)
+	if err != nil || current.RunID != worker.RunID {
+		t.Fatalf("replacement worker = %#v, %v; want run %q", current, err, worker.RunID)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("stale recovery cursor = %#v, %v", cursor, err)
 	}
 }
 
@@ -948,6 +1065,15 @@ func TestBootstrapRecoveryClaimHasOneWinner(t *testing.T) {
 	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
 		t.Fatal(err)
 	}
+	leaseNow := now.Add(time.Second)
+	if err := db.AcquireGitHubPollLease(ctx, repository, "recovery-test", leaseNow, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.ReleaseGitHubPollLease(ctx, repository, "recovery-test", leaseNow); err != nil {
+			t.Error(err)
+		}
+	}()
 	start := make(chan struct{})
 	results := make(chan bool, 2)
 	errorsFound := make(chan error, 2)
@@ -957,7 +1083,7 @@ func TestBootstrapRecoveryClaimHasOneWinner(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			claimed, err := db.ClaimGitHubPollBootstrapRecovery(ctx, repository, 1, now.Add(time.Second))
+			claimed, err := db.ClaimGitHubPollBootstrapRecoveryLeased(ctx, repository, 1, leaseNow, "recovery-test", leaseNow)
 			if err != nil {
 				errorsFound <- err
 				return
@@ -1271,9 +1397,15 @@ func TestRecordFailurePersistsAfterParentCancellation(t *testing.T) {
 	}
 	defer db.Close()
 	ctx, cancel := context.WithCancel(context.Background())
+	poller := Poller{Store: db, Now: func() time.Time { return time.Now().UTC() }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cancel()
 	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
-	_, err = (Poller{Store: db}).recordFailure(ctx, "owner/repo", now, context.DeadlineExceeded)
+	_, err = poller.recordFailure(leaseCtx, "owner/repo", now, context.DeadlineExceeded)
+	err = errors.Join(err, release())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("record failure error = %v", err)
 	}
@@ -1321,7 +1453,8 @@ func TestRateLimitConsumesExhaustedBootstrapRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	retryAt := now.Add(time.Minute)
-	_, err = (Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}).RecordFailure(ctx, repository, &apiError{StatusCode: 403, RetryAt: retryAt})
+	readyAt := now.Add(time.Second)
+	_, err = (Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return readyAt }}).RecordFailure(ctx, repository, &apiError{StatusCode: 403, RetryAt: retryAt})
 	if !errors.Is(err, store.ErrNeedsAttention) {
 		t.Fatalf("rate-limited exhausted poll = %v, want needs attention", err)
 	}

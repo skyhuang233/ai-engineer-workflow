@@ -336,6 +336,36 @@ func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
 	}
 }
 
+func TestResumeGatewayWritesCommitsAfterPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	activateWorkflowInboxPlan(t, ctx, db, repository)
+	now := time.Now().UTC()
+	rotation, err := db.BeginGatewayCredentialRotation(ctx, "rotation", "credential unavailable", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versionID string
+	if err := db.db.QueryRowContext(ctx, `SELECT current_version_id FROM plans WHERE repository = ?`, repository).Scan(&versionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, rotation, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("Gateway pause after resume = %t, %v", paused, err)
+	}
+}
+
 func activateWorkflowInboxPlan(t *testing.T, ctx context.Context, db *Store, repository string) {
 	t.Helper()
 	snapshot := plan.Snapshot{
