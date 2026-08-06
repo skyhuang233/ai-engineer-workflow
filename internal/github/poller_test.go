@@ -3,10 +3,12 @@ package github
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -82,8 +84,25 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	repository := "owner/repo"
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	now := failedAt.Add(time.Minute)
-	if err := db.RecordGitHubPollFailure(ctx, repository, failedAt); err != nil {
+	controlToken := "control-token"
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db}, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
+	defer server.Close()
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: controlToken},
+		MaxFailures:    1,
+		Now:            func() time.Time { return failedAt },
+	}).Poll(ctx, repository)
+	if err == nil {
+		t.Fatal("cold-start inbox conflict returned nil")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict {
+		t.Fatalf("failure kind = %q", cursor.FailureKind)
 	}
 	projector := &activePlanInboxProjector{store: db, now: now}
 	bootstrapRuns := 0
@@ -98,8 +117,11 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 		bootstrapRuns++
 		activatePollerPlan(t, ctx, db, repository)
 		return nil
-	}, func(context.Context) error {
+	}, func(_ context.Context, bootstrapped bool) error {
 		controlRuns++
+		if !bootstrapped {
+			t.Fatal("recovered poll did not report bootstrap completion")
+		}
 		return nil
 	})
 	if err != nil {
@@ -108,12 +130,71 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	if bootstrapRuns != 1 || controlRuns != 1 || projector.calls != 1 {
 		t.Fatalf("bootstrap, control, projection = %d, %d, %d", bootstrapRuns, controlRuns, projector.calls)
 	}
-	cursor, err := db.GitHubPollCursor(ctx, repository)
+	cursor, err = db.GitHubPollCursor(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cursor.ConsecutiveFailures != 0 {
 		t.Fatalf("consecutive failures = %d, want 0", cursor.ConsecutiveFailures)
+	}
+}
+
+func TestPollDoesNotBootstrapPastFailureBudgetWithUnclassifiedOrMixedFailures(t *testing.T) {
+	for _, scenario := range []struct {
+		name        string
+		maxFailures int
+		record      func(context.Context, *store.Store, string, time.Time) error
+	}{
+		{
+			name:        "unclassified",
+			maxFailures: 1,
+			record: func(ctx context.Context, db *store.Store, repository string, now time.Time) error {
+				return db.RecordGitHubPollFailure(ctx, repository, now)
+			},
+		},
+		{
+			name:        "mixed",
+			maxFailures: 2,
+			record: func(ctx context.Context, db *store.Store, repository string, now time.Time) error {
+				if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+					return err
+				}
+				return db.RecordGitHubPollFailure(ctx, repository, now.Add(time.Second))
+			},
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			repository := "owner/repo"
+			failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+			if err := scenario.record(ctx, db, repository, failedAt); err != nil {
+				t.Fatal(err)
+			}
+			bootstrapRuns := 0
+			_, err = (Poller{
+				Store:       db,
+				Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+				MaxFailures: scenario.maxFailures,
+				Now:         func() time.Time { return failedAt.Add(time.Minute) },
+			}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+				bootstrapRuns++
+				return nil
+			}, func(context.Context, bool) error {
+				t.Fatal("control pass ran after an unrecoverable failure")
+				return nil
+			})
+			if !errors.Is(err, store.ErrNeedsAttention) {
+				t.Fatalf("poll error = %v, want needs attention", err)
+			}
+			if bootstrapRuns != 0 {
+				t.Fatalf("bootstrap runs = %d, want 0", bootstrapRuns)
+			}
+		})
 	}
 }
 
@@ -140,7 +221,7 @@ func TestPollDoesNotBootstrapPastFailureBudgetWithActivePlan(t *testing.T) {
 	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
 		bootstrapRuns++
 		return nil
-	}, func(context.Context) error {
+	}, func(context.Context, bool) error {
 		controlRuns++
 		return nil
 	})

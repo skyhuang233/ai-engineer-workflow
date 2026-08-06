@@ -581,9 +581,11 @@ func runPollGitHub(args []string) {
 			}
 			return nil
 		}
-		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context) error {
-			if err := bootstrap(ctx); err != nil {
-				return err
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) error {
+			if !bootstrapped {
+				if err := bootstrap(ctx); err != nil {
+					return err
+				}
 			}
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {

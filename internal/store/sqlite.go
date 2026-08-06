@@ -815,6 +815,20 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 			return err
 		}
 	}
+	if applied < 31 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "failure_kind")
+		if err != nil {
+			return fmt.Errorf("migration 31: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN failure_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 31: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (31, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

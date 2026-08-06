@@ -95,14 +95,19 @@ type GitHubPollCursor struct {
 	LastSuccessAt       time.Time
 	LastFullReconcileAt time.Time
 	ConsecutiveFailures int
+	FailureKind         GitHubPollFailureKind
 	NextAttemptAt       time.Time
 }
+
+type GitHubPollFailureKind string
+
+const GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind = "pre_activation_inbox_conflict"
 
 func (s *Store) GitHubPollCursor(ctx context.Context, repository string) (GitHubPollCursor, error) {
 	var cursor GitHubPollCursor
 	var success, full, next string
-	err := s.db.QueryRowContext(ctx, `SELECT repository, last_success_at, last_full_reconcile_at, consecutive_failures, next_attempt_at
-FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&cursor.Repository, &success, &full, &cursor.ConsecutiveFailures, &next)
+	err := s.db.QueryRowContext(ctx, `SELECT repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, next_attempt_at
+FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&cursor.Repository, &success, &full, &cursor.ConsecutiveFailures, &cursor.FailureKind, &next)
 	if errors.Is(err, sql.ErrNoRows) {
 		return GitHubPollCursor{}, ErrNotFound
 	}
@@ -144,16 +149,23 @@ WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).
 	return true, nil
 }
 
-func (s *Store) RecoverGitHubPollAfterBootstrap(ctx context.Context, repository string, now time.Time) error {
+func (s *Store) RecoverGitHubPollAfterBootstrap(ctx context.Context, repository string, now time.Time) (bool, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, next_attempt_at, updated_at)
-VALUES (?, 0, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), formatTimestamp(now))
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = '', next_attempt_at = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ?`, formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return updated == 1, nil
 }
 
 func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time, fullReconcile bool) error {
@@ -166,11 +178,11 @@ func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, 
 	if fullReconcile {
 		full = formatTimestamp(now)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, last_success_at, last_full_reconcile_at, consecutive_failures, next_attempt_at, updated_at)
-VALUES (?, ?, ?, 0, ?, ?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, next_attempt_at, updated_at)
+VALUES (?, ?, ?, 0, '', ?, ?)
 ON CONFLICT(repository) DO UPDATE SET last_success_at = excluded.last_success_at,
 last_full_reconcile_at = CASE WHEN excluded.last_full_reconcile_at = '' THEN github_poll_cursors.last_full_reconcile_at ELSE excluded.last_full_reconcile_at END,
-consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), full, formatTimestamp(now), formatTimestamp(now))
+consecutive_failures = 0, failure_kind = '', next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), full, formatTimestamp(now), formatTimestamp(now))
 	return err
 }
 
@@ -183,8 +195,8 @@ func (s *Store) DeferGitHubPoll(ctx context.Context, repository string, retryAt,
 	} else {
 		now = now.UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, next_attempt_at, updated_at)
-VALUES (?, 0, ?, ?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, next_attempt_at, updated_at)
+VALUES (?, 0, '', ?, ?)
 ON CONFLICT(repository) DO UPDATE SET next_attempt_at = CASE WHEN github_poll_cursors.next_attempt_at > excluded.next_attempt_at THEN github_poll_cursors.next_attempt_at ELSE excluded.next_attempt_at END, updated_at = excluded.updated_at`, repository, formatTimestamp(retryAt), formatTimestamp(now))
 	return err
 }
@@ -424,7 +436,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 		return err
 	}
 	if kind == "poll_failure" {
-		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, failure_kind = '', next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
 			return err
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT t.issue_id, COALESCE(s.session_id, ''), COALESCE(s.accepted_commit, '')
@@ -743,6 +755,10 @@ func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason
 }
 
 func (s *Store) RecordGitHubPollFailure(ctx context.Context, repository string, now time.Time) error {
+	return s.RecordGitHubPollFailureWithKind(ctx, repository, now, "")
+}
+
+func (s *Store) RecordGitHubPollFailureWithKind(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -754,17 +770,24 @@ func (s *Store) RecordGitHubPollFailure(ctx context.Context, repository string, 
 	}
 	defer tx.Rollback()
 	var failures int
-	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures)
+	var existingKind GitHubPollFailureKind
+	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &existingKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		failures = 0
 	} else if err != nil {
 		return err
 	}
 	failures++
+	if kind != GitHubPollFailurePreActivationInboxConflict {
+		kind = ""
+	}
+	if failures > 1 && (kind != GitHubPollFailurePreActivationInboxConflict || existingKind != GitHubPollFailurePreActivationInboxConflict) {
+		kind = ""
+	}
 	delay := time.Second << min(failures-1, 6)
-	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, next_attempt_at, updated_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, formatTimestamp(now.Add(delay)), formatTimestamp(now))
+	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, next_attempt_at, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, failure_kind = excluded.failure_kind, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, kind, formatTimestamp(now.Add(delay)), formatTimestamp(now))
 	if err != nil {
 		return err
 	}

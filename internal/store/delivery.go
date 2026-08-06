@@ -30,8 +30,9 @@ const (
 )
 
 var (
-	ErrDeliveryRejected  = errors.New("delivery command rejected")
-	ErrDeliveryUncertain = errors.New("delivery outcome is uncertain")
+	ErrDeliveryRejected     = errors.New("delivery command rejected")
+	ErrNoActiveDeliveryPlan = fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
+	ErrDeliveryUncertain    = errors.New("delivery outcome is uncertain")
 )
 
 // DeliveryRequest is the schema-only command accepted from a Ticket Agent.
@@ -857,7 +858,7 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
 WHERE p.repository = ? AND (`+currentActivePlanPredicate+` OR ? = 1) LIMIT 1`, request.Repository, boolInt(request.WorkflowQuestions != nil)).Scan(&admitted)
 		if errors.Is(err, sql.ErrNoRows) {
-			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
+			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}
 		if err != nil {
 			return DeliveryTarget{}, request, err

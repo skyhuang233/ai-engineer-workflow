@@ -17,6 +17,20 @@ import (
 
 const controlPlaneTokenHeader = "X-Workflow-Control-Token"
 
+const errorCodeHeader = "X-Workflow-Error-Code"
+
+const ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
+
+type HTTPError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("control-plane gateway returned %d: %s", e.StatusCode, e.Message)
+}
+
 type HTTPOptions struct {
 	ControlPlaneToken string
 }
@@ -69,7 +83,7 @@ func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryReques
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
-		return fmt.Errorf("control-plane gateway returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		return &HTTPError{StatusCode: response.StatusCode, Code: response.Header.Get(errorCodeHeader), Message: strings.TrimSpace(string(message))}
 	}
 	return nil
 }
@@ -113,6 +127,9 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 			status := http.StatusInternalServerError
 			if errors.Is(err, store.ErrDeliveryRejected) || errors.Is(err, store.ErrInvalidClaim) || errors.Is(err, store.ErrFencingConflict) {
 				status = http.StatusConflict
+			}
+			if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+				writer.Header().Set(errorCodeHeader, ErrorCodeNoActiveDeliveryPlan)
 			}
 			http.Error(writer, err.Error(), status)
 			return
