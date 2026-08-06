@@ -902,6 +902,15 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 )`); err != nil {
 			return fmt.Errorf("migration 35: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_inbox_projections(repository, generation, projection_version, plan_version_ids_json, updated_at)
+SELECT json_extract(request_json, '$.repository'), 1, 'legacy-unfenced', '[]', MAX(updated_at)
+FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_valid(request_json)
+  AND TRIM(COALESCE(json_extract(request_json, '$.repository'), '')) != ''
+GROUP BY json_extract(request_json, '$.repository')`); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (35, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}

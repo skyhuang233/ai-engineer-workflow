@@ -996,24 +996,11 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 }
 
 func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	if repository == "" || questionID == "" || answer == "" {
-		return ErrInvalidClaim
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
-		return err
-	}
-	return tx.Commit()
+	_, err := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, leaseToken, leaseNow)
+	return err
 }
 
-func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time) (DeliveryOutbox, error) {
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) (DeliveryOutbox, error) {
 	if repository == "" || questionID == "" || answer == "" {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
@@ -1022,15 +1009,6 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 	} else {
 		now = now.UTC()
 	}
-	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
-	if err != nil {
-		return DeliveryOutbox{}, err
-	}
-	outbox, answerErr := s.answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
-	return outbox, errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
-}
-
-func (s *Store) answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) (DeliveryOutbox, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DeliveryOutbox{}, err
@@ -1047,6 +1025,23 @@ func (s *Store) answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.
 		return DeliveryOutbox{}, err
 	}
 	return outbox, nil
+}
+
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time) (DeliveryOutbox, error) {
+	if repository == "" || questionID == "" || answer == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	outbox, answerErr := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
+	return outbox, errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) QueueWorkflowInboxProjection(ctx context.Context, repository string, now time.Time) (DeliveryOutbox, error) {

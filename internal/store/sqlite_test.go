@@ -319,6 +319,89 @@ func TestMigrationFromV33AddsBootstrapPlanProvenance(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV34BackfillsLegacyInboxProjectionRepositories(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	snapshot := testSnapshot()
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := store.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueWorkflowInboxProjection(ctx, snapshot.Repository, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 35"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE workflow_inbox_projections"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + ".migration.bak"); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var generation int64
+	var projectionVersion, planVersionIDs string
+	if err := migrated.db.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&generation, &projectionVersion, &planVersionIDs); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 1 || projectionVersion != "legacy-unfenced" || planVersionIDs != "[]" {
+		t.Fatalf("migrated Inbox projection = %d/%q/%s", generation, projectionVersion, planVersionIDs)
+	}
+	for _, ticket := range snapshot.Children {
+		if err := migrated.MarkTicketDelivered(ctx, version.ID, ticket.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	emptyVersion, err := workflowInboxProjectionVersion(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrated.db.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&generation, &projectionVersion, &planVersionIDs); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 2 || projectionVersion != emptyVersion || planVersionIDs != "null" {
+		t.Fatalf("completed Inbox projection = %d/%q/%s, want generation 2 empty projection", generation, projectionVersion, planVersionIDs)
+	}
+	var corrections int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_extract(request_json, '$.repository') = ?
+  AND json_extract(request_json, '$.inbox_projection_generation') = 2`, snapshot.Repository).Scan(&corrections); err != nil {
+		t.Fatal(err)
+	}
+	if corrections != 1 {
+		t.Fatalf("queued empty Inbox corrections = %d, want 1", corrections)
+	}
+}
+
 func TestMigrationBackupCanBeRestored(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

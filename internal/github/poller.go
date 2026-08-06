@@ -736,7 +736,7 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 			if !leased {
 				return wrapPollStoreError(store.ErrFencingConflict)
 			}
-			if err := p.Store.AnswerWorkflowQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
+			if _, err := p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return wrapPollStoreError(err)
 			}
 		}

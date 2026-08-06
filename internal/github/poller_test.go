@@ -1582,8 +1582,12 @@ func TestPermanentAdmissionFailureTerminalizesExhaustedRecovery(t *testing.T) {
 	if !ok {
 		t.Fatal("poll lease token missing")
 	}
-	if err := db.AnswerWorkflowQuestionLeased(leaseCtx, repository, recoveryQuestion.ID, "retry", now.Add(time.Second), leaseToken, now); err != nil {
+	outbox, err := db.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(leaseCtx, repository, recoveryQuestion.ID, "retry", now.Add(time.Second), leaseToken, now)
+	if err != nil {
 		t.Fatalf("answer projecting recovery question = %v", err)
+	}
+	if outbox.Request.InboxProjectionGeneration == 0 || len(outbox.Request.WorkflowQuestions) != 0 || len(outbox.Request.InboxPlanVersionIDs) != 0 {
+		t.Fatalf("answered recovery Inbox projection = %#v, want authoritative empty generation", outbox.Request)
 	}
 	cursor, err = db.GitHubPollCursor(ctx, repository)
 	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
