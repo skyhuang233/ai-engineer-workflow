@@ -36,6 +36,19 @@ func (p errorInboxProjector) ProjectWorkflowInbox(context.Context, string, []pla
 	return p.err
 }
 
+type failOnceInboxProjector struct {
+	calls int
+	err   error
+}
+
+func (p *failOnceInboxProjector) ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error {
+	p.calls++
+	if p.calls == 1 {
+		return p.err
+	}
+	return nil
+}
+
 type activePlanInboxProjector struct {
 	store *store.Store
 	now   time.Time
@@ -815,6 +828,65 @@ func TestActiveClaimedBootstrapRecoveryResumesWithoutRepeatingBootstrap(t *testi
 	}
 }
 
+func TestClaimedBootstrapRecoveryRetriesAfterDatabaseFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	broken, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "broken.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broken.Close()
+	var ignored int
+	databaseErr := broken.QueryRowContext(ctx, "SELECT value FROM missing_table").Scan(&ignored)
+	if databaseErr == nil {
+		t.Fatal("missing table query succeeded")
+	}
+	now := failedAt.Add(time.Minute)
+	poller := Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 1,
+		Now:         func() time.Time { return now },
+	}
+	_, err = poller.PollWithBootstrap(ctx, repository, func(context.Context) error {
+		return fmt.Errorf("read bootstrap state: %w", databaseErr)
+	}, nil)
+	if !errors.Is(err, databaseErr) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("bootstrap database failure = %v, want retryable database error", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
+		t.Fatalf("bootstrap database failure changed recovery = %#v", cursor)
+	}
+	_, err = poller.PollWithBootstrap(ctx, repository, func(ctx context.Context) error {
+		activatePollerPlan(t, ctx, db, repository)
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("resumed bootstrap recovery = %v", err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 || cursor.RecoveryState != store.GitHubPollRecoveryCompleted {
+		t.Fatalf("resumed recovery cursor = %#v", cursor)
+	}
+}
+
 func TestInboxConflictProvenanceReadFailureRemainsRetryable(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
@@ -1016,6 +1088,37 @@ func TestTerminalFailureProjectsRecoveryForActivePlanBelowRetryBudget(t *testing
 	}
 	if !found {
 		t.Fatalf("active terminal recovery questions = %#v", questions)
+	}
+}
+
+func TestNeedsAttentionPollRetriesRecoveryInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	projectionErr := errors.New("Gateway temporarily unavailable")
+	projector := &failOnceInboxProjector{err: projectionErr}
+	poller := Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		Now:            func() time.Time { return now },
+	}
+	_, err = poller.RecordTerminalFailure(ctx, repository, errors.New("GitHub polling exhausted"))
+	if !errors.Is(err, store.ErrNeedsAttention) || !errors.Is(err, projectionErr) {
+		t.Fatalf("terminal projection failure = %v", err)
+	}
+	_, err = poller.Poll(ctx, repository)
+	if !errors.Is(err, store.ErrNeedsAttention) || errors.Is(err, projectionErr) {
+		t.Fatalf("retried recovery projection = %v", err)
+	}
+	if projector.calls != 2 {
+		t.Fatalf("recovery projection calls = %d, want 2", projector.calls)
 	}
 }
 

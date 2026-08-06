@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const (
@@ -35,6 +35,11 @@ var (
 	ErrWorkerLaunched      = errors.New("worker run has already been launched")
 	ErrNeedsAttention      = errors.New("workflow needs attention")
 )
+
+func IsDatabaseError(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) || errors.Is(err, sql.ErrConnDone) || errors.Is(err, sql.ErrTxDone)
+}
 
 const (
 	SessionRunning = "running"
