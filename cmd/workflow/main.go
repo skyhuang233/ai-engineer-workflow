@@ -506,7 +506,6 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	gatewayControlURL := gatewayControlURL(*gatewayURL, *gatewayControlURLOverride)
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -553,7 +552,7 @@ func runPollGitHub(args []string) {
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		projector := delivery.HTTPProjector{URL: gatewayControlURL, ControlPlaneToken: *gatewayControlToken}
+		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		var client *github.Client
 		_, err := admitGatewayCredential(ctx, db, func(token string) error {
@@ -652,6 +651,10 @@ func gatewayControlURL(workerURL, controlURL string) string {
 		return controlURL
 	}
 	return strings.TrimSpace(workerURL)
+}
+
+func gatewayControlProjector(workerURL, controlURL, controlToken string) delivery.HTTPProjector {
+	return delivery.HTTPProjector{URL: gatewayControlURL(workerURL, controlURL), ControlPlaneToken: controlToken}
 }
 
 func nextPollDelay(db *store.Store, repository string, interval time.Duration, result github.PollResult, now time.Time) time.Duration {

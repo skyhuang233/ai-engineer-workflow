@@ -48,6 +48,31 @@ func TestGatewayControlURLUsesHostOverrideAndPreservesLegacyFallback(t *testing.
 	}
 }
 
+func TestGatewayControlProjectorSendsHostInboxProjectionToOverride(t *testing.T) {
+	const controlToken = "control-token"
+	requests := 0
+	controlGateway := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.URL.Path != "/v1/deliveries" {
+			t.Errorf("control projection path = %q, want /v1/deliveries", request.URL.Path)
+		}
+		if got := request.Header.Get("X-Workflow-Control-Token"); got != controlToken {
+			t.Errorf("control projection token = %q, want %q", got, controlToken)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer controlGateway.Close()
+
+	projector := gatewayControlProjector("http://host.docker.internal:8787", controlGateway.URL, controlToken)
+	if err := projector.ProjectWorkflowInbox(context.Background(), "owner/repo", nil); err != nil {
+		t.Fatalf("project host inbox through control Gateway: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("control Gateway inbox requests = %d, want 1", requests)
+	}
+	t.Logf("Inbox projection reached the host control Gateway at %s while Worker routing remains %s", controlGateway.URL, "http://host.docker.internal:8787")
+}
+
 func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
 	err := gatewayCredentialVerificationError(store.ErrNotFound)
 	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
