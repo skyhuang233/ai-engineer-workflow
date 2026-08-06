@@ -236,6 +236,49 @@ func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV32AddsGitHubPollLeaseColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 33"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	for _, column := range []string{"lease_token", "lease_expires_at"} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN "+column); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for _, column := range []string{"lease_token", "lease_expires_at"} {
+		if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", column) {
+			t.Fatalf("migration did not add github_poll_cursors.%s", column)
+		}
+	}
+}
+
 func TestMigrationBackupCanBeRestored(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

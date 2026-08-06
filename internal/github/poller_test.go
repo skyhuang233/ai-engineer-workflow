@@ -229,6 +229,7 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	}
 	defer db.Close()
 	repository := "owner/repo"
+	beginProjectingPollerPlan(t, ctx, db, repository)
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	now := failedAt.Add(time.Minute)
 	controlToken := "control-token"
@@ -559,7 +560,7 @@ func TestPollConsumesRecoveryAfterActivePlanReadFailure(t *testing.T) {
 	}
 }
 
-func TestPollConsumesRecoveryAfterCursorReadFailure(t *testing.T) {
+func TestPollCursorReadFailureDoesNotTerminalizeRecovery(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	db, err := store.Open(ctx, dbPath)
@@ -593,8 +594,8 @@ func TestPollConsumesRecoveryAfterCursorReadFailure(t *testing.T) {
 		bootstrapRuns++
 		return nil
 	}, nil)
-	if !errors.Is(err, store.ErrNeedsAttention) {
-		t.Fatalf("cursor read failure = %v, want needs attention", err)
+	if err == nil || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("cursor read failure = %v, want retryable non-terminal error", err)
 	}
 	if bootstrapRuns != 0 {
 		t.Fatalf("bootstrap runs = %d, want 0", bootstrapRuns)
@@ -609,8 +610,8 @@ func TestPollConsumesRecoveryAfterCursorReadFailure(t *testing.T) {
 	if err := raw.QueryRowContext(ctx, "SELECT failure_kind, recovery_state FROM github_poll_cursors WHERE repository = ?", repository).Scan(&kind, &recovery); err != nil {
 		t.Fatal(err)
 	}
-	if kind != store.GitHubPollFailureUnrecoverable || recovery != store.GitHubPollRecoveryConsumed {
-		t.Fatalf("cursor provenance = %q/%q, want unrecoverable/consumed", kind, recovery)
+	if kind != store.GitHubPollFailurePreActivationInboxConflict || recovery != store.GitHubPollRecoveryAvailable {
+		t.Fatalf("cursor provenance = %q/%q, want preserved pre-activation/available", kind, recovery)
 	}
 }
 
@@ -911,7 +912,84 @@ func TestTerminalFailureProjectsRecoveryForActivePlanBelowRetryBudget(t *testing
 	}
 }
 
-func activatePollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) {
+func activatePollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) string {
+	t.Helper()
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.MarkActive(ctx, versionID); err != nil {
+		t.Fatal(err)
+	}
+	return versionID
+}
+
+func TestCompletedOrAbsentPlanInboxConflictIsNotBootstrapEligible(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cause := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
+	kind, err := (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/repo", cause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != "" {
+		t.Fatalf("absent-plan failure kind = %q, want retryable", kind)
+	}
+	completedVersion := activatePollerPlan(t, ctx, db, "owner/completed")
+	if err := db.MarkTicketDelivered(ctx, completedVersion, 2); err != nil {
+		t.Fatal(err)
+	}
+	kind, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/completed", cause)
+	if err != nil || kind != "" {
+		t.Fatalf("completed-plan failure kind = %q, %v; want retryable", kind, err)
+	}
+	beginProjectingPollerPlan(t, ctx, db, "owner/projecting")
+	kind, err = (Poller{Store: db}).inboxProjectionFailureKind(ctx, "owner/projecting", cause)
+	if err != nil || kind != store.GitHubPollFailurePreActivationInboxConflict {
+		t.Fatalf("projecting-plan failure kind = %q, %v", kind, err)
+	}
+}
+
+func TestMidPollCredentialFailurePausesGatewayWithoutTerminalizingPlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now.Add(-time.Minute), store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	credentialErr := &APIError{StatusCode: http.StatusUnauthorized, Message: "bad credentials"}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: errorInboxProjector{err: credentialErr},
+		MaxFailures:    5,
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if !errors.Is(err, credentialErr) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("credential poll error = %v", err)
+	}
+	paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || !paused {
+		t.Fatalf("Gateway pause = %v, %v", paused, pauseErr)
+	}
+	active, activeErr := db.HasActiveDeliveryPlan(ctx, repository)
+	if activeErr != nil || !active {
+		t.Fatalf("active plan after credential failure = %v, %v", active, activeErr)
+	}
+	cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
+	if cursorErr != nil || cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+		t.Fatalf("credential cursor = %#v, %v", cursor, cursorErr)
+	}
+}
+
+func beginProjectingPollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) string {
 	t.Helper()
 	snapshot := plan.Snapshot{
 		Repository: repository,
@@ -926,9 +1004,7 @@ func activatePollerPlan(t *testing.T, ctx context.Context, db *store.Store, repo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkActive(ctx, version.ID); err != nil {
-		t.Fatal(err)
-	}
+	return version.ID
 }
 
 func TestRecordFailurePersistsAfterParentCancellation(t *testing.T) {

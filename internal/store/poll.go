@@ -171,6 +171,95 @@ WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).
 	return true, nil
 }
 
+func (s *Store) HasProjectingDeliveryPlan(ctx context.Context, repository string) (bool, error) {
+	var projecting int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND p.current_version_id = v.version_id AND p.state = ? AND v.state = ?
+AND NOT EXISTS (SELECT 1 FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id)
+AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id)
+LIMIT 1`, repository, StateProjecting, StateProjecting).Scan(&projecting)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// AcquireGitHubPollLease atomically combines readiness admission with exclusive
+// ownership. The lease is persisted so concurrent control-plane processes cannot
+// both pass NextAttemptAt and begin GitHub access for the same repository.
+func (s *Store) AcquireGitHubPollLease(ctx context.Context, repository, token string, now time.Time, ttl time.Duration) error {
+	if repository == "" || token == "" || ttl <= 0 {
+		return ErrInvalidClaim
+	}
+	now = now.UTC()
+	timestamp := formatTimestamp(now)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, next_attempt_at, updated_at)
+VALUES (?, ?, ?) ON CONFLICT(repository) DO NOTHING`, repository, timestamp, timestamp); err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET lease_token = ?, lease_expires_at = ?, updated_at = ?
+WHERE repository = ? AND next_attempt_at <= ? AND (lease_token = '' OR lease_expires_at <= ?)`,
+		token, formatTimestamp(now.Add(ttl)), timestamp, repository, timestamp, timestamp)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return ErrNotReady
+	}
+	return nil
+}
+
+func (s *Store) RenewGitHubPollLease(ctx context.Context, repository, token string, now time.Time, ttl time.Duration) error {
+	if repository == "" || token == "" || ttl <= 0 {
+		return ErrFencingConflict
+	}
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET lease_expires_at = ?, updated_at = ?
+WHERE repository = ? AND lease_token = ? AND lease_expires_at > ?`,
+		formatTimestamp(now.Add(ttl)), formatTimestamp(now), repository, token, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return ErrFencingConflict
+	}
+	return nil
+}
+
+func (s *Store) ReleaseGitHubPollLease(ctx context.Context, repository, token string, now time.Time) error {
+	if repository == "" || token == "" {
+		return ErrFencingConflict
+	}
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET lease_token = '', lease_expires_at = '', updated_at = ?
+WHERE repository = ? AND lease_token = ?`, formatTimestamp(now), repository, token)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return ErrFencingConflict
+	}
+	return nil
+}
+
 func (s *Store) ClaimGitHubPollBootstrapRecovery(ctx context.Context, repository string, minimumFailures int, now time.Time) (bool, error) {
 	if minimumFailures < 1 {
 		return false, ErrInvalidClaim

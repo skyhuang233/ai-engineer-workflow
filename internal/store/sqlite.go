@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 32
+	latestSchemaVersion = 33
 )
 
 var (
@@ -844,6 +844,29 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 			return fmt.Errorf("migration 32: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (32, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 33 {
+		columns := []struct {
+			name       string
+			definition string
+		}{
+			{name: "lease_token", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "lease_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 33: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE github_poll_cursors ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 33: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (33, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

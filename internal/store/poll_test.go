@@ -47,6 +47,38 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	}
 }
 
+func TestGitHubPollLeaseAtomicallyFencesRepositoryReadiness(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "first", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "second", now, time.Minute); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("concurrent lease error = %v, want not ready", err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "second", now); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("foreign release error = %v, want fencing conflict", err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "first", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeferGitHubPoll(ctx, repository, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "third", now, time.Minute); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("backoff lease error = %v, want not ready", err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "third", now.Add(time.Minute), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

@@ -549,13 +549,24 @@ func runPollGitHub(args []string) {
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
-	poll := func() error {
+	poll := func() (resultErr error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+		leasedCtx, releasePollLease, err := poller.AcquireLease(ctx, *repository)
+		if err != nil {
+			if errors.Is(err, store.ErrNotReady) {
+				return nil
+			}
+			return err
+		}
+		ctx = leasedCtx
+		defer func() {
+			resultErr = errors.Join(resultErr, releasePollLease())
+		}()
 		var client *github.Client
-		_, err := admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
+		_, err = admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})

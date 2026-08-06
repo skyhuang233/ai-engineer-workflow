@@ -219,6 +219,34 @@ func TestGatewayRejectsClaimedInboxWhenCurrentPlanCompletes(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	outbox, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "old-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, outbox.IdempotencyKey, "old-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: "new-dispatcher", Now: func() time.Time { return now.Add(time.Hour) }}
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("inactive uncertain replay error = %v, want no active delivery plan", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("inactive uncertain replay reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
 type deadlineRemote struct {
 	deadlineSeen bool
 }

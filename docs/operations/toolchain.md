@@ -69,7 +69,10 @@ updates, CI, and the review-driven revision cycle. `run-ticket` never
 dispatches GitHub mutations itself; it requires the credential-isolated Gateway
 URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
-applies retry backoff, and runs the approved Plan Root control pass before
+applies retry backoff, and acquires a fenced per-repository SQLite poll lease
+before loading the Gateway Credential or making GitHub requests. Concurrent
+pollers therefore cannot both pass the same `NextAttemptAt` boundary. It runs
+the approved Plan Root control pass before
 projecting the repository Workflow Inbox, so an eligible Delivery Plan is
 active before the Gateway admits that projection. It then reconciles every
 active ticket pull request and deduplicates newly observed reviews and comments

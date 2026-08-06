@@ -58,6 +58,7 @@ type gatewayStore interface {
 	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
 	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
+	HasActiveDeliveryPlan(context.Context, string) (bool, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
 	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
@@ -155,6 +156,21 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				return g.pauseForCredential(outbox, err)
 			}
 			return g.retry(outbox, err)
+		}
+	}
+	if outbox.Request.Operation == store.DeliveryProjectInbox {
+		active, activeErr := g.Store.HasActiveDeliveryPlan(operationCtx, outbox.Request.Repository)
+		if activeErr != nil {
+			if leaseErr := stopDispatcher(); leaseErr != nil {
+				return errors.Join(activeErr, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
+			}
+			return errors.Join(activeErr, g.requeueClaim(outbox, activeErr, outbox.ReconcileOnly))
+		}
+		if !active {
+			if leaseErr := stopDispatcher(); leaseErr != nil {
+				return errors.Join(store.ErrNoActiveDeliveryPlan, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
+			}
+			return g.reject(outbox, store.ErrNoActiveDeliveryPlan)
 		}
 	}
 	if outbox.ReconcileOnly {
