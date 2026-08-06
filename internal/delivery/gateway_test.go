@@ -174,6 +174,23 @@ func TestGatewayStoreFailureHasStructuredHTTPClassification(t *testing.T) {
 	}
 }
 
+func TestGatewayWritesPausedHasStructuredHTTPClassification(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.PauseGatewayWrites(ctx, "rotate credential", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err := (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusServiceUnavailable || httpErr.Code != delivery.ErrorCodeGatewayWritesPaused || !httpErr.AuthenticationFailure() {
+		t.Fatalf("paused Gateway HTTP error = %#v, %v", httpErr, err)
+	}
+}
+
 func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)
@@ -321,7 +338,7 @@ func TestRejectedInactiveInboxKeyDoesNotPoisonReplacementPlan(t *testing.T) {
 	}
 }
 
-func TestGatewayRejectsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T) {
+func TestGatewayClearsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
@@ -341,11 +358,59 @@ func TestGatewayRejectsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T
 	}
 	remote := &fakeRemote{}
 	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: "new-dispatcher", Now: func() time.Time { return now.Add(time.Hour) }}
-	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
-		t.Fatalf("inactive uncertain replay error = %v, want no active delivery plan", err)
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); err != nil {
+		t.Fatalf("inactive uncertain replay error = %v", err)
 	}
-	if remote.observeCalls != 0 || remote.applyCalls != 0 {
-		t.Fatalf("inactive uncertain replay reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	if remote.observeCalls != 1 || remote.applyCalls != 1 || len(remote.requests) != 1 || len(remote.requests[0].WorkflowQuestions) != 0 {
+		t.Fatalf("inactive uncertain replay correction: observe=%d apply=%d requests=%#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayCorrectsInboxWhenPlanCompletesDuringApply(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	peer, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	advanced := false
+	remote := &advancingRemote{fakeRemote: fakeRemote{}, advance: func() {
+		if !advanced {
+			advanced = true
+			if err := peer.MarkTicketDelivered(ctx, version.ID, 2); err != nil {
+				t.Error(err)
+			}
+		}
+	}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 2 || len(remote.requests) < 2 || len(remote.requests[len(remote.requests)-1].WorkflowQuestions) != 0 {
+		t.Fatalf("corrective Inbox delivery = applies %d requests %#v", remote.applyCalls, remote.requests)
 	}
 }
 

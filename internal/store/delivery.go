@@ -875,7 +875,7 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 				return DeliveryTarget{}, request, err
 			}
 		}
-		activeVersionIDs, err := activeDeliveryPlanVersions(ctx, tx, request.Repository)
+		activeVersionIDs, err := workflowInboxDeliveryPlanVersions(ctx, tx, request.Repository)
 		if err != nil {
 			return DeliveryTarget{}, request, err
 		}
@@ -895,19 +895,11 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		} else {
 			request.InboxPlanVersionID = ""
 		}
-		questions, err := openWorkflowQuestions(ctx, tx, request.Repository, 0, true)
+		questions, err := workflowInboxQuestions(ctx, tx, request.Repository)
 		if err != nil {
 			return DeliveryTarget{}, request, err
 		}
-		request.WorkflowQuestions = make([]plan.WorkflowQuestion, 0, len(questions))
-		for _, question := range questions {
-			request.WorkflowQuestions = append(request.WorkflowQuestions, plan.WorkflowQuestion{
-				ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
-				PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
-				PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind,
-				Diagnostics: question.Diagnostics, Evidence: question.Evidence,
-			})
-		}
+		request.WorkflowQuestions = WorkflowQuestionProjections(questions)
 		request.InboxProjectionVersion, err = workflowInboxProjectionVersion(questions)
 		if err != nil {
 			return DeliveryTarget{}, request, err

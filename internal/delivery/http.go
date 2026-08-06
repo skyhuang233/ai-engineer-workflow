@@ -22,6 +22,7 @@ const errorCodeHeader = "X-Workflow-Error-Code"
 const (
 	ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
 	ErrorCodeRetryableStore       = "retryable_store"
+	ErrorCodeGatewayWritesPaused  = "gateway_writes_paused"
 )
 
 type HTTPError struct {
@@ -36,6 +37,10 @@ func (e *HTTPError) Error() string {
 
 func (e *HTTPError) PollStoreFailure() bool {
 	return e.Code == ErrorCodeRetryableStore
+}
+
+func (e *HTTPError) AuthenticationFailure() bool {
+	return e.Code == ErrorCodeGatewayWritesPaused
 }
 
 type HTTPOptions struct {
@@ -135,7 +140,10 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 			if errors.Is(err, store.ErrDeliveryRejected) || errors.Is(err, store.ErrInvalidClaim) || errors.Is(err, store.ErrFencingConflict) {
 				status = http.StatusConflict
 			}
-			if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+			if errors.Is(err, ErrGatewayWritesPaused) {
+				status = http.StatusServiceUnavailable
+				writer.Header().Set(errorCodeHeader, ErrorCodeGatewayWritesPaused)
+			} else if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
 				writer.Header().Set(errorCodeHeader, ErrorCodeNoActiveDeliveryPlan)
 			} else if errors.Is(err, ErrGatewayStore) || store.IsDatabaseError(err) {
 				writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)

@@ -1403,7 +1403,7 @@ func TestMultipleActivePlanCompletionRaceDoesNotConsumePollFailureBudget(t *test
 	}
 }
 
-func TestGatewayStoreProjectionFailureDoesNotConsumePollFailureBudget(t *testing.T) {
+func TestGatewayStoreProjectionFailurePersistsBoundedBackoff(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -1424,7 +1424,7 @@ func TestGatewayStoreProjectionFailureDoesNotConsumePollFailureBudget(t *testing
 		t.Fatalf("Gateway store poll error = %v", err)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
-	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+	if err != nil || cursor.ConsecutiveFailures != 1 || cursor.NeedsAttention() || !cursor.NextAttemptAt.After(now) {
 		t.Fatalf("Gateway store cursor = %#v, %v", cursor, err)
 	}
 }
@@ -1560,6 +1560,52 @@ func TestPermanentAdmissionFailureTerminalizesExhaustedRecovery(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("projecting recovery Plan has no poll failure question: %#v", questions)
+	}
+	projected, _, versionIDs, err := db.WorkflowInboxProjection(ctx, repository)
+	if err != nil || len(versionIDs) != 1 || versionIDs[0] != versionID || len(projected) == 0 {
+		t.Fatalf("projecting recovery Inbox = versions %v, questions %#v, %v", versionIDs, projected, err)
+	}
+	var recoveryQuestion store.WorkflowQuestion
+	for _, question := range questions {
+		if question.VersionID == versionID && question.Kind == "poll_failure" {
+			recoveryQuestion = question
+		}
+	}
+	leaseToken, ok := poller.pollLeaseToken(leaseCtx, repository)
+	if !ok {
+		t.Fatal("poll lease token missing")
+	}
+	if err := db.AnswerWorkflowQuestionLeased(leaseCtx, repository, recoveryQuestion.ID, "retry", now.Add(time.Second), leaseToken, now); err != nil {
+		t.Fatalf("answer projecting recovery question = %v", err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("answered recovery cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestPausedGatewayHTTPFailurePausesPollRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	paused := &delivery.HTTPError{StatusCode: http.StatusServiceUnavailable, Code: delivery.ErrorCodeGatewayWritesPaused, Message: "writes paused"}
+	_, err = (Poller{
+		Store: db, Client: NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: errorInboxProjector{err: paused}, Now: func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if !errors.Is(err, paused) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("paused Gateway poll = %v", err)
+	}
+	writesPaused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
+	if pauseErr != nil || !writesPaused || cursorErr != nil || cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
+		t.Fatalf("paused Gateway state = paused %t/%v cursor %#v/%v", writesPaused, pauseErr, cursor, cursorErr)
 	}
 }
 
