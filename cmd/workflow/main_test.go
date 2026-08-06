@@ -208,7 +208,7 @@ func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *test
 	}
 }
 
-func TestCredentialAdmissionTerminallyConsumesBootstrapRecovery(t *testing.T) {
+func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		err  error
@@ -224,22 +224,52 @@ func TestCredentialAdmissionTerminallyConsumesBootstrapRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			repository := "owner/repo"
-			now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+			now := time.Now().UTC()
+			snapshot := plan.Snapshot{
+				Repository: repository,
+				Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+				Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}},
+			}
+			fingerprint, err := snapshot.Fingerprint()
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.MarkActive(ctx, version.ID); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
 			if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
 				db.Close()
 				t.Fatal(err)
 			}
 			admissionErr := persistGatewayCredentialAdmissionError(ctx, db, test.err, now.Add(time.Second))
 			err = recordPollAdmissionFailure(ctx, github.Poller{Store: db, MaxFailures: 5, Now: func() time.Time { return now.Add(time.Second) }}, repository, admissionErr)
-			if !errors.Is(err, store.ErrNeedsAttention) {
+			if !errors.Is(err, test.err) && !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 				db.Close()
-				t.Fatalf("credential terminal failure = %v, want needs attention", err)
+				t.Fatalf("credential admission failure = %v", err)
 			}
 			paused, _, pauseErr := db.GatewayWritesPaused(ctx)
 			cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
-			if pauseErr != nil || !paused || cursorErr != nil || !cursor.NeedsAttention() {
+			current, claimErr := db.CurrentClaim(ctx, version.ID, claim.TicketID)
+			if pauseErr != nil || !paused || cursorErr != nil || cursor.NeedsAttention() || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed || claimErr != nil || current.RunID != claim.RunID {
 				db.Close()
-				t.Fatalf("credential state paused=%t cursor=%#v errors=%v/%v", paused, cursor, pauseErr, cursorErr)
+				t.Fatalf("credential state paused=%t cursor=%#v claim=%#v errors=%v/%v/%v", paused, cursor, current, pauseErr, cursorErr, claimErr)
+			}
+			questions, questionErr := db.OpenWorkflowQuestions(ctx, repository, 0)
+			if questionErr != nil || len(questions) != 1 || questions[0].Kind != "gateway_credential" {
+				db.Close()
+				t.Fatalf("credential questions = %#v, %v", questions, questionErr)
 			}
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
@@ -250,10 +280,36 @@ func TestCredentialAdmissionTerminallyConsumesBootstrapRecovery(t *testing.T) {
 			}
 			defer restarted.Close()
 			cursor, err = restarted.GitHubPollCursor(ctx, repository)
-			if err != nil || !cursor.NeedsAttention() {
+			if err != nil || cursor.NeedsAttention() || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
 				t.Fatalf("restarted credential cursor = %#v, %v", cursor, err)
 			}
 		})
+	}
+}
+
+func TestPollAdmissionHonorsNextAttemptBeforeCredentialAccess(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.DeferGitHubPoll(ctx, repository, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	authenticated := false
+	_, err = admitPollGitHubCredential(ctx, github.Poller{Store: db, Now: func() time.Time { return now }}, db, repository, func(string) error {
+		authenticated = true
+		return nil
+	})
+	if !errors.Is(err, store.ErrNotReady) || authenticated {
+		t.Fatalf("deferred admission error=%v authenticated=%t", err, authenticated)
+	}
+	paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || paused {
+		t.Fatalf("deferred admission paused=%t error=%v", paused, pauseErr)
 	}
 }
 

@@ -109,6 +109,7 @@ type GitHubPollRecoveryState string
 
 const (
 	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind   = "pre_activation_inbox_conflict"
+	GitHubPollFailureRetryable                  GitHubPollFailureKind   = "retryable"
 	GitHubPollFailureUnrecoverable              GitHubPollFailureKind   = "unrecoverable"
 	GitHubPollRecoveryAvailable                 GitHubPollRecoveryState = "available"
 	GitHubPollRecoveryClaimed                   GitHubPollRecoveryState = "claimed"
@@ -211,6 +212,18 @@ WHERE repository = ? AND failure_kind = ? AND recovery_state = ?`, GitHubPollRec
 	return updated == 1, nil
 }
 
+func (s *Store) ConsumeGitHubPollBootstrapEligibility(ctx context.Context, repository string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET failure_kind = ?, recovery_state = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?)`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed)
+	return err
+}
+
 func (s *Store) MarkGitHubPollFailureUnrecoverable(ctx context.Context, repository string, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -258,13 +271,13 @@ func (s *Store) DeferGitHubPollWithCursor(ctx context.Context, repository string
 		now = now.UTC()
 	}
 	return scanGitHubPollCursor(s.db.QueryRowContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, next_attempt_at, updated_at)
-VALUES (?, 0, '', '', ?, ?)
+VALUES (?, 0, ?, ?, ?, ?)
 ON CONFLICT(repository) DO UPDATE SET
 failure_kind = CASE WHEN github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.failure_kind END,
 recovery_state = CASE WHEN github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.recovery_state END,
 next_attempt_at = CASE WHEN github_poll_cursors.next_attempt_at > excluded.next_attempt_at THEN github_poll_cursors.next_attempt_at ELSE excluded.next_attempt_at END,
 updated_at = excluded.updated_at
-RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, next_attempt_at`, repository, formatTimestamp(retryAt), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollFailureUnrecoverable, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollRecoveryConsumed))
+RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, next_attempt_at`, repository, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(retryAt), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollFailureRetryable, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollRecoveryConsumed))
 }
 
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
@@ -853,10 +866,12 @@ func (s *Store) AdvanceGitHubPollFailure(ctx context.Context, repository string,
 	previousFailures := failures
 	failures++
 	recovery := GitHubPollRecoveryConsumed
-	if kind == GitHubPollFailurePreActivationInboxConflict && (previousFailures == 0 || existingKind == GitHubPollFailurePreActivationInboxConflict && existingRecovery == GitHubPollRecoveryAvailable) {
+	if existingKind == GitHubPollFailureUnrecoverable && existingRecovery == GitHubPollRecoveryConsumed {
+		kind = GitHubPollFailureUnrecoverable
+	} else if kind == GitHubPollFailurePreActivationInboxConflict && (previousFailures == 0 || existingKind == GitHubPollFailurePreActivationInboxConflict && existingRecovery == GitHubPollRecoveryAvailable) {
 		recovery = GitHubPollRecoveryAvailable
 	} else {
-		kind = GitHubPollFailureUnrecoverable
+		kind = GitHubPollFailureRetryable
 	}
 	delay := time.Second << min(failures-1, 6)
 	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, next_attempt_at, updated_at)

@@ -555,11 +555,14 @@ func runPollGitHub(args []string) {
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		var client *github.Client
-		_, err := admitGatewayCredential(ctx, db, func(token string) error {
+		_, err := admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
 		if err != nil {
+			if errors.Is(err, store.ErrNotReady) {
+				return nil
+			}
 			err = recordPollAdmissionFailure(ctx, poller, *repository, err)
 			fmt.Fprintln(os.Stderr, err)
 			return err
@@ -842,11 +845,17 @@ func shouldPauseGatewayForCredential(err error) bool {
 
 func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
 	if shouldPauseGatewayForCredential(admissionErr) {
-		_, err := poller.RecordTerminalFailure(ctx, repository, admissionErr)
-		return err
+		return errors.Join(admissionErr, poller.ConsumeBootstrapEligibility(ctx, repository))
 	}
 	_, err := poller.RecordFailure(ctx, repository, admissionErr)
 	return err
+}
+
+func admitPollGitHubCredential(ctx context.Context, poller github.Poller, database *store.Store, repository string, authenticate func(string) error) (string, error) {
+	if err := poller.Ready(ctx, repository); err != nil {
+		return "", err
+	}
+	return admitGatewayCredential(ctx, database, authenticate)
 }
 
 func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {

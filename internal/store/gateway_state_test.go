@@ -237,9 +237,19 @@ func TestWorkflowInboxProjectionRequiresActiveDeliveryPlan(t *testing.T) {
 	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/admitted"}, time.Now().UTC()); err != nil {
 		t.Fatalf("active-plan inbox projection error = %v", err)
 	}
+	var completedVersionID string
+	if err := db.db.QueryRowContext(ctx, "SELECT current_version_id FROM plans WHERE repository = ?", "owner/admitted").Scan(&completedVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?)", completedVersionID, formatTimestamp(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: "owner/admitted"}, time.Now().UTC()); !errors.Is(err, ErrNoActiveDeliveryPlan) {
+		t.Fatalf("completed-plan inbox projection error = %v, want no active delivery plan", err)
+	}
 }
 
-func TestAdmittedWorkflowInboxReplayUsesPersistedClaimFence(t *testing.T) {
+func TestAdmittedWorkflowInboxReplayRequiresCurrentActivePlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -278,11 +288,11 @@ func TestAdmittedWorkflowInboxReplayUsesPersistedClaimFence(t *testing.T) {
 	if _, err := db.ExecuteDelivery(ctx, claim.Request, "wrong-claim", func() time.Time { return now }, apply); !errors.Is(err, ErrFencingConflict) {
 		t.Fatalf("unfenced admitted replay error = %v, want fencing conflict", err)
 	}
-	if _, err := db.ExecuteDelivery(ctx, claim.Request, claim.ClaimToken, func() time.Time { return now }, apply); err != nil {
-		t.Fatalf("fenced admitted replay = %v", err)
+	if _, err := db.ExecuteDelivery(ctx, claim.Request, claim.ClaimToken, func() time.Time { return now }, apply); !errors.Is(err, ErrNoActiveDeliveryPlan) {
+		t.Fatalf("inactive admitted replay error = %v, want no active delivery plan", err)
 	}
-	if applyCalls != 1 {
-		t.Fatalf("admitted replay apply calls = %d, want 1", applyCalls)
+	if applyCalls != 0 {
+		t.Fatalf("inactive admitted replay apply calls = %d, want 0", applyCalls)
 	}
 }
 

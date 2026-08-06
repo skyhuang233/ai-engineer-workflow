@@ -197,6 +197,28 @@ func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsClaimedInboxWhenCurrentPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	outbox, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("completed-plan dispatch error = %v, want no active delivery plan", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("inactive Inbox reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
 type deadlineRemote struct {
 	deadlineSeen bool
 }

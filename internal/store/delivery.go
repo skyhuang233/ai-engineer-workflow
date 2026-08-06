@@ -854,7 +854,6 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
-		persistedAdmission := false
 		if admittedClaimToken != "" {
 			key, keyErr := deliveryKey(request)
 			if keyErr != nil {
@@ -872,14 +871,10 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 			if err != nil {
 				return DeliveryTarget{}, request, err
 			}
-			persistedAdmission = true
 		}
 		var admitted int
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentWorkflowInboxPlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
-		if errors.Is(err, sql.ErrNoRows) && persistedAdmission {
-			err = nil
-		}
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&admitted)
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}

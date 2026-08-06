@@ -62,6 +62,28 @@ func (p Poller) RecordTerminalFailure(ctx context.Context, repository string, ca
 	return PollResult{}, p.terminalFailure(ctx, repository, p.now(), cause)
 }
 
+func (p Poller) Ready(ctx context.Context, repository string) error {
+	if p.Store == nil {
+		return fmt.Errorf("GitHub poller store is unavailable")
+	}
+	if err := ValidateRepository(repository); err != nil {
+		return err
+	}
+	return p.readyAt(ctx, repository, p.now())
+}
+
+func (p Poller) ConsumeBootstrapEligibility(ctx context.Context, repository string) error {
+	if p.Store == nil {
+		return fmt.Errorf("GitHub poller store is unavailable")
+	}
+	if err := ValidateRepository(repository); err != nil {
+		return err
+	}
+	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, p.now())
+}
+
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
 	var control BootstrapControlPass
 	if before != nil {
@@ -80,12 +102,14 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 		return PollResult{}, err
 	}
 	now := p.now()
-	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
-	if err == nil {
-		if cursor.NextAttemptAt.After(now) && !cursor.NeedsAttention() {
-			return PollResult{}, store.ErrNotReady
+	if err := p.readyAt(ctx, repository, now); err != nil {
+		if errors.Is(err, store.ErrNotReady) {
+			return PollResult{}, err
 		}
-	} else if !errors.Is(err, store.ErrNotFound) {
+		return PollResult{}, p.terminalFailure(ctx, repository, now, err)
+	}
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, p.terminalFailure(ctx, repository, now, err)
 	}
 	if err := p.routeInboxAnswers(ctx, repository); err != nil {
@@ -161,6 +185,20 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 	return result, nil
 }
 
+func (p Poller) readyAt(ctx context.Context, repository string, now time.Time) error {
+	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if cursor.NextAttemptAt.After(now) {
+		return store.ErrNotReady
+	}
+	return nil
+}
+
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
 	return p.recordFailureWithKind(ctx, repository, now, "", cause)
 }
@@ -184,12 +222,27 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 		return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, recordErr)
 	}
 	if updated.ConsecutiveFailures >= p.maxFailures() {
+		if updated.FailureKind == store.GitHubPollFailurePreActivationInboxConflict && updated.RecoveryState == store.GitHubPollRecoveryAvailable {
+			active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
+			if activeErr != nil {
+				return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, activeErr)
+			}
+			if !active {
+				return PollResult{}, errors.Join(cause, store.ErrNeedsAttention)
+			}
+			if consumeErr := p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, now); consumeErr != nil {
+				return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, consumeErr)
+			}
+		}
 		return PollResult{}, p.finishExhaustedFailure(persistenceCtx, repository, now, cause)
 	}
 	return PollResult{}, cause
 }
 
 func (p Poller) finishExhaustedFailure(ctx context.Context, repository string, now time.Time, cause error) error {
+	if terminalErr := p.Store.MarkGitHubPollFailureUnrecoverable(ctx, repository, now); terminalErr != nil {
+		return p.terminalFailure(ctx, repository, now, cause, terminalErr)
+	}
 	if attentionErr := p.Store.MarkRepositoryNeedsAttention(ctx, repository, now); attentionErr != nil {
 		return p.terminalFailure(ctx, repository, now, cause, attentionErr)
 	}

@@ -334,6 +334,44 @@ func TestRecordFailureProjectsNeedsAttentionInboxForActivePlan(t *testing.T) {
 	}
 }
 
+func TestTransientFailureIsRetryableUntilBudgetExhaustion(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	cause := errors.New("GitHub temporarily unavailable")
+	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
+	if _, err := poller.RecordFailure(ctx, repository, cause); !errors.Is(err, cause) || errors.Is(err, store.ErrNeedsAttention) {
+		db.Close()
+		t.Fatalf("first transient failure = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.NeedsAttention() || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed || cursor.ConsecutiveFailures != 1 {
+		db.Close()
+		t.Fatalf("retryable cursor = %#v, %v", cursor, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	poller = Poller{Store: restarted, MaxFailures: 2, Now: func() time.Time { return now.Add(time.Minute) }}
+	if _, err := poller.RecordFailure(ctx, repository, cause); !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("exhausted transient failure = %v, want needs attention", err)
+	}
+	cursor, err = restarted.GitHubPollCursor(ctx, repository)
+	if err != nil || !cursor.NeedsAttention() || cursor.ConsecutiveFailures != 2 {
+		t.Fatalf("exhausted cursor = %#v, %v", cursor, err)
+	}
+}
+
 func TestRecordFailureInvalidatesBootstrapProvenanceAfterSecondaryInboxError(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -622,8 +660,8 @@ func TestClaimedBootstrapRecoverySurvivesRestartWithoutRepeatingBootstrap(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
-		t.Fatalf("recovery state = %q, want claimed", cursor.RecoveryState)
+	if !cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+		t.Fatalf("recovery state = %q/%q, want terminal consumed", cursor.FailureKind, cursor.RecoveryState)
 	}
 }
 
@@ -932,7 +970,7 @@ func TestRecordFailureDefersRateLimitedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cursor.NextAttemptAt.Equal(retryAt) || cursor.ConsecutiveFailures != 0 {
+	if !cursor.NextAttemptAt.Equal(retryAt) || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
 		t.Fatalf("cursor = %#v", cursor)
 	}
 }
@@ -981,5 +1019,33 @@ func TestPollSkipsInboxWhileRateLimited(t *testing.T) {
 	}
 	if projector.calls != 0 {
 		t.Fatalf("inbox projector calls = %d, want 0", projector.calls)
+	}
+}
+
+func TestPollHonorsNextAttemptForNeedsAttentionCursor(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.DeferGitHubPoll(ctx, repository, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverable(ctx, repository, now); err != nil {
+		t.Fatal(err)
+	}
+	projector := &countingInboxProjector{}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		Now:            func() time.Time { return now },
+	}).Poll(ctx, repository)
+	if !errors.Is(err, store.ErrNotReady) || projector.calls != 0 {
+		t.Fatalf("paused deferred poll error=%v projections=%d", err, projector.calls)
 	}
 }
