@@ -128,6 +128,7 @@ $logRoot = Join-Path $runtimeRoot 'logs'
 $configPath = Join-Path $projectRoot 'config\toolchain.json'
 $gatewayPort = 8787
 $gatewayUrl = "http://host.docker.internal:$gatewayPort"
+$gatewayControlUrl = "http://127.0.0.1:$gatewayPort"
 $gatewayListen = "0.0.0.0:$gatewayPort"
 $rootNumber = 2
 
@@ -214,6 +215,7 @@ try {
       '--workspace-root', $workspaceRoot,
       '--state-root', $stateRoot,
       '--gateway-url', $gatewayUrl,
+      '--gateway-control-url', $gatewayControlUrl,
       '--once',
       '--interval', "${IntervalSeconds}s",
       '--max-parallel-runs', $MaxParallelRuns
