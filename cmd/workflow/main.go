@@ -487,6 +487,7 @@ func runPollGitHub(args []string) {
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
 	workspaceRetention := flags.Duration("workspace-retention", 7*24*time.Hour, "retention period before closed Ticket Workspaces are reclaimed")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
+	gatewayControlURLOverride := flags.String("gateway-control-url", "", "optional host-side Gateway URL; defaults to gateway-url")
 	gatewayControlToken := flags.String("gateway-control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
@@ -505,6 +506,7 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	defer db.Close()
+	gatewayControlURL := gatewayControlURL(*gatewayURL, *gatewayControlURLOverride)
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -551,7 +553,7 @@ func runPollGitHub(args []string) {
 	poll := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		projector := delivery.HTTPProjector{URL: *gatewayURL, ControlPlaneToken: *gatewayControlToken}
+		projector := delivery.HTTPProjector{URL: gatewayControlURL, ControlPlaneToken: *gatewayControlToken}
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
 		var client *github.Client
 		_, err := admitGatewayCredential(ctx, db, func(token string) error {
@@ -643,6 +645,13 @@ func runPollGitHub(args []string) {
 		_ = poll()
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func gatewayControlURL(workerURL, controlURL string) string {
+	if controlURL = strings.TrimSpace(controlURL); controlURL != "" {
+		return controlURL
+	}
+	return strings.TrimSpace(workerURL)
 }
 
 func nextPollDelay(db *store.Store, repository string, interval time.Duration, result github.PollResult, now time.Time) time.Duration {

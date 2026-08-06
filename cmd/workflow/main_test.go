@@ -37,6 +37,17 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 	}
 }
 
+func TestGatewayControlURLUsesHostOverrideAndPreservesLegacyFallback(t *testing.T) {
+	workerURL := "http://host.docker.internal:8787"
+	if got := gatewayControlURL(workerURL, ""); got != workerURL {
+		t.Fatalf("legacy Gateway control URL = %q, want %q", got, workerURL)
+	}
+	controlURL := "http://127.0.0.1:8787"
+	if got := gatewayControlURL(workerURL, controlURL); got != controlURL {
+		t.Fatalf("host Gateway control URL = %q, want %q", got, controlURL)
+	}
+}
+
 func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
 	err := gatewayCredentialVerificationError(store.ErrNotFound)
 	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) {

@@ -80,6 +80,12 @@ routing and decisions. `workflow reconcile-delivered` checks merged pull request
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 
+On Docker Desktop, pass the Worker-facing Gateway address through
+`--gateway-url` (for example `http://host.docker.internal:8787`) and the
+Windows host loopback address through `--gateway-control-url` (for example
+`http://127.0.0.1:8787`). When the latter is omitted, it defaults to
+`--gateway-url` for backward compatibility.
+
 The workflow adapter enables the fork's workflow mode only for those Delivery
 Controller runs and fails closed before launch if either its Delivery Cycle or
 Revision Round identity is missing. It uses the Ticket Session ID as the stable
