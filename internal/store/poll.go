@@ -100,6 +100,10 @@ type GitHubPollCursor struct {
 	NextAttemptAt       time.Time
 }
 
+func (c GitHubPollCursor) NeedsAttention() bool {
+	return c.FailureKind == GitHubPollFailureUnrecoverable && c.RecoveryState == GitHubPollRecoveryConsumed
+}
+
 type GitHubPollFailureKind string
 type GitHubPollRecoveryState string
 
@@ -213,9 +217,9 @@ func (s *Store) MarkGitHubPollFailureUnrecoverable(ctx context.Context, reposito
 	} else {
 		now = now.UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
-SET failure_kind = ?, recovery_state = ?, updated_at = ?
-WHERE repository = ?`, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, formatTimestamp(now), repository)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, next_attempt_at, updated_at)
+VALUES (?, 0, ?, ?, ?, ?)
+ON CONFLICT(repository) DO UPDATE SET failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, updated_at = excluded.updated_at`, repository, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now))
 	return err
 }
 

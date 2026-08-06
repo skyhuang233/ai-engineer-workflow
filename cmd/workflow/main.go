@@ -560,11 +560,7 @@ func runPollGitHub(args []string) {
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
 		if err != nil {
-			if shouldPauseGatewayForCredential(err) {
-				fmt.Fprintln(os.Stderr, err)
-				return err
-			}
-			_, err = poller.RecordFailure(ctx, *repository, err)
+			err = recordPollAdmissionFailure(ctx, poller, *repository, err)
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
@@ -842,6 +838,15 @@ func gatewayCredentialVerificationError(err error) error {
 
 func shouldPauseGatewayForCredential(err error) bool {
 	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
+}
+
+func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
+	if shouldPauseGatewayForCredential(admissionErr) {
+		_, err := poller.RecordTerminalFailure(ctx, repository, admissionErr)
+		return err
+	}
+	_, err := poller.RecordFailure(ctx, repository, admissionErr)
+	return err
 }
 
 func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {

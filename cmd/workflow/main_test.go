@@ -208,6 +208,55 @@ func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *test
 	}
 }
 
+func TestCredentialAdmissionTerminallyConsumesBootstrapRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "missing credential", err: credential.ErrNotFound},
+		{name: "rejected by GitHub", err: &github.APIError{StatusCode: http.StatusUnauthorized}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "workflow.db")
+			db, err := store.Open(ctx, dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			repository := "owner/repo"
+			now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+			if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			admissionErr := persistGatewayCredentialAdmissionError(ctx, db, test.err, now.Add(time.Second))
+			err = recordPollAdmissionFailure(ctx, github.Poller{Store: db, MaxFailures: 5, Now: func() time.Time { return now.Add(time.Second) }}, repository, admissionErr)
+			if !errors.Is(err, store.ErrNeedsAttention) {
+				db.Close()
+				t.Fatalf("credential terminal failure = %v, want needs attention", err)
+			}
+			paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+			cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
+			if pauseErr != nil || !paused || cursorErr != nil || !cursor.NeedsAttention() {
+				db.Close()
+				t.Fatalf("credential state paused=%t cursor=%#v errors=%v/%v", paused, cursor, pauseErr, cursorErr)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := store.Open(ctx, dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			cursor, err = restarted.GitHubPollCursor(ctx, repository)
+			if err != nil || !cursor.NeedsAttention() {
+				t.Fatalf("restarted credential cursor = %#v, %v", cursor, err)
+			}
+		})
+	}
+}
+
 func TestRequireOwnerGuardedControlPlaneRepositoryAcceptsPrivateRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/owner/repo" {

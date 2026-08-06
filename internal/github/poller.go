@@ -52,6 +52,16 @@ func (p Poller) RecordFailure(ctx context.Context, repository string, cause erro
 	return p.recordFailure(ctx, repository, p.now(), cause)
 }
 
+func (p Poller) RecordTerminalFailure(ctx context.Context, repository string, cause error) (PollResult, error) {
+	if p.Store == nil {
+		return PollResult{}, errors.Join(cause, fmt.Errorf("GitHub poller store is unavailable"), store.ErrNeedsAttention)
+	}
+	if err := ValidateRepository(repository); err != nil {
+		return PollResult{}, errors.Join(cause, err, store.ErrNeedsAttention)
+	}
+	return PollResult{}, p.terminalFailure(ctx, repository, p.now(), cause)
+}
+
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
 	var control BootstrapControlPass
 	if before != nil {
@@ -72,7 +82,7 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 	now := p.now()
 	cursor, err := p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
-		if cursor.NextAttemptAt.After(now) {
+		if cursor.NextAttemptAt.After(now) && !cursor.NeedsAttention() {
 			return PollResult{}, store.ErrNotReady
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -84,6 +94,9 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 	bootstrapped := false
 	cursor, err = p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
+		if cursor.NeedsAttention() {
+			return PollResult{}, p.terminalFailure(ctx, repository, now, fmt.Errorf("GitHub polling is paused pending human recovery"))
+		}
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
 			active, activeErr := p.Store.HasActiveDeliveryPlan(ctx, repository)
 			if activeErr != nil {
@@ -197,7 +210,19 @@ func (p Poller) terminalFailure(ctx context.Context, repository string, now time
 	defer cancel()
 	result := errors.Join(append(causes, store.ErrNeedsAttention)...)
 	if provenanceErr := p.Store.MarkGitHubPollFailureUnrecoverable(persistenceCtx, repository, now); provenanceErr != nil {
-		return errors.Join(result, provenanceErr)
+		result = errors.Join(result, provenanceErr)
+	}
+	if attentionErr := p.Store.MarkRepositoryNeedsAttention(persistenceCtx, repository, now); attentionErr != nil {
+		return errors.Join(result, attentionErr)
+	}
+	active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
+	if activeErr != nil {
+		return errors.Join(result, activeErr)
+	}
+	if active {
+		if inboxErr := p.projectWorkflowInbox(persistenceCtx, repository); inboxErr != nil {
+			return errors.Join(result, inboxErr)
+		}
 	}
 	return result
 }

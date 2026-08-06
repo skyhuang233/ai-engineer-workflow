@@ -793,6 +793,86 @@ func TestBootstrapRecoveryClaimHasOneWinner(t *testing.T) {
 	}
 }
 
+func TestTerminalFailureRemainsPausedAcrossRestartBelowRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("control database read failed")
+	_, err = (Poller{Store: db, MaxFailures: 5, Now: func() time.Time { return now }}).RecordTerminalFailure(ctx, repository, cause)
+	if !errors.Is(err, cause) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("terminal failure = %v, want cause and needs attention", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || !cursor.NeedsAttention() || cursor.ConsecutiveFailures >= 5 {
+		t.Fatalf("terminal cursor = %#v, %v", cursor, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	bootstrapRuns := 0
+	_, err = (Poller{
+		Store:       restarted,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 5,
+		Now:         func() time.Time { return now.Add(time.Minute) },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		bootstrapRuns++
+		return nil
+	}, nil)
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("restarted terminal poll = %v, want needs attention", err)
+	}
+	if bootstrapRuns != 0 {
+		t.Fatalf("bootstrap runs after terminal restart = %d, want 0", bootstrapRuns)
+	}
+	cursor, err = restarted.GitHubPollCursor(ctx, repository)
+	if err != nil || !cursor.NeedsAttention() {
+		t.Fatalf("restarted terminal cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestTerminalFailureProjectsRecoveryForActivePlanBelowRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	projector := &activePlanInboxProjector{store: db, now: now}
+	_, err = (Poller{Store: db, InboxProjector: projector, MaxFailures: 5, Now: func() time.Time { return now }}).RecordTerminalFailure(ctx, repository, errors.New("control failure"))
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("active terminal failure = %v, want needs attention", err)
+	}
+	if projector.calls != 1 {
+		t.Fatalf("active terminal projections = %d, want 1", projector.calls)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		found = found || question.Kind == "poll_failure"
+	}
+	if !found {
+		t.Fatalf("active terminal recovery questions = %#v", questions)
+	}
+}
+
 func activatePollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) {
 	t.Helper()
 	snapshot := plan.Snapshot{
