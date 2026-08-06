@@ -1039,7 +1039,7 @@ func (s *Store) answerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.
 	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
 		return DeliveryOutbox{}, err
 	}
-	outbox, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now)
+	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -1098,6 +1098,10 @@ func (s *Store) QueueWorkflowInboxProjectionIfActive(ctx context.Context, reposi
 }
 
 func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
+	versionIDs, err := workflowInboxDeliveryPlanVersions(ctx, tx, repository)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
 	questions, err := workflowInboxQuestions(ctx, tx, repository)
 	if err != nil {
 		return DeliveryOutbox{}, err
@@ -1106,7 +1110,22 @@ func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, 
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
-	return s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, InboxProjectionVersion: version}, now)
+	generation, err := workflowInboxProjectionGenerationTx(ctx, tx, repository, version, versionIDs, now, true)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return s.enqueueDeliveryTx(ctx, tx, DeliveryRequest{Operation: DeliveryProjectInbox, Repository: repository, InboxProjectionVersion: version, InboxProjectionGeneration: generation}, now)
+}
+
+func (s *Store) queueWorkflowInboxProjectionTransitionTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM workflow_inbox_projections WHERE repository = ?)`, repository).Scan(&exists); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if exists == 0 {
+		return DeliveryOutbox{}, nil
+	}
+	return s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 }
 
 func (s *Store) queueWorkflowInboxProjectionIfActiveTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
@@ -1127,6 +1146,36 @@ func workflowInboxProjectionVersion(questions []WorkflowQuestion) (string, error
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func workflowInboxProjectionGenerationTx(ctx context.Context, tx *sql.Tx, repository, projectionVersion string, planVersionIDs []string, now time.Time, advance bool) (int64, error) {
+	encodedPlanVersionIDs, err := json.Marshal(planVersionIDs)
+	if err != nil {
+		return 0, err
+	}
+	var generation int64
+	var currentProjectionVersion, currentPlanVersionIDs string
+	err = tx.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, repository).Scan(&generation, &currentProjectionVersion, &currentPlanVersionIDs)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !advance {
+			return 0, nil
+		}
+		generation = 1
+		_, err = tx.ExecContext(ctx, `INSERT INTO workflow_inbox_projections(repository, generation, projection_version, plan_version_ids_json, updated_at) VALUES (?, ?, ?, ?, ?)`, repository, generation, projectionVersion, string(encodedPlanVersionIDs), formatTimestamp(now))
+		return generation, err
+	}
+	if err != nil {
+		return 0, err
+	}
+	if currentProjectionVersion == projectionVersion && currentPlanVersionIDs == string(encodedPlanVersionIDs) {
+		return generation, nil
+	}
+	if !advance {
+		return 0, nil
+	}
+	generation++
+	_, err = tx.ExecContext(ctx, `UPDATE workflow_inbox_projections SET generation = ?, projection_version = ?, plan_version_ids_json = ?, updated_at = ? WHERE repository = ?`, generation, projectionVersion, string(encodedPlanVersionIDs), formatTimestamp(now), repository)
+	return generation, err
 }
 
 func WorkflowQuestionProjections(questions []WorkflowQuestion) []plan.WorkflowQuestion {
@@ -1176,7 +1225,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 			if decision.Replacement != nil {
 				return ErrInvalidClaim
 			}
-			if err := cancelPlanTx(ctx, tx, versionID, now); err != nil {
+			if err := s.cancelPlanTx(ctx, tx, versionID, now); err != nil {
 				return err
 			}
 		case "replace":
@@ -1253,7 +1302,7 @@ WHERE t.poll_question_id = ? AND t.version_id = ?`, questionID, versionID)
 	return nil
 }
 
-func cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
+func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
 	stamp := formatTimestamp(now)
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0`, plan.StateCancelled, stamp, versionID); err != nil {
 		return err
@@ -1270,7 +1319,14 @@ func cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Ti
 	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, "cancelled", stamp); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ?`, versionID)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ?`, versionID); err != nil {
+		return err
+	}
+	var repository string
+	if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions v ON v.plan_id = p.id WHERE v.version_id = ?`, versionID).Scan(&repository); err != nil {
+		return err
+	}
+	_, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now)
 	return err
 }
 
@@ -1396,7 +1452,7 @@ WHERE v.version_id = ? AND p.repository = ? AND p.current_version_id = v.version
 		return 0, ErrNotReady
 	}
 	if handoffState == "approved" {
-		if err := cancelPlanTx(ctx, tx, sourceVersionID, now); err != nil {
+		if err := s.cancelPlanTx(ctx, tx, sourceVersionID, now); err != nil {
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE replacement_tickets SET state = 'active' WHERE version_id = ? AND state = 'approved'`, sourceVersionID); err != nil {

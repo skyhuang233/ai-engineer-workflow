@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -59,8 +58,6 @@ type gatewayStore interface {
 	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
 	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
-	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, []string, error)
-	WorkflowInboxProjectionState(context.Context, string) ([]store.WorkflowQuestion, string, []string, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	QueueWorkflowInboxProjectionIfActive(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
@@ -165,24 +162,18 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 			return g.retry(outbox, err)
 		}
 	}
-	if outbox.Request.Operation == store.DeliveryProjectInbox && !outbox.ReconcileOnly {
-		_, _, activeVersionIDs, activeErr := g.Store.WorkflowInboxProjectionState(operationCtx, outbox.Request.Repository)
-		if activeErr != nil {
-			if leaseErr := stopDispatcher(); leaseErr != nil {
-				return errors.Join(activeErr, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
-			}
-			return errors.Join(ErrGatewayStore, activeErr, g.requeueClaim(outbox, activeErr, outbox.ReconcileOnly))
-		}
-		if len(activeVersionIDs) == 0 || !inboxPlanVersionsMatch(outbox.Request, activeVersionIDs) {
-			if leaseErr := stopDispatcher(); leaseErr != nil {
-				return errors.Join(store.ErrNoActiveDeliveryPlan, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
-			}
-			return g.reject(outbox, store.ErrNoActiveDeliveryPlan)
-		}
-	}
 	if outbox.ReconcileOnly {
 		if outbox.Request.Operation == store.DeliveryProjectInbox {
-			err := g.ensureCurrentWorkflowInbox(operationCtx, outbox.Request.Repository, nil)
+			result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+				observation, observeErr := g.observe(operationCtx, request)
+				if observeErr != nil {
+					return store.DeliveryResult{}, observeErr
+				}
+				if !observation.Applied {
+					return store.DeliveryResult{}, fmt.Errorf("%w: uncertain Workflow Inbox delivery was not observed", store.ErrDeliveryRejected)
+				}
+				return resultFrom(observation), nil
+			})
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 			}
@@ -190,9 +181,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				if isCredentialRejection(err) {
 					return g.pauseForCredential(outbox, err)
 				}
+				if errors.Is(err, store.ErrDeliveryRejected) {
+					return g.reject(outbox, err)
+				}
 				return errors.Join(err, g.markUncertain(outbox, err))
 			}
-			return g.succeed(outbox, store.DeliveryResult{})
+			return g.succeed(outbox, result)
 		}
 		err := g.reconcileOnly(operationCtx, outbox)
 		if leaseErr := stopDispatcher(); leaseErr != nil {
@@ -207,18 +201,6 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, projectionErr)
 			}
 			request.PlanProjection = &projection
-		} else if request.Operation == store.DeliveryProjectInbox {
-			questions, version, activeVersionIDs, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
-			if questionsErr != nil {
-				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, questionsErr)
-			}
-			if !inboxPlanVersionsMatch(request, activeVersionIDs) {
-				return store.DeliveryResult{}, store.ErrNoActiveDeliveryPlan
-			}
-			if request.InboxProjectionVersion != "" && request.InboxProjectionVersion != version {
-				return store.DeliveryResult{}, nil
-			}
-			request.WorkflowQuestions = store.WorkflowQuestionProjections(questions)
 		}
 		observation, observeErr := g.observe(operationCtx, request)
 		if observeErr != nil {
@@ -249,11 +231,6 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if applyErr != nil {
 			return store.DeliveryResult{}, applyErr
 		}
-		if request.Operation == store.DeliveryProjectInbox {
-			if correctionErr := g.ensureCurrentWorkflowInbox(operationCtx, request.Repository, &request); correctionErr != nil {
-				return store.DeliveryResult{}, correctionErr
-			}
-		}
 		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 	})
 	if leaseErr := stopDispatcher(); leaseErr != nil {
@@ -282,52 +259,6 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(outbox, err)
 	}
 	return g.succeed(outbox, result)
-}
-
-const maxInboxProjectionCorrections = 3
-
-func (g Gateway) ensureCurrentWorkflowInbox(ctx context.Context, repository string, lastApplied *store.DeliveryRequest) error {
-	for attempt := 0; attempt < maxInboxProjectionCorrections; attempt++ {
-		questions, version, versionIDs, err := g.Store.WorkflowInboxProjectionState(ctx, repository)
-		if err != nil {
-			return errors.Join(ErrGatewayStore, err)
-		}
-		current := store.DeliveryRequest{
-			Operation:              store.DeliveryProjectInbox,
-			Repository:             repository,
-			WorkflowQuestions:      store.WorkflowQuestionProjections(questions),
-			InboxPlanVersionIDs:    versionIDs,
-			InboxProjectionVersion: version,
-		}
-		if len(versionIDs) == 1 {
-			current.InboxPlanVersionID = versionIDs[0]
-		}
-		if lastApplied != nil && sameWorkflowInboxProjection(*lastApplied, current) {
-			return nil
-		}
-		observation, err := g.observe(ctx, current)
-		if err != nil {
-			return err
-		}
-		if !observation.Applied {
-			if _, err := g.apply(ctx, current); err != nil {
-				return fmt.Errorf("%w: corrective Workflow Inbox projection failed: %v", store.ErrDeliveryUncertain, err)
-			}
-		}
-		lastApplied = &current
-	}
-	return fmt.Errorf("%w: Workflow Inbox projection changed during corrective delivery", store.ErrDeliveryUncertain)
-}
-
-func sameWorkflowInboxProjection(left, right store.DeliveryRequest) bool {
-	return left.Repository == right.Repository && left.InboxProjectionVersion == right.InboxProjectionVersion && slices.Equal(left.InboxPlanVersionIDs, right.InboxPlanVersionIDs)
-}
-
-func inboxPlanVersionsMatch(request store.DeliveryRequest, activeVersionIDs []string) bool {
-	if len(request.InboxPlanVersionIDs) > 0 {
-		return slices.Equal(request.InboxPlanVersionIDs, activeVersionIDs)
-	}
-	return len(activeVersionIDs) == 1 && request.InboxPlanVersionID != "" && request.InboxPlanVersionID == activeVersionIDs[0]
 }
 
 func (g Gateway) DispatchPending(ctx context.Context, limit int) error {

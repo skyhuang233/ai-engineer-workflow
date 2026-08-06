@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 34
+	latestSchemaVersion = 35
 )
 
 var (
@@ -892,6 +892,20 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 			return err
 		}
 	}
+	if applied < 35 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workflow_inbox_projections (
+    repository TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    projection_version TEXT NOT NULL,
+    plan_version_ids_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (35, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -1081,6 +1095,7 @@ VALUES (?, ?, ?, ?, ?)`, versionID, ticket.ID, runtimeState, boolInt(ticket.IsDe
 }
 
 func (s *Store) MarkActive(ctx context.Context, versionID string) error {
+	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1102,7 +1117,7 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, formatTimestamp(time.Now()), versionID, StateProjecting)
+	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, formatTimestamp(now), versionID, StateProjecting)
 	if err != nil {
 		return err
 	}
@@ -1118,7 +1133,14 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	if err := markPlanCompletedTx(ctx, tx, versionID, formatTimestamp(time.Now())); err != nil {
+	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+		return err
+	}
+	var repository string
+	if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions v ON v.plan_id = p.id WHERE v.version_id = ?`, versionID).Scan(&repository); err != nil {
+		return err
+	}
+	if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
 		return err
 	}
 	return tx.Commit()

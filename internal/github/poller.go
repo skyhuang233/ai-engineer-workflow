@@ -41,6 +41,8 @@ type pollStoreError struct {
 	err error
 }
 
+var ErrLocalPollStore = errors.New("local GitHub poll persistence is unavailable")
+
 func (e pollStoreError) Error() string {
 	return e.err.Error()
 }
@@ -62,13 +64,26 @@ func isRemotePollStoreError(err error) bool {
 }
 
 func isLocalPollStoreError(err error) bool {
+	if errors.Is(err, ErrLocalPollStore) {
+		return true
+	}
+	if store.IsDatabaseError(err) {
+		return true
+	}
 	if isRemotePollStoreError(err) {
 		return false
 	}
 	var storeErr pollStoreError
 	var markedStoreErr interface{ PollStoreFailure() bool }
-	return errors.As(err, &storeErr) || store.IsDatabaseError(err) ||
+	return errors.As(err, &storeErr) ||
 		errors.As(err, &markedStoreErr) && markedStoreErr.PollStoreFailure()
+}
+
+func ClassifyPollError(err error) error {
+	if err != nil && isLocalPollStoreError(err) && !errors.Is(err, ErrLocalPollStore) {
+		return errors.Join(ErrLocalPollStore, err)
+	}
+	return err
 }
 
 func isPollStoreError(err error) bool {
@@ -178,7 +193,7 @@ func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, c
 		return result, errors.Join(recordErr, release())
 	}
 	if isLocalPollStoreError(cause) {
-		return PollResult{}, cause
+		return PollResult{}, ClassifyPollError(cause)
 	}
 	if isPollCredentialFailure(cause) {
 		return p.recordFailure(ctx, repository, p.now(), cause)
@@ -293,7 +308,7 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 	if releaseErr := release(); releaseErr != nil {
 		pollErr = errors.Join(pollErr, releaseErr)
 	}
-	return result, pollErr
+	return result, ClassifyPollError(pollErr)
 }
 
 func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, bootstrap ControlPass, before BootstrapControlPass) (PollResult, error) {
@@ -516,7 +531,7 @@ func (p Poller) recordFailure(ctx context.Context, repository string, now time.T
 
 func (p Poller) recordFailureWithKind(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, recoveryPlanVersionID string, cause error) (PollResult, error) {
 	if isLocalPollStoreError(cause) {
-		return PollResult{}, cause
+		return PollResult{}, ClassifyPollError(cause)
 	}
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()

@@ -302,8 +302,8 @@ func TestPollStoreFailureDoesNotConsumeRetryBudget(t *testing.T) {
 		MaxFailures:    1,
 		Now:            func() time.Time { return now },
 	}).Poll(ctx, repository)
-	if err == nil || errors.Is(err, store.ErrNeedsAttention) {
-		t.Fatalf("store failure = %v, want retryable local error", err)
+	if err == nil || !errors.Is(err, ErrLocalPollStore) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("store failure = %v, want fatal local-store error", err)
 	}
 	cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
 	if cursorErr != nil {
@@ -311,6 +311,13 @@ func TestPollStoreFailureDoesNotConsumeRetryBudget(t *testing.T) {
 	}
 	if cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() {
 		t.Fatalf("store failure consumed retry budget: %#v", cursor)
+	}
+}
+
+func TestClassifyPollErrorLeavesGatewayStoreFailuresRetryable(t *testing.T) {
+	err := ClassifyPollError(errors.Join(delivery.ErrGatewayStore, errors.New("remote SQLite unavailable")))
+	if errors.Is(err, ErrLocalPollStore) {
+		t.Fatalf("remote Gateway store failure classified as fatal local error: %v", err)
 	}
 }
 

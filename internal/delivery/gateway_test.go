@@ -152,8 +152,17 @@ func TestGatewayCredentialInboxQueueIgnoresInactiveRepositories(t *testing.T) {
 		t.Fatalf("queue inactive credential Inbox = %v", err)
 	}
 	keys, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Second), 10)
-	if err != nil || len(keys) != 0 {
-		t.Fatalf("inactive credential Inbox keys = %#v, %v", keys, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		outbox, err := db.DeliveryOutbox(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(outbox.Request.WorkflowQuestions) != 0 {
+			t.Fatalf("inactive credential Inbox projection = %#v", outbox.Request)
+		}
 	}
 }
 
@@ -214,7 +223,10 @@ func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 	if err := db.ResumeGatewayWrites(ctx, rotation, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, keys[0]); err != nil {
+	if err := gateway.Dispatch(ctx, keys[0]); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("stale credential projection = %v", err)
+	}
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
 		t.Fatal(err)
 	}
 	remote := gateway.Remote.(*fakeRemote)
@@ -358,11 +370,14 @@ func TestGatewayClearsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T)
 	}
 	remote := &fakeRemote{}
 	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: "new-dispatcher", Now: func() time.Time { return now.Add(time.Hour) }}
-	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); err != nil {
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
 		t.Fatalf("inactive uncertain replay error = %v", err)
 	}
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
 	if remote.observeCalls != 1 || remote.applyCalls != 1 || len(remote.requests) != 1 || len(remote.requests[0].WorkflowQuestions) != 0 {
-		t.Fatalf("inactive uncertain replay correction: observe=%d apply=%d requests=%#v", remote.observeCalls, remote.applyCalls, remote.requests)
+		t.Fatalf("durable inactive Inbox projection: observe=%d apply=%d requests=%#v", remote.observeCalls, remote.applyCalls, remote.requests)
 	}
 }
 
@@ -409,8 +424,60 @@ func TestGatewayCorrectsInboxWhenPlanCompletesDuringApply(t *testing.T) {
 	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
+	now = now.Add(time.Second)
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
 	if remote.applyCalls != 2 || len(remote.requests) < 2 || len(remote.requests[len(remote.requests)-1].WorkflowQuestions) != 0 {
-		t.Fatalf("corrective Inbox delivery = applies %d requests %#v", remote.applyCalls, remote.requests)
+		t.Fatalf("durable Inbox delivery = applies %d requests %#v", remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayQueuesEmptyInboxWhenPlanCompletesDuringAppliedObservation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	peer, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "observation-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	remote := &observingAdvanceRemote{fakeRemote: fakeRemote{observations: []delivery.Observation{{Applied: true}}}, advance: func() {
+		if err := peer.MarkTicketDelivered(ctx, version.ID, 2); err != nil {
+			t.Error(err)
+		}
+	}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 1 || len(remote.requests) < 2 || len(remote.requests[len(remote.requests)-1].WorkflowQuestions) != 0 {
+		t.Fatalf("durable observation correction = applies %d requests %#v", remote.applyCalls, remote.requests)
 	}
 }
 
@@ -438,9 +505,21 @@ type advancingRemote struct {
 	advance func()
 }
 
+type observingAdvanceRemote struct {
+	fakeRemote
+	advance func()
+}
+
 func (r *advancingRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	r.advance()
 	return r.fakeRemote.Apply(ctx, request)
+}
+
+func (r *observingAdvanceRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	advance := r.advance
+	r.advance = func() {}
+	advance()
+	return r.fakeRemote.Observe(ctx, request)
 }
 
 func (r *blockingRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {

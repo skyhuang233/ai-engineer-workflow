@@ -40,27 +40,28 @@ var (
 // The gateway derives all authoritative ownership fields from RunID and the
 // current Run Lease before this request can reach an external writer.
 type DeliveryRequest struct {
-	Operation              DeliveryOperation       `json:"operation"`
-	RunID                  string                  `json:"run_id"`
-	LeaseToken             string                  `json:"lease_token"`
-	LeaseGeneration        int64                   `json:"lease_generation"`
-	Repository             string                  `json:"repository"`
-	RootNumber             int64                   `json:"root_number,omitempty"`
-	Branch                 string                  `json:"branch,omitempty"`
-	PullRequestNumber      int64                   `json:"pull_request_number,omitempty"`
-	CommitSHA              string                  `json:"commit_sha,omitempty"`
-	ExpectedRemoteHead     string                  `json:"expected_remote_head,omitempty"`
-	ExpectRemoteAbsent     bool                    `json:"expect_remote_absent,omitempty"`
-	Title                  string                  `json:"title,omitempty"`
-	Body                   string                  `json:"body,omitempty"`
-	Evidence               string                  `json:"evidence,omitempty"`
-	PlanProjection         *plan.Projection        `json:"plan_projection,omitempty"`
-	WorkflowQuestions      []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
-	InboxPlanVersionID     string                  `json:"inbox_plan_version_id,omitempty"`
-	InboxPlanVersionIDs    []string                `json:"inbox_plan_version_ids,omitempty"`
-	InboxProjectionVersion string                  `json:"inbox_projection_version,omitempty"`
-	Label                  string                  `json:"label,omitempty"`
-	IdempotencyKey         string                  `json:"idempotency_key,omitempty"`
+	Operation                 DeliveryOperation       `json:"operation"`
+	RunID                     string                  `json:"run_id"`
+	LeaseToken                string                  `json:"lease_token"`
+	LeaseGeneration           int64                   `json:"lease_generation"`
+	Repository                string                  `json:"repository"`
+	RootNumber                int64                   `json:"root_number,omitempty"`
+	Branch                    string                  `json:"branch,omitempty"`
+	PullRequestNumber         int64                   `json:"pull_request_number,omitempty"`
+	CommitSHA                 string                  `json:"commit_sha,omitempty"`
+	ExpectedRemoteHead        string                  `json:"expected_remote_head,omitempty"`
+	ExpectRemoteAbsent        bool                    `json:"expect_remote_absent,omitempty"`
+	Title                     string                  `json:"title,omitempty"`
+	Body                      string                  `json:"body,omitempty"`
+	Evidence                  string                  `json:"evidence,omitempty"`
+	PlanProjection            *plan.Projection        `json:"plan_projection,omitempty"`
+	WorkflowQuestions         []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
+	InboxPlanVersionID        string                  `json:"inbox_plan_version_id,omitempty"`
+	InboxPlanVersionIDs       []string                `json:"inbox_plan_version_ids,omitempty"`
+	InboxProjectionVersion    string                  `json:"inbox_projection_version,omitempty"`
+	InboxProjectionGeneration int64                   `json:"inbox_projection_generation,omitempty"`
+	Label                     string                  `json:"label,omitempty"`
+	IdempotencyKey            string                  `json:"idempotency_key,omitempty"`
 }
 
 type DeliveryTarget struct {
@@ -879,7 +880,22 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		if err != nil {
 			return DeliveryTarget{}, request, err
 		}
-		if len(activeVersionIDs) == 0 {
+		questions, err := workflowInboxQuestions(ctx, tx, request.Repository)
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
+		projectionVersion, err := workflowInboxProjectionVersion(questions)
+		if err != nil {
+			return DeliveryTarget{}, request, err
+		}
+		generation, generationErr := workflowInboxProjectionGenerationTx(ctx, tx, request.Repository, projectionVersion, activeVersionIDs, now, admittedClaimToken == "" && len(activeVersionIDs) > 0 && request.InboxProjectionGeneration == 0)
+		if generationErr != nil {
+			return DeliveryTarget{}, request, generationErr
+		}
+		if generation == 0 || request.InboxProjectionGeneration > 0 && request.InboxProjectionGeneration != generation {
+			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
+		}
+		if admittedClaimToken != "" && request.InboxProjectionGeneration != generation {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}
 		if len(request.InboxPlanVersionIDs) > 0 {
@@ -895,16 +911,14 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		} else {
 			request.InboxPlanVersionID = ""
 		}
-		questions, err := workflowInboxQuestions(ctx, tx, request.Repository)
-		if err != nil {
-			return DeliveryTarget{}, request, err
-		}
 		request.WorkflowQuestions = WorkflowQuestionProjections(questions)
-		request.InboxProjectionVersion, err = workflowInboxProjectionVersion(questions)
-		if err != nil {
-			return DeliveryTarget{}, request, err
+		request.InboxProjectionVersion = projectionVersion
+		request.InboxProjectionGeneration = generation
+		versionID := ""
+		if len(activeVersionIDs) > 0 {
+			versionID = activeVersionIDs[0]
 		}
-		return DeliveryTarget{VersionID: activeVersionIDs[0], Repository: request.Repository}, request, nil
+		return DeliveryTarget{VersionID: versionID, Repository: request.Repository}, request, nil
 	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber <= 0 || request.PlanProjection == nil || request.PlanProjection.VersionID == "" {

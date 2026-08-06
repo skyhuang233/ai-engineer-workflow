@@ -550,6 +550,9 @@ func runPollGitHub(args []string) {
 	}
 	var lastPollResult github.PollResult
 	poll := func() (resultErr error) {
+		defer func() {
+			resultErr = github.ClassifyPollError(resultErr)
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
@@ -662,7 +665,9 @@ func runPollGitHub(args []string) {
 		return
 	}
 	for {
-		_ = poll()
+		if err := poll(); errors.Is(err, github.ErrLocalPollStore) {
+			fail(err)
+		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
 }

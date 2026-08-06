@@ -237,8 +237,8 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outbox.IdempotencyKey != "" {
-		t.Fatalf("cancelled plan queued Inbox projection = %#v", outbox)
+	if outbox.IdempotencyKey == "" || len(outbox.Request.WorkflowQuestions) != 0 || outbox.Request.InboxProjectionGeneration == 0 {
+		t.Fatalf("cancelled plan Inbox projection = %#v", outbox)
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Second)}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("cancelled plan claim = %v, want not ready", err)
@@ -283,7 +283,7 @@ func TestAnswerWorkflowQuestionRejectsSupersededPlanVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cancelPlanTx(ctx, tx, version.ID, now.Add(time.Second)); err != nil {
+	if err := db.cancelPlanTx(ctx, tx, version.ID, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
