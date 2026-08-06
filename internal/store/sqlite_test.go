@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
@@ -172,6 +173,66 @@ func TestMigrationFromV30AddsGitHubPollFailureKind(t *testing.T) {
 	defer backup.Close()
 	if hasColumn(t, ctx, backup, "github_poll_cursors", "failure_kind") {
 		t.Fatal("migration backup includes the v31 GitHub poll failure column")
+	}
+}
+
+func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordGitHubPollFailureWithKind(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 32"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN recovery_state"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "recovery_state") {
+		t.Fatal("migration did not add github_poll_cursors.recovery_state")
+	}
+	cursor, err := migrated.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.RecoveryState != GitHubPollRecoveryAvailable {
+		t.Fatalf("migrated recovery state = %q, want available", cursor.RecoveryState)
+	}
+	backup, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "github_poll_cursors", "recovery_state") {
+		t.Fatal("migration backup includes the v32 GitHub poll recovery column")
 	}
 }
 
