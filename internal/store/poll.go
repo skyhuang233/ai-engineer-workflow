@@ -101,7 +101,10 @@ type GitHubPollCursor struct {
 
 type GitHubPollFailureKind string
 
-const GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind = "pre_activation_inbox_conflict"
+const (
+	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind = "pre_activation_inbox_conflict"
+	GitHubPollFailureUnrecoverable              GitHubPollFailureKind = "unrecoverable"
+)
 
 func (s *Store) GitHubPollCursor(ctx context.Context, repository string) (GitHubPollCursor, error) {
 	var cursor GitHubPollCursor
@@ -166,6 +169,18 @@ WHERE repository = ? AND failure_kind = ?`, formatTimestamp(now), formatTimestam
 		return false, err
 	}
 	return updated == 1, nil
+}
+
+func (s *Store) MarkGitHubPollFailureUnrecoverable(ctx context.Context, repository string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE github_poll_cursors
+SET failure_kind = ?, updated_at = ?
+WHERE repository = ?`, GitHubPollFailureUnrecoverable, formatTimestamp(now), repository)
+	return err
 }
 
 func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time, fullReconcile bool) error {

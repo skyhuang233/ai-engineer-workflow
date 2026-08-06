@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
@@ -28,6 +29,16 @@ type activePlanInboxProjector struct {
 	store *store.Store
 	now   time.Time
 	calls int
+}
+
+type recordingInboxProjector struct {
+	delegate WorkflowInboxProjector
+	err      error
+}
+
+func (p *recordingInboxProjector) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	p.err = p.delegate.ProjectWorkflowInbox(ctx, repository, questions)
+	return p.err
 }
 
 func (p *activePlanInboxProjector) ProjectWorkflowInbox(ctx context.Context, repository string, _ []plan.WorkflowQuestion) error {
@@ -210,7 +221,12 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	now := failedAt.Add(time.Minute)
 	controlToken := "control-token"
-	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return failedAt }}, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
+	requests := 0
+	handler := delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return failedAt }}, delivery.HTTPOptions{ControlPlaneToken: controlToken})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		handler.ServeHTTP(writer, request)
+	}))
 	defer server.Close()
 	_, err = (Poller{
 		Store:          db,
@@ -219,8 +235,11 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 		MaxFailures:    1,
 		Now:            func() time.Time { return failedAt },
 	}).Poll(ctx, repository)
-	if err == nil {
-		t.Fatal("cold-start inbox conflict returned nil")
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("cold-start inbox conflict = %v, want needs attention", err)
+	}
+	if requests != 1 {
+		t.Fatalf("cold-start Gateway requests = %d, want 1", requests)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
 	if err != nil {
@@ -263,6 +282,83 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 		t.Fatalf("consecutive failures = %d, want 0", cursor.ConsecutiveFailures)
 	}
 	t.Logf("recovery: classified cold-start failure budget reset to %d after bootstrap; %s", cursor.ConsecutiveFailures, projector.events[0])
+}
+
+func TestRecordFailureProjectsNeedsAttentionInboxForActivePlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	controlToken := "control-token"
+	requests := 0
+	handler := delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: controlToken})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		handler.ServeHTTP(writer, request)
+	}))
+	defer server.Close()
+
+	_, err = (Poller{
+		Store:          db,
+		InboxProjector: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: controlToken},
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).RecordFailure(ctx, repository, errors.New("GitHub read failed"))
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("record failure = %v, want needs attention", err)
+	}
+	if requests != 1 {
+		t.Fatalf("Needs Attention Inbox projections = %d, want 1", requests)
+	}
+}
+
+func TestRecordFailureInvalidatesBootstrapProvenanceAfterSecondaryInboxError(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	controlToken := "control-token"
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
+	defer server.Close()
+	projector := &recordingInboxProjector{delegate: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "wrong-token"}}
+	preActivationConflict := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
+
+	_, err = (Poller{
+		Store:          db,
+		InboxProjector: projector,
+		MaxFailures:    1,
+	}).recordFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, preActivationConflict)
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("record failure = %v, want needs attention", err)
+	}
+	var gatewayErr *delivery.HTTPError
+	if !errors.As(projector.err, &gatewayErr) || gatewayErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("secondary Inbox projection error = %#v, want HTTP 403", projector.err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailureUnrecoverable {
+		t.Fatalf("failure kind = %q, want unrecoverable", cursor.FailureKind)
+	}
+	recovered, err := db.RecoverGitHubPollAfterBootstrap(ctx, repository, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered {
+		t.Fatal("bootstrap recovered a cursor contaminated by a secondary error")
+	}
 }
 
 func TestPollDoesNotBootstrapPastFailureBudgetWithUnclassifiedOrMixedFailures(t *testing.T) {

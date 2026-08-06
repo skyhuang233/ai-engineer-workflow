@@ -157,14 +157,28 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 	updated, cursorErr := p.Store.GitHubPollCursor(persistenceCtx, repository)
 	if cursorErr == nil && updated.ConsecutiveFailures >= p.maxFailures() {
 		if attentionErr := p.Store.MarkRepositoryNeedsAttention(persistenceCtx, repository, now); attentionErr != nil {
-			return PollResult{}, errors.Join(cause, attentionErr)
+			return PollResult{}, p.needsAttentionFailure(persistenceCtx, repository, now, cause, attentionErr)
 		}
-		if inboxErr := p.projectWorkflowInbox(persistenceCtx, repository); inboxErr != nil {
-			return PollResult{}, errors.Join(cause, inboxErr)
+		active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
+		if activeErr != nil {
+			return PollResult{}, p.needsAttentionFailure(persistenceCtx, repository, now, cause, activeErr)
 		}
-		return PollResult{}, store.ErrNeedsAttention
+		if active {
+			if inboxErr := p.projectWorkflowInbox(persistenceCtx, repository); inboxErr != nil {
+				return PollResult{}, p.needsAttentionFailure(persistenceCtx, repository, now, cause, inboxErr)
+			}
+		}
+		return PollResult{}, errors.Join(cause, store.ErrNeedsAttention)
 	}
 	return PollResult{}, cause
+}
+
+func (p Poller) needsAttentionFailure(ctx context.Context, repository string, now time.Time, cause, secondary error) error {
+	result := errors.Join(cause, store.ErrNeedsAttention, secondary)
+	if provenanceErr := p.Store.MarkGitHubPollFailureUnrecoverable(ctx, repository, now); provenanceErr != nil {
+		return errors.Join(result, provenanceErr)
+	}
+	return result
 }
 
 func (p Poller) maxFailures() int {
