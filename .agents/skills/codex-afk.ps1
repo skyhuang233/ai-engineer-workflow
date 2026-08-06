@@ -98,6 +98,16 @@ function Wait-Gateway {
   throw "Gateway did not listen on port $Port within 30 seconds"
 }
 
+function Assert-GatewayPortAvailable {
+  param([Parameter(Mandatory = $true)][int]$Port)
+
+  $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+    Where-Object { $_.Port -eq $Port }
+  if (@($listeners).Count -gt 0) {
+    throw "Gateway port $Port is already occupied; stop the existing listener before starting the Control Plane"
+  }
+}
+
 function Stop-Gateway {
   param([System.Diagnostics.Process]$Process)
 
@@ -177,6 +187,7 @@ try {
         '--database', $database,
         '--listen', $gatewayListen
       )
+      Assert-GatewayPortAvailable $gatewayPort
       $gatewayProcess = Start-Process -FilePath $binaryPath `
         -ArgumentList $gatewayArguments `
         -WorkingDirectory $projectRoot `
