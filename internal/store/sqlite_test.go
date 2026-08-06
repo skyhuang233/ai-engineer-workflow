@@ -128,6 +128,53 @@ func TestMigrationFromV29AddsRotationFencingColumns(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV30AddsGitHubPollFailureKind(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 31"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN failure_kind"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "failure_kind") {
+		t.Fatal("migration did not add github_poll_cursors.failure_kind")
+	}
+	backup, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "github_poll_cursors", "failure_kind") {
+		t.Fatal("migration backup includes the v31 GitHub poll failure column")
+	}
+}
+
 func TestMigrationBackupCanBeRestored(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

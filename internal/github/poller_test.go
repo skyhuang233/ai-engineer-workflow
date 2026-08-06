@@ -3,8 +3,10 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -35,6 +37,129 @@ func (p *activePlanInboxProjector) ProjectWorkflowInbox(ctx context.Context, rep
 		Repository: repository,
 	}, p.now)
 	return err
+}
+
+type coldStartPlanReader struct {
+	snapshot plan.Snapshot
+}
+
+func (r coldStartPlanReader) ReadPlan(context.Context, string, int64) (plan.Snapshot, error) {
+	return r.snapshot, nil
+}
+
+type acceptingDeliveryRemote struct{}
+
+func (acceptingDeliveryRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	return delivery.Observation{}, nil
+}
+
+func (acceptingDeliveryRemote) Apply(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
+	return delivery.Observation{Applied: true}, nil
+}
+
+type coldStartProjector struct {
+	store    *store.Store
+	delegate delivery.HTTPProjector
+	events   []string
+}
+
+func (p *coldStartProjector) ProjectPlan(ctx context.Context, repository string, rootNumber int64, projection plan.Projection, label string) error {
+	active, err := p.store.HasActiveDeliveryPlan(ctx, repository)
+	if err != nil {
+		return err
+	}
+	p.events = append(p.events, "control: project Plan Root #2 (active="+fmt.Sprint(active)+")")
+	return p.delegate.ProjectPlan(ctx, repository, rootNumber, projection, label)
+}
+
+func (p *coldStartProjector) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
+	active, err := p.store.HasActiveDeliveryPlan(ctx, repository)
+	if err != nil {
+		return err
+	}
+	p.events = append(p.events, "poll: project Workflow Inbox (active="+fmt.Sprint(active)+")")
+	return p.delegate.ProjectWorkflowInbox(ctx, repository, questions)
+}
+
+func TestColdStartActivatesApprovedPlanBeforeUnifiedInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	controlToken := "control-token"
+	gateway := delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return now }}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
+	defer server.Close()
+	httpProjector := delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: controlToken}
+	if err := httpProjector.ProjectWorkflowInbox(ctx, repository, nil); err == nil {
+		t.Fatal("Gateway admitted the repository before its Delivery Plan was active")
+	} else {
+		var gatewayErr *delivery.HTTPError
+		if !errors.As(err, &gatewayErr) || gatewayErr.StatusCode != 409 || gatewayErr.Code != delivery.ErrorCodeNoActiveDeliveryPlan {
+			t.Fatalf("cold-start Gateway rejection = %v", err)
+		}
+		t.Logf("before poll: Gateway rejected Workflow Inbox with HTTP %d %s", gatewayErr.StatusCode, gatewayErr.Code)
+	}
+	snapshot := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 2, Number: 2, Body: "approved plan", Labels: []string{plan.PlanLabel}, UpdatedAt: "approved-root-2"},
+		Children: []plan.Issue{
+			{ID: 8, Number: 8, Title: "completed blocker", Labels: []string{plan.TicketLabel}, State: "closed", Delivered: true},
+			{ID: 9, Number: 9, Title: "ready next ticket", Labels: []string{plan.TicketLabel}, State: "open"},
+		},
+		BlockedBy: map[int64][]plan.Issue{9: {{ID: 8, Number: 8, Title: "completed blocker", Labels: []string{plan.TicketLabel}, State: "closed", Delivered: true}}},
+	}
+	projector := &coldStartProjector{store: db, delegate: httpProjector}
+	activator := plan.Activator{Reader: coldStartPlanReader{snapshot: snapshot}, Projector: projector, Store: db}
+	bootstrap := func(ctx context.Context) error {
+		_, err := activator.Activate(ctx, repository, 2)
+		return err
+	}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		Now:            func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, bootstrap, func(ctx context.Context, bootstrapped bool) error {
+		if !bootstrapped {
+			return bootstrap(ctx)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cold-start poll = %v; sequence = %#v", err, projector.events)
+	}
+	wantEvents := []string{
+		"control: project Plan Root #2 (active=false)",
+		"control: project Plan Root #2 (active=true)",
+		"poll: project Workflow Inbox (active=true)",
+	}
+	if !reflect.DeepEqual(projector.events, wantEvents) {
+		t.Fatalf("cold-start sequence = %#v, want %#v", projector.events, wantEvents)
+	}
+	version, err := db.CurrentVersion(ctx, repository, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontier, err := db.ReadyFrontier(ctx, version.ID, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 1 || frontier[0].IssueID != 9 {
+		t.Fatalf("ready frontier = %#v, want ticket #9", frontier)
+	}
+	for index, event := range projector.events {
+		t.Logf("step %d: %s", index+1, event)
+	}
+	active, err := db.HasActiveDeliveryPlan(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("after poll: active Delivery Plan=%t; ready Executable Ticket=#%d", active, frontier[0].Number)
 }
 
 func TestPollRunsControlPassBeforeWorkflowInboxProjection(t *testing.T) {
@@ -85,7 +210,7 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	now := failedAt.Add(time.Minute)
 	controlToken := "control-token"
-	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db}, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: acceptingDeliveryRemote{}, Now: func() time.Time { return failedAt }}, delivery.HTTPOptions{ControlPlaneToken: controlToken}))
 	defer server.Close()
 	_, err = (Poller{
 		Store:          db,
@@ -104,7 +229,7 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict {
 		t.Fatalf("failure kind = %q", cursor.FailureKind)
 	}
-	projector := &activePlanInboxProjector{store: db, now: now}
+	projector := &coldStartProjector{store: db, delegate: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: controlToken}}
 	bootstrapRuns := 0
 	controlRuns := 0
 	_, err = (Poller{
@@ -127,8 +252,8 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bootstrapRuns != 1 || controlRuns != 1 || projector.calls != 1 {
-		t.Fatalf("bootstrap, control, projection = %d, %d, %d", bootstrapRuns, controlRuns, projector.calls)
+	if bootstrapRuns != 1 || controlRuns != 1 || len(projector.events) != 1 || projector.events[0] != "poll: project Workflow Inbox (active=true)" {
+		t.Fatalf("bootstrap, control, projection = %d, %d, %#v", bootstrapRuns, controlRuns, projector.events)
 	}
 	cursor, err = db.GitHubPollCursor(ctx, repository)
 	if err != nil {
@@ -137,6 +262,7 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	if cursor.ConsecutiveFailures != 0 {
 		t.Fatalf("consecutive failures = %d, want 0", cursor.ConsecutiveFailures)
 	}
+	t.Logf("recovery: classified cold-start failure budget reset to %d after bootstrap; %s", cursor.ConsecutiveFailures, projector.events[0])
 }
 
 func TestPollDoesNotBootstrapPastFailureBudgetWithUnclassifiedOrMixedFailures(t *testing.T) {
