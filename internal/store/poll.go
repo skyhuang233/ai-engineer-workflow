@@ -131,6 +131,31 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&cursor.Reposit
 	return cursor, nil
 }
 
+func (s *Store) HasActiveDeliveryPlan(ctx context.Context, repository string) (bool, error) {
+	var active int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) RecoverGitHubPollAfterBootstrap(ctx context.Context, repository string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, next_attempt_at, updated_at)
+VALUES (?, 0, ?, ?)
+ON CONFLICT(repository) DO UPDATE SET consecutive_failures = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), formatTimestamp(now))
+	return err
+}
+
 func (s *Store) RecordGitHubPollSuccess(ctx context.Context, repository string, now time.Time, fullReconcile bool) error {
 	if now.IsZero() {
 		now = time.Now().UTC()

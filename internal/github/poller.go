@@ -51,6 +51,10 @@ func (p Poller) RecordFailure(ctx context.Context, repository string, cause erro
 }
 
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
+	return p.PollWithBootstrap(ctx, repository, nil, before)
+}
+
+func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootstrap, before ControlPass) (PollResult, error) {
 	if p.Store == nil || p.Client == nil {
 		return PollResult{}, fmt.Errorf("GitHub poller dependencies are incomplete")
 	}
@@ -72,7 +76,30 @@ func (p Poller) PollWith(ctx context.Context, repository string, before ControlP
 	cursor, err = p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
-			return PollResult{}, store.ErrNeedsAttention
+			active, activeErr := p.Store.HasActiveDeliveryPlan(ctx, repository)
+			if activeErr != nil {
+				return PollResult{}, activeErr
+			}
+			if active || bootstrap == nil {
+				return PollResult{}, store.ErrNeedsAttention
+			}
+			if bootstrapErr := bootstrap(ctx); bootstrapErr != nil {
+				return p.recordFailure(ctx, repository, now, bootstrapErr)
+			}
+			active, activeErr = p.Store.HasActiveDeliveryPlan(ctx, repository)
+			if activeErr != nil {
+				return PollResult{}, activeErr
+			}
+			if !active {
+				return p.recordFailure(ctx, repository, now, fmt.Errorf("plan bootstrap did not activate a delivery plan"))
+			}
+			if err := p.Store.RecoverGitHubPollAfterBootstrap(ctx, repository, now); err != nil {
+				return PollResult{}, err
+			}
+			cursor, err = p.Store.GitHubPollCursor(ctx, repository)
+			if err != nil {
+				return PollResult{}, err
+			}
 		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, err

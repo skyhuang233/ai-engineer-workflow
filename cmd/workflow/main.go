@@ -570,7 +570,7 @@ func runPollGitHub(args []string) {
 		}
 		poller.Client = client
 		poller.LaunchReview = launcher
-		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
+		bootstrap := func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
 				return err
@@ -579,7 +579,13 @@ func runPollGitHub(args []string) {
 			if _, err := activator.Activate(ctx, *repository, activeRoot); err != nil {
 				return err
 			}
-			activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			return nil
+		}
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context) error {
+			if err := bootstrap(ctx); err != nil {
+				return err
+			}
+			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
 				return err
 			}

@@ -72,6 +72,106 @@ func TestPollRunsControlPassBeforeWorkflowInboxProjection(t *testing.T) {
 	}
 }
 
+func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	now := failedAt.Add(time.Minute)
+	if err := db.RecordGitHubPollFailure(ctx, repository, failedAt); err != nil {
+		t.Fatal(err)
+	}
+	projector := &activePlanInboxProjector{store: db, now: now}
+	bootstrapRuns := 0
+	controlRuns := 0
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: projector,
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, func(ctx context.Context) error {
+		bootstrapRuns++
+		activatePollerPlan(t, ctx, db, repository)
+		return nil
+	}, func(context.Context) error {
+		controlRuns++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrapRuns != 1 || controlRuns != 1 || projector.calls != 1 {
+		t.Fatalf("bootstrap, control, projection = %d, %d, %d", bootstrapRuns, controlRuns, projector.calls)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("consecutive failures = %d, want 0", cursor.ConsecutiveFailures)
+	}
+}
+
+func TestPollDoesNotBootstrapPastFailureBudgetWithActivePlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.RecordGitHubPollFailure(ctx, repository, failedAt); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapRuns := 0
+	controlRuns := 0
+	_, err = (Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 1,
+		Now:         func() time.Time { return failedAt.Add(time.Minute) },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		bootstrapRuns++
+		return nil
+	}, func(context.Context) error {
+		controlRuns++
+		return nil
+	})
+	if !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("poll error = %v, want needs attention", err)
+	}
+	if bootstrapRuns != 0 || controlRuns != 0 {
+		t.Fatalf("bootstrap, control = %d, %d", bootstrapRuns, controlRuns)
+	}
+}
+
+func activatePollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) {
+	t.Helper()
+	snapshot := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "poller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecordFailurePersistsAfterParentCancellation(t *testing.T) {
 	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
