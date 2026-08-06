@@ -30,6 +30,14 @@ type WorkflowInboxItem struct {
 }
 
 func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.Time) error {
+	return s.pauseGatewayWrites(ctx, "", "", reason, now)
+}
+
+func (s *Store) PauseGatewayWritesForGitHubPoll(ctx context.Context, repository, leaseToken, reason string, now time.Time) error {
+	return s.pauseGatewayWrites(ctx, repository, leaseToken, reason, now)
+}
+
+func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, reason string, now time.Time) error {
 	if reason == "" {
 		return errors.New("Gateway pause reason is required")
 	}
@@ -39,6 +47,11 @@ func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.
 		return err
 	}
 	defer tx.Rollback()
+	if leaseToken != "" {
+		if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, now); err != nil {
+			return err
+		}
+	}
 	timestamp := now.Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 1, reason = ?, updated_at = ? WHERE singleton = 1`, reason, timestamp); err != nil {
 		return err

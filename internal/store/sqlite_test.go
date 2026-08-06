@@ -185,7 +185,8 @@ func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordGitHubPollFailureWithKind(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict); err != nil {
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
+VALUES (?, 1, ?, ?, '', ?, ?)`, repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, formatTimestamp(now), formatTimestamp(now)); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -223,8 +224,8 @@ func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.RecoveryState != GitHubPollRecoveryAvailable {
-		t.Fatalf("migrated recovery state = %q, want available", cursor.RecoveryState)
+	if cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed {
+		t.Fatalf("migrated recovery = %q/%q, want safely consumed legacy provenance", cursor.FailureKind, cursor.RecoveryState)
 	}
 	backup, err := sql.Open("sqlite", backupPath)
 	if err != nil {
@@ -276,6 +277,45 @@ func TestMigrationFromV32AddsGitHubPollLeaseColumns(t *testing.T) {
 		if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", column) {
 			t.Fatalf("migration did not add github_poll_cursors.%s", column)
 		}
+	}
+}
+
+func TestMigrationFromV33AddsBootstrapPlanProvenance(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 34"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN recovery_plan_version_id"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "recovery_plan_version_id") {
+		t.Fatal("migration did not add github_poll_cursors.recovery_plan_version_id")
 	}
 }
 

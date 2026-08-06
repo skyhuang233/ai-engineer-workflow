@@ -80,6 +80,11 @@ func (p Poller) Ready(ctx context.Context, repository string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
+	if _, ok := p.pollLeaseToken(ctx, repository); ok {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return err
+		}
+	}
 	return p.readyAt(ctx, repository, p.now())
 }
 
@@ -127,7 +132,23 @@ func (p Poller) ConsumeBootstrapEligibility(ctx context.Context, repository stri
 	}
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
+	if token, ok := p.pollLeaseToken(ctx, repository); ok {
+		return p.Store.ConsumeGitHubPollBootstrapEligibilityLeased(persistenceCtx, repository, token, p.now())
+	}
 	return p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, p.now())
+}
+
+func (p Poller) pollLeaseToken(ctx context.Context, repository string) (string, bool) {
+	lease, ok := ctx.Value(githubPollLeaseContextKey{}).(githubPollLease)
+	return lease.token, ok && lease.repository == repository && lease.token != ""
+}
+
+func (p Poller) renewPollLease(ctx context.Context, repository string) error {
+	token, ok := p.pollLeaseToken(ctx, repository)
+	if !ok {
+		return store.ErrFencingConflict
+	}
+	return p.Store.RenewGitHubPollLease(ctx, repository, token, p.now(), githubPollLeaseTTL)
 }
 
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
@@ -160,6 +181,10 @@ func (p Poller) PollWithBootstrap(ctx context.Context, repository string, bootst
 
 func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, bootstrap ControlPass, before BootstrapControlPass) (PollResult, error) {
 	now := p.now()
+	leaseToken, ok := p.pollLeaseToken(ctx, repository)
+	if !ok {
+		return PollResult{}, store.ErrFencingConflict
+	}
 	if err := p.readyAt(ctx, repository, now); err != nil {
 		if errors.Is(err, store.ErrNotReady) {
 			return PollResult{}, err
@@ -170,6 +195,9 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, err
 	}
+	if err := p.renewPollLease(ctx, repository); err != nil {
+		return PollResult{}, err
+	}
 	if err := p.routeInboxAnswers(ctx, repository); err != nil {
 		return p.recordFailure(ctx, repository, now, err)
 	}
@@ -177,22 +205,25 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	cursor, err = p.Store.GitHubPollCursor(ctx, repository)
 	if err == nil {
 		if cursor.NeedsAttention() {
-			return PollResult{}, p.terminalFailure(ctx, repository, now, fmt.Errorf("GitHub polling is paused pending human recovery"))
+			return PollResult{}, errors.Join(fmt.Errorf("GitHub polling is paused pending human recovery"), store.ErrNeedsAttention)
 		}
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
 			active, activeErr := p.Store.HasActiveDeliveryPlan(ctx, repository)
 			if activeErr != nil {
-				return PollResult{}, p.terminalFailure(ctx, repository, now, activeErr)
+				return PollResult{}, activeErr
 			}
 			if active || bootstrap == nil || cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryAvailable {
 				return PollResult{}, p.finishExhaustedFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap recovery is unavailable"))
 			}
-			claimed, claimErr := p.Store.ClaimGitHubPollBootstrapRecovery(ctx, repository, p.maxFailures(), now)
+			claimed, claimErr := p.Store.ClaimGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), now, leaseToken)
 			if claimErr != nil {
-				return PollResult{}, p.terminalFailure(ctx, repository, now, claimErr)
+				return PollResult{}, claimErr
 			}
 			if !claimed {
-				return PollResult{}, store.ErrNeedsAttention
+				return PollResult{}, p.finishExhaustedFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap provenance is no longer current"))
+			}
+			if err := p.renewPollLease(ctx, repository); err != nil {
+				return PollResult{}, err
 			}
 			if bootstrapErr := bootstrap(ctx); bootstrapErr != nil {
 				return p.recordFailure(ctx, repository, now, bootstrapErr)
@@ -200,14 +231,14 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 			bootstrapped = true
 			active, activeErr = p.Store.HasActiveDeliveryPlan(ctx, repository)
 			if activeErr != nil {
-				return PollResult{}, p.terminalFailure(ctx, repository, now, activeErr)
+				return PollResult{}, activeErr
 			}
 			if !active {
 				return p.recordFailure(ctx, repository, now, fmt.Errorf("plan bootstrap did not activate a delivery plan"))
 			}
-			recovered, err := p.Store.RecoverGitHubPollAfterBootstrap(ctx, repository, now)
+			recovered, err := p.Store.RecoverGitHubPollAfterBootstrapLeased(ctx, repository, now, leaseToken)
 			if err != nil {
-				return PollResult{}, p.terminalFailure(ctx, repository, now, err)
+				return PollResult{}, err
 			}
 			if !recovered {
 				return PollResult{}, p.terminalFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap recovery claim was lost"))
@@ -222,23 +253,39 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	}
 	full := err != nil || cursor.LastFullReconcileAt.IsZero() || now.Sub(cursor.LastFullReconcileAt) >= p.fullReconcileInterval()
 	if before != nil {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
 		if err := before(ctx, bootstrapped); err != nil {
 			return p.recordFailure(ctx, repository, now, err)
 		}
 	}
+	if err := p.renewPollLease(ctx, repository); err != nil {
+		return PollResult{}, err
+	}
+	recoveryCandidateVersionID, singleProjectingPlan, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
+	if err != nil {
+		return PollResult{}, err
+	}
+	if !singleProjectingPlan {
+		recoveryCandidateVersionID = ""
+	}
 	if err := p.projectWorkflowInbox(ctx, repository); err != nil {
-		failureKind, classificationErr := p.inboxProjectionFailureKind(ctx, repository, err)
+		failureKind, recoveryPlanVersionID, classificationErr := p.inboxProjectionFailureKind(ctx, repository, recoveryCandidateVersionID, err)
 		if classificationErr != nil {
-			return p.recordFailure(ctx, repository, now, errors.Join(err, classificationErr))
+			return PollResult{}, errors.Join(err, classificationErr)
 		}
-		return p.recordFailureWithKind(ctx, repository, now, failureKind, err)
+		return p.recordFailureWithKind(ctx, repository, now, failureKind, recoveryPlanVersionID, err)
+	}
+	if err := p.renewPollLease(ctx, repository); err != nil {
+		return PollResult{}, err
 	}
 	result, err := p.poll(ctx, repository, now, cursor.LastSuccessAt, full)
 	if err != nil {
 		return p.recordFailure(ctx, repository, now, err)
 	}
-	if err := p.Store.RecordGitHubPollSuccess(ctx, repository, now, full); err != nil {
-		return p.recordFailure(ctx, repository, now, err)
+	if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken); err != nil {
+		return PollResult{}, err
 	}
 	return result, nil
 }
@@ -258,43 +305,70 @@ func (p Poller) readyAt(ctx context.Context, repository string, now time.Time) e
 }
 
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
-	return p.recordFailureWithKind(ctx, repository, now, "", cause)
+	return p.recordFailureWithKind(ctx, repository, now, "", "", cause)
 }
 
-func (p Poller) recordFailureWithKind(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, cause error) (PollResult, error) {
+func (p Poller) recordFailureWithKind(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, recoveryPlanVersionID string, cause error) (PollResult, error) {
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
+	leaseToken, leased := p.pollLeaseToken(ctx, repository)
 	if isPollCredentialFailure(cause) {
-		consumeErr := p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, now)
-		pauseErr := p.Store.PauseGatewayWrites(persistenceCtx, "Gateway Credential is unavailable; replace and verify it to resume writes", now)
+		var consumeErr, pauseErr error
+		if leased {
+			consumeErr = p.Store.PauseGitHubPollForCredential(persistenceCtx, repository, leaseToken, now)
+			if consumeErr == nil {
+				pauseErr = p.Store.PauseGatewayWritesForGitHubPoll(persistenceCtx, repository, leaseToken, "Gateway Credential is unavailable; replace and verify it to resume writes", now)
+			}
+		} else {
+			consumeErr = p.Store.PauseGitHubPollForCredential(persistenceCtx, repository, "", now)
+			pauseErr = p.Store.PauseGatewayWrites(persistenceCtx, "Gateway Credential is unavailable; replace and verify it to resume writes", now)
+		}
 		return PollResult{}, errors.Join(cause, consumeErr, pauseErr)
 	}
 	var githubError *apiError
 	if errors.As(cause, &githubError) && githubError.RetryAt.After(now) {
-		updated, err := p.Store.DeferGitHubPollWithCursor(persistenceCtx, repository, githubError.RetryAt, now)
+		var updated store.GitHubPollCursor
+		var err error
+		if leased {
+			updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, githubError.RetryAt, now, leaseToken)
+		} else {
+			updated, err = p.Store.DeferGitHubPollWithCursor(persistenceCtx, repository, githubError.RetryAt, now)
+		}
 		if err != nil {
-			return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, err)
+			return PollResult{}, errors.Join(cause, err)
 		}
 		if updated.ConsecutiveFailures >= p.maxFailures() {
 			return PollResult{}, p.finishExhaustedFailure(persistenceCtx, repository, now, cause)
 		}
 		return PollResult{}, cause
 	}
-	updated, recordErr := p.Store.AdvanceGitHubPollFailure(persistenceCtx, repository, now, failureKind)
+	var updated store.GitHubPollCursor
+	var recordErr error
+	if leased {
+		updated, recordErr = p.Store.AdvanceGitHubPollFailureLeased(persistenceCtx, repository, now, failureKind, recoveryPlanVersionID, leaseToken)
+	} else {
+		updated, recordErr = p.Store.AdvanceGitHubPollFailureLeased(persistenceCtx, repository, now, failureKind, recoveryPlanVersionID, "")
+	}
 	if recordErr != nil {
-		return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, recordErr)
+		return PollResult{}, errors.Join(cause, recordErr)
 	}
 	if updated.ConsecutiveFailures >= p.maxFailures() {
 		if updated.FailureKind == store.GitHubPollFailurePreActivationInboxConflict && updated.RecoveryState == store.GitHubPollRecoveryAvailable {
 			active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
 			if activeErr != nil {
-				return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, activeErr)
+				return PollResult{}, errors.Join(cause, activeErr)
 			}
 			if !active {
 				return PollResult{}, errors.Join(cause, store.ErrNeedsAttention)
 			}
-			if consumeErr := p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, now); consumeErr != nil {
-				return PollResult{}, p.terminalFailure(persistenceCtx, repository, now, cause, consumeErr)
+			var consumeErr error
+			if leased {
+				consumeErr = p.Store.ConsumeGitHubPollBootstrapEligibilityLeased(persistenceCtx, repository, leaseToken, now)
+			} else {
+				consumeErr = p.Store.ConsumeGitHubPollBootstrapEligibility(persistenceCtx, repository, now)
+			}
+			if consumeErr != nil {
+				return PollResult{}, errors.Join(cause, consumeErr)
 			}
 		}
 		return PollResult{}, p.finishExhaustedFailure(persistenceCtx, repository, now, cause)
@@ -317,18 +391,38 @@ func isPollCredentialFailure(err error) bool {
 func (p Poller) terminalFailure(ctx context.Context, repository string, now time.Time, causes ...error) error {
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	result := errors.Join(append(causes, store.ErrNeedsAttention)...)
-	if provenanceErr := p.Store.MarkGitHubPollFailureUnrecoverable(persistenceCtx, repository, now); provenanceErr != nil {
-		result = errors.Join(result, provenanceErr)
+	result := errors.Join(causes...)
+	leaseToken, leased := p.pollLeaseToken(ctx, repository)
+	var provenanceErr error
+	if leased {
+		provenanceErr = p.Store.MarkGitHubPollFailureUnrecoverableLeased(persistenceCtx, repository, now, leaseToken)
+	} else {
+		provenanceErr = p.Store.MarkGitHubPollFailureUnrecoverable(persistenceCtx, repository, now)
 	}
-	if attentionErr := p.Store.MarkRepositoryNeedsAttention(persistenceCtx, repository, now); attentionErr != nil {
+	if provenanceErr != nil {
+		result = errors.Join(result, provenanceErr)
+		return result
+	}
+	var attentionErr error
+	if leased {
+		attentionErr = p.Store.MarkRepositoryNeedsAttentionLeased(persistenceCtx, repository, now, leaseToken)
+	} else {
+		attentionErr = p.Store.MarkRepositoryNeedsAttention(persistenceCtx, repository, now)
+	}
+	if attentionErr != nil {
 		return errors.Join(result, attentionErr)
 	}
+	result = errors.Join(result, store.ErrNeedsAttention)
 	active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
 	if activeErr != nil {
 		return errors.Join(result, activeErr)
 	}
 	if active {
+		if leased {
+			if err := p.Store.RenewGitHubPollLease(persistenceCtx, repository, leaseToken, p.now(), githubPollLeaseTTL); err != nil {
+				return errors.Join(result, err)
+			}
+		}
 		if inboxErr := p.projectWorkflowInbox(persistenceCtx, repository); inboxErr != nil {
 			return errors.Join(result, inboxErr)
 		}
@@ -358,11 +452,17 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 	result := PollResult{Deliveries: len(deliveries)}
 	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
 	for _, delivery := range deliveries {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
 		terminal, err := reconciler.ReconcileTicket(ctx, delivery)
 		if err != nil {
 			return PollResult{}, err
 		}
 		if !terminal {
+			if err := p.renewPollLease(ctx, repository); err != nil {
+				return PollResult{}, err
+			}
 			events, err := p.Client.ActionablePullRequestFeedbackSince(ctx, repository, delivery.PullRequestNumber, since, full)
 			if err != nil {
 				return PollResult{}, err
@@ -377,6 +477,9 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 			}
 			result.Feedback += inserted
 			if p.LaunchReview != nil {
+				if err := p.renewPollLease(ctx, repository); err != nil {
+					return PollResult{}, err
+				}
 				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
 				if claimErr == nil {
 					if err := p.LaunchReview(ctx, claim, prompt); err != nil {
@@ -386,6 +489,9 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 					return PollResult{}, claimErr
 				}
 			}
+		}
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
 		}
 		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
 		if err != nil {
@@ -450,19 +556,22 @@ func (p Poller) projectWorkflowInbox(ctx context.Context, repository string) err
 	return p.InboxProjector.ProjectWorkflowInbox(ctx, repository, projected)
 }
 
-func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository string, cause error) (store.GitHubPollFailureKind, error) {
+func (p Poller) inboxProjectionFailureKind(ctx context.Context, repository, candidateVersionID string, cause error) (store.GitHubPollFailureKind, string, error) {
 	var gatewayError *delivery.HTTPError
 	if !errors.As(cause, &gatewayError) || gatewayError.StatusCode != 409 || gatewayError.Code != delivery.ErrorCodeNoActiveDeliveryPlan {
-		return "", nil
+		return "", "", nil
 	}
-	projecting, err := p.Store.HasProjectingDeliveryPlan(ctx, repository)
+	if candidateVersionID == "" {
+		return "", "", nil
+	}
+	versionID, projecting, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if !projecting {
-		return "", nil
+	if !projecting || versionID != candidateVersionID {
+		return "", "", nil
 	}
-	return store.GitHubPollFailurePreActivationInboxConflict, nil
+	return store.GitHubPollFailurePreActivationInboxConflict, candidateVersionID, nil
 }
 
 func workflowQuestionProjection(question store.WorkflowQuestion) plan.WorkflowQuestion {

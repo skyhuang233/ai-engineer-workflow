@@ -262,7 +262,7 @@ func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *test
 			paused, _, pauseErr := db.GatewayWritesPaused(ctx)
 			cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
 			current, claimErr := db.CurrentClaim(ctx, version.ID, claim.TicketID)
-			if pauseErr != nil || !paused || cursorErr != nil || cursor.NeedsAttention() || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed || claimErr != nil || current.RunID != claim.RunID {
+			if pauseErr != nil || !paused || cursorErr != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed || claimErr != nil || current.RunID != claim.RunID {
 				db.Close()
 				t.Fatalf("credential state paused=%t cursor=%#v claim=%#v errors=%v/%v/%v", paused, cursor, current, pauseErr, cursorErr, claimErr)
 			}
@@ -280,7 +280,7 @@ func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *test
 			}
 			defer restarted.Close()
 			cursor, err = restarted.GitHubPollCursor(ctx, repository)
-			if err != nil || cursor.NeedsAttention() || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+			if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
 				t.Fatalf("restarted credential cursor = %#v, %v", cursor, err)
 			}
 		})

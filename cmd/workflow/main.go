@@ -855,8 +855,8 @@ func shouldPauseGatewayForCredential(err error) bool {
 }
 
 func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
-	if shouldPauseGatewayForCredential(admissionErr) {
-		return errors.Join(admissionErr, poller.ConsumeBootstrapEligibility(ctx, repository))
+	if shouldPauseGatewayForCredential(admissionErr) && !errors.Is(admissionErr, delivery.ErrGatewayCredentialRejected) {
+		admissionErr = fmt.Errorf("%w: Gateway Credential is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
 	}
 	_, err := poller.RecordFailure(ctx, repository, admissionErr)
 	return err
@@ -866,7 +866,20 @@ func admitPollGitHubCredential(ctx context.Context, poller github.Poller, databa
 	if err := poller.Ready(ctx, repository); err != nil {
 		return "", err
 	}
-	return admitGatewayCredential(ctx, database, authenticate)
+	token, err := verifiedGatewayCredential(ctx, database)
+	if err == nil && authenticate != nil {
+		err = authenticate(token)
+	}
+	if err != nil {
+		var authenticationFailure interface{ AuthenticationFailure() bool }
+		if errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
+			err = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, err)
+		} else if errors.Is(err, credential.ErrNotFound) {
+			err = fmt.Errorf("%w: Gateway Credential is missing: %w", delivery.ErrGatewayCredentialRejected, err)
+		}
+		return "", err
+	}
+	return token, nil
 }
 
 func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {

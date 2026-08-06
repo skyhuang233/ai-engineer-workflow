@@ -19,7 +19,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 33
+	latestSchemaVersion = 34
 )
 
 var (
@@ -867,6 +867,23 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (33, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 34 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "recovery_plan_version_id")
+		if err != nil {
+			return fmt.Errorf("migration 34: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN recovery_plan_version_id TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 34: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '' WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, GitHubPollFailurePreActivationInboxConflict); err != nil {
+			return fmt.Errorf("migration 34: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (34, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
