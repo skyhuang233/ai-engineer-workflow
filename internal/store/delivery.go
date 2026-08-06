@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -56,6 +57,7 @@ type DeliveryRequest struct {
 	PlanProjection         *plan.Projection        `json:"plan_projection,omitempty"`
 	WorkflowQuestions      []plan.WorkflowQuestion `json:"workflow_questions,omitempty"`
 	InboxPlanVersionID     string                  `json:"inbox_plan_version_id,omitempty"`
+	InboxPlanVersionIDs    []string                `json:"inbox_plan_version_ids,omitempty"`
 	InboxProjectionVersion string                  `json:"inbox_projection_version,omitempty"`
 	Label                  string                  `json:"label,omitempty"`
 	IdempotencyKey         string                  `json:"idempotency_key,omitempty"`
@@ -873,20 +875,27 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 				return DeliveryTarget{}, request, err
 			}
 		}
-		var activeVersionID string
-		err := tx.QueryRowContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, request.Repository).Scan(&activeVersionID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
-		}
+		activeVersionIDs, err := activeDeliveryPlanVersions(ctx, tx, request.Repository)
 		if err != nil {
 			return DeliveryTarget{}, request, err
 		}
-		if request.InboxPlanVersionID != "" && request.InboxPlanVersionID != activeVersionID {
+		if len(activeVersionIDs) == 0 {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}
-		request.InboxPlanVersionID = activeVersionID
-		return DeliveryTarget{VersionID: activeVersionID, Repository: request.Repository}, request, nil
+		if len(request.InboxPlanVersionIDs) > 0 {
+			if !slices.Equal(request.InboxPlanVersionIDs, activeVersionIDs) {
+				return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
+			}
+		} else if request.InboxPlanVersionID != "" && (len(activeVersionIDs) != 1 || request.InboxPlanVersionID != activeVersionIDs[0]) {
+			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
+		}
+		request.InboxPlanVersionIDs = activeVersionIDs
+		if len(activeVersionIDs) == 1 {
+			request.InboxPlanVersionID = activeVersionIDs[0]
+		} else {
+			request.InboxPlanVersionID = ""
+		}
+		return DeliveryTarget{VersionID: activeVersionIDs[0], Repository: request.Repository}, request, nil
 	}
 	if (request.Operation == DeliveryProjectPlan || request.Operation == DeliveryAddIssueLabel) && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber <= 0 || request.PlanProjection == nil || request.PlanProjection.VersionID == "" {

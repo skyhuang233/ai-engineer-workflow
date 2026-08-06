@@ -772,6 +772,49 @@ func TestClaimedBootstrapRecoveryResumesExactVersionAfterRestart(t *testing.T) {
 	}
 }
 
+func TestClaimedBootstrapRecoveryIgnoresUnrelatedProjectingPlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	versionID := beginProjectingPollerPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := db.ClaimGitHubPollBootstrapRecovery(ctx, repository, 1, failedAt.Add(time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("claim = %t, %v", claimed, err)
+	}
+	beginProjectingPollerPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	now := failedAt.Add(time.Minute)
+	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapRuns := 0
+	recovered, err := poller.resumeClaimedBootstrapRecovery(leaseCtx, repository, cursor, func(context.Context) error {
+		bootstrapRuns++
+		return db.MarkActive(ctx, versionID)
+	}, now, leaseCtx.Value(githubPollLeaseContextKey{}).(githubPollLease).token)
+	if err != nil || !recovered || bootstrapRuns != 1 {
+		t.Fatalf("recovery = %t runs=%d error=%v", recovered, bootstrapRuns, err)
+	}
+}
+
 func TestActiveClaimedBootstrapRecoveryResumesWithoutRepeatingBootstrap(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
@@ -1397,6 +1440,87 @@ func TestPrepareAdmissionResolvesBoundRecoveryBeforeRateLimit(t *testing.T) {
 	}
 }
 
+func TestRateLimitedAdmissionPreservesProjectingRecoveryClaim(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	now := failedAt.Add(time.Minute)
+	retryAt := now.Add(5 * time.Minute)
+	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := poller.PrepareAdmission(leaseCtx, repository); err != nil {
+		t.Fatal(err)
+	}
+	rateLimit := &APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
+	if _, err := poller.RecordAdmissionFailure(leaseCtx, repository, rateLimit); !errors.Is(err, rateLimit) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("rate-limited admission = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.RecoveryPlanVersionID != versionID || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || !cursor.NextAttemptAt.Equal(retryAt) {
+		t.Fatalf("preserved recovery cursor = %#v", cursor)
+	}
+}
+
+func TestPermanentAdmissionFailureTerminalizesExhaustedRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	now := failedAt.Add(time.Minute)
+	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := poller.PrepareAdmission(leaseCtx, repository); err != nil {
+		t.Fatal(err)
+	}
+	ownerMismatch := errors.New("repository owner does not match configured owner")
+	if _, err := poller.RecordAdmissionFailure(leaseCtx, repository, ownerMismatch); !errors.Is(err, ownerMismatch) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("permanent admission = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailureUnrecoverable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+		t.Fatalf("terminal admission cursor = %#v", cursor)
+	}
+}
+
 func TestMidPollCredentialFailurePausesGatewayWithoutTerminalizingPlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -1481,10 +1605,15 @@ func TestExpiredPollLeaseCannotPersistFailure(t *testing.T) {
 
 func beginProjectingPollerPlan(t *testing.T, ctx context.Context, db *store.Store, repository string) string {
 	t.Helper()
+	return beginProjectingPollerPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+}
+
+func beginProjectingPollerPlanAt(t *testing.T, ctx context.Context, db *store.Store, repository string, rootID, rootNumber, ticketID, ticketNumber int64) string {
+	t.Helper()
 	snapshot := plan.Snapshot{
 		Repository: repository,
-		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
-		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+		Root:       plan.Issue{ID: rootID, Number: rootNumber, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: ticketID, Number: ticketNumber, Labels: []string{plan.TicketLabel}, State: "open"}},
 	}
 	fingerprint, err := snapshot.Fingerprint()
 	if err != nil {

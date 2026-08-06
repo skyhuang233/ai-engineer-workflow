@@ -43,26 +43,49 @@ type replacementReference struct {
 }
 
 func (s *Store) OpenWorkflowQuestions(ctx context.Context, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
-	return openWorkflowQuestions(ctx, s.db, repository, rootNumber)
+	return openWorkflowQuestions(ctx, s.db, repository, rootNumber, false)
 }
 
-func (s *Store) WorkflowInboxProjection(ctx context.Context, repository string) ([]WorkflowQuestion, string, error) {
-	questions, err := s.OpenWorkflowQuestions(ctx, repository, 0)
+func (s *Store) ActiveWorkflowQuestions(ctx context.Context, repository string) ([]WorkflowQuestion, error) {
+	return openWorkflowQuestions(ctx, s.db, repository, 0, true)
+}
+
+func (s *Store) WorkflowInboxProjection(ctx context.Context, repository string) ([]WorkflowQuestion, string, []string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
+	}
+	defer tx.Rollback()
+	versionIDs, err := activeDeliveryPlanVersions(ctx, tx, repository)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if len(versionIDs) == 0 {
+		return nil, "", nil, ErrNoActiveDeliveryPlan
+	}
+	questions, err := openWorkflowQuestions(ctx, tx, repository, 0, true)
+	if err != nil {
+		return nil, "", nil, err
 	}
 	version, err := workflowInboxProjectionVersion(questions)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	return questions, version, nil
+	if err := tx.Commit(); err != nil {
+		return nil, "", nil, err
+	}
+	return questions, version, versionIDs, nil
 }
 
 type workflowQuestionQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func openWorkflowQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string, rootNumber int64) ([]WorkflowQuestion, error) {
+func openWorkflowQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string, rootNumber int64, activeOnly bool) ([]WorkflowQuestion, error) {
+	active := 0
+	if activeOnly {
+		active = 1
+	}
 	rows, err := querier.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
 COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
 FROM workflow_questions q
@@ -74,7 +97,9 @@ LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.
 LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
 LEFT JOIN run_diagnostics rd ON rd.run_id = s.current_run_id
 LEFT JOIN candidate_revisions c ON c.run_id = s.current_run_id
-WHERE q.repository = ? AND (? = 0 OR p.root_issue_number = ?) AND q.state = 'open' ORDER BY q.created_at, q.question_id`, repository, rootNumber, rootNumber)
+WHERE q.repository = ? AND (? = 0 OR p.root_issue_number = ?) AND q.state = 'open'
+AND (? = 0 OR (`+currentActivePlanPredicate+`))
+ORDER BY q.created_at, q.question_id`, repository, rootNumber, rootNumber, active)
 	if err != nil {
 		return nil, err
 	}
@@ -170,16 +195,36 @@ func (s *Store) HasActiveDeliveryPlan(ctx context.Context, repository string) (b
 }
 
 func (s *Store) ActiveDeliveryPlanVersion(ctx context.Context, repository string) (string, bool, error) {
-	var versionID string
-	err := s.db.QueryRowContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&versionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
+	versionIDs, err := s.ActiveDeliveryPlanVersions(ctx, repository)
 	if err != nil {
 		return "", false, err
 	}
-	return versionID, true, nil
+	if len(versionIDs) == 0 {
+		return "", false, nil
+	}
+	return versionIDs[0], true, nil
+}
+
+func (s *Store) ActiveDeliveryPlanVersions(ctx context.Context, repository string) ([]string, error) {
+	return activeDeliveryPlanVersions(ctx, s.db, repository)
+}
+
+func activeDeliveryPlanVersions(ctx context.Context, querier workflowQuestionQuerier, repository string) ([]string, error) {
+	rows, err := querier.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ? AND `+currentActivePlanPredicate+` ORDER BY v.version_id`, repository)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var versionIDs []string
+	for rows.Next() {
+		var versionID string
+		if err := rows.Scan(&versionID); err != nil {
+			return nil, err
+		}
+		versionIDs = append(versionIDs, versionID)
+	}
+	return versionIDs, rows.Err()
 }
 
 func (s *Store) HasProjectingDeliveryPlan(ctx context.Context, repository string) (bool, error) {
@@ -198,6 +243,17 @@ AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.
 		return "", false, err
 	}
 	return versionID, count == 1, nil
+}
+
+func (s *Store) IsProjectingDeliveryPlanVersion(ctx context.Context, repository, versionID string) (bool, error) {
+	var projecting int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+    WHERE p.repository = ? AND v.version_id = ? AND p.state = ? AND v.state = ?
+    AND NOT EXISTS (SELECT 1 FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id)
+    AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id)
+)`, repository, versionID, StateProjecting, StateProjecting).Scan(&projecting)
+	return projecting != 0, err
 }
 
 func requireGitHubPollLeaseTx(ctx context.Context, tx *sql.Tx, repository, token string, leaseNow time.Time) error {
@@ -671,6 +727,37 @@ RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failu
 	return cursor, nil
 }
 
+func (s *Store) DeferGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+	if retryAt.IsZero() {
+		return GitHubPollCursor{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
+	defer tx.Rollback()
+	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
+		return GitHubPollCursor{}, err
+	}
+	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `UPDATE github_poll_cursors
+SET next_attempt_at = CASE WHEN next_attempt_at > ? THEN next_attempt_at ELSE ? END, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id != ''
+RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`,
+		formatTimestamp(retryAt), formatTimestamp(retryAt), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GitHubPollCursor{}, err
+	}
+	return cursor, nil
+}
+
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
 	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
 	if err != nil {
@@ -937,7 +1024,7 @@ func (s *Store) QueueWorkflowInboxProjectionIfActive(ctx context.Context, reposi
 }
 
 func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
-	questions, err := openWorkflowQuestions(ctx, tx, repository, 0)
+	questions, err := openWorkflowQuestions(ctx, tx, repository, 0, true)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -949,14 +1036,12 @@ func (s *Store) queueWorkflowInboxProjectionTx(ctx context.Context, tx *sql.Tx, 
 }
 
 func (s *Store) queueWorkflowInboxProjectionIfActiveTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) (DeliveryOutbox, error) {
-	var active int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND `+currentActivePlanPredicate+` LIMIT 1`, repository).Scan(&active)
-	if errors.Is(err, sql.ErrNoRows) {
-		return DeliveryOutbox{}, nil
-	}
+	versionIDs, err := activeDeliveryPlanVersions(ctx, tx, repository)
 	if err != nil {
 		return DeliveryOutbox{}, err
+	}
+	if len(versionIDs) == 0 {
+		return DeliveryOutbox{}, nil
 	}
 	return s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 }

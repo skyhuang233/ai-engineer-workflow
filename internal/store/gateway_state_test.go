@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -296,6 +297,65 @@ func TestAdmittedWorkflowInboxReplayRequiresCurrentActivePlan(t *testing.T) {
 	}
 }
 
+func TestWorkflowInboxProjectionFencesCompleteActivePlanSet(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	firstVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	secondVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, firstVersionID, 2, "first", "first question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, secondVersionID, 12, "second", "second question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedVersions := []string{firstVersionID, secondVersionID}
+	slices.Sort(expectedVersions)
+	if queued.Request.InboxPlanVersionID != "" || !slices.Equal(queued.Request.InboxPlanVersionIDs, expectedVersions) {
+		t.Fatalf("Inbox plan fence = %q/%v, want complete set %v", queued.Request.InboxPlanVersionID, queued.Request.InboxPlanVersionIDs, expectedVersions)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?)", secondVersionID, formatTimestamp(now.Add(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	applyCalls := 0
+	if _, err := db.ExecuteDelivery(ctx, claim.Request, claim.ClaimToken, func() time.Time { return now.Add(time.Second) }, func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		applyCalls++
+		return DeliveryResult{}, nil
+	}); !errors.Is(err, ErrNoActiveDeliveryPlan) {
+		t.Fatalf("changed active set dispatch error = %v, want no active delivery plan", err)
+	}
+	if applyCalls != 0 {
+		t.Fatalf("changed active set apply calls = %d, want 0", applyCalls)
+	}
+	questions, _, activeVersionIDs, err := db.WorkflowInboxProjection(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeVersionIDs) != 1 || activeVersionIDs[0] != firstVersionID || len(questions) != 1 || questions[0].VersionID != firstVersionID {
+		t.Fatalf("active Inbox projection versions=%v questions=%#v", activeVersionIDs, questions)
+	}
+}
+
 func TestAnswerWorkflowQuestionQueuesInboxProjectionAtomically(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -368,10 +428,15 @@ func TestResumeGatewayWritesCommitsAfterPlanCompletes(t *testing.T) {
 
 func activateWorkflowInboxPlan(t *testing.T, ctx context.Context, db *Store, repository string) {
 	t.Helper()
+	activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+}
+
+func activateWorkflowInboxPlanAt(t *testing.T, ctx context.Context, db *Store, repository string, rootID, rootNumber, ticketID, ticketNumber int64) string {
+	t.Helper()
 	snapshot := plan.Snapshot{
 		Repository: repository,
-		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
-		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+		Root:       plan.Issue{ID: rootID, Number: rootNumber, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: ticketID, Number: ticketNumber, Labels: []string{plan.TicketLabel}, State: "open"}},
 	}
 	fingerprint, err := snapshot.Fingerprint()
 	if err != nil {
@@ -384,4 +449,5 @@ func activateWorkflowInboxPlan(t *testing.T, ctx context.Context, db *Store, rep
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
+	return version.ID
 }

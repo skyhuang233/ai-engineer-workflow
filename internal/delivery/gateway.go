@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -58,8 +59,8 @@ type gatewayStore interface {
 	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
 	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
-	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
-	ActiveDeliveryPlanVersion(context.Context, string) (string, bool, error)
+	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, []string, error)
+	ActiveDeliveryPlanVersions(context.Context, string) ([]string, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	QueueWorkflowInboxProjectionIfActive(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
@@ -165,14 +166,14 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 	}
 	if outbox.Request.Operation == store.DeliveryProjectInbox {
-		activeVersionID, active, activeErr := g.Store.ActiveDeliveryPlanVersion(operationCtx, outbox.Request.Repository)
+		activeVersionIDs, activeErr := g.Store.ActiveDeliveryPlanVersions(operationCtx, outbox.Request.Repository)
 		if activeErr != nil {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(activeErr, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
 			}
 			return errors.Join(ErrGatewayStore, activeErr, g.requeueClaim(outbox, activeErr, outbox.ReconcileOnly))
 		}
-		if !active || outbox.Request.InboxPlanVersionID == "" || outbox.Request.InboxPlanVersionID != activeVersionID {
+		if !inboxPlanVersionsMatch(outbox.Request, activeVersionIDs) {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(store.ErrNoActiveDeliveryPlan, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.ReconcileOnly))
 			}
@@ -194,9 +195,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 			}
 			request.PlanProjection = &projection
 		} else if request.Operation == store.DeliveryProjectInbox {
-			questions, version, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
+			questions, version, activeVersionIDs, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
 			if questionsErr != nil {
 				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, questionsErr)
+			}
+			if !inboxPlanVersionsMatch(request, activeVersionIDs) {
+				return store.DeliveryResult{}, store.ErrNoActiveDeliveryPlan
 			}
 			if request.InboxProjectionVersion != "" && request.InboxProjectionVersion != version {
 				return store.DeliveryResult{}, nil
@@ -268,6 +272,13 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(outbox, err)
 	}
 	return g.succeed(outbox, result)
+}
+
+func inboxPlanVersionsMatch(request store.DeliveryRequest, activeVersionIDs []string) bool {
+	if len(request.InboxPlanVersionIDs) > 0 {
+		return slices.Equal(request.InboxPlanVersionIDs, activeVersionIDs)
+	}
+	return len(activeVersionIDs) == 1 && request.InboxPlanVersionID != "" && request.InboxPlanVersionID == activeVersionIDs[0]
 }
 
 func (g Gateway) DispatchPending(ctx context.Context, limit int) error {

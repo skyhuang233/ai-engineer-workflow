@@ -157,7 +157,8 @@ func (p Poller) PrepareAdmission(ctx context.Context, repository string) error {
 // its exact projecting plan still owns the recovery claim. Credential
 // rejection remains exceptional because it must pause all Gateway writes.
 func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, cause error) (PollResult, error) {
-	if _, leased := p.pollLeaseToken(ctx, repository); !leased {
+	leaseToken, leased := p.pollLeaseToken(ctx, repository)
+	if !leased {
 		leaseCtx, release, err := p.AcquireLease(ctx, repository)
 		if err != nil {
 			return PollResult{}, errors.Join(cause, err)
@@ -177,7 +178,12 @@ func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, c
 	}
 	if err == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
 		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
-		return PollResult{}, cause
+		var githubError *apiError
+		if errors.As(cause, &githubError) && githubError.RetryAt.After(p.now()) {
+			_, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, githubError.RetryAt, p.now(), leaseToken, p.now())
+			return PollResult{}, errors.Join(cause, deferErr)
+		}
+		return PollResult{}, p.finishExhaustedFailure(ctx, repository, p.now(), cause)
 	}
 	return p.recordFailure(ctx, repository, p.now(), cause)
 }
@@ -322,35 +328,15 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 			switch disposition {
 			case store.GitHubPollBootstrapRecoveryActive:
 				bootstrapped = true
-				cursor.ConsecutiveFailures = 0
-				cursor.FailureKind = ""
-				cursor.RecoveryState = store.GitHubPollRecoveryCompleted
-				cursor.NextAttemptAt = now
 			case store.GitHubPollBootstrapRecoveryProjecting:
-				cursor.RecoveryState = store.GitHubPollRecoveryClaimed
 				recovered, recoveryErr := p.resumeClaimedBootstrapRecovery(ctx, repository, cursor, bootstrap, now, leaseToken)
 				if recoveryErr != nil {
 					return PollResult{}, recoveryErr
 				}
 				if recovered {
 					bootstrapped = true
-					cursor.ConsecutiveFailures = 0
-					cursor.FailureKind = ""
-					cursor.RecoveryState = store.GitHubPollRecoveryCompleted
-					cursor.NextAttemptAt = now
-				} else {
-					cursor.ConsecutiveFailures = 0
-					cursor.FailureKind = store.GitHubPollFailureRetryable
-					cursor.RecoveryState = store.GitHubPollRecoveryConsumed
-					cursor.RecoveryPlanVersionID = ""
-					cursor.NextAttemptAt = now
 				}
 			case store.GitHubPollBootstrapRecoveryStale:
-				cursor.ConsecutiveFailures = 0
-				cursor.FailureKind = store.GitHubPollFailureRetryable
-				cursor.RecoveryState = store.GitHubPollRecoveryConsumed
-				cursor.RecoveryPlanVersionID = ""
-				cursor.NextAttemptAt = now
 			default:
 				return PollResult{}, p.finishExhaustedFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap provenance is no longer current"))
 			}
@@ -446,11 +432,11 @@ func (p Poller) resumeClaimedBootstrapRecovery(ctx context.Context, repository s
 	if recovered {
 		return true, nil
 	}
-	versionID, projecting, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
+	projecting, err := p.Store.IsProjectingDeliveryPlanVersion(ctx, repository, cursor.RecoveryPlanVersionID)
 	if err != nil {
 		return false, err
 	}
-	if bootstrap == nil || !projecting || versionID != cursor.RecoveryPlanVersionID {
+	if bootstrap == nil || !projecting {
 		disposition, resolveErr := p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), now, leaseToken, p.now())
 		if resolveErr != nil {
 			return false, resolveErr
@@ -697,7 +683,7 @@ func (p Poller) maxParallelRuns() int {
 }
 
 func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error {
-	questions, err := p.Store.OpenWorkflowQuestions(ctx, repository, 0)
+	questions, err := p.Store.ActiveWorkflowQuestions(ctx, repository)
 	if err != nil {
 		return wrapPollStoreError(err)
 	}
