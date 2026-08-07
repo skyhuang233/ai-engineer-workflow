@@ -139,6 +139,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
 			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
 		}
+		if errors.Is(err, store.ErrInboxDeliveryPending) {
+			queued, loadErr := g.Store.DeliveryOutbox(ctx, key)
+			if loadErr == nil && queued.Request.Operation == store.DeliveryProjectInbox {
+				return nil
+			}
+		}
 		return err
 	}
 	if outbox.State == store.OutboxSucceeded {
@@ -180,6 +186,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 			if err != nil {
 				if isCredentialRejection(err) {
 					return g.pauseForCredential(outbox, err)
+				}
+				if errors.Is(err, store.ErrDeliverySuperseded) {
+					return g.succeed(outbox, store.DeliveryResult{})
 				}
 				if errors.Is(err, store.ErrDeliveryRejected) {
 					return g.reject(outbox, err)
@@ -239,6 +248,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	if err != nil {
 		if isCredentialRejection(err) {
 			return g.pauseForCredential(outbox, err)
+		}
+		if errors.Is(err, store.ErrDeliverySuperseded) {
+			return g.succeed(outbox, store.DeliveryResult{})
 		}
 		if errors.Is(err, store.ErrDeliveryRejected) {
 			return g.reject(outbox, err)

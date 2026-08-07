@@ -555,7 +555,7 @@ func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, n
 		return PollResult{}, errors.Join(cause, err)
 	}
 	if !projecting {
-		return p.recordFailure(ctx, repository, now, cause)
+		return p.recordFailureWithKind(ctx, repository, now, "", attemptedPlanVersionID, cause)
 	}
 	return p.recordFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, attemptedPlanVersionID, cause)
 }

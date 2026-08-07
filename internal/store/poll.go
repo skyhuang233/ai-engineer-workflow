@@ -863,10 +863,8 @@ func (s *Store) markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLea
 		return err
 	}
 	if recoveryPlanVersionID == "" {
-		err = tx.QueryRowContext(ctx, `SELECT CASE
-WHEN failure_kind = ? AND recovery_state IN (?, ?) THEN recovery_plan_version_id
-ELSE '' END
-FROM github_poll_cursors WHERE repository = ?`, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, repository).Scan(&recoveryPlanVersionID)
+		err = tx.QueryRowContext(ctx, `SELECT recovery_plan_version_id
+FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVersionID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -883,9 +881,11 @@ FROM github_poll_cursors WHERE repository = ?`, GitHubPollFailurePreActivationIn
 func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) error {
 	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
 WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
-    v.version_id = ? AND p.state = ? AND v.state = ?
-    AND NOT EXISTS (SELECT 1 FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id)
-    AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id)
+    v.version_id = ? AND ((
+        p.state = ? AND v.state = ?
+        AND NOT EXISTS (SELECT 1 FROM plan_terminal_states terminal WHERE terminal.version_id = v.version_id)
+        AND NOT EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id)
+    ) OR EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id))
 )) ORDER BY v.version_id`, repository, recoveryPlanVersionID, StateProjecting, StateProjecting)
 	if err != nil {
 		return err
@@ -1158,7 +1158,7 @@ func workflowInboxProjectionGenerationTx(ctx context.Context, tx *sql.Tx, reposi
 		return generation, nil
 	}
 	if !advance {
-		return 0, nil
+		return generation, nil
 	}
 	generation++
 	_, err = tx.ExecContext(ctx, `UPDATE workflow_inbox_projections SET generation = ?, projection_version = ?, plan_version_ids_json = ?, updated_at = ? WHERE repository = ?`, generation, projectionVersion, string(encodedPlanVersionIDs), formatTimestamp(now), repository)
@@ -1624,7 +1624,9 @@ func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository s
 		}
 	} else {
 		kind = GitHubPollFailureRetryable
-		recoveryPlanVersionID = ""
+		if recoveryPlanVersionID == "" {
+			recoveryPlanVersionID = existingRecoveryPlanVersionID
+		}
 	}
 	delay := time.Second << min(failures-1, 6)
 	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)

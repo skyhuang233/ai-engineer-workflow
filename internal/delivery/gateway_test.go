@@ -239,7 +239,7 @@ func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 	if err := db.ResumeGatewayWrites(ctx, rotation, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.Dispatch(ctx, keys[0]); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+	if err := gateway.Dispatch(ctx, keys[0]); err != nil {
 		t.Fatalf("stale credential projection = %v", err)
 	}
 	if err := gateway.DispatchPending(ctx, 8); err != nil {
@@ -290,6 +290,69 @@ func TestGatewayNormalizesWorkflowInboxProjectionIntents(t *testing.T) {
 		if question.ID == "stale" {
 			t.Fatalf("current projection retained stale question: %#v", remote.requests)
 		}
+	}
+}
+
+func TestGatewayCompletesSupersededInboxGenerationWithoutRemoteWrite(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 0, 0, 0, time.UTC)
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Request.InboxProjectionGeneration >= second.Request.InboxProjectionGeneration {
+		t.Fatalf("Inbox generations = %d then %d", first.Request.InboxProjectionGeneration, second.Request.InboxProjectionGeneration)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("superseded Inbox dispatch = %v", err)
+	}
+	completed, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || completed.State != store.OutboxSucceeded {
+		t.Fatalf("superseded Inbox outbox = %#v, %v", completed, err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("superseded Inbox reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
+func TestHTTPProjectorAcceptsDurableInboxSerializationContention(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 3, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, first.IdempotencyKey, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	projector := delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}
+	if err := projector.ProjectWorkflowInbox(ctx, "owner/repo", nil); err != nil {
+		t.Fatalf("serialized Inbox projection = %v", err)
 	}
 }
 
@@ -351,6 +414,7 @@ func TestRejectedInactiveInboxKeyDoesNotPoisonReplacementPlan(t *testing.T) {
 	if err := db.MarkActive(ctx, replacement.ID); err != nil {
 		t.Fatal(err)
 	}
+	now = time.Now().UTC()
 	second, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
 	if err != nil {
 		t.Fatal(err)
@@ -370,7 +434,7 @@ func TestGatewayClearsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T)
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
-	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	outbox, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"}, now)
 	if err != nil {
 		t.Fatal(err)

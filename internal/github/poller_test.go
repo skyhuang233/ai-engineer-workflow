@@ -865,7 +865,7 @@ func TestClaimedBootstrapRecoveryStartsFreshBudgetAfterActivationProjectionFailu
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryPlanVersionID != "" || cursor.NeedsAttention() {
+			if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryPlanVersionID != versionID || cursor.NeedsAttention() {
 				t.Fatalf("post-activation cursor = %#v, want fresh retry budget", cursor)
 			}
 			questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
@@ -878,6 +878,62 @@ func TestClaimedBootstrapRecoveryStartsFreshBudgetAfterActivationProjectionFailu
 				}
 			}
 		})
+	}
+}
+
+func TestCompletedBootstrapProjectionExhaustionRetainsRecoveryOwner(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.MarkActive(ctx, versionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
+	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
+	projectionErr := errors.New("reconcile completed plan root: Gateway unavailable")
+	for attempt := range 2 {
+		leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, failureErr := poller.recordBootstrapFailure(leaseCtx, repository, now, versionID, projectionErr)
+		failureErr = errors.Join(failureErr, release())
+		if !errors.Is(failureErr, projectionErr) {
+			t.Fatalf("projection failure %d = %v", attempt+1, failureErr)
+		}
+		if attempt == 0 && errors.Is(failureErr, store.ErrNeedsAttention) {
+			t.Fatalf("first projection failure exhausted fresh budget: %v", failureErr)
+		}
+		if attempt == 1 && !errors.Is(failureErr, store.ErrNeedsAttention) {
+			t.Fatalf("second projection failure = %v, want Needs Attention", failureErr)
+		}
+		now = now.Add(2 * time.Second)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() || cursor.RecoveryPlanVersionID != versionID {
+		t.Fatalf("terminal completed-plan cursor = %#v", cursor)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		found = found || question.VersionID == versionID && question.Kind == "poll_failure"
+	}
+	if !found {
+		t.Fatalf("completed-plan recovery questions = %#v", questions)
 	}
 }
 

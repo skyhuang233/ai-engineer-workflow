@@ -33,6 +33,8 @@ const (
 var (
 	ErrDeliveryRejected     = errors.New("delivery command rejected")
 	ErrNoActiveDeliveryPlan = fmt.Errorf("%w: workflow inbox repository has no active delivery plan", ErrDeliveryRejected)
+	ErrDeliverySuperseded   = errors.New("delivery command was superseded")
+	ErrInboxDeliveryPending = fmt.Errorf("%w: another workflow inbox projection is processing", ErrDeliveryInProgress)
 	ErrDeliveryUncertain    = errors.New("delivery outcome is uncertain")
 )
 
@@ -540,7 +542,7 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 WHERE idempotency_key != ? AND operation = ? AND state = ?
 AND json_extract(request_json, '$.repository') = ? LIMIT 1`, key, DeliveryProjectInbox, OutboxProcessing, request.Repository).Scan(&processing)
 		if err == nil {
-			return DeliveryOutbox{}, ErrDeliveryInProgress
+			return DeliveryOutbox{}, ErrInboxDeliveryPending
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return DeliveryOutbox{}, err
@@ -904,10 +906,7 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		if generationErr != nil {
 			return DeliveryTarget{}, request, generationErr
 		}
-		if generation == 0 || request.InboxProjectionGeneration > 0 && request.InboxProjectionGeneration != generation {
-			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
-		}
-		if admittedClaimToken != "" && request.InboxProjectionGeneration != generation {
+		if generation == 0 || len(activeVersionIDs) == 0 && request.InboxProjectionGeneration == 0 {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
 		}
 		if len(request.InboxPlanVersionIDs) > 0 {
@@ -916,6 +915,12 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 			}
 		} else if request.InboxPlanVersionID != "" && (len(activeVersionIDs) != 1 || request.InboxPlanVersionID != activeVersionIDs[0]) {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
+		}
+		if request.InboxProjectionGeneration > 0 && request.InboxProjectionGeneration != generation {
+			return DeliveryTarget{}, request, ErrDeliverySuperseded
+		}
+		if admittedClaimToken != "" && request.InboxProjectionGeneration != generation {
+			return DeliveryTarget{}, request, ErrDeliverySuperseded
 		}
 		request.InboxPlanVersionIDs = activeVersionIDs
 		if len(activeVersionIDs) == 1 {
