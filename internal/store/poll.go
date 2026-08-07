@@ -749,7 +749,7 @@ func recordGitHubPollSuccessTx(ctx context.Context, tx *sql.Tx, repository strin
 VALUES (?, ?, ?, 0, '', '', '', ?, ?)
 ON CONFLICT(repository) DO UPDATE SET last_success_at = excluded.last_success_at,
 last_full_reconcile_at = CASE WHEN excluded.last_full_reconcile_at = '' THEN github_poll_cursors.last_full_reconcile_at ELSE excluded.last_full_reconcile_at END,
-consecutive_failures = 0, failure_kind = '', recovery_plan_version_id = '',
+consecutive_failures = 0, failure_kind = '', recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]',
 recovery_state = CASE WHEN github_poll_cursors.recovery_state = 'completed' THEN github_poll_cursors.recovery_state ELSE '' END,
 next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), full, formatTimestamp(now), formatTimestamp(now)); err != nil {
 		return err
@@ -772,6 +772,10 @@ func (s *Store) DeferGitHubPollWithCursor(ctx context.Context, repository string
 }
 
 func (s *Store) DeferGitHubPollWithCursorLeased(ctx context.Context, repository string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+	return s.DeferGitHubPollWithCursorForPlanAttemptsLeased(ctx, repository, nil, retryAt, now, leaseToken, leaseNow)
+}
+
+func (s *Store) DeferGitHubPollWithCursorForPlanAttemptsLeased(ctx context.Context, repository string, attemptedPlanVersionIDs []string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
 	if retryAt.IsZero() {
 		return GitHubPollCursor{}, ErrInvalidClaim
 	}
@@ -788,16 +792,21 @@ func (s *Store) DeferGitHubPollWithCursorLeased(ctx context.Context, repository 
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return GitHubPollCursor{}, err
 	}
-	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
-VALUES (?, 1, ?, ?, '', ?, ?)
+	attemptedJSON, err := mergeAttemptedPlanVersionIDsTx(ctx, tx, repository, attemptedPlanVersionIDs)
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
+	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, attempted_plan_version_ids_json, next_attempt_at, updated_at)
+VALUES (?, 1, ?, ?, '', ?, ?, ?)
 ON CONFLICT(repository) DO UPDATE SET
 consecutive_failures = github_poll_cursors.consecutive_failures + 1,
 failure_kind = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.failure_kind END,
 recovery_state = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.recovery_state END,
 recovery_plan_version_id = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN '' ELSE github_poll_cursors.recovery_plan_version_id END,
+attempted_plan_version_ids_json = excluded.attempted_plan_version_ids_json,
 next_attempt_at = CASE WHEN github_poll_cursors.next_attempt_at > excluded.next_attempt_at THEN github_poll_cursors.next_attempt_at ELSE excluded.next_attempt_at END,
 updated_at = excluded.updated_at
-RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`, repository, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(retryAt), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollFailureRetryable, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollRecoveryConsumed, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
+RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`, repository, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, attemptedJSON, formatTimestamp(retryAt), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollFailureRetryable, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, GitHubPollRecoveryConsumed, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
 	if err != nil {
 		return GitHubPollCursor{}, err
 	}
@@ -808,13 +817,17 @@ RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failu
 }
 
 func (s *Store) DeferGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository, recoveryPlanVersionID string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+	return s.DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(ctx, repository, recoveryPlanVersionID, nil, retryAt, now, leaseToken, leaseNow)
+}
+
+func (s *Store) DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
 	if retryAt.IsZero() {
 		return GitHubPollCursor{}, ErrInvalidClaim
 	}
 	if recoveryPlanVersionID == "" {
 		return GitHubPollCursor{}, ErrInvalidClaim
 	}
-	return s.advanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, recoveryPlanVersionID, retryAt, leaseToken, leaseNow)
+	return s.advanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, recoveryPlanVersionID, attemptedPlanVersionIDs, retryAt, leaseToken, leaseNow)
 }
 
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
@@ -887,11 +900,22 @@ func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Contex
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return false, err
 	}
-	if recoveryPlanVersionID == "" {
-		err = tx.QueryRowContext(ctx, `SELECT recovery_plan_version_id
-FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVersionID)
+	if recoveryPlanVersionID == "" || len(attemptedPlanVersionIDs) == 0 {
+		var persistedRecoveryPlanVersionID, attemptedJSON string
+		err = tx.QueryRowContext(ctx, `SELECT recovery_plan_version_id, attempted_plan_version_ids_json
+FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&persistedRecoveryPlanVersionID, &attemptedJSON)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return false, err
+		}
+		if err == nil {
+			if recoveryPlanVersionID == "" {
+				recoveryPlanVersionID = persistedRecoveryPlanVersionID
+			}
+			if len(attemptedPlanVersionIDs) == 0 {
+				if err := json.Unmarshal([]byte(attemptedJSON), &attemptedPlanVersionIDs); err != nil {
+					return false, err
+				}
+			}
 		}
 	}
 	completed, err := allAttemptedPlanVersionsCompletedTx(ctx, tx, attemptedPlanVersionIDs)
@@ -1718,10 +1742,14 @@ func (s *Store) AdvanceGitHubPollFailure(ctx context.Context, repository string,
 }
 
 func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
-	return s.advanceGitHubPollFailureLeased(ctx, repository, now, kind, recoveryPlanVersionID, time.Time{}, leaseToken, leaseNow)
+	return s.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, kind, recoveryPlanVersionID, nil, leaseToken, leaseNow)
 }
 
-func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID string, deferredUntil time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+func (s *Store) AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+	return s.advanceGitHubPollFailureLeased(ctx, repository, now, kind, recoveryPlanVersionID, attemptedPlanVersionIDs, time.Time{}, leaseToken, leaseNow)
+}
+
+func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, deferredUntil time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -1740,8 +1768,8 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 	var existingKind GitHubPollFailureKind
 	var existingRecovery GitHubPollRecoveryState
 	var existingRecoveryPlanVersionID string
-	var existingNextAttemptText string
-	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &existingKind, &existingRecovery, &existingRecoveryPlanVersionID, &existingNextAttemptText)
+	var existingAttemptedJSON, existingNextAttemptText string
+	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, attempted_plan_version_ids_json, next_attempt_at FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &existingKind, &existingRecovery, &existingRecoveryPlanVersionID, &existingAttemptedJSON, &existingNextAttemptText)
 	if errors.Is(err, sql.ErrNoRows) {
 		failures = 0
 	} else if err != nil {
@@ -1749,6 +1777,10 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 	}
 	previousFailures := failures
 	failures++
+	attemptedJSON, err := mergeAttemptedPlanVersionIDs(existingAttemptedJSON, attemptedPlanVersionIDs)
+	if err != nil {
+		return GitHubPollCursor{}, err
+	}
 	recovery := GitHubPollRecoveryConsumed
 	if existingKind == GitHubPollFailureUnrecoverable && existingRecovery == GitHubPollRecoveryConsumed {
 		kind = GitHubPollFailureUnrecoverable
@@ -1778,9 +1810,9 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 			}
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, recovery_plan_version_id = excluded.recovery_plan_version_id, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, kind, recovery, recoveryPlanVersionID, formatTimestamp(nextAttempt), formatTimestamp(now))
+	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, attempted_plan_version_ids_json, next_attempt_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, recovery_plan_version_id = excluded.recovery_plan_version_id, attempted_plan_version_ids_json = excluded.attempted_plan_version_ids_json, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, kind, recovery, recoveryPlanVersionID, attemptedJSON, formatTimestamp(nextAttempt), formatTimestamp(now))
 	if err != nil {
 		return GitHubPollCursor{}, err
 	}
@@ -1793,6 +1825,38 @@ FROM github_poll_cursors WHERE repository = ?`, repository))
 		return GitHubPollCursor{}, err
 	}
 	return cursor, nil
+}
+
+func mergeAttemptedPlanVersionIDsTx(ctx context.Context, tx *sql.Tx, repository string, additions []string) (string, error) {
+	var existing string
+	err := tx.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	return mergeAttemptedPlanVersionIDs(existing, additions)
+}
+
+func mergeAttemptedPlanVersionIDs(existing string, additions []string) (string, error) {
+	var versionIDs []string
+	if existing != "" {
+		if err := json.Unmarshal([]byte(existing), &versionIDs); err != nil {
+			return "", err
+		}
+	}
+	seen := make(map[string]struct{}, len(versionIDs)+len(additions))
+	merged := make([]string, 0, len(versionIDs)+len(additions))
+	for _, versionID := range append(versionIDs, additions...) {
+		if versionID == "" {
+			continue
+		}
+		if _, exists := seen[versionID]; exists {
+			continue
+		}
+		seen[versionID] = struct{}{}
+		merged = append(merged, versionID)
+	}
+	encoded, err := json.Marshal(merged)
+	return string(encoded), err
 }
 
 func min(left, right int) int {

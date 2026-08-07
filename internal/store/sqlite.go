@@ -994,6 +994,20 @@ ORDER BY idempotency_key`, DeliveryProjectInbox, OutboxRejected)
 			return err
 		}
 	}
+	if applied < 37 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "attempted_plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 37: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN attempted_plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 37: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (37, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

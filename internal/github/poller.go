@@ -619,7 +619,7 @@ func (p Poller) recordFailureWithKindForPlans(ctx context.Context, repository st
 		var err error
 		if failureKind == store.GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" {
 			if existingCursorErr == nil && existingCursor.HasBootstrapRecoveryCandidate(p.maxFailures()) && existingCursor.RecoveryPlanVersionID == recoveryPlanVersionID {
-				updated, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, recoveryPlanVersionID, retryAt, now, leaseToken, p.now())
+				updated, err = p.Store.DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, retryAt, now, leaseToken, p.now())
 				if err != nil {
 					return PollResult{}, errors.Join(cause, err)
 				}
@@ -628,12 +628,12 @@ func (p Poller) recordFailureWithKindForPlans(ctx context.Context, repository st
 				}
 				return PollResult{}, cause
 			}
-			updated, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, recoveryPlanVersionID, retryAt, now, leaseToken, p.now())
+			updated, err = p.Store.DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, retryAt, now, leaseToken, p.now())
 			if err != nil {
 				return PollResult{}, errors.Join(cause, err)
 			}
 		} else {
-			updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
+			updated, err = p.Store.DeferGitHubPollWithCursorForPlanAttemptsLeased(persistenceCtx, repository, attemptedPlanVersionIDs, retryAt, now, leaseToken, p.now())
 			if err != nil {
 				return PollResult{}, errors.Join(cause, err)
 			}
@@ -645,7 +645,7 @@ func (p Poller) recordFailureWithKindForPlans(ctx context.Context, repository st
 	}
 	var updated store.GitHubPollCursor
 	var recordErr error
-	updated, recordErr = p.Store.AdvanceGitHubPollFailureLeased(persistenceCtx, repository, now, failureKind, recoveryPlanVersionID, leaseToken, p.now())
+	updated, recordErr = p.Store.AdvanceGitHubPollFailureForPlanAttemptsLeased(persistenceCtx, repository, now, failureKind, recoveryPlanVersionID, attemptedPlanVersionIDs, leaseToken, p.now())
 	if recordErr != nil {
 		return PollResult{}, errors.Join(cause, recordErr)
 	}

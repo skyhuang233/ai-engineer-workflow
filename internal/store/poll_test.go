@@ -312,6 +312,41 @@ func TestTerminalPollFallbackUsesOnlyAttemptedCompletedPlans(t *testing.T) {
 	}
 }
 
+func TestTerminalPollFallbackUsesPersistedAttemptedPlansAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 5, 30, 0, 0, time.UTC)
+	completedVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, completedVersionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, GitHubPollFailureRetryable, "", []string{completedVersionID}, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminalized {
+		t.Fatal("persisted completed Plan attempt remained terminal after restart")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("persisted completed Plan cursor = %#v", cursor)
+	}
+}
+
 func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

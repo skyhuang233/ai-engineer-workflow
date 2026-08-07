@@ -561,6 +561,39 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if !claim.ReconcileOnly || !claim.Uncertain || claim.Attempts != 1 {
 		t.Fatalf("recovered uncertain Inbox = %#v", claim)
 	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation still unavailable", true, now); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 2; attempt <= maxDeliveryAttempts; attempt++ {
+		now = now.Add(70 * time.Second)
+		claim, err = db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if err != nil {
+			t.Fatalf("second-cycle Inbox claim %d = %v", attempt, err)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation still unavailable", true, now); err != nil {
+			t.Fatalf("second-cycle Inbox requeue %d = %v", attempt, err)
+		}
+	}
+	secondQuestionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, repository, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondQuestionID == recoveryQuestionID {
+		t.Fatalf("repeated terminal cycle reused recovery question %q", recoveryQuestionID)
+	}
+	if _, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, recoveryQuestionID, "retry", now); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("consumed Inbox recovery question reused = %v, want invalid claim", err)
+	}
+	if _, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, secondQuestionID, "retry", now); err != nil {
+		t.Fatalf("second-cycle Inbox recovery = %v", err)
+	}
+	var authorizations int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_audits WHERE idempotency_key = ? AND decision = 'recovery_authorized'`, queued.IdempotencyKey).Scan(&authorizations); err != nil {
+		t.Fatal(err)
+	}
+	if authorizations != 2 {
+		t.Fatalf("recovery authorizations = %d, want 2 question-bound decisions", authorizations)
+	}
 }
 
 func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {

@@ -756,8 +756,8 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND uncertain != 0
 	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_audits(idempotency_key, operation, run_id, lease_generation, decision, reason, created_at)
 	SELECT idempotency_key, operation, '', 0, 'recovery_authorized', ?, ?
 	FROM delivery_outbox WHERE idempotency_key = ? AND NOT EXISTS (
-	    SELECT 1 FROM delivery_audits WHERE idempotency_key = ? AND decision = 'recovery_authorized'
-	)`, questionID, formatTimestamp(now), key, key); err != nil {
+	    SELECT 1 FROM delivery_audits WHERE idempotency_key = ? AND decision = 'recovery_authorized' AND reason = ?
+	)`, questionID, formatTimestamp(now), key, key, questionID); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
@@ -973,12 +973,15 @@ func ensureUncertainInboxRecoveryQuestionTx(ctx context.Context, tx *sql.Tx, req
 	if request.Repository == "" || key == "" {
 		return ErrInvalidClaim
 	}
-	var existing string
-	err := tx.QueryRowContext(ctx, `SELECT question_id FROM inbox_delivery_recovery_questions WHERE idempotency_key = ?`, key).Scan(&existing)
-	if err == nil {
+	var existing, existingState string
+	err := tx.QueryRowContext(ctx, `SELECT recovery.question_id, question.state
+FROM inbox_delivery_recovery_questions recovery
+JOIN workflow_questions question ON question.question_id = recovery.question_id
+WHERE recovery.idempotency_key = ?`, key).Scan(&existing, &existingState)
+	if err == nil && existingState == "open" {
 		return nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	candidates := append([]string(nil), request.InboxPlanVersionIDs...)
@@ -1011,19 +1014,20 @@ func ensureUncertainInboxRecoveryQuestionTx(ctx context.Context, tx *sql.Tx, req
 			return err
 		}
 	}
-	digest := sha256.Sum256([]byte(key))
-	questionID := "inbox-delivery-recovery-" + hex.EncodeToString(digest[:])
 	var generation int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) + 1 FROM workflow_questions
-WHERE repository = ? AND version_id = ? AND issue_id = 0 AND kind = 'inbox_delivery_recovery'`, request.Repository, versionID).Scan(&generation); err != nil {
+WHERE repository = ? AND issue_id = 0 AND kind = 'inbox_delivery_recovery'`, request.Repository).Scan(&generation); err != nil {
 		return err
 	}
+	digest := sha256.Sum256([]byte(key))
+	questionID := fmt.Sprintf("inbox-delivery-recovery-%s-g%d", hex.EncodeToString(digest[:]), generation)
 	prompt := fmt.Sprintf("Workflow Inbox delivery %s has an uncertain remote outcome. Reply to this id-addressed question to authorize reconciliation after verifying the remote state. %s", key, reason)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, generation, prompt, state, created_at)
 VALUES (?, ?, ?, 0, 'inbox_delivery_recovery', ?, ?, 'open', ?)`, questionID, request.Repository, versionID, generation, prompt, formatTimestamp(now)); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO inbox_delivery_recovery_questions(idempotency_key, question_id) VALUES (?, ?)`, key, questionID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO inbox_delivery_recovery_questions(idempotency_key, question_id) VALUES (?, ?)
+ON CONFLICT(idempotency_key) DO UPDATE SET question_id = excluded.question_id`, key, questionID)
 	return err
 }
 
@@ -1145,7 +1149,12 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 			}
 			var recoveryAuthorized int
 			err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-SELECT 1 FROM delivery_audits WHERE idempotency_key = ? AND decision = 'recovery_authorized'
+SELECT 1
+FROM inbox_delivery_recovery_questions recovery
+JOIN delivery_audits audit ON audit.idempotency_key = recovery.idempotency_key
+    AND audit.decision = 'recovery_authorized'
+    AND audit.reason = recovery.question_id
+WHERE recovery.idempotency_key = ?
 )`, request.IdempotencyKey).Scan(&recoveryAuthorized)
 			if err != nil {
 				return DeliveryTarget{}, request, err
