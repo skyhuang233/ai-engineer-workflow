@@ -525,16 +525,17 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 		return DeliveryOutbox{}, err
 	}
 	if attempts >= maxDeliveryAttempts {
-		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, "delivery retries exhausted", now); err != nil {
+		lastError := inboxDeliveryRecoveryReason(request, key, "delivery retries exhausted", uncertain != 0)
+		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 			return DeliveryOutbox{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ? WHERE idempotency_key = ?`, OutboxRejected, "delivery retries exhausted", formatTimestamp(now), formatTimestamp(now), key); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ? WHERE idempotency_key = ?`, OutboxRejected, lastError, formatTimestamp(now), formatTimestamp(now), key); err != nil {
 			return DeliveryOutbox{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return DeliveryOutbox{}, err
 		}
-		return DeliveryOutbox{}, fmt.Errorf("%w: delivery retries exhausted", ErrDeliveryRejected)
+		return DeliveryOutbox{}, fmt.Errorf("%w: %s", ErrDeliveryRejected, lastError)
 	}
 	claimToken, err := randomID("outbox-claim")
 	if err != nil {
@@ -727,6 +728,7 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
+		lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
 		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 			return err
 		}
@@ -865,6 +867,13 @@ WHERE rt.version_id = s.version_id AND rt.issue_id = s.issue_id`, request.RunID)
 		return err
 	}
 	return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)
+}
+
+func inboxDeliveryRecoveryReason(request DeliveryRequest, key, reason string, uncertain bool) string {
+	if !uncertain || request.Operation != DeliveryProjectInbox || request.RunID != "" {
+		return reason
+	}
+	return fmt.Sprintf("%s. Recover the uncertain Workflow Inbox delivery with workflow recover-inbox-delivery --repository %s --delivery %s.", reason, request.Repository, key)
 }
 
 func (s *Store) RecordDeliveryMapping(ctx context.Context, request DeliveryRequest, number int64, nodeID, remoteHead string, now time.Time) error {

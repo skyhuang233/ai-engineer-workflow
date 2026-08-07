@@ -289,7 +289,7 @@ func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
 			}
 			progressed = true
 			if err != nil {
-				dispatchErr = errors.Join(dispatchErr, err)
+				dispatchErr = errors.Join(dispatchErr, fmt.Errorf("delivery %s: %w", key, err))
 			}
 		}
 		if !progressed {

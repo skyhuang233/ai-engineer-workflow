@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -507,6 +508,20 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	}
 	if exhausted.State != OutboxRejected || !exhausted.Uncertain || exhausted.Attempts != maxDeliveryAttempts {
 		t.Fatalf("exhausted uncertain Inbox = %#v", exhausted)
+	}
+	if !strings.Contains(exhausted.LastError, queued.IdempotencyKey) || !strings.Contains(exhausted.LastError, "workflow recover-inbox-delivery") {
+		t.Fatalf("exhausted uncertain Inbox recovery instructions = %q", exhausted.LastError)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRecoveryKey := false
+	for _, question := range questions {
+		foundRecoveryKey = foundRecoveryKey || strings.Contains(question.Prompt, queued.IdempotencyKey)
+	}
+	if !foundRecoveryKey {
+		t.Fatalf("Needs Attention questions omit delivery key %q: %#v", queued.IdempotencyKey, questions)
 	}
 	projection, err := db.PlanProjectionAt(ctx, versionID, now)
 	if err != nil {

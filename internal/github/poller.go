@@ -220,8 +220,14 @@ func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, c
 	if err == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
 		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
 		if retryAt := pollRetryAt(cause); retryAt.After(p.now()) {
-			_, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, retryAt, p.now(), leaseToken, p.now())
-			return PollResult{}, errors.Join(cause, deferErr)
+			updated, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, retryAt, p.now(), leaseToken, p.now())
+			if deferErr != nil {
+				return PollResult{}, errors.Join(cause, deferErr)
+			}
+			if updated.ConsecutiveFailures > p.bootstrapRecoveryFailureLimit() {
+				return PollResult{}, p.finishExhaustedFailure(ctx, repository, p.now(), cause)
+			}
+			return PollResult{}, cause
 		}
 		return PollResult{}, p.finishExhaustedFailure(ctx, repository, p.now(), cause)
 	}
@@ -584,8 +590,14 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 			}
 			if cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
 				(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) && cursor.RecoveryPlanVersionID == recoveryPlanVersionID {
-				_, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
-				return PollResult{}, errors.Join(cause, err)
+				updated, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
+				if err != nil {
+					return PollResult{}, errors.Join(cause, err)
+				}
+				if updated.ConsecutiveFailures > p.bootstrapRecoveryFailureLimit() {
+					return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+				}
+				return PollResult{}, cause
 			}
 		}
 		updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
@@ -675,6 +687,10 @@ func (p Poller) maxFailures() int {
 		return p.MaxFailures
 	}
 	return store.DefaultMaxWorkerAttempts
+}
+
+func (p Poller) bootstrapRecoveryFailureLimit() int {
+	return p.maxFailures() * 2
 }
 
 func (p Poller) fullReconcileInterval() time.Duration {

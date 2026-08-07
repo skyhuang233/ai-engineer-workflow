@@ -1072,6 +1072,22 @@ func TestGatewayDispatchPendingPublishesAcceptedCandidateInOrder(t *testing.T) {
 	}
 }
 
+func TestGatewayDispatchPendingReportsFailingDeliveryKey(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{applyErr: errors.New("remote unavailable")}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gateway.DispatchPending(ctx, 1)
+	if err == nil || !strings.Contains(err.Error(), queued.IdempotencyKey) {
+		t.Fatalf("dispatch error = %v, want delivery key %q", err, queued.IdempotencyKey)
+	}
+}
+
 func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditions(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)

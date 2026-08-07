@@ -781,7 +781,7 @@ func TestClaimedBootstrapRecoveryResumesExactVersionAfterRestart(t *testing.T) {
 	}
 }
 
-func TestClaimedBootstrapRecoveryPreservesProvenanceWhenRateLimited(t *testing.T) {
+func TestClaimedBootstrapRecoveryRateLimitHasBoundedDeferrals(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -812,8 +812,29 @@ func TestClaimedBootstrapRecoveryPreservesProvenanceWhenRateLimited(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || cursor.RecoveryPlanVersionID != versionID || !cursor.NextAttemptAt.Equal(retryAt) {
+	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || cursor.RecoveryPlanVersionID != versionID || cursor.ConsecutiveFailures != 2 || !cursor.NextAttemptAt.Equal(retryAt) {
 		t.Fatalf("deferred recovery cursor = %#v", cursor)
+	}
+	now = retryAt
+	secondRetryAt := now.Add(5 * time.Minute)
+	secondRateLimit := &delivery.HTTPError{StatusCode: http.StatusInternalServerError, Message: "Gateway rate limited again", RetryAt: secondRetryAt}
+	_, err = (Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 1,
+		Now:         func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		return secondRateLimit
+	}, nil)
+	if !errors.Is(err, secondRateLimit) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("exhausted rate-limited recovery = %v", err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() {
+		t.Fatalf("exhausted recovery cursor = %#v", cursor)
 	}
 }
 
@@ -1756,14 +1777,16 @@ func TestPrepareAdmissionResolvesBoundRecoveryBeforeRateLimit(t *testing.T) {
 	repository := "owner/repo"
 	failedAt := time.Now().UTC().Add(-time.Minute)
 	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
-	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := db.MarkActive(ctx, versionID); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
+	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
 	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
@@ -1781,12 +1804,12 @@ func TestPrepareAdmissionResolvesBoundRecoveryBeforeRateLimit(t *testing.T) {
 		t.Fatalf("rate-limited admission = %v", err)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
-	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.RecoveryPlanVersionID != "" {
+	if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 1 || cursor.RecoveryPlanVersionID != "" {
 		t.Fatalf("post-admission cursor = %#v, %v", cursor, err)
 	}
 }
 
-func TestRateLimitedAdmissionPreservesProjectingRecoveryClaim(t *testing.T) {
+func TestRateLimitedAdmissionRecoveryClaimHasBoundedDeferrals(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -1800,7 +1823,7 @@ func TestRateLimitedAdmissionPreservesProjectingRecoveryClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := failedAt.Add(time.Minute)
-	retryAt := now.Add(5 * time.Minute)
+	retryAt := now.Add(time.Second)
 	poller := Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now }}
 	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
 	if err != nil {
@@ -1822,8 +1845,20 @@ func TestRateLimitedAdmissionPreservesProjectingRecoveryClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.RecoveryPlanVersionID != versionID || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || !cursor.NextAttemptAt.Equal(retryAt) {
+	if cursor.RecoveryPlanVersionID != versionID || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || cursor.ConsecutiveFailures != 2 || !cursor.NextAttemptAt.Equal(retryAt) {
 		t.Fatalf("preserved recovery cursor = %#v", cursor)
+	}
+	now = retryAt
+	secondRateLimit := &APIError{StatusCode: http.StatusForbidden, RetryAt: now.Add(time.Second)}
+	if _, err := poller.RecordAdmissionFailure(leaseCtx, repository, secondRateLimit); !errors.Is(err, secondRateLimit) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("exhausted rate-limited admission = %v", err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() {
+		t.Fatalf("exhausted recovery cursor = %#v", cursor)
 	}
 }
 
@@ -2080,8 +2115,37 @@ func TestRecordFailureDefersRateLimitedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cursor.NextAttemptAt.Equal(retryAt) || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+	if !cursor.NextAttemptAt.Equal(retryAt) || cursor.ConsecutiveFailures != 1 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
 		t.Fatalf("cursor = %#v", cursor)
+	}
+}
+
+func TestRecordFailureBoundsRepeatedRateLimits(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
+	first := &apiError{StatusCode: 403, RetryAt: now.Add(time.Minute)}
+	if _, err := poller.RecordFailure(ctx, repository, first); !errors.Is(err, first) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("first rate limit = %v", err)
+	}
+	now = first.RetryAt
+	second := &apiError{StatusCode: 403, RetryAt: now.Add(time.Minute)}
+	if _, err := poller.RecordFailure(ctx, repository, second); !errors.Is(err, second) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("exhausted rate limit = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() || cursor.ConsecutiveFailures != 2 {
+		t.Fatalf("exhausted rate-limit cursor = %#v", cursor)
 	}
 }
 

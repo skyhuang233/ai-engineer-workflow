@@ -769,8 +769,9 @@ func (s *Store) DeferGitHubPollWithCursorLeased(ctx context.Context, repository 
 		return GitHubPollCursor{}, err
 	}
 	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
-VALUES (?, 0, ?, ?, '', ?, ?)
+VALUES (?, 1, ?, ?, '', ?, ?)
 ON CONFLICT(repository) DO UPDATE SET
+consecutive_failures = github_poll_cursors.consecutive_failures + 1,
 failure_kind = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.failure_kind END,
 recovery_state = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN ? ELSE github_poll_cursors.recovery_state END,
 recovery_plan_version_id = CASE WHEN github_poll_cursors.failure_kind = '' OR github_poll_cursors.failure_kind = ? OR github_poll_cursors.recovery_state IN (?, ?) THEN '' ELSE github_poll_cursors.recovery_plan_version_id END,
@@ -804,7 +805,8 @@ func (s *Store) DeferGitHubPollBootstrapRecoveryLeased(ctx context.Context, repo
 		return GitHubPollCursor{}, err
 	}
 	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `UPDATE github_poll_cursors
-SET next_attempt_at = CASE WHEN next_attempt_at > ? THEN next_attempt_at ELSE ? END, updated_at = ?
+SET consecutive_failures = consecutive_failures + 1,
+    next_attempt_at = CASE WHEN next_attempt_at > ? THEN next_attempt_at ELSE ? END, updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id != ''
 RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`,
 		formatTimestamp(retryAt), formatTimestamp(retryAt), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
