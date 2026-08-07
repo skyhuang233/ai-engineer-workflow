@@ -859,24 +859,28 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ct
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow, false)
 	return err
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, false)
 	return err
 }
 
 func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow)
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, true)
 }
 
 func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow)
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, true)
 }
 
-func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, false)
+}
+
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, retryUnowned bool) (GitHubPollTerminalFailureDisposition, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -931,6 +935,15 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&persistedRecov
 	}
 	owned = owned || frozenOwned
 	if !owned {
+		if !retryUnowned {
+			if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
+				return "", err
+			}
+			if err := tx.Commit(); err != nil {
+				return "", err
+			}
+			return GitHubPollTerminalFailureNeedsAttention, nil
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
 SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]', updated_at = ?
 WHERE repository = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), repository); err != nil {
@@ -1848,9 +1861,6 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 		}
 	} else {
 		kind = GitHubPollFailureRetryable
-		if recoveryPlanVersionID == "" && !(existingKind == GitHubPollFailurePreActivationInboxConflict && (existingRecovery == GitHubPollRecoveryAvailable || existingRecovery == GitHubPollRecoveryClaimed)) {
-			recoveryPlanVersionID = existingRecoveryPlanVersionID
-		}
 	}
 	delay := time.Second << min(failures-1, 6)
 	nextAttempt := now.Add(delay)
