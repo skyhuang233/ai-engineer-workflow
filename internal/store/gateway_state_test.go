@@ -60,6 +60,38 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	}
 }
 
+func TestGitHubPollCredentialPauseRollsBackCursorWithGatewayState(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	if err := db.RecordGitHubPollFailure(ctx, repository, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER fail_gateway_poll_pause BEFORE UPDATE OF writes_paused ON gateway_runtime
+BEGIN SELECT RAISE(ABORT, 'injected Gateway pause failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PauseGatewayWritesForGitHubPollCredential(ctx, repository, "poll-lease", "credential unavailable", now, now); err == nil {
+		t.Fatal("credential pause succeeded despite injected Gateway failure")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.ConsecutiveFailures != 1 || cursor.RecoveryState != GitHubPollRecoveryConsumed {
+		t.Fatalf("rolled-back poll cursor = %#v, %v", cursor, err)
+	}
+	paused, _, err := db.GatewayWritesPaused(ctx)
+	if err != nil || paused {
+		t.Fatalf("rolled-back Gateway pause = %t, %v", paused, err)
+	}
+}
+
 func TestGatewayCredentialRotationRequiresLiveOwnerToResume(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

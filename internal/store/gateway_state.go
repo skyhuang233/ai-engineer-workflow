@@ -33,7 +33,7 @@ func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.
 	return s.pauseGatewayWrites(ctx, "", "", reason, now, time.Time{})
 }
 
-func (s *Store) PauseGatewayWritesForGitHubPoll(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
+func (s *Store) PauseGatewayWritesForGitHubPollCredential(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
 	return s.pauseGatewayWrites(ctx, repository, leaseToken, reason, now, leaseNow)
 }
 
@@ -49,6 +49,9 @@ func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, 
 	defer tx.Rollback()
 	if leaseToken != "" {
 		if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
+			return err
+		}
+		if err := resetGitHubPollForCredentialTx(ctx, tx, repository, now); err != nil {
 			return err
 		}
 	}

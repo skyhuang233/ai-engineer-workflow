@@ -609,19 +609,15 @@ func (s *Store) ConsumeGitHubPollBootstrapEligibility(ctx context.Context, repos
 	if err != nil {
 		return err
 	}
-	consumeErr := s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, token, leaseNow, false)
+	consumeErr := s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, token, leaseNow)
 	return errors.Join(consumeErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
 func (s *Store) ConsumeGitHubPollBootstrapEligibilityLeased(ctx context.Context, repository, leaseToken string, now, leaseNow time.Time) error {
-	return s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, leaseToken, leaseNow, false)
+	return s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, leaseToken, leaseNow)
 }
 
-func (s *Store) PauseGitHubPollForCredential(ctx context.Context, repository, leaseToken string, now, leaseNow time.Time) error {
-	return s.consumeGitHubPollBootstrapEligibility(ctx, repository, now, leaseToken, leaseNow, true)
-}
-
-func (s *Store) consumeGitHubPollBootstrapEligibility(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, resetFailures bool) error {
+func (s *Store) consumeGitHubPollBootstrapEligibility(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -635,19 +631,20 @@ func (s *Store) consumeGitHubPollBootstrapEligibility(ctx context.Context, repos
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	if resetFailures {
-		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
-WHERE repository = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), repository)
-	} else {
-		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
+	_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
 SET failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?)`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed)
-	}
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func resetGitHubPollForCredentialTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+WHERE repository = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), repository)
+	return err
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverable(ctx context.Context, repository string, now time.Time) error {

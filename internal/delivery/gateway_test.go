@@ -200,6 +200,22 @@ func TestGatewayWritesPausedHasStructuredHTTPClassification(t *testing.T) {
 	}
 }
 
+func TestGatewayRateLimitHasStructuredHTTPRetryTime(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	retryAt := now.Add(5 * time.Minute)
+	remote := &fakeRemote{applyErr: &githubapi.APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}}
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err := (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || !httpErr.RetryAtTime().Equal(retryAt) {
+		t.Fatalf("Gateway rate-limit HTTP error = %#v, %v", httpErr, err)
+	}
+}
+
 func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)

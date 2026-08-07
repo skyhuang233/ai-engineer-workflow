@@ -44,6 +44,10 @@ type pollStoreError struct {
 	err error
 }
 
+type retryAtFailure interface {
+	RetryAtTime() time.Time
+}
+
 var ErrLocalPollStore = errors.New("local GitHub poll persistence is unavailable")
 
 func (e pollStoreError) Error() string {
@@ -91,6 +95,14 @@ func ClassifyPollError(err error) error {
 
 func isPollStoreError(err error) bool {
 	return isLocalPollStoreError(err) || isRemotePollStoreError(err)
+}
+
+func pollRetryAt(err error) time.Time {
+	var failure retryAtFailure
+	if errors.As(err, &failure) {
+		return failure.RetryAtTime()
+	}
+	return time.Time{}
 }
 
 type Poller struct {
@@ -207,9 +219,8 @@ func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, c
 	}
 	if err == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
 		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
-		var githubError *apiError
-		if errors.As(cause, &githubError) && githubError.RetryAt.After(p.now()) {
-			_, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, githubError.RetryAt, p.now(), leaseToken, p.now())
+		if retryAt := pollRetryAt(cause); retryAt.After(p.now()) {
+			_, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, retryAt, p.now(), leaseToken, p.now())
 			return PollResult{}, errors.Join(cause, deferErr)
 		}
 		return PollResult{}, p.finishExhaustedFailure(ctx, repository, p.now(), cause)
@@ -557,15 +568,10 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 		return PollResult{}, errors.Join(cause, store.ErrFencingConflict)
 	}
 	if isPollCredentialFailure(cause) {
-		consumeErr := p.Store.PauseGitHubPollForCredential(persistenceCtx, repository, leaseToken, now, p.now())
-		var pauseErr error
-		if consumeErr == nil {
-			pauseErr = p.Store.PauseGatewayWritesForGitHubPoll(persistenceCtx, repository, leaseToken, "Gateway Credential is unavailable; replace and verify it to resume writes", now, p.now())
-		}
-		return PollResult{}, errors.Join(cause, consumeErr, pauseErr)
+		pauseErr := p.Store.PauseGatewayWritesForGitHubPollCredential(persistenceCtx, repository, leaseToken, "Gateway Credential is unavailable; replace and verify it to resume writes", now, p.now())
+		return PollResult{}, errors.Join(cause, pauseErr)
 	}
-	var githubError *apiError
-	if errors.As(cause, &githubError) && githubError.RetryAt.After(now) {
+	if retryAt := pollRetryAt(cause); retryAt.After(now) {
 		var updated store.GitHubPollCursor
 		var err error
 		if recoveryPlanVersionID != "" {
@@ -575,11 +581,11 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 			}
 			if cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
 				(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) && cursor.RecoveryPlanVersionID == recoveryPlanVersionID {
-				_, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, githubError.RetryAt, now, leaseToken, p.now())
+				_, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
 				return PollResult{}, errors.Join(cause, err)
 			}
 		}
-		updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, githubError.RetryAt, now, leaseToken, p.now())
+		updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, retryAt, now, leaseToken, p.now())
 		if err != nil {
 			return PollResult{}, errors.Join(cause, err)
 		}

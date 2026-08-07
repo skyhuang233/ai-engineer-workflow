@@ -796,7 +796,7 @@ func TestClaimedBootstrapRecoveryPreservesProvenanceWhenRateLimited(t *testing.T
 	}
 	now := failedAt.Add(time.Minute)
 	retryAt := now.Add(5 * time.Minute)
-	rateLimit := &apiError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
+	rateLimit := &delivery.HTTPError{StatusCode: http.StatusInternalServerError, Message: "Gateway rate limited", RetryAt: retryAt}
 	_, err = (Poller{
 		Store:       db,
 		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),

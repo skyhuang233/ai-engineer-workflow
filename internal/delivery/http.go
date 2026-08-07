@@ -19,6 +19,8 @@ const controlPlaneTokenHeader = "X-Workflow-Control-Token"
 
 const errorCodeHeader = "X-Workflow-Error-Code"
 
+const retryAtHeader = "X-Workflow-Retry-At"
+
 const (
 	ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
 	ErrorCodeRetryableStore       = "retryable_store"
@@ -29,6 +31,7 @@ type HTTPError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	RetryAt    time.Time
 }
 
 func (e *HTTPError) Error() string {
@@ -41,6 +44,10 @@ func (e *HTTPError) PollStoreFailure() bool {
 
 func (e *HTTPError) AuthenticationFailure() bool {
 	return e.Code == ErrorCodeGatewayWritesPaused
+}
+
+func (e *HTTPError) RetryAtTime() time.Time {
+	return e.RetryAt
 }
 
 type HTTPOptions struct {
@@ -95,7 +102,8 @@ func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryReques
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
-		return &HTTPError{StatusCode: response.StatusCode, Code: response.Header.Get(errorCodeHeader), Message: strings.TrimSpace(string(message))}
+		retryAt, _ := time.Parse(time.RFC3339Nano, response.Header.Get(retryAtHeader))
+		return &HTTPError{StatusCode: response.StatusCode, Code: response.Header.Get(errorCodeHeader), Message: strings.TrimSpace(string(message)), RetryAt: retryAt}
 	}
 	return nil
 }
@@ -137,6 +145,9 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 		}
 		if err != nil {
 			status := http.StatusInternalServerError
+			if retryAt := retryAt(err); !retryAt.IsZero() {
+				writer.Header().Set(retryAtHeader, retryAt.UTC().Format(time.RFC3339Nano))
+			}
 			if errors.Is(err, store.ErrDeliveryRejected) || errors.Is(err, store.ErrInvalidClaim) || errors.Is(err, store.ErrFencingConflict) {
 				status = http.StatusConflict
 			}
