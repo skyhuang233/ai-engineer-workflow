@@ -477,6 +477,39 @@ func TestWorkflowInboxClaimsFenceOlderUncertainGeneration(t *testing.T) {
 	}
 }
 
+func TestWorkflowInboxUncertaintyDoesNotExhaustBeforeReconciliation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 4, 30, 0, 0, time.UTC)
+	activateWorkflowInboxPlan(t, ctx, db, repository)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= maxDeliveryAttempts; attempt++ {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if claimErr != nil {
+			t.Fatalf("uncertain Inbox claim %d = %v", attempt, claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation unavailable", true, now); err != nil {
+			t.Fatalf("uncertain Inbox requeue %d = %v", attempt, err)
+		}
+		now = now.Add(4 * time.Second)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatalf("uncertain Inbox reconciliation after retry budget = %v", err)
+	}
+	if !claim.ReconcileOnly || !claim.Uncertain || claim.Attempts != maxDeliveryAttempts+1 {
+		t.Fatalf("uncertain Inbox reconciliation claim = %#v", claim)
+	}
+}
+
 func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

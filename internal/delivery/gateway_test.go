@@ -326,6 +326,46 @@ func TestGatewayCompletesSupersededInboxGenerationWithoutRemoteWrite(t *testing.
 	}
 }
 
+func TestGatewayReconcilesUncertainInboxBeforeNewerGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 30, 0, 0, time.UTC)
+	first, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, first.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true}, {}}}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("uncertain Inbox reconciliation = %v", err)
+	}
+	if remote.observeCalls != 1 || remote.applyCalls != 0 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != first.Request.InboxProjectionGeneration {
+		t.Fatalf("historical Inbox reconciliation = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
+		t.Fatalf("newer Inbox dispatch = %v", err)
+	}
+	if remote.observeCalls != 2 || remote.applyCalls != 1 || len(remote.requests) != 2 || remote.requests[1].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
+		t.Fatalf("authoritative Inbox dispatch = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
 func TestHTTPProjectorAcceptsDurableInboxSerializationContention(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)
@@ -1403,7 +1443,7 @@ func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reclaimed.Attempts != 2 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly {
+	if reclaimed.Attempts != 2 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly || !reclaimed.Uncertain {
 		t.Fatalf("reclaimed outbox = %#v", reclaimed)
 	}
 }

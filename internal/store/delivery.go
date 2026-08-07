@@ -176,7 +176,7 @@ func (s *Store) EnqueueDelivery(ctx context.Context, request DeliveryRequest, no
 }
 
 func (s *Store) enqueueDeliveryTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time) (DeliveryOutbox, error) {
-	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now, "")
+	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, now, "", false)
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now); auditErr != nil {
 			return DeliveryOutbox{}, auditErr
@@ -274,7 +274,7 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 		return DeliveryTarget{}, err
 	}
 	defer tx.Rollback()
-	target, _, err := loadDeliveryTargetTx(ctx, tx, request, now.UTC(), "")
+	target, _, err := loadDeliveryTargetTx(ctx, tx, request, now.UTC(), "", false)
 	if err != nil {
 		if auditErr := insertDeliveryAuditTx(ctx, tx, request, "rejected", err.Error(), now.UTC()); auditErr != nil {
 			return DeliveryTarget{}, auditErr
@@ -291,6 +291,14 @@ func (s *Store) ValidateDelivery(ctx context.Context, request DeliveryRequest, n
 }
 
 func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, claimToken string, now func() time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
+	return s.executeDelivery(ctx, request, claimToken, now, apply, false)
+}
+
+func (s *Store) ReconcileDelivery(ctx context.Context, request DeliveryRequest, claimToken string, now func() time.Time, reconcile func(context.Context, DeliveryRequest) (DeliveryResult, error)) (DeliveryResult, error) {
+	return s.executeDelivery(ctx, request, claimToken, now, reconcile, true)
+}
+
+func (s *Store) executeDelivery(ctx context.Context, request DeliveryRequest, claimToken string, now func() time.Time, apply func(context.Context, DeliveryRequest) (DeliveryResult, error), historicalInbox bool) (DeliveryResult, error) {
 	if apply == nil {
 		return DeliveryResult{}, ErrInvalidClaim
 	}
@@ -305,7 +313,7 @@ func (s *Store) ExecuteDelivery(ctx context.Context, request DeliveryRequest, cl
 		return DeliveryResult{}, err
 	}
 	defer tx.Rollback()
-	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, validatedAt, claimToken)
+	target, normalized, err := loadDeliveryTargetTx(ctx, tx, request, validatedAt, claimToken, historicalInbox)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
@@ -512,11 +520,11 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 		}
 	}
 	reconcileOnly := uncertain != 0 || state == OutboxProcessing
-	if attempts >= maxDeliveryAttempts {
-		var request DeliveryRequest
-		if err := json.Unmarshal([]byte(raw), &request); err != nil {
-			return DeliveryOutbox{}, err
-		}
+	var request DeliveryRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if attempts >= maxDeliveryAttempts && !(request.Operation == DeliveryProjectInbox && reconcileOnly) {
 		if err := markDeliveryNeedsAttentionTx(ctx, tx, request, "delivery retries exhausted", now); err != nil {
 			return DeliveryOutbox{}, err
 		}
@@ -530,10 +538,6 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	}
 	claimToken, err := randomID("outbox-claim")
 	if err != nil {
-		return DeliveryOutbox{}, err
-	}
-	var request DeliveryRequest
-	if err := json.Unmarshal([]byte(raw), &request); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	if request.Operation == DeliveryProjectInbox {
@@ -570,7 +574,7 @@ AND (state = ? OR (
 		}
 		claimedDispatcherToken = dispatcherToken
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + 1, claim_token = ?, dispatcher_token = ?, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ? AND dispatcher_token = ?) OR (state = ? AND claim_token = ? AND dispatcher_token = ?))`, OutboxProcessing, claimToken, claimedDispatcherToken, formatTimestamp(now), key, OutboxPending, previousClaimToken, previousDispatcherToken, OutboxProcessing, previousClaimToken, previousDispatcherToken)
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, attempts = attempts + 1, claim_token = ?, dispatcher_token = ?, uncertain = CASE WHEN state = ? THEN 1 ELSE uncertain END, updated_at = ? WHERE idempotency_key = ? AND ((state = ? AND claim_token = ? AND dispatcher_token = ?) OR (state = ? AND claim_token = ? AND dispatcher_token = ?))`, OutboxProcessing, claimToken, claimedDispatcherToken, OutboxProcessing, formatTimestamp(now), key, OutboxPending, previousClaimToken, previousDispatcherToken, OutboxProcessing, previousClaimToken, previousDispatcherToken)
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -683,7 +687,7 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 				}
 			}
 		}
-	} else if attempts >= maxDeliveryAttempts {
+	} else if attempts >= maxDeliveryAttempts && !(uncertain && request.Operation == DeliveryProjectInbox) {
 		state = OutboxRejected
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
@@ -691,7 +695,8 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 			return err
 		}
 	} else {
-		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(attempts-1))))
+		retryAttempt := min(attempts, maxDeliveryAttempts)
+		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(retryAttempt-1))))
 		if retryAt.After(now) {
 			nextAttempt = formatTimestamp(retryAt.UTC())
 		}
@@ -871,11 +876,12 @@ func (s *Store) RecordDeliveryAudit(ctx context.Context, request DeliveryRequest
 	return execErr
 }
 
-func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time, admittedClaimToken string) (DeliveryTarget, DeliveryRequest, error) {
+func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, now time.Time, admittedClaimToken string, historicalInbox bool) (DeliveryTarget, DeliveryRequest, error) {
 	if request.Operation == DeliveryProjectInbox && request.RunID == "" {
 		if request.Repository == "" || request.RootNumber != 0 || request.PlanProjection != nil || request.Label != "" || request.Body != "" {
 			return DeliveryTarget{}, request, fmt.Errorf("%w: workflow inbox projection is incomplete", ErrDeliveryRejected)
 		}
+		admittedUncertain := 0
 		if admittedClaimToken != "" {
 			key, keyErr := deliveryKey(request)
 			if keyErr != nil {
@@ -885,14 +891,24 @@ func loadDeliveryTargetTx(ctx context.Context, tx *sql.Tx, request DeliveryReque
 				return DeliveryTarget{}, request, ErrFencingConflict
 			}
 			var admitted int
-			err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox
-WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LIMIT 1`, request.IdempotencyKey, DeliveryProjectInbox, OutboxProcessing, admittedClaimToken).Scan(&admitted)
+			err := tx.QueryRowContext(ctx, `SELECT 1, uncertain FROM delivery_outbox
+WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LIMIT 1`, request.IdempotencyKey, DeliveryProjectInbox, OutboxProcessing, admittedClaimToken).Scan(&admitted, &admittedUncertain)
 			if errors.Is(err, sql.ErrNoRows) {
 				return DeliveryTarget{}, request, ErrFencingConflict
 			}
 			if err != nil {
 				return DeliveryTarget{}, request, err
 			}
+		}
+		if historicalInbox {
+			if admittedClaimToken == "" || admittedUncertain == 0 {
+				return DeliveryTarget{}, request, ErrFencingConflict
+			}
+			versionID := request.InboxPlanVersionID
+			if versionID == "" && len(request.InboxPlanVersionIDs) > 0 {
+				versionID = request.InboxPlanVersionIDs[0]
+			}
+			return DeliveryTarget{VersionID: versionID, Repository: request.Repository}, request, nil
 		}
 		activeVersionIDs, err := workflowInboxDeliveryPlanVersions(ctx, tx, request.Repository)
 		if err != nil {
