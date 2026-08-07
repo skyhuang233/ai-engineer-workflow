@@ -602,12 +602,14 @@ func runPollGitHub(args []string) {
 		}
 		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
 			controlResult := github.BootstrapControlResult{}
+			var bootstrapErr error
 			if !bootstrapped {
-				if err := bootstrap(ctx); err != nil {
-					return controlResult, err
-				}
+				bootstrapErr = bootstrap(ctx)
 			}
 			controlResult.AttemptedPlanVersionID = attemptedPlanVersionID
+			if bootstrapErr != nil {
+				return controlResult, bootstrapErr
+			}
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
 				return controlResult, err

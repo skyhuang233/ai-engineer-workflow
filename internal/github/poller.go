@@ -409,7 +409,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		}
 		controlResult, err = before(ctx, bootstrapped)
 		if err != nil {
-			return p.recordFailure(ctx, repository, now, err)
+			return p.recordBootstrapFailure(ctx, repository, now, controlResult.AttemptedPlanVersionID, err)
 		}
 	}
 	if err := p.renewPollLease(ctx, repository); err != nil {
@@ -491,7 +491,7 @@ func (p Poller) resumeClaimedBootstrapRecovery(ctx context.Context, repository s
 		return false, err
 	}
 	if err := bootstrap(ctx); err != nil {
-		_, failureErr := p.recordFailure(ctx, repository, now, err)
+		_, failureErr := p.recordBootstrapFailure(ctx, repository, now, cursor.RecoveryPlanVersionID, err)
 		return false, failureErr
 	}
 	recovered, err = p.Store.RecoverGitHubPollAfterBootstrapLeased(ctx, repository, now, leaseToken, p.now())
@@ -530,6 +530,20 @@ func (p Poller) readyAt(ctx context.Context, repository string, now time.Time) e
 
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
 	return p.recordFailureWithKind(ctx, repository, now, "", "", cause)
+}
+
+func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, now time.Time, attemptedPlanVersionID string, cause error) (PollResult, error) {
+	if attemptedPlanVersionID == "" || isLocalPollStoreError(cause) {
+		return p.recordFailure(ctx, repository, now, cause)
+	}
+	projecting, err := p.Store.IsProjectingDeliveryPlanVersion(ctx, repository, attemptedPlanVersionID)
+	if err != nil {
+		return PollResult{}, errors.Join(cause, err)
+	}
+	if !projecting {
+		return p.recordFailure(ctx, repository, now, cause)
+	}
+	return p.recordFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, attemptedPlanVersionID, cause)
 }
 
 func (p Poller) recordFailureWithKind(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, recoveryPlanVersionID string, cause error) (PollResult, error) {
