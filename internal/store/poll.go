@@ -86,8 +86,7 @@ func (s *Store) WorkflowInboxProjectionState(ctx context.Context, repository str
 	return questions, version, versionIDs, nil
 }
 
-func workflowInboxQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string) ([]WorkflowQuestion, error) {
-	rows, err := querier.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
+const workflowQuestionSelect = `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
 COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
 FROM workflow_questions q
 JOIN plan_versions v ON v.version_id = q.version_id
@@ -98,21 +97,15 @@ LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.
 LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
 LEFT JOIN run_diagnostics rd ON rd.run_id = s.current_run_id
 LEFT JOIN candidate_revisions c ON c.run_id = s.current_run_id
-WHERE q.repository = ? AND q.state = 'open' AND (`+workflowInboxPlanPredicate+`)
+`
+
+func workflowInboxQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string) ([]WorkflowQuestion, error) {
+	rows, err := querier.QueryContext(ctx, workflowQuestionSelect+`WHERE q.repository = ? AND q.state = 'open' AND (`+workflowInboxPlanPredicate+`)
 ORDER BY q.created_at, q.question_id`, repository)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var questions []WorkflowQuestion
-	for rows.Next() {
-		var question WorkflowQuestion
-		if err := rows.Scan(&question.ID, &question.Repository, &question.VersionID, &question.IssueID, &question.Kind, &question.Prompt, &question.State, &question.Answer, &question.RootNumber, &question.TicketNumber, &question.PullRequest, &question.Commit, &question.Diagnostics, &question.Evidence); err != nil {
-			return nil, err
-		}
-		questions = append(questions, question)
-	}
-	return questions, rows.Err()
+	return scanWorkflowQuestions(rows)
 }
 
 type workflowQuestionQuerier interface {
@@ -124,23 +117,16 @@ func openWorkflowQuestions(ctx context.Context, querier workflowQuestionQuerier,
 	if activeOnly {
 		active = 1
 	}
-	rows, err := querier.QueryContext(ctx, `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
-COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
-FROM workflow_questions q
-JOIN plan_versions v ON v.version_id = q.version_id
-JOIN plans p ON p.id = v.plan_id
-LEFT JOIN workflow_question_contexts qc ON qc.question_id = q.question_id
-LEFT JOIN plan_tickets t ON t.version_id = q.version_id AND t.issue_id = q.issue_id
-LEFT JOIN ticket_deliveries d ON d.version_id = q.version_id AND d.issue_id = q.issue_id
-LEFT JOIN ticket_sessions s ON s.version_id = q.version_id AND s.issue_id = q.issue_id
-LEFT JOIN run_diagnostics rd ON rd.run_id = s.current_run_id
-LEFT JOIN candidate_revisions c ON c.run_id = s.current_run_id
-WHERE q.repository = ? AND (? = 0 OR p.root_issue_number = ?) AND q.state = 'open'
+	rows, err := querier.QueryContext(ctx, workflowQuestionSelect+`WHERE q.repository = ? AND (? = 0 OR p.root_issue_number = ?) AND q.state = 'open'
 AND (? = 0 OR (`+currentActivePlanPredicate+`))
 ORDER BY q.created_at, q.question_id`, repository, rootNumber, rootNumber, active)
 	if err != nil {
 		return nil, err
 	}
+	return scanWorkflowQuestions(rows)
+}
+
+func scanWorkflowQuestions(rows *sql.Rows) ([]WorkflowQuestion, error) {
 	defer rows.Close()
 	var questions []WorkflowQuestion
 	for rows.Next() {

@@ -586,34 +586,39 @@ func runPollGitHub(args []string) {
 		}
 		poller.Client = client
 		poller.LaunchReview = launcher
+		attemptedPlanVersionID := ""
 		bootstrap := func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
 				return err
 			}
 			activator := plan.Activator{Reader: client, Projector: projector, Store: db}
-			if _, err := activator.Activate(ctx, *repository, activeRoot); err != nil {
+			version, err := activator.Activate(ctx, *repository, activeRoot)
+			attemptedPlanVersionID = version.ID
+			if err != nil {
 				return err
 			}
 			return nil
 		}
-		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) error {
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
+			controlResult := github.BootstrapControlResult{}
 			if !bootstrapped {
 				if err := bootstrap(ctx); err != nil {
-					return err
+					return controlResult, err
 				}
 			}
+			controlResult.AttemptedPlanVersionID = attemptedPlanVersionID
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
-				return err
+				return controlResult, err
 			}
 			workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}
 			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}}
 			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
-				return err
+				return controlResult, err
 			}
 			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
-				return err
+				return controlResult, err
 			}
 			var deliveryWorkers *sync.WaitGroup
 			if *once {
@@ -624,21 +629,21 @@ func runPollGitHub(args []string) {
 				workerError = errors.Join(workerError, err)
 				workerErrorMu.Unlock()
 			}); err != nil {
-				return err
+				return controlResult, err
 			}
 			for {
 				claim, claimErr := dispatcher.Claim(ctx, *repository, activeRoot, 0, "workflow-control-plane")
 				if claimErr == nil {
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
-						return err
+						return controlResult, err
 					}
 					continue
 				}
 				if errors.Is(claimErr, store.ErrNoReadyTickets) || errors.Is(claimErr, store.ErrCapacity) || errors.Is(claimErr, store.ErrNotReady) {
-					return nil
+					return controlResult, nil
 				}
-				return claimErr
+				return controlResult, claimErr
 			}
 		})
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {

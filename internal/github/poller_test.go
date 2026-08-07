@@ -172,11 +172,11 @@ func TestColdStartActivatesApprovedPlanBeforeUnifiedInboxProjection(t *testing.T
 		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
 		InboxProjector: projector,
 		Now:            func() time.Time { return now },
-	}).PollWithBootstrap(ctx, repository, bootstrap, func(ctx context.Context, bootstrapped bool) error {
+	}).PollWithBootstrap(ctx, repository, bootstrap, func(ctx context.Context, bootstrapped bool) (BootstrapControlResult, error) {
 		if !bootstrapped {
-			return bootstrap(ctx)
+			return BootstrapControlResult{}, bootstrap(ctx)
 		}
-		return nil
+		return BootstrapControlResult{}, nil
 	})
 	if err != nil {
 		t.Fatalf("cold-start poll = %v; sequence = %#v", err, projector.events)
@@ -329,7 +329,7 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 	}
 	defer db.Close()
 	repository := "owner/repo"
-	beginProjectingPollerPlan(t, ctx, db, repository)
+	projectingVersionID := beginProjectingPollerPlan(t, ctx, db, repository)
 	failedAt := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	now := failedAt.Add(time.Minute)
 	controlToken := "control-token"
@@ -346,7 +346,9 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 		InboxProjector: delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: controlToken},
 		MaxFailures:    1,
 		Now:            func() time.Time { return failedAt },
-	}).Poll(ctx, repository)
+	}).PollWithBootstrap(ctx, repository, nil, func(context.Context, bool) (BootstrapControlResult, error) {
+		return BootstrapControlResult{AttemptedPlanVersionID: projectingVersionID}, nil
+	})
 	if !errors.Is(err, store.ErrNeedsAttention) {
 		t.Fatalf("cold-start inbox conflict = %v, want needs attention", err)
 	}
@@ -379,12 +381,12 @@ func TestPollBootstrapRecoversFailureBudgetWithoutActivePlan(t *testing.T) {
 		bootstrapRuns++
 		activatePollerPlan(t, ctx, db, repository)
 		return nil
-	}, func(_ context.Context, bootstrapped bool) error {
+	}, func(_ context.Context, bootstrapped bool) (BootstrapControlResult, error) {
 		controlRuns++
 		if !bootstrapped {
 			t.Fatal("recovered poll did not report bootstrap completion")
 		}
-		return nil
+		return BootstrapControlResult{}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -572,9 +574,9 @@ func TestPollDoesNotBootstrapPastFailureBudgetWithUnclassifiedOrMixedFailures(t 
 			}).PollWithBootstrap(ctx, repository, func(context.Context) error {
 				bootstrapRuns++
 				return nil
-			}, func(context.Context, bool) error {
+			}, func(context.Context, bool) (BootstrapControlResult, error) {
 				t.Fatal("control pass ran after an unrecoverable failure")
-				return nil
+				return BootstrapControlResult{}, nil
 			})
 			if !errors.Is(err, store.ErrNeedsAttention) {
 				t.Fatalf("poll error = %v, want needs attention", err)
@@ -609,9 +611,9 @@ func TestPollDoesNotBootstrapPastFailureBudgetWithActivePlan(t *testing.T) {
 	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
 		bootstrapRuns++
 		return nil
-	}, func(context.Context, bool) error {
+	}, func(context.Context, bool) (BootstrapControlResult, error) {
 		controlRuns++
-		return nil
+		return BootstrapControlResult{}, nil
 	})
 	if !errors.Is(err, store.ErrNeedsAttention) {
 		t.Fatalf("poll error = %v, want needs attention", err)
@@ -1353,6 +1355,46 @@ func TestCompletedOrAbsentPlanInboxConflictIsNotBootstrapEligible(t *testing.T) 
 	}
 	if ignored {
 		t.Fatal("projecting-plan conflict was ignored")
+	}
+}
+
+func TestInboxConflictUsesControlPassPlanProvenance(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	unrelatedVersionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	attemptedVersionID := beginProjectingPollerPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	if err := db.MarkActive(ctx, attemptedVersionID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	conflict := &delivery.HTTPError{StatusCode: http.StatusConflict, Code: delivery.ErrorCodeNoActiveDeliveryPlan}
+	_, err = (Poller{
+		Store:          db,
+		Client:         NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		InboxProjector: errorInboxProjector{err: conflict},
+		MaxFailures:    1,
+		Now:            func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, nil, func(context.Context, bool) (BootstrapControlResult, error) {
+		if err := db.MarkTicketDelivered(ctx, attemptedVersionID, 12); err != nil {
+			return BootstrapControlResult{}, err
+		}
+		return BootstrapControlResult{AttemptedPlanVersionID: attemptedVersionID}, nil
+	})
+	if err != nil {
+		t.Fatalf("completed attempted Plan conflict = %v, want ignored", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || cursor.ConsecutiveFailures != 0 || cursor.RecoveryPlanVersionID != "" || cursor.NeedsAttention() {
+		t.Fatalf("poll cursor = %#v, %v", cursor, err)
+	}
+	unrelated, err := db.CurrentVersion(ctx, repository, 1)
+	if err != nil || unrelated.ID != unrelatedVersionID || unrelated.State != store.StateProjecting {
+		t.Fatalf("unrelated Plan = %#v, %v", unrelated, err)
 	}
 }
 

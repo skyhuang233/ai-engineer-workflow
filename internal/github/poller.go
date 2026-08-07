@@ -22,7 +22,10 @@ type PollResult struct {
 
 type ReviewLauncher func(context.Context, store.TicketClaim, string) error
 type ControlPass func(context.Context) error
-type BootstrapControlPass func(context.Context, bool) error
+type BootstrapControlResult struct {
+	AttemptedPlanVersionID string
+}
+type BootstrapControlPass func(context.Context, bool) (BootstrapControlResult, error)
 
 type WorkflowInboxProjector interface {
 	ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error
@@ -286,8 +289,8 @@ func (p Poller) renewPollLease(ctx context.Context, repository string) error {
 func (p Poller) PollWith(ctx context.Context, repository string, before ControlPass) (PollResult, error) {
 	var control BootstrapControlPass
 	if before != nil {
-		control = func(ctx context.Context, _ bool) error {
-			return before(ctx)
+		control = func(ctx context.Context, _ bool) (BootstrapControlResult, error) {
+			return BootstrapControlResult{}, before(ctx)
 		}
 	}
 	return p.PollWithBootstrap(ctx, repository, nil, control)
@@ -399,11 +402,13 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		}
 	}
 	full := cursorMissing || cursor.LastFullReconcileAt.IsZero() || now.Sub(cursor.LastFullReconcileAt) >= p.fullReconcileInterval()
+	controlResult := BootstrapControlResult{}
 	if before != nil {
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err
 		}
-		if err := before(ctx, bootstrapped); err != nil {
+		controlResult, err = before(ctx, bootstrapped)
+		if err != nil {
 			return p.recordFailure(ctx, repository, now, err)
 		}
 	}
@@ -414,14 +419,12 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if err != nil {
 		return PollResult{}, err
 	}
-	recoveryCandidateVersionID, singleProjectingPlan, err := p.Store.ProjectingDeliveryPlanVersion(ctx, repository)
-	if err != nil {
-		return PollResult{}, err
+	recoveryCandidateVersionID := controlResult.AttemptedPlanVersionID
+	if recoveryCandidateVersionID == "" && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
+		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
+		recoveryCandidateVersionID = cursor.RecoveryPlanVersionID
 	}
-	if !singleProjectingPlan {
-		recoveryCandidateVersionID = ""
-	}
-	if len(attemptedActiveVersionIDs) == 0 && !singleProjectingPlan {
+	if len(attemptedActiveVersionIDs) == 0 && recoveryCandidateVersionID == "" {
 		if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
 			return PollResult{}, err
 		}
