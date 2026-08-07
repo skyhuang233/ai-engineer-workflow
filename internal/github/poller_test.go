@@ -817,6 +817,70 @@ func TestClaimedBootstrapRecoveryPreservesProvenanceWhenRateLimited(t *testing.T
 	}
 }
 
+func TestClaimedBootstrapRecoveryStartsFreshBudgetAfterActivationProjectionFailure(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		complete bool
+	}{
+		{name: "active"},
+		{name: "completed", complete: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			repository := "owner/repo"
+			failedAt := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+			versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+			for range 2 {
+				if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+					t.Fatal(err)
+				}
+			}
+			projectionErr := errors.New("reconcile active plan root: Gateway unavailable")
+			now := failedAt.Add(time.Minute)
+			_, err = (Poller{
+				Store:       db,
+				Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+				MaxFailures: 2,
+				Now:         func() time.Time { return now },
+			}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+				if err := db.MarkActive(ctx, versionID); err != nil {
+					return err
+				}
+				if test.complete {
+					if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+						return err
+					}
+				}
+				return projectionErr
+			}, nil)
+			if !errors.Is(err, projectionErr) || errors.Is(err, store.ErrNeedsAttention) {
+				t.Fatalf("post-activation projection failure = %v, want fresh retry", err)
+			}
+			cursor, err := db.GitHubPollCursor(ctx, repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryPlanVersionID != "" || cursor.NeedsAttention() {
+				t.Fatalf("post-activation cursor = %#v, want fresh retry budget", cursor)
+			}
+			questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, question := range questions {
+				if question.Kind == "poll_failure" {
+					t.Fatalf("post-activation failure created recovery question: %#v", question)
+				}
+			}
+		})
+	}
+}
+
 func TestClaimedBootstrapRecoveryIgnoresUnrelatedProjectingPlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

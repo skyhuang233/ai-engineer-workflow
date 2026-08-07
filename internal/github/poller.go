@@ -502,6 +502,9 @@ func (p Poller) resumeClaimedBootstrapRecovery(ctx context.Context, repository s
 		return false, err
 	}
 	if err := bootstrap(ctx); err != nil {
+		if _, resolveErr := p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), now, leaseToken, p.now()); resolveErr != nil {
+			return false, errors.Join(err, resolveErr)
+		}
 		_, failureErr := p.recordBootstrapFailure(ctx, repository, now, cursor.RecoveryPlanVersionID, err)
 		return false, failureErr
 	}
