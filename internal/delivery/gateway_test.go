@@ -393,6 +393,46 @@ func TestGatewayAppliesCurrentUnobservedUncertainInbox(t *testing.T) {
 	}
 }
 
+func TestGatewayPreservesUncertainInboxAcrossCredentialPreflightFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "transient", err: errors.New("credential store unavailable")},
+		{name: "rejected", err: delivery.ErrGatewayCredentialRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _ := newAcceptedClaim(t, ctx)
+			defer db.Close()
+			now := time.Date(2026, 8, 7, 2, 50, 0, 0, time.UTC)
+			queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+				t.Fatal(err)
+			}
+			remote := &fakeRemote{credentialErr: test.err}
+			gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now.Add(2 * time.Second) }}
+			if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+				t.Fatal("credential preflight failure returned nil")
+			}
+			outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+			if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain {
+				t.Fatalf("uncertain Inbox after credential preflight = %#v, %v", outbox, err)
+			}
+			if remote.observeCalls != 0 || remote.applyCalls != 0 {
+				t.Fatalf("credential preflight reached remote: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
+			}
+		})
+	}
+}
+
 func TestHTTPProjectorAcceptsDurableInboxSerializationContention(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)

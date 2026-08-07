@@ -76,13 +76,18 @@ the approved Plan Root control pass before
 projecting the repository Workflow Inbox, so an eligible Delivery Plan is
 active before the Gateway admits that projection. It then reconciles every
 active ticket pull request and deduplicates newly observed reviews and comments
-before the owning Ticket Session is resumed. `--review-feedback` and
-`workflow answer-inbox` are
+before the owning Ticket Session is resumed. `--review-feedback`,
+`workflow answer-inbox`, and `workflow recover-inbox-delivery` are
 privileged local Control Plane operations: run them only on the trusted Control
 Plane host. `answer-inbox` forwards the resulting inbox projection through the
 Gateway control-plane credential; that transport credential is not the local
-operator authorization boundary. They use the same durable queue for manual
-routing and decisions. `workflow reconcile-delivered` checks merged pull requests
+operator authorization boundary. If an uncertain Workflow Inbox delivery
+exhausts reconciliation, recover the rejected generation by its logged delivery
+key with `workflow recover-inbox-delivery --repository owner/repository
+--delivery delivery-key`. The recovery atomically requeues the uncertain
+generation and the current Needs Attention projection while preserving their
+delivery order. They use the same durable queue for manual routing and decisions.
+`workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 

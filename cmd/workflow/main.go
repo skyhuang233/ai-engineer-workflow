@@ -60,6 +60,8 @@ func main() {
 		runReconcileDelivered(os.Args[2:])
 	case "answer-inbox":
 		runAnswerInbox(os.Args[2:])
+	case "recover-inbox-delivery":
+		runRecoverInboxDelivery(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -75,6 +77,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow poll-github [options]")
 	fmt.Fprintln(os.Stderr, "  workflow reconcile-delivered [options]")
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
+	fmt.Fprintln(os.Stderr, "  workflow recover-inbox-delivery [options]")
 }
 
 func runDoctor(args []string) {
@@ -759,6 +762,26 @@ func runAnswerInbox(args []string) {
 	defer db.Close()
 	ctx := context.Background()
 	if _, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+		fail(err)
+	}
+}
+
+func runRecoverInboxDelivery(args []string) {
+	flags := flag.NewFlagSet("recover-inbox-delivery", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	repository := flags.String("repository", "", "GitHub owner/repository")
+	deliveryKey := flags.String("delivery", "", "rejected uncertain Workflow Inbox delivery key")
+	_ = flags.Parse(args)
+	if *repository == "" || *deliveryKey == "" {
+		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository and delivery")
+		os.Exit(2)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	if _, err := db.RecoverUncertainInboxDelivery(context.Background(), *repository, *deliveryKey, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 }

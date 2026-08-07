@@ -643,27 +643,40 @@ func (s *Store) DeferDeliveryOutbox(ctx context.Context, key, claimToken, lastEr
 	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, true, retryAt)
 }
 
-func (s *Store) RecoverUncertainInboxDelivery(ctx context.Context, key string, now time.Time) error {
-	if key == "" {
-		return ErrInvalidClaim
+func (s *Store) RecoverUncertainInboxDelivery(ctx context.Context, repository, key string, now time.Time) (DeliveryOutbox, error) {
+	if repository == "" || key == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE delivery_outbox
-SET state = ?, attempts = 0, last_error = '', claim_token = '', dispatcher_token = '',
-    next_attempt_at = ?, updated_at = ?, completed_at = NULL
-WHERE idempotency_key = ? AND operation = ? AND state = ? AND uncertain != 0`,
-		OutboxPending, formatTimestamp(now), formatTimestamp(now), key, DeliveryProjectInbox, OutboxRejected)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return DeliveryOutbox{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox
+SET state = ?, attempts = 0, last_error = '', claim_token = '', dispatcher_token = '',
+	    next_attempt_at = ?, updated_at = ?, completed_at = NULL
+WHERE idempotency_key = ? AND operation = ? AND state = ? AND uncertain != 0
+  AND json_extract(request_json, '$.repository') = ?`,
+		OutboxPending, formatTimestamp(now), formatTimestamp(now), key, DeliveryProjectInbox, OutboxRejected, repository)
+	if err != nil {
+		return DeliveryOutbox{}, err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
-		return ErrInvalidClaim
+		return DeliveryOutbox{}, ErrInvalidClaim
 	}
-	return nil
+	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
+	if err != nil {
+		return DeliveryOutbox{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryOutbox{}, err
+	}
+	return outbox, nil
 }
 
 func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool, retryAt time.Time) error {

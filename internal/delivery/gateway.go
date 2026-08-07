@@ -156,12 +156,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	operationCtx, stopDispatcher, err := g.controlPlaneDispatchContext(ctx, outbox, dispatcherToken)
 	if err != nil {
-		return errors.Join(err, g.requeueClaim(outbox, err, false))
+		return errors.Join(err, g.requeueClaim(outbox, err, outbox.Uncertain))
 	}
 	if remote, ok := g.Remote.(credentialAwareRemote); ok {
 		if err := g.credentialAvailable(operationCtx, outbox.Request, remote); err != nil {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
-				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, false))
+				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.Uncertain))
 			}
 			if isCredentialRejection(err) {
 				return g.pauseForCredential(outbox, err)
@@ -417,6 +417,7 @@ func (g Gateway) renewDispatcher(dispatcherToken string) error {
 func (g Gateway) requeueClaim(outbox store.DeliveryOutbox, cause error, uncertain bool) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
+	uncertain = uncertain || outbox.Uncertain
 	err := g.Store.RequeueDeliveryOutboxClaim(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), uncertain, g.now())
 	if errors.Is(err, store.ErrFencingConflict) {
 		return nil
@@ -469,9 +470,9 @@ func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 	now := g.now()
 	var err error
 	if retryAfter := retryAt(cause); retryAfter.After(now) {
-		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), false, retryAfter, now)
+		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, retryAfter, now)
 	} else {
-		err = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), now)
+		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, time.Time{}, now)
 	}
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
@@ -489,7 +490,7 @@ func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) er
 	if err := g.QueueGatewayCredentialInboxProjections(ctx); err != nil {
 		return errors.Join(fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
-	if err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now()); err != nil {
+	if err := g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, reason, outbox.Uncertain, time.Time{}, g.now()); err != nil {
 		return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err, g.requeueClaim(outbox, cause, false))
 	}
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)

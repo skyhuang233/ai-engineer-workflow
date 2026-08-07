@@ -522,8 +522,15 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if _, err := db.ClaimDeliveryOutbox(ctx, newer.IdempotencyKey, now); !errors.Is(err, ErrInboxDeliveryPending) {
 		t.Fatalf("newer Inbox claim while exhausted generation is unresolved = %v", err)
 	}
-	if err := db.RecoverUncertainInboxDelivery(ctx, queued.IdempotencyKey, now); err != nil {
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM delivery_outbox WHERE idempotency_key = ?`, newer.IdempotencyKey); err != nil {
 		t.Fatal(err)
+	}
+	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveryProjection.State != OutboxPending || recoveryProjection.Request.InboxProjectionGeneration <= queued.Request.InboxProjectionGeneration {
+		t.Fatalf("recovery projection = %#v", recoveryProjection)
 	}
 	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
 	if err != nil {
