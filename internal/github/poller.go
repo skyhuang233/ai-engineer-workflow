@@ -186,8 +186,7 @@ func (p Poller) PrepareAdmission(ctx context.Context, repository string) error {
 	if err != nil {
 		return err
 	}
-	if cursor.ConsecutiveFailures < p.maxFailures() || cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict ||
-		cursor.RecoveryState != store.GitHubPollRecoveryAvailable && cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
+	if !cursor.HasBootstrapRecoveryCandidate(p.maxFailures()) {
 		return nil
 	}
 	_, err = p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), p.now(), leaseToken, p.now())
@@ -217,8 +216,7 @@ func (p Poller) RecordAdmissionFailure(ctx context.Context, repository string, c
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, errors.Join(cause, err)
 	}
-	if err == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
-		(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) {
+	if err == nil && cursor.HasBootstrapRecoveryCandidate(p.maxFailures()) {
 		if retryAt := pollRetryAt(cause); retryAt.After(p.now()) {
 			updated, deferErr := p.Store.DeferGitHubPollBootstrapRecoveryLeased(ctx, repository, cursor.RecoveryPlanVersionID, retryAt, p.now(), leaseToken, p.now())
 			if deferErr != nil {
@@ -377,7 +375,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 			}
 		}
 		if cursor.ConsecutiveFailures >= p.maxFailures() {
-			if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryAvailable && cursor.RecoveryState != store.GitHubPollRecoveryClaimed {
+			if !cursor.HasBootstrapRecoveryCandidate(p.maxFailures()) {
 				return PollResult{}, p.finishExhaustedFailure(ctx, repository, now, fmt.Errorf("GitHub poll bootstrap recovery is unavailable"))
 			}
 			disposition, resolveErr := p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), now, leaseToken, p.now())
@@ -580,16 +578,22 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 		pauseErr := p.Store.PauseGatewayWritesForGitHubPollCredential(persistenceCtx, repository, leaseToken, "Gateway Credential is unavailable; replace and verify it to resume writes", now, p.now())
 		return PollResult{}, errors.Join(cause, pauseErr)
 	}
+	var existingCursor store.GitHubPollCursor
+	var existingCursorErr error
+	conflictingBootstrapFailureHistory := false
+	if failureKind == store.GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" {
+		existingCursor, existingCursorErr = p.Store.GitHubPollCursor(persistenceCtx, repository)
+		if existingCursorErr != nil && !errors.Is(existingCursorErr, store.ErrNotFound) {
+			return PollResult{}, errors.Join(cause, existingCursorErr)
+		}
+		continuingBootstrapRecovery := existingCursorErr == nil && existingCursor.HasBootstrapRecoveryCandidate(1) && existingCursor.RecoveryPlanVersionID == recoveryPlanVersionID
+		conflictingBootstrapFailureHistory = existingCursorErr == nil && existingCursor.ConsecutiveFailures > 0 && !continuingBootstrapRecovery
+	}
 	if retryAt := pollRetryAt(cause); retryAt.After(now) {
 		var updated store.GitHubPollCursor
 		var err error
 		if failureKind == store.GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" {
-			cursor, cursorErr := p.Store.GitHubPollCursor(persistenceCtx, repository)
-			if cursorErr != nil && !errors.Is(cursorErr, store.ErrNotFound) {
-				return PollResult{}, errors.Join(cause, cursorErr)
-			}
-			if cursorErr == nil && cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
-				(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) && cursor.RecoveryPlanVersionID == recoveryPlanVersionID {
+			if existingCursorErr == nil && existingCursor.HasBootstrapRecoveryCandidate(p.maxFailures()) && existingCursor.RecoveryPlanVersionID == recoveryPlanVersionID {
 				updated, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, recoveryPlanVersionID, retryAt, now, leaseToken, p.now())
 				if err != nil {
 					return PollResult{}, errors.Join(cause, err)
@@ -622,6 +626,9 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 	}
 	if updated.ConsecutiveFailures >= p.maxFailures() {
 		if updated.FailureKind == store.GitHubPollFailurePreActivationInboxConflict && updated.RecoveryState == store.GitHubPollRecoveryAvailable {
+			if conflictingBootstrapFailureHistory {
+				return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+			}
 			active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
 			if activeErr != nil {
 				return PollResult{}, errors.Join(cause, activeErr)

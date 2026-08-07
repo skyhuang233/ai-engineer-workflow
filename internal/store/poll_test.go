@@ -10,6 +10,32 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 )
 
+func TestGitHubPollCursorBootstrapRecoveryCandidateRequiresBoundExhaustedState(t *testing.T) {
+	cursor := GitHubPollCursor{
+		ConsecutiveFailures:   3,
+		FailureKind:           GitHubPollFailurePreActivationInboxConflict,
+		RecoveryState:         GitHubPollRecoveryAvailable,
+		RecoveryPlanVersionID: "version-1",
+	}
+	if !cursor.HasBootstrapRecoveryCandidate(3) {
+		t.Fatal("bound exhausted cursor was not a bootstrap recovery candidate")
+	}
+	for name, mutate := range map[string]func(*GitHubPollCursor){
+		"below limit":        func(candidate *GitHubPollCursor) { candidate.ConsecutiveFailures = 2 },
+		"missing Plan":       func(candidate *GitHubPollCursor) { candidate.RecoveryPlanVersionID = "" },
+		"wrong failure kind": func(candidate *GitHubPollCursor) { candidate.FailureKind = GitHubPollFailureRetryable },
+		"consumed recovery":  func(candidate *GitHubPollCursor) { candidate.RecoveryState = GitHubPollRecoveryConsumed },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cursor
+			mutate(&candidate)
+			if candidate.HasBootstrapRecoveryCandidate(3) {
+				t.Fatalf("cursor = %#v, want ineligible", candidate)
+			}
+		})
+	}
+}
+
 func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

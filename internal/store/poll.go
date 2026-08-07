@@ -154,6 +154,14 @@ func (c GitHubPollCursor) NeedsAttention() bool {
 	return c.FailureKind == GitHubPollFailureUnrecoverable && c.RecoveryState == GitHubPollRecoveryConsumed
 }
 
+func (c GitHubPollCursor) HasBootstrapRecoveryCandidate(minimumFailures int) bool {
+	return minimumFailures > 0 &&
+		c.ConsecutiveFailures >= minimumFailures &&
+		c.FailureKind == GitHubPollFailurePreActivationInboxConflict &&
+		c.RecoveryPlanVersionID != "" &&
+		(c.RecoveryState == GitHubPollRecoveryAvailable || c.RecoveryState == GitHubPollRecoveryClaimed)
+}
+
 type GitHubPollFailureKind string
 type GitHubPollRecoveryState string
 type GitHubPollBootstrapRecoveryDisposition string
@@ -502,18 +510,16 @@ func (s *Store) ResolveGitHubPollBootstrapRecoveryLeased(ctx context.Context, re
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return GitHubPollBootstrapRecoveryUnavailable, err
 	}
-	var failures int
-	var failureKind GitHubPollFailureKind
-	var recoveryState GitHubPollRecoveryState
-	var versionID string
+	var cursor GitHubPollCursor
 	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id
-FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &failureKind, &recoveryState, &versionID)
+FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&cursor.ConsecutiveFailures, &cursor.FailureKind, &cursor.RecoveryState, &cursor.RecoveryPlanVersionID)
 	if err != nil {
 		return GitHubPollBootstrapRecoveryUnavailable, err
 	}
-	if failures < minimumFailures || failureKind != GitHubPollFailurePreActivationInboxConflict || versionID == "" || recoveryState != GitHubPollRecoveryAvailable && recoveryState != GitHubPollRecoveryClaimed {
+	if !cursor.HasBootstrapRecoveryCandidate(minimumFailures) {
 		return GitHubPollBootstrapRecoveryUnavailable, nil
 	}
+	versionID := cursor.RecoveryPlanVersionID
 	var planState, versionState string
 	var terminal, completed int
 	err = tx.QueryRowContext(ctx, `SELECT p.state, v.state,

@@ -876,6 +876,7 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 		}
 	}
 	if applied < 34 {
+		now := time.Now().UTC()
 		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "recovery_plan_version_id")
 		if err != nil {
 			return fmt.Errorf("migration 34: %w", err)
@@ -885,7 +886,9 @@ SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THE
 				return fmt.Errorf("migration 34: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '' WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, GitHubPollFailurePreActivationInboxConflict); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict); err != nil {
 			return fmt.Errorf("migration 34: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (34, ?)", formatTimestamp(time.Now())); err != nil {

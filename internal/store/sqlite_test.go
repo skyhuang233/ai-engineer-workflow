@@ -181,13 +181,13 @@ func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	repository := "owner/repo"
-	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(24 * time.Hour)
 	store, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
-VALUES (?, 1, ?, ?, '', ?, ?)`, repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, formatTimestamp(now), formatTimestamp(now)); err != nil {
+VALUES (?, 99, ?, ?, '', ?, ?)`, repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, formatTimestamp(now), formatTimestamp(now)); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -225,8 +225,11 @@ VALUES (?, 1, ?, ?, '', ?, ?)`, repository, GitHubPollFailurePreActivationInboxC
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed {
-		t.Fatalf("migrated recovery = %q/%q, want safely consumed legacy provenance", cursor.FailureKind, cursor.RecoveryState)
+	if cursor.ConsecutiveFailures != 0 || cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed {
+		t.Fatalf("migrated recovery = %#v, want reset retry budget with safely consumed legacy provenance", cursor)
+	}
+	if cursor.NextAttemptAt.IsZero() || cursor.NextAttemptAt.After(time.Now().UTC()) {
+		t.Fatalf("migrated next attempt = %v, want immediately ready", cursor.NextAttemptAt)
 	}
 	backup, err := sql.Open("sqlite", backupPath)
 	if err != nil {
