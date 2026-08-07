@@ -60,6 +60,22 @@ func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	}
 }
 
+func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	version, err := store.schemaVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != latestSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, latestSchemaVersion)
+	}
+}
+
 func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
