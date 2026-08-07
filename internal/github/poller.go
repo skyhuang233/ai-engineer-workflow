@@ -671,10 +671,13 @@ func (p Poller) terminalFailureForPlan(ctx context.Context, repository, recovery
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	attentionErr := p.Store.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(persistenceCtx, repository, recoveryPlanVersionID, now, leaseToken, p.now())
+	terminalized, attentionErr := p.Store.ResolveGitHubPollTerminalFailureForPlanLeased(persistenceCtx, repository, recoveryPlanVersionID, now, leaseToken, p.now())
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
 		return result
+	}
+	if !terminalized {
+		return nil
 	}
 	result = errors.Join(result, store.ErrNeedsAttention)
 	eligible, eligibilityErr := p.Store.HasWorkflowInboxDeliveryPlan(persistenceCtx, repository)

@@ -719,10 +719,6 @@ func (s *Store) RecordGitHubPollSuccessLeased(ctx context.Context, repository st
 	} else {
 		now = now.UTC()
 	}
-	full := ""
-	if fullReconcile {
-		full = formatTimestamp(now)
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -730,6 +726,17 @@ func (s *Store) RecordGitHubPollSuccessLeased(ctx context.Context, repository st
 	defer tx.Rollback()
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
+	}
+	if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, fullReconcile); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func recordGitHubPollSuccessTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time, fullReconcile bool) error {
+	full := ""
+	if fullReconcile {
+		full = formatTimestamp(now)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
 VALUES (?, ?, ?, 0, '', '', '', ?, ?)
@@ -740,7 +747,7 @@ recovery_state = CASE WHEN github_poll_cursors.recovery_state = 'completed' THEN
 next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, formatTimestamp(now), full, formatTimestamp(now), formatTimestamp(now)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) DeferGitHubPoll(ctx context.Context, repository string, retryAt, now time.Time) error {
@@ -826,7 +833,7 @@ func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, reposito
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, "", now); err != nil {
+	if _, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, "", now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -842,14 +849,20 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ct
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	return s.markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, "", now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", now, leaseToken, leaseNow)
+	return err
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	return s.markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+	return err
 }
 
-func (s *Store) markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+}
+
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -857,29 +870,42 @@ func (s *Store) markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLea
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
-		return err
+		return false, err
 	}
 	if recoveryPlanVersionID == "" {
 		err = tx.QueryRowContext(ctx, `SELECT recovery_plan_version_id
 FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVersionID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
+			return false, err
 		}
 	}
-	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
-		return err
+	owned, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now)
+	if err != nil {
+		return false, err
+	}
+	if !owned {
+		if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
 	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) error {
+func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
 WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
     v.version_id = ? AND ((
@@ -889,67 +915,67 @@ WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
     ) OR EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id))
 )) ORDER BY v.version_id`, repository, recoveryPlanVersionID, StateProjecting, StateProjecting)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var versionIDs []string
 	for rows.Next() {
 		var versionID string
 		if err := rows.Scan(&versionID); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		versionIDs = append(versionIDs, versionID)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return false, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 	for _, versionID := range versionIDs {
 		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
-			return err
+			return false, err
 		}
 		var pollQuestionID string
 		if err := tx.QueryRowContext(ctx, `SELECT question_id FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = 0 AND kind = 'poll_failure' AND state = 'open'`, repository, versionID).Scan(&pollQuestionID); err != nil {
-			return err
+			return false, err
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT issue_id FROM ticket_runtime WHERE version_id = ? AND delivered = 0 AND state != ?`, versionID, plan.StateNeedsAttention)
 		if err != nil {
-			return err
+			return false, err
 		}
 		var issueIDs []int64
 		for rows.Next() {
 			var issueID int64
 			if err := rows.Scan(&issueID); err != nil {
 				rows.Close()
-				return err
+				return false, err
 			}
 			issueIDs = append(issueIDs, issueID)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		if err := rows.Close(); err != nil {
-			return err
+			return false, err
 		}
 		for _, issueID := range issueIDs {
 			if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "GitHub polling exhausted its retry budget", now); err != nil {
-				return err
+				return false, err
 			}
 			var ticketQuestionID string
 			if err := tx.QueryRowContext(ctx, `SELECT question_id FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = ? AND kind = 'needs_attention' AND state = 'open'`, repository, versionID, issueID).Scan(&ticketQuestionID); err != nil {
-				return err
+				return false, err
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO poll_failure_targets(poll_question_id, version_id, issue_id, ticket_question_id) VALUES (?, ?, ?, ?)
 ON CONFLICT(poll_question_id, version_id, issue_id) DO NOTHING`, pollQuestionID, versionID, issueID, ticketQuestionID); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
-	return nil
+	return len(versionIDs) > 0, nil
 }
 
 func (s *Store) WorkflowQuestion(ctx context.Context, repository, questionID string) (WorkflowQuestion, error) {
