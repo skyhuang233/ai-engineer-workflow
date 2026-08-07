@@ -415,7 +415,11 @@ func TestGatewayFencesUnobservedSupersededUncertainInboxUntilAuthorizedRecovery(
 	if err := db.RejectDeliveryOutbox(ctx, first.IdempotencyKey, claim.ClaimToken, "operator review required", true, now); err != nil {
 		t.Fatal(err)
 	}
-	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, "owner/repo", first.IdempotencyKey, now)
+	recoveryQuestionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, "owner/repo", first.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, "owner/repo", first.IdempotencyKey, recoveryQuestionID, "retry", now)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 35
+	latestSchemaVersion = 36
 )
 
 var (
@@ -896,14 +897,20 @@ WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed,
 		}
 	}
 	if applied < 35 {
-		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workflow_inbox_projections (
+		statements := []string{`CREATE TABLE IF NOT EXISTS workflow_inbox_projections (
     repository TEXT PRIMARY KEY,
     generation INTEGER NOT NULL CHECK (generation > 0),
     projection_version TEXT NOT NULL,
     plan_version_ids_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
-)`); err != nil {
-			return fmt.Errorf("migration 35: %w", err)
+		)`, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
+    idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id)
+)`}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 35: %w", err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_inbox_projections(repository, generation, projection_version, plan_version_ids_json, updated_at)
 SELECT json_extract(request_json, '$.repository'), 1, 'legacy-unfenced', '[]', MAX(updated_at)
@@ -939,6 +946,51 @@ GROUP BY json_extract(request_json, '$.repository')`); err != nil {
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (35, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 36 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
+    idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id)
+)`); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT idempotency_key, request_json, last_error FROM delivery_outbox
+WHERE operation = ? AND state = ? AND uncertain != 0
+  AND NOT EXISTS (SELECT 1 FROM inbox_delivery_recovery_questions recovery WHERE recovery.idempotency_key = delivery_outbox.idempotency_key)
+ORDER BY idempotency_key`, DeliveryProjectInbox, OutboxRejected)
+		if err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		type legacyRecovery struct {
+			key, raw, reason string
+		}
+		var recoveries []legacyRecovery
+		for rows.Next() {
+			var recovery legacyRecovery
+			if err := rows.Scan(&recovery.key, &recovery.raw, &recovery.reason); err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 36: %w", err)
+			}
+			recoveries = append(recoveries, recovery)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		for _, recovery := range recoveries {
+			var request DeliveryRequest
+			if err := json.Unmarshal([]byte(recovery.raw), &request); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+			if err := ensureUncertainInboxRecoveryQuestionTx(ctx, tx, request, recovery.key, recovery.reason, time.Now().UTC()); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (36, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

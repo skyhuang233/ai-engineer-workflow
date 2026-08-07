@@ -540,7 +540,14 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, `DELETE FROM delivery_outbox WHERE idempotency_key = ?`, newer.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
-	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, now)
+	recoveryQuestionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, repository, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, "unbound-question", "retry", now); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("unbound Inbox recovery = %v, want invalid claim", err)
+	}
+	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, recoveryQuestionID, "retry", now)
 	if err != nil {
 		t.Fatal(err)
 	}

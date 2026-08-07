@@ -425,7 +425,11 @@ WHERE operation = 'project_workflow_inbox'
 	if _, err := migrated.ClaimDeliveryOutbox(ctx, correctionKey, time.Now().UTC()); !errors.Is(err, ErrInboxDeliveryPending) {
 		t.Fatalf("legacy uncertain Inbox fence = %v, want pending", err)
 	}
-	if _, err := migrated.RecoverUncertainInboxDelivery(ctx, snapshot.Repository, recoverableKeys[0], time.Now().UTC()); err != nil {
+	recoveryQuestionID, err := migrated.UncertainInboxDeliveryRecoveryQuestionID(ctx, snapshot.Repository, recoverableKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrated.RecoverUncertainInboxDelivery(ctx, snapshot.Repository, recoverableKeys[0], recoveryQuestionID, "retry", time.Now().UTC()); err != nil {
 		t.Fatalf("recover discoverable legacy Inbox delivery: %v", err)
 	}
 	recovered, err := migrated.DeliveryOutbox(ctx, recoverableKeys[0])

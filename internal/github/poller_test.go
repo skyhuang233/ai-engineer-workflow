@@ -902,7 +902,7 @@ func TestClaimedBootstrapRecoveryStartsFreshBudgetAfterActivationProjectionFailu
 	}
 }
 
-func TestCompletedBootstrapProjectionExhaustionRetainsRecoveryOwner(t *testing.T) {
+func TestCompletedBootstrapProjectionExhaustionClearsAttemptedFailure(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -927,14 +927,14 @@ func TestCompletedBootstrapProjectionExhaustionRetainsRecoveryOwner(t *testing.T
 		}
 		_, failureErr := poller.recordBootstrapFailure(leaseCtx, repository, now, versionID, projectionErr)
 		failureErr = errors.Join(failureErr, release())
-		if !errors.Is(failureErr, projectionErr) {
+		if attempt == 0 && !errors.Is(failureErr, projectionErr) {
 			t.Fatalf("projection failure %d = %v", attempt+1, failureErr)
 		}
 		if attempt == 0 && errors.Is(failureErr, store.ErrNeedsAttention) {
 			t.Fatalf("first projection failure exhausted fresh budget: %v", failureErr)
 		}
-		if attempt == 1 && !errors.Is(failureErr, store.ErrNeedsAttention) {
-			t.Fatalf("second projection failure = %v, want Needs Attention", failureErr)
+		if attempt == 1 && failureErr != nil {
+			t.Fatalf("second projection failure = %v, want completed attempt ignored", failureErr)
 		}
 		now = now.Add(2 * time.Second)
 	}
@@ -942,19 +942,17 @@ func TestCompletedBootstrapProjectionExhaustionRetainsRecoveryOwner(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cursor.NeedsAttention() || cursor.RecoveryPlanVersionID != versionID {
-		t.Fatalf("terminal completed-plan cursor = %#v", cursor)
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.RecoveryPlanVersionID != "" {
+		t.Fatalf("completed bootstrap cursor = %#v, want cleared attempt", cursor)
 	}
 	questions, err := db.WorkflowInboxQuestions(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
 	for _, question := range questions {
-		found = found || question.VersionID == versionID && question.Kind == "poll_failure"
-	}
-	if !found {
-		t.Fatalf("completed-plan recovery questions = %#v", questions)
+		if question.VersionID == versionID && question.Kind == "poll_failure" {
+			t.Fatalf("completed attempted Plan received recovery question: %#v", question)
+		}
 	}
 }
 
@@ -2264,7 +2262,7 @@ func TestRateLimitTerminalizesExhaustedUnownedBootstrapRecovery(t *testing.T) {
 	}
 }
 
-func TestFrozenPlanFailureAtRetryLimitRemainsTerminalWithoutPollQuestion(t *testing.T) {
+func TestFrozenPlanFailureAtRetryLimitCreatesPollRecoveryQuestion(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -2292,13 +2290,12 @@ func TestFrozenPlanFailureAtRetryLimitRemainsTerminalWithoutPollQuestion(t *test
 		t.Fatal(err)
 	}
 	foundFreezeQuestion := false
+	foundPollQuestion := false
 	for _, question := range questions {
 		foundFreezeQuestion = foundFreezeQuestion || question.Kind == "closed_unmerged_impact"
-		if question.Kind == "poll_failure" {
-			t.Fatalf("frozen Plan received poll failure question: %#v", question)
-		}
+		foundPollQuestion = foundPollQuestion || question.Kind == "poll_failure"
 	}
-	if !foundFreezeQuestion {
+	if !foundFreezeQuestion || !foundPollQuestion {
 		t.Fatalf("frozen Plan questions = %#v", questions)
 	}
 	frozen, err = db.FreezePlanForClosedPullRequest(ctx, versionID, 2, now.Add(2*time.Second))

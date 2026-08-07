@@ -12,4 +12,8 @@ const workflowInboxPlanPredicate = `(` + currentActivePlanPredicate + `) OR (
           AND cursor.recovery_state = 'consumed'
           AND cursor.recovery_plan_version_id = v.version_id
     )
+) OR EXISTS (
+    SELECT 1 FROM inbox_delivery_recovery_questions recovery
+    JOIN workflow_questions recovery_question ON recovery_question.question_id = recovery.question_id
+    WHERE recovery_question.version_id = v.version_id AND recovery_question.state = 'open'
 )`

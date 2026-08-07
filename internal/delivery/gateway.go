@@ -183,6 +183,9 @@ func (g Gateway) Dispatch(ctx context.Context, key string) (dispatchErr error) {
 				if isCredentialRejection(err) {
 					return g.pauseForCredential(outbox, err)
 				}
+				if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+					return errors.Join(err, g.succeed(outbox, store.DeliveryResult{}))
+				}
 				if errors.Is(err, store.ErrDeliverySuperseded) {
 					return errors.Join(err, g.markUncertain(outbox, err))
 				}

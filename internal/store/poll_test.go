@@ -273,6 +273,112 @@ func TestTerminalPollOwnerSurvivesAdmissionAndCredentialFailures(t *testing.T) {
 	}
 }
 
+func TestTerminalPollFallbackUsesOnlyAttemptedCompletedPlans(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 5, 0, 0, 0, time.UTC)
+	completedVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, completedVersionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now, "poll-lease", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminalized {
+		t.Fatal("ownerless failure was cleared by an unrelated completed Plan")
+	}
+	terminalized, err = db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{completedVersionID}, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminalized {
+		t.Fatal("failure from an attempted completed Plan remained terminal")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("completed attempted Plan cursor = %#v", cursor)
+	}
+}
+
+func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 6, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, versionID, int64(2), "closed pull request", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "closed_unmerged_impact", "choose", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{versionID}, now, "poll-lease", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminalized {
+		t.Fatal("frozen attempted Plan failure was not terminalized")
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closedQuestionID string
+	foundPollRecovery := false
+	for _, question := range questions {
+		if question.Kind == "closed_unmerged_impact" {
+			closedQuestionID = question.ID
+		}
+		foundPollRecovery = foundPollRecovery || question.Kind == "poll_failure"
+	}
+	if closedQuestionID == "" || !foundPollRecovery {
+		t.Fatalf("frozen Plan recovery questions = %#v", questions)
+	}
+	var frozen int
+	if err := db.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM plan_freezes WHERE version_id = ?)`, versionID).Scan(&frozen); err != nil || frozen == 0 {
+		t.Fatalf("freeze before decision = %d, %v", frozen, err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, repository, closedQuestionID, `{"action":"cancel-plan"}`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("cursor after frozen Plan decision = %#v", cursor)
+	}
+}
+
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

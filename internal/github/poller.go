@@ -133,7 +133,24 @@ func (p Poller) RecordFailure(ctx context.Context, repository string, cause erro
 	if err != nil {
 		return PollResult{}, errors.Join(cause, err)
 	}
-	result, recordErr := p.recordFailure(leaseCtx, repository, p.now(), cause)
+	attemptedPlanVersionIDs, attemptedErr := p.Store.ActiveDeliveryPlanVersions(leaseCtx, repository)
+	if attemptedErr != nil {
+		return PollResult{}, errors.Join(cause, attemptedErr, release())
+	}
+	recoveryPlanVersionID := ""
+	if len(attemptedPlanVersionIDs) == 1 {
+		recoveryPlanVersionID = attemptedPlanVersionIDs[0]
+	} else if len(attemptedPlanVersionIDs) == 0 {
+		cursor, cursorErr := p.Store.GitHubPollCursor(leaseCtx, repository)
+		if cursorErr != nil && !errors.Is(cursorErr, store.ErrNotFound) {
+			return PollResult{}, errors.Join(cause, cursorErr, release())
+		}
+		if cursorErr == nil && cursor.RecoveryPlanVersionID != "" {
+			recoveryPlanVersionID = cursor.RecoveryPlanVersionID
+			attemptedPlanVersionIDs = []string{recoveryPlanVersionID}
+		}
+	}
+	result, recordErr := p.recordFailureWithKindForPlans(leaseCtx, repository, p.now(), "", recoveryPlanVersionID, attemptedPlanVersionIDs, cause)
 	return result, errors.Join(recordErr, release())
 }
 
@@ -401,11 +418,11 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return PollResult{}, err
 	}
-	activeBeforeControl, err := p.Store.HasActiveDeliveryPlan(ctx, repository)
+	activeBeforeControlVersionIDs, err := p.Store.ActiveDeliveryPlanVersions(ctx, repository)
 	if err != nil {
 		return PollResult{}, err
 	}
-	if activeBeforeControl {
+	if len(activeBeforeControlVersionIDs) > 0 {
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err
 		}
@@ -413,7 +430,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 			if isLocalPollStoreError(err) {
 				return PollResult{}, err
 			}
-			return p.recordFailure(ctx, repository, now, err)
+			return p.recordFailureForPlans(ctx, repository, now, activeBeforeControlVersionIDs, err)
 		}
 	}
 	full := cursorMissing || cursor.LastFullReconcileAt.IsZero() || now.Sub(cursor.LastFullReconcileAt) >= p.fullReconcileInterval()
@@ -459,7 +476,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 			}
 			return PollResult{}, nil
 		}
-		return p.recordFailureWithKind(ctx, repository, now, failureKind, recoveryPlanVersionID, err)
+		return p.recordFailureWithKindForPlans(ctx, repository, now, failureKind, recoveryPlanVersionID, attemptedActiveVersionIDs, err)
 	}
 	if err := p.renewPollLease(ctx, repository); err != nil {
 		return PollResult{}, err
@@ -469,7 +486,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		if isLocalPollStoreError(err) {
 			return PollResult{}, err
 		}
-		return p.recordFailure(ctx, repository, now, err)
+		return p.recordFailureForPlans(ctx, repository, now, attemptedActiveVersionIDs, err)
 	}
 	if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
 		return PollResult{}, err
@@ -547,7 +564,11 @@ func (p Poller) readyAt(ctx context.Context, repository string, now time.Time) e
 }
 
 func (p Poller) recordFailure(ctx context.Context, repository string, now time.Time, cause error) (PollResult, error) {
-	return p.recordFailureWithKind(ctx, repository, now, "", "", cause)
+	return p.recordFailureForPlans(ctx, repository, now, nil, cause)
+}
+
+func (p Poller) recordFailureForPlans(ctx context.Context, repository string, now time.Time, attemptedPlanVersionIDs []string, cause error) (PollResult, error) {
+	return p.recordFailureWithKindForPlans(ctx, repository, now, "", "", attemptedPlanVersionIDs, cause)
 }
 
 func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, now time.Time, attemptedPlanVersionID string, cause error) (PollResult, error) {
@@ -559,12 +580,16 @@ func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, n
 		return PollResult{}, errors.Join(cause, err)
 	}
 	if !projecting {
-		return p.recordFailureWithKind(ctx, repository, now, "", attemptedPlanVersionID, cause)
+		return p.recordFailureWithKindForPlans(ctx, repository, now, "", attemptedPlanVersionID, []string{attemptedPlanVersionID}, cause)
 	}
-	return p.recordFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, attemptedPlanVersionID, cause)
+	return p.recordFailureWithKindForPlans(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict, attemptedPlanVersionID, []string{attemptedPlanVersionID}, cause)
 }
 
 func (p Poller) recordFailureWithKind(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, recoveryPlanVersionID string, cause error) (PollResult, error) {
+	return p.recordFailureWithKindForPlans(ctx, repository, now, failureKind, recoveryPlanVersionID, nil, cause)
+}
+
+func (p Poller) recordFailureWithKindForPlans(ctx context.Context, repository string, now time.Time, failureKind store.GitHubPollFailureKind, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, cause error) (PollResult, error) {
 	if isLocalPollStoreError(cause) {
 		return PollResult{}, ClassifyPollError(cause)
 	}
@@ -599,7 +624,7 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 					return PollResult{}, errors.Join(cause, err)
 				}
 				if updated.ConsecutiveFailures > p.bootstrapRecoveryFailureLimit() {
-					return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+					return PollResult{}, p.terminalFailureForPlanAttempts(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, cause)
 				}
 				return PollResult{}, cause
 			}
@@ -614,7 +639,7 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 			}
 		}
 		if updated.ConsecutiveFailures >= p.maxFailures() {
-			return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+			return PollResult{}, p.terminalFailureForPlanAttempts(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, cause)
 		}
 		return PollResult{}, cause
 	}
@@ -627,7 +652,7 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 	if updated.ConsecutiveFailures >= p.maxFailures() {
 		if updated.FailureKind == store.GitHubPollFailurePreActivationInboxConflict && updated.RecoveryState == store.GitHubPollRecoveryAvailable {
 			if conflictingBootstrapFailureHistory {
-				return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+				return PollResult{}, p.terminalFailureForPlanAttempts(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, cause)
 			}
 			active, activeErr := p.Store.HasActiveDeliveryPlan(persistenceCtx, repository)
 			if activeErr != nil {
@@ -642,7 +667,7 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 				return PollResult{}, errors.Join(cause, consumeErr)
 			}
 		}
-		return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
+		return PollResult{}, p.terminalFailureForPlanAttempts(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, cause)
 	}
 	return PollResult{}, cause
 }
@@ -664,6 +689,10 @@ func (p Poller) terminalFailure(ctx context.Context, repository string, now time
 }
 
 func (p Poller) terminalFailureForPlan(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, causes ...error) error {
+	return p.terminalFailureForPlanAttempts(ctx, repository, recoveryPlanVersionID, nil, now, causes...)
+}
+
+func (p Poller) terminalFailureForPlanAttempts(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, causes ...error) error {
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	result := errors.Join(causes...)
@@ -671,7 +700,7 @@ func (p Poller) terminalFailureForPlan(ctx context.Context, repository, recovery
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	terminalized, attentionErr := p.Store.ResolveGitHubPollTerminalFailureForPlanLeased(persistenceCtx, repository, recoveryPlanVersionID, now, leaseToken, p.now())
+	terminalized, attentionErr := p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now())
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
 		return result

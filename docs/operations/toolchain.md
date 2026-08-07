@@ -84,9 +84,11 @@ Gateway control-plane credential; that transport credential is not the local
 operator authorization boundary. If an uncertain Workflow Inbox delivery
 exhausts reconciliation, recover the rejected generation with the delivery key
 shown in its Needs Attention prompt or Gateway recovery log. Run `workflow
-recover-inbox-delivery --repository owner/repository` to list recoverable keys,
-including legacy rejected deliveries, then run `workflow recover-inbox-delivery
---repository owner/repository --delivery delivery-key` only after confirming
+recover-inbox-delivery --repository owner/repository` to list recoverable keys
+with their stable Workflow Inbox question ids, including legacy rejected
+deliveries, then run `workflow recover-inbox-delivery
+--repository owner/repository --delivery delivery-key --question question-id
+--answer retry` only after confirming
 that the historical projection is absent or safe to resolve. The recovery
 records that authorization, re-observes without replaying a superseded
 projection, and atomically queues the current Needs Attention projection behind

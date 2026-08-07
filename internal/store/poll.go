@@ -265,8 +265,15 @@ WHERE p.repository = ? AND `+currentActivePlanPredicate+` ORDER BY v.version_id`
 }
 
 func workflowInboxDeliveryPlanVersions(ctx context.Context, querier workflowQuestionQuerier, repository string) ([]string, error) {
-	rows, err := querier.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ? AND (`+workflowInboxPlanPredicate+`) ORDER BY v.version_id`, repository)
+	rows, err := querier.QueryContext(ctx, `SELECT version_id FROM (
+    SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+    WHERE p.repository = ? AND (`+workflowInboxPlanPredicate+`)
+    UNION
+    SELECT recovery_question.version_id
+    FROM inbox_delivery_recovery_questions recovery
+    JOIN workflow_questions recovery_question ON recovery_question.question_id = recovery.question_id
+    WHERE recovery_question.repository = ? AND recovery_question.state = 'open'
+) ORDER BY version_id`, repository, repository)
 	if err != nil {
 		return nil, err
 	}
@@ -849,20 +856,24 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ct
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow)
 	return err
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow)
 	return err
 }
 
 func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow)
 }
 
-func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow)
+}
+
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -883,25 +894,28 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVe
 			return false, err
 		}
 	}
+	completed, err := allAttemptedPlanVersionsCompletedTx(ctx, tx, attemptedPlanVersionIDs)
+	if err != nil {
+		return false, err
+	}
+	if completed {
+		if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
 	owned, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now)
 	if err != nil {
 		return false, err
 	}
-	if !owned {
-		completed, err := allCurrentPlanVersionsCompletedTx(ctx, tx, repository)
-		if err != nil {
-			return false, err
-		}
-		if completed {
-			if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
-				return false, err
-			}
-			if err := tx.Commit(); err != nil {
-				return false, err
-			}
-			return false, nil
-		}
+	frozenOwned, err := markFrozenAttemptedPlansPollRecoveryTx(ctx, tx, repository, attemptedPlanVersionIDs, now)
+	if err != nil {
+		return false, err
 	}
+	owned = owned || frozenOwned
 	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
 		return false, err
 	}
@@ -911,15 +925,58 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVe
 	return true, nil
 }
 
-func allCurrentPlanVersionsCompletedTx(ctx context.Context, tx *sql.Tx, repository string) (bool, error) {
-	var count, incomplete int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE
-    WHEN EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id) THEN 0
-    ELSE 1
-END), 0)
-FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-WHERE p.repository = ?`, repository).Scan(&count, &incomplete)
-	return count > 0 && incomplete == 0, err
+func allAttemptedPlanVersionsCompletedTx(ctx context.Context, tx *sql.Tx, attemptedPlanVersionIDs []string) (bool, error) {
+	if len(attemptedPlanVersionIDs) == 0 {
+		return false, nil
+	}
+	seen := make(map[string]struct{}, len(attemptedPlanVersionIDs))
+	for _, versionID := range attemptedPlanVersionIDs {
+		if versionID == "" {
+			return false, nil
+		}
+		if _, duplicate := seen[versionID]; duplicate {
+			continue
+		}
+		seen[versionID] = struct{}{}
+		var completed int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM completed_plan_versions WHERE version_id = ?)`, versionID).Scan(&completed); err != nil {
+			return false, err
+		}
+		if completed == 0 {
+			return false, nil
+		}
+	}
+	return len(seen) > 0, nil
+}
+
+func markFrozenAttemptedPlansPollRecoveryTx(ctx context.Context, tx *sql.Tx, repository string, attemptedPlanVersionIDs []string, now time.Time) (bool, error) {
+	owned := false
+	seen := make(map[string]struct{}, len(attemptedPlanVersionIDs))
+	for _, versionID := range attemptedPlanVersionIDs {
+		if versionID == "" {
+			continue
+		}
+		if _, duplicate := seen[versionID]; duplicate {
+			continue
+		}
+		seen[versionID] = struct{}{}
+		var frozen int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+    WHERE p.repository = ? AND v.version_id = ? AND (`+currentActivePlanPredicate+`)
+      AND EXISTS (SELECT 1 FROM plan_freezes freeze WHERE freeze.version_id = v.version_id)
+)`, repository, versionID).Scan(&frozen); err != nil {
+			return false, err
+		}
+		if frozen == 0 {
+			continue
+		}
+		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
+			return false, err
+		}
+		owned = true
+	}
+	return owned, nil
 }
 
 func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) (bool, error) {
@@ -1228,7 +1285,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 		return err
 	}
 	if state != "open" {
-		if kind == "closed_unmerged_impact" && state == "answered" && priorAnswer == answer {
+		if (kind == "closed_unmerged_impact" || kind == "inbox_delivery_recovery") && state == "answered" && priorAnswer == answer {
 			return nil
 		}
 		return ErrNotFound
@@ -1268,6 +1325,9 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 			}
 		default:
 			return ErrInvalidClaim
+		}
+		if err := resolveFrozenPlanPollFailureTx(ctx, tx, repository, versionID, now); err != nil {
+			return err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = ?, answered_at = ? WHERE question_id = ?`, answer, formatTimestamp(now), questionID); err != nil {
@@ -1331,6 +1391,31 @@ WHERE t.poll_question_id = ? AND t.version_id = ?`, questionID, versionID)
 		}
 	}
 	return nil
+}
+
+func resolveFrozenPlanPollFailureTx(ctx context.Context, tx *sql.Tx, repository, versionID string, now time.Time) error {
+	var pollQuestionID string
+	err := tx.QueryRowContext(ctx, `SELECT question_id FROM workflow_questions
+WHERE repository = ? AND version_id = ? AND issue_id = 0 AND kind = 'poll_failure' AND state = 'open'
+ORDER BY generation DESC LIMIT 1`, repository, versionID).Scan(&pollQuestionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = '', recovery_state = '', recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+WHERE repository = ? AND failure_kind = ? AND (recovery_plan_version_id = '' OR recovery_plan_version_id = ?)`,
+		formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailureUnrecoverable, versionID)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = ?, answered_at = ? WHERE question_id = ?`, "resolved by closed Plan decision", formatTimestamp(now), pollQuestionID)
+	return err
 }
 
 func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {

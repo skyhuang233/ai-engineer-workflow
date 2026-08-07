@@ -778,6 +778,8 @@ func runRecoverInboxDelivery(args []string) {
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	deliveryKey := flags.String("delivery", "", "rejected uncertain Workflow Inbox delivery key")
+	questionID := flags.String("question", "", "stable Workflow Inbox recovery question ID")
+	answer := flags.String("answer", "", "human recovery authorization")
 	_ = flags.Parse(args)
 	if *repository == "" {
 		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository")
@@ -797,11 +799,19 @@ func runRecoverInboxDelivery(args []string) {
 			fail(fmt.Errorf("%w: no rejected uncertain Workflow Inbox deliveries for %s", store.ErrNotFound, *repository))
 		}
 		for _, key := range keys {
-			fmt.Fprintln(os.Stdout, key)
+			questionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(context.Background(), *repository, key)
+			if err != nil {
+				fail(err)
+			}
+			fmt.Fprintln(os.Stdout, key, questionID)
 		}
 		return
 	}
-	if _, err := db.RecoverUncertainInboxDelivery(context.Background(), *repository, *deliveryKey, time.Now().UTC()); err != nil {
+	if *questionID == "" || *answer == "" {
+		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires question and answer when delivery is provided")
+		os.Exit(2)
+	}
+	if _, err := db.RecoverUncertainInboxDelivery(context.Background(), *repository, *deliveryKey, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 }
