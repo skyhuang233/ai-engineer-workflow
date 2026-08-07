@@ -327,7 +327,7 @@ func TestGatewayCompletesSupersededInboxGenerationWithoutRemoteWrite(t *testing.
 	}
 }
 
-func TestGatewayCompletesSupersededUncertainInboxBeforeNewerGeneration(t *testing.T) {
+func TestGatewayObservesSupersededUncertainInboxBeforeNewerGeneration(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)
 	defer db.Close()
@@ -350,20 +350,87 @@ func TestGatewayCompletesSupersededUncertainInboxBeforeNewerGeneration(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote := &fakeRemote{}
+	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true}}}
 	now = now.Add(2 * time.Second)
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
 	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
 		t.Fatalf("uncertain Inbox reconciliation = %v", err)
 	}
-	if remote.observeCalls != 0 || remote.applyCalls != 0 || len(remote.requests) != 0 {
+	if remote.observeCalls != 1 || remote.applyCalls != 0 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != first.Request.InboxProjectionGeneration {
 		t.Fatalf("superseded Inbox reconciliation = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
 	}
 	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
 		t.Fatalf("newer Inbox dispatch = %v", err)
 	}
-	if remote.observeCalls != 1 || remote.applyCalls != 1 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
+	if remote.observeCalls != 2 || remote.applyCalls != 1 || len(remote.requests) != 2 || remote.requests[1].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
 		t.Fatalf("authoritative Inbox dispatch = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayFencesUnobservedSupersededUncertainInboxUntilAuthorizedRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 35, 0, 0, time.UTC)
+	first, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, first.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); !errors.Is(err, store.ErrDeliverySuperseded) {
+		t.Fatalf("unobserved superseded Inbox reconciliation = %v", err)
+	}
+	retained, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || retained.State != store.OutboxPending || !retained.Uncertain || remote.observeCalls != 1 || remote.applyCalls != 0 {
+		t.Fatalf("retained superseded Inbox = %#v, %v; observes=%d applies=%d", retained, err, remote.observeCalls, remote.applyCalls)
+	}
+	if err := gateway.Dispatch(ctx, newer.IdempotencyKey); err != nil {
+		t.Fatalf("deferred newer Inbox dispatch = %v", err)
+	}
+	blocked, err := db.DeliveryOutbox(ctx, newer.IdempotencyKey)
+	if err != nil || blocked.State != store.OutboxPending || remote.observeCalls != 1 || remote.applyCalls != 0 {
+		t.Fatalf("fenced newer Inbox = %#v, %v; observes=%d applies=%d", blocked, err, remote.observeCalls, remote.applyCalls)
+	}
+	now = now.Add(time.Hour)
+	claim, err = db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RejectDeliveryOutbox(ctx, first.IdempotencyKey, claim.ClaimToken, "operator review required", true, now); err != nil {
+		t.Fatal(err)
+	}
+	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, "owner/repo", first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("authorized historical Inbox resolution = %v", err)
+	}
+	resolved, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || resolved.State != store.OutboxSucceeded || resolved.Uncertain || remote.observeCalls != 2 || remote.applyCalls != 0 {
+		t.Fatalf("resolved historical Inbox = %#v, %v; observes=%d applies=%d", resolved, err, remote.observeCalls, remote.applyCalls)
+	}
+	if err := gateway.Dispatch(ctx, recoveryProjection.IdempotencyKey); err != nil {
+		t.Fatalf("authorized current Inbox dispatch = %v", err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("authorized recovery applies = %d, want current projection only", remote.applyCalls)
 	}
 }
 

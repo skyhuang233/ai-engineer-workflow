@@ -86,9 +86,11 @@ exhausts reconciliation, recover the rejected generation with the delivery key
 shown in its Needs Attention prompt or Gateway recovery log. Run `workflow
 recover-inbox-delivery --repository owner/repository` to list recoverable keys,
 including legacy rejected deliveries, then run `workflow recover-inbox-delivery
---repository owner/repository --delivery delivery-key`. The recovery atomically requeues the uncertain
-generation and the current Needs Attention projection while preserving their
-delivery order. They use the same durable queue for manual routing and decisions.
+--repository owner/repository --delivery delivery-key` only after confirming
+that the historical projection is absent or safe to resolve. The recovery
+records that authorization, re-observes without replaying a superseded
+projection, and atomically queues the current Needs Attention projection behind
+it. They use the same durable queue for manual routing and decisions.
 `workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.

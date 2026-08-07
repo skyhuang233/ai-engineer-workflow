@@ -184,7 +184,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) (dispatchErr error) {
 					return g.pauseForCredential(outbox, err)
 				}
 				if errors.Is(err, store.ErrDeliverySuperseded) {
-					return g.succeed(outbox, store.DeliveryResult{})
+					return errors.Join(err, g.markUncertain(outbox, err))
 				}
 				if errors.Is(err, store.ErrDeliveryRejected) {
 					return g.reject(outbox, err)
@@ -258,6 +258,9 @@ func (g Gateway) execute(ctx context.Context, request store.DeliveryRequest) (st
 	}
 	if observation.Applied {
 		return resultFrom(observation), nil
+	}
+	if request.InboxProjectionSuperseded {
+		return store.DeliveryResult{}, store.ErrDeliverySuperseded
 	}
 	if request.ExpectRemoteAbsent && observation.RemoteExists {
 		return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)

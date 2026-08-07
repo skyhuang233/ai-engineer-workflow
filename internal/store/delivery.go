@@ -62,24 +62,26 @@ type DeliveryRequest struct {
 	InboxPlanVersionIDs       []string                `json:"inbox_plan_version_ids,omitempty"`
 	InboxProjectionVersion    string                  `json:"inbox_projection_version,omitempty"`
 	InboxProjectionGeneration int64                   `json:"inbox_projection_generation,omitempty"`
+	InboxProjectionSuperseded bool                    `json:"-"`
 	Label                     string                  `json:"label,omitempty"`
 	IdempotencyKey            string                  `json:"idempotency_key,omitempty"`
 }
 
 type DeliveryTarget struct {
-	VersionID         string
-	TicketID          int64
-	SessionID         string
-	RunID             string
-	LeaseGeneration   int64
-	Repository        string
-	RootNumber        int64
-	Branch            string
-	AcceptedCommit    string
-	PullRequestNumber int64
-	PullRequestNodeID string
-	RemoteHead        string
-	LeaseExpiresAt    time.Time
+	VersionID               string
+	TicketID                int64
+	SessionID               string
+	RunID                   string
+	LeaseGeneration         int64
+	Repository              string
+	RootNumber              int64
+	Branch                  string
+	AcceptedCommit          string
+	PullRequestNumber       int64
+	PullRequestNodeID       string
+	RemoteHead              string
+	LeaseExpiresAt          time.Time
+	InboxRecoveryAuthorized bool
 }
 
 type DeliveryOutbox struct {
@@ -332,6 +334,9 @@ func (s *Store) executeDelivery(ctx context.Context, request DeliveryRequest, cl
 	defer cancel()
 	deliveryResult, err := apply(operationCtx, normalized)
 	if err != nil {
+		if reconcileInbox && target.InboxRecoveryAuthorized && errors.Is(err, ErrDeliverySuperseded) {
+			return DeliveryResult{}, nil
+		}
 		return DeliveryResult{}, err
 	}
 	if err := operationCtx.Err(); err != nil {
@@ -698,6 +703,11 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND uncertain != 0
 	if count, _ := result.RowsAffected(); count != 1 {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_audits(idempotency_key, operation, run_id, lease_generation, decision, reason, created_at)
+SELECT idempotency_key, operation, '', 0, 'recovery_authorized', 'operator authorized uncertain Workflow Inbox resolution', ?
+FROM delivery_outbox WHERE idempotency_key = ?`, formatTimestamp(now), key); err != nil {
+		return DeliveryOutbox{}, err
+	}
 	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
 	if err != nil {
 		return DeliveryOutbox{}, err
@@ -1013,6 +1023,17 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND claim_token = ? LI
 		generation, generationErr := workflowInboxProjectionGenerationTx(ctx, tx, request.Repository, projectionVersion, activeVersionIDs, now, admittedClaimToken == "" && len(activeVersionIDs) > 0 && request.InboxProjectionGeneration == 0)
 		if generationErr != nil {
 			return DeliveryTarget{}, request, generationErr
+		}
+		if reconcileInbox && admittedClaimToken != "" && generation > 0 && request.InboxProjectionGeneration != generation {
+			var recoveryAuthorized int
+			err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM delivery_audits WHERE idempotency_key = ? AND decision = 'recovery_authorized'
+)`, request.IdempotencyKey).Scan(&recoveryAuthorized)
+			if err != nil {
+				return DeliveryTarget{}, request, err
+			}
+			request.InboxProjectionSuperseded = true
+			return DeliveryTarget{Repository: request.Repository, InboxRecoveryAuthorized: recoveryAuthorized != 0}, request, nil
 		}
 		if generation == 0 || len(activeVersionIDs) == 0 && request.InboxProjectionGeneration == 0 {
 			return DeliveryTarget{}, request, ErrNoActiveDeliveryPlan
