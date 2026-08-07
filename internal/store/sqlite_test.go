@@ -358,8 +358,9 @@ func TestMigrationFromV34QueuesAuthoritativeLegacyInboxProjection(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `UPDATE delivery_outbox
-SET request_json = json_remove(request_json, '$.inbox_projection_generation'), uncertain = 1
-WHERE operation = 'project_workflow_inbox'`); err != nil {
+	SET request_json = json_remove(request_json, '$.inbox_projection_generation'), uncertain = 1,
+	    state = 'rejected', last_error = 'legacy rejection', completed_at = updated_at
+	WHERE operation = 'project_workflow_inbox'`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -404,6 +405,13 @@ WHERE operation = 'project_workflow_inbox'
 	if corrections != 1 {
 		t.Fatalf("queued empty Inbox corrections = %d, want 1", corrections)
 	}
+	recoverableKeys, err := migrated.RecoverableUncertainInboxDeliveryKeys(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoverableKeys) != 1 {
+		t.Fatalf("recoverable legacy Inbox deliveries = %v, want one key", recoverableKeys)
+	}
 	var correctionKey string
 	if err := migrated.db.QueryRowContext(ctx, `SELECT idempotency_key FROM delivery_outbox
 WHERE operation = 'project_workflow_inbox'
@@ -413,6 +421,16 @@ WHERE operation = 'project_workflow_inbox'
 	}
 	if _, err := migrated.ClaimDeliveryOutbox(ctx, correctionKey, time.Now().UTC()); !errors.Is(err, ErrInboxDeliveryPending) {
 		t.Fatalf("legacy uncertain Inbox fence = %v, want pending", err)
+	}
+	if _, err := migrated.RecoverUncertainInboxDelivery(ctx, snapshot.Repository, recoverableKeys[0], time.Now().UTC()); err != nil {
+		t.Fatalf("recover discoverable legacy Inbox delivery: %v", err)
+	}
+	recovered, err := migrated.DeliveryOutbox(ctx, recoverableKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != OutboxPending || !recovered.Uncertain {
+		t.Fatalf("recovered legacy Inbox delivery = %#v", recovered)
 	}
 }
 

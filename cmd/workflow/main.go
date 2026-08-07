@@ -779,8 +779,8 @@ func runRecoverInboxDelivery(args []string) {
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	deliveryKey := flags.String("delivery", "", "rejected uncertain Workflow Inbox delivery key")
 	_ = flags.Parse(args)
-	if *repository == "" || *deliveryKey == "" {
-		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository and delivery")
+	if *repository == "" {
+		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository")
 		os.Exit(2)
 	}
 	db, err := store.Open(context.Background(), *databasePath)
@@ -788,6 +788,19 @@ func runRecoverInboxDelivery(args []string) {
 		fail(err)
 	}
 	defer db.Close()
+	if *deliveryKey == "" {
+		keys, err := db.RecoverableUncertainInboxDeliveryKeys(context.Background(), *repository)
+		if err != nil {
+			fail(err)
+		}
+		if len(keys) == 0 {
+			fail(fmt.Errorf("%w: no rejected uncertain Workflow Inbox deliveries for %s", store.ErrNotFound, *repository))
+		}
+		for _, key := range keys {
+			fmt.Fprintln(os.Stdout, key)
+		}
+		return
+	}
 	if _, err := db.RecoverUncertainInboxDelivery(context.Background(), *repository, *deliveryKey, time.Now().UTC()); err != nil {
 		fail(err)
 	}

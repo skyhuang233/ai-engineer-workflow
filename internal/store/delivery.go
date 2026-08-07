@@ -381,6 +381,30 @@ func (s *Store) DeliveryOutbox(ctx context.Context, key string) (DeliveryOutbox,
 	return result, nil
 }
 
+func (s *Store) RecoverableUncertainInboxDeliveryKeys(ctx context.Context, repository string) ([]string, error) {
+	if repository == "" {
+		return nil, ErrInvalidClaim
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT idempotency_key FROM delivery_outbox
+WHERE operation = ? AND state = ? AND uncertain != 0
+  AND json_valid(request_json)
+  AND json_extract(request_json, '$.repository') = ?
+ORDER BY updated_at, idempotency_key`, DeliveryProjectInbox, OutboxRejected, repository)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 func (s *Store) DueDeliveryOutboxKeys(ctx context.Context, now time.Time, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 32

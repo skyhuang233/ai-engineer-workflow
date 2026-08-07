@@ -83,7 +83,9 @@ Plane host. `answer-inbox` forwards the resulting inbox projection through the
 Gateway control-plane credential; that transport credential is not the local
 operator authorization boundary. If an uncertain Workflow Inbox delivery
 exhausts reconciliation, recover the rejected generation with the delivery key
-shown in its Needs Attention prompt or Gateway recovery log by running `workflow recover-inbox-delivery
+shown in its Needs Attention prompt or Gateway recovery log. Run `workflow
+recover-inbox-delivery --repository owner/repository` to list recoverable keys,
+including legacy rejected deliveries, then run `workflow recover-inbox-delivery
 --repository owner/repository --delivery delivery-key`. The recovery atomically requeues the uncertain
 generation and the current Needs Attention projection while preserving their
 delivery order. They use the same durable queue for manual routing and decisions.
