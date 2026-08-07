@@ -100,7 +100,7 @@ LEFT JOIN candidate_revisions c ON c.run_id = s.current_run_id
 `
 
 func workflowInboxQuestions(ctx context.Context, querier workflowQuestionQuerier, repository string) ([]WorkflowQuestion, error) {
-	rows, err := querier.QueryContext(ctx, workflowQuestionSelect+`WHERE q.repository = ? AND q.state = 'open' AND (`+workflowInboxPlanPredicate+`)
+	rows, err := querier.QueryContext(ctx, workflowQuestionSelect+`WHERE q.repository = ? AND q.state = 'open' AND ((`+workflowInboxPlanPredicate+`) OR (`+workflowInboxRecoveryQuestionPredicate+`))
 ORDER BY q.created_at, q.question_id`, repository)
 	if err != nil {
 		return nil, err
@@ -1298,8 +1298,10 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 	var eligible int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
     SELECT 1 FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
-    WHERE p.repository = ? AND v.version_id = ? AND (`+workflowInboxPlanPredicate+`)
-)`, repository, versionID).Scan(&eligible); err != nil {
+    WHERE p.repository = ? AND v.version_id = ? AND ((`+workflowInboxPlanPredicate+`) OR EXISTS (
+        SELECT 1 FROM inbox_delivery_recovery_questions recovery WHERE recovery.question_id = ?
+    ))
+)`, repository, versionID, questionID).Scan(&eligible); err != nil {
 		return err
 	}
 	if eligible == 0 {

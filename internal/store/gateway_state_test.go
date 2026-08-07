@@ -596,6 +596,88 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	}
 }
 
+func TestTerminalInboxRecoveryDoesNotQualifyStaleQuestions(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 5, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= maxDeliveryAttempts; attempt++ {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if claimErr != nil {
+			t.Fatalf("uncertain Inbox claim %d = %v", attempt, claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation unavailable", true, now); err != nil {
+			t.Fatalf("uncertain Inbox requeue %d = %v", attempt, err)
+		}
+		now = now.Add(4 * time.Second)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "retry polling", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveryID string
+	var staleIDs []string
+	for _, question := range questions {
+		switch question.Kind {
+		case "inbox_delivery_recovery":
+			recoveryID = question.ID
+		case "needs_attention", "poll_failure":
+			staleIDs = append(staleIDs, question.ID)
+		}
+	}
+	if recoveryID == "" || len(staleIDs) != 2 {
+		t.Fatalf("pre-cancellation questions = %#v", questions)
+	}
+	tx, err = db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.cancelPlanTx(ctx, tx, versionID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err = db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 || questions[0].ID != recoveryID {
+		t.Fatalf("terminal Inbox questions = %#v", questions)
+	}
+	for _, questionID := range staleIDs {
+		if err := db.AnswerWorkflowQuestion(ctx, repository, questionID, "retry", now.Add(time.Second)); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("terminal stale question %q answer = %v, want not found", questionID, err)
+		}
+		question, err := db.WorkflowQuestion(ctx, repository, questionID)
+		if err != nil || question.State != "open" || question.Answer != "" {
+			t.Fatalf("terminal stale question %q changed = %#v, %v", questionID, question, err)
+		}
+	}
+	if _, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, repository, recoveryID, "retry", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("terminal Inbox recovery answer = %v", err)
+	}
+}
+
 func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
