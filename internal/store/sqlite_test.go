@@ -361,7 +361,7 @@ func TestMigrationFromV34QueuesAuthoritativeLegacyInboxProjection(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `UPDATE delivery_outbox
-	SET request_json = json_remove(request_json, '$.inbox_projection_generation'), uncertain = 1,
+	SET request_json = json_remove(request_json, '$.inbox_projection_generation', '$.inbox_projection_version', '$.inbox_plan_version_id', '$.inbox_plan_version_ids'), uncertain = 1,
 	    state = 'rejected', last_error = 'legacy rejection', completed_at = updated_at
 	WHERE operation = 'project_workflow_inbox'`); err != nil {
 		db.Close()
@@ -428,6 +428,13 @@ WHERE operation = 'project_workflow_inbox'
 	recoveryQuestionID, err := migrated.UncertainInboxDeliveryRecoveryQuestionID(ctx, snapshot.Repository, recoverableKeys[0])
 	if err != nil {
 		t.Fatal(err)
+	}
+	questions, err := migrated.WorkflowInboxQuestions(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 || questions[0].ID != recoveryQuestionID || questions[0].RootNumber != 0 || len(questions[0].PlanNumbers) != 0 {
+		t.Fatalf("legacy repository-scoped recovery question = %#v", questions)
 	}
 	if _, err := migrated.RecoverUncertainInboxDelivery(ctx, snapshot.Repository, recoverableKeys[0], recoveryQuestionID, "retry", time.Now().UTC()); err != nil {
 		t.Fatalf("recover discoverable legacy Inbox delivery: %v", err)

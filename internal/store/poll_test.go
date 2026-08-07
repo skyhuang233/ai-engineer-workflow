@@ -289,21 +289,28 @@ func TestTerminalPollFallbackUsesOnlyAttemptedCompletedPlans(t *testing.T) {
 	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now, "poll-lease", now)
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now, "poll-lease", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !terminalized {
-		t.Fatal("ownerless failure was cleared by an unrelated completed Plan")
-	}
-	terminalized, err = db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{completedVersionID}, now.Add(time.Second), "poll-lease", now.Add(time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if terminalized {
-		t.Fatal("failure from an attempted completed Plan remained terminal")
+	if disposition != GitHubPollTerminalFailureRetryable {
+		t.Fatalf("ownerless failure disposition = %q, want retryable", disposition)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != GitHubPollFailureRetryable {
+		t.Fatalf("ownerless retry cursor = %#v", cursor)
+	}
+	disposition, err = db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{completedVersionID}, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != GitHubPollTerminalFailureResolved {
+		t.Fatalf("completed Plan failure disposition = %q, want resolved", disposition)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,12 +338,12 @@ func TestTerminalPollFallbackUsesPersistedAttemptedPlansAfterRestart(t *testing.
 	if _, err := db.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, GitHubPollFailureRetryable, "", []string{completedVersionID}, "poll-lease", now); err != nil {
 		t.Fatal(err)
 	}
-	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now.Add(time.Second), "poll-lease", now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if terminalized {
-		t.Fatal("persisted completed Plan attempt remained terminal after restart")
+	if disposition != GitHubPollTerminalFailureResolved {
+		t.Fatalf("persisted completed Plan disposition = %q, want resolved", disposition)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
 	if err != nil {
@@ -373,12 +380,12 @@ func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
 	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	terminalized, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{versionID}, now, "poll-lease", now)
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{versionID}, now, "poll-lease", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !terminalized {
-		t.Fatal("frozen attempted Plan failure was not terminalized")
+	if disposition != GitHubPollTerminalFailureNeedsAttention {
+		t.Fatalf("frozen attempted Plan disposition = %q, want needs attention", disposition)
 	}
 	questions, err := db.WorkflowInboxQuestions(ctx, repository)
 	if err != nil {

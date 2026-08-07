@@ -1742,6 +1742,41 @@ func TestBootstrapFailurePreservesAttemptedPlanThroughRecoveryTerminalization(t 
 	}
 }
 
+func TestOwnerlessColdStartFailureRemainsDurablyRetryable(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 7, 0, 30, 0, 0, time.UTC)
+	admissionErr := errors.New("repository admission rate limited")
+	attempts := 0
+	poller := Poller{Store: db, Client: NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"), MaxFailures: 1, Now: func() time.Time { return now }}
+	before := func(context.Context, bool) (BootstrapControlResult, error) {
+		attempts++
+		return BootstrapControlResult{}, admissionErr
+	}
+	if _, err := poller.PollWithBootstrap(ctx, repository, nil, before); !errors.Is(err, admissionErr) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("first ownerless failure = %v, want retryable admission error", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.NeedsAttention() {
+		t.Fatalf("first ownerless cursor = %#v", cursor)
+	}
+	now = cursor.NextAttemptAt
+	if _, err := poller.PollWithBootstrap(ctx, repository, nil, before); !errors.Is(err, admissionErr) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("second ownerless failure = %v, want retryable admission error", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("cold-start admission attempts = %d, want 2", attempts)
+	}
+}
+
 func TestMixedBootstrapFailureTerminalizesAttemptedPlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

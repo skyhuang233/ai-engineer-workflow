@@ -905,7 +905,8 @@ WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed,
     updated_at TEXT NOT NULL
 		)`, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
     idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
-    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id)
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    plan_version_ids_json TEXT NOT NULL DEFAULT '[]'
 )`}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -950,9 +951,19 @@ GROUP BY json_extract(request_json, '$.repository')`); err != nil {
 		}
 	}
 	if applied < 36 {
+		exists, err := tableHasColumnTx(ctx, tx, "inbox_delivery_recovery_questions", "plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE inbox_delivery_recovery_questions ADD COLUMN plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
     idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
-    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id)
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    plan_version_ids_json TEXT NOT NULL DEFAULT '[]'
 )`); err != nil {
 			return fmt.Errorf("migration 36: %w", err)
 		}
@@ -1005,6 +1016,36 @@ ORDER BY idempotency_key`, DeliveryProjectInbox, OutboxRejected)
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (37, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 38 {
+		exists, err := tableHasColumnTx(ctx, tx, "inbox_delivery_recovery_questions", "plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 38: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE inbox_delivery_recovery_questions ADD COLUMN plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 38: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE inbox_delivery_recovery_questions AS recovery
+SET plan_version_ids_json = COALESCE((
+    SELECT CASE
+        WHEN json_valid(outbox.request_json)
+         AND json_type(outbox.request_json, '$.inbox_plan_version_ids') = 'array'
+         AND json_array_length(outbox.request_json, '$.inbox_plan_version_ids') > 0
+            THEN json_extract(outbox.request_json, '$.inbox_plan_version_ids')
+        WHEN TRIM(COALESCE(json_extract(outbox.request_json, '$.inbox_plan_version_id'), '')) != ''
+            THEN json_array(json_extract(outbox.request_json, '$.inbox_plan_version_id'))
+        ELSE '[]'
+    END
+    FROM delivery_outbox outbox
+    WHERE outbox.idempotency_key = recovery.idempotency_key
+), '[]')`); err != nil {
+			return fmt.Errorf("migration 38: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (38, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

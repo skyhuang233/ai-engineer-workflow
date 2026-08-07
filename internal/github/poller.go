@@ -711,13 +711,16 @@ func (p Poller) terminalFailureForPlanAttempts(ctx context.Context, repository, 
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	terminalized, attentionErr := p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now())
+	disposition, attentionErr := p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now())
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
 		return result
 	}
-	if !terminalized {
+	switch disposition {
+	case store.GitHubPollTerminalFailureResolved:
 		return nil
+	case store.GitHubPollTerminalFailureRetryable:
+		return result
 	}
 	result = errors.Join(result, store.ErrNeedsAttention)
 	eligible, eligibilityErr := p.Store.HasWorkflowInboxDeliveryPlan(persistenceCtx, repository)

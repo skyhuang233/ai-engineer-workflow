@@ -1016,11 +1016,17 @@ WHERE recovery.idempotency_key = ?`, key).Scan(&existing, &existingState)
 	if request.InboxPlanVersionID != "" {
 		candidates = append(candidates, request.InboxPlanVersionID)
 	}
+	slices.Sort(candidates)
+	candidates = slices.Compact(candidates)
+	for len(candidates) > 0 && candidates[0] == "" {
+		candidates = candidates[1:]
+	}
+	encodedCandidates, err := json.Marshal(candidates)
+	if err != nil {
+		return err
+	}
 	versionID := ""
 	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
 		var valid int
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
     SELECT 1 FROM plan_versions v JOIN plans p ON p.id = v.plan_id
@@ -1028,9 +1034,11 @@ WHERE recovery.idempotency_key = ?`, key).Scan(&existing, &existingState)
 )`, candidate, request.Repository).Scan(&valid); err != nil {
 			return err
 		}
-		if valid != 0 {
+		if valid == 0 {
+			return ErrNotFound
+		}
+		if versionID == "" {
 			versionID = candidate
-			break
 		}
 	}
 	if versionID == "" {
@@ -1054,8 +1062,8 @@ WHERE repository = ? AND issue_id = 0 AND kind = 'inbox_delivery_recovery'`, req
 VALUES (?, ?, ?, 0, 'inbox_delivery_recovery', ?, ?, 'open', ?)`, questionID, request.Repository, versionID, generation, prompt, formatTimestamp(now)); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO inbox_delivery_recovery_questions(idempotency_key, question_id) VALUES (?, ?)
-ON CONFLICT(idempotency_key) DO UPDATE SET question_id = excluded.question_id`, key, questionID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO inbox_delivery_recovery_questions(idempotency_key, question_id, plan_version_ids_json) VALUES (?, ?, ?)
+ON CONFLICT(idempotency_key) DO UPDATE SET question_id = excluded.question_id, plan_version_ids_json = excluded.plan_version_ids_json`, key, questionID, string(encodedCandidates))
 	return err
 }
 

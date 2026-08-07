@@ -24,6 +24,7 @@ type WorkflowQuestion struct {
 	State        string
 	Answer       string
 	RootNumber   int64
+	PlanNumbers  []int64
 	TicketNumber int64
 	PullRequest  int64
 	Commit       string
@@ -86,8 +87,21 @@ func (s *Store) WorkflowInboxProjectionState(ctx context.Context, repository str
 	return questions, version, versionIDs, nil
 }
 
-const workflowQuestionSelect = `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer, p.root_issue_number,
-COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, '')
+const workflowQuestionSelect = `SELECT q.question_id, q.repository, q.version_id, q.issue_id, q.kind, q.prompt, q.state, q.answer,
+CASE WHEN q.kind = 'inbox_delivery_recovery' THEN 0 ELSE p.root_issue_number END,
+COALESCE(qc.ticket_number, t.issue_number, 0), COALESCE(qc.pull_request_number, d.pull_request_number, 0), COALESCE(qc.accepted_commit, s.accepted_commit, ''), COALESCE(qc.diagnostics_path, rd.diagnostics_path, ''), COALESCE(qc.candidate_evidence, c.structured_output, ''),
+COALESCE((
+    SELECT json_group_array(origin.root_issue_number)
+    FROM (
+        SELECT DISTINCT origin_plan.root_issue_number
+        FROM inbox_delivery_recovery_questions recovery
+        JOIN json_each(recovery.plan_version_ids_json) provenance
+        JOIN plan_versions origin_version ON origin_version.version_id = provenance.value
+        JOIN plans origin_plan ON origin_plan.id = origin_version.plan_id
+        WHERE recovery.question_id = q.question_id
+        ORDER BY origin_plan.root_issue_number
+    ) origin
+), '[]')
 FROM workflow_questions q
 JOIN plan_versions v ON v.version_id = q.version_id
 JOIN plans p ON p.id = v.plan_id
@@ -131,7 +145,11 @@ func scanWorkflowQuestions(rows *sql.Rows) ([]WorkflowQuestion, error) {
 	var questions []WorkflowQuestion
 	for rows.Next() {
 		var question WorkflowQuestion
-		if err := rows.Scan(&question.ID, &question.Repository, &question.VersionID, &question.IssueID, &question.Kind, &question.Prompt, &question.State, &question.Answer, &question.RootNumber, &question.TicketNumber, &question.PullRequest, &question.Commit, &question.Diagnostics, &question.Evidence); err != nil {
+		var planNumbersJSON string
+		if err := rows.Scan(&question.ID, &question.Repository, &question.VersionID, &question.IssueID, &question.Kind, &question.Prompt, &question.State, &question.Answer, &question.RootNumber, &question.TicketNumber, &question.PullRequest, &question.Commit, &question.Diagnostics, &question.Evidence, &planNumbersJSON); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(planNumbersJSON), &question.PlanNumbers); err != nil {
 			return nil, err
 		}
 		questions = append(questions, question)
@@ -165,6 +183,7 @@ func (c GitHubPollCursor) HasBootstrapRecoveryCandidate(minimumFailures int) boo
 type GitHubPollFailureKind string
 type GitHubPollRecoveryState string
 type GitHubPollBootstrapRecoveryDisposition string
+type GitHubPollTerminalFailureDisposition string
 
 const (
 	GitHubPollFailurePreActivationInboxConflict GitHubPollFailureKind                  = "pre_activation_inbox_conflict"
@@ -178,6 +197,9 @@ const (
 	GitHubPollBootstrapRecoveryActive           GitHubPollBootstrapRecoveryDisposition = "active"
 	GitHubPollBootstrapRecoveryProjecting       GitHubPollBootstrapRecoveryDisposition = "projecting"
 	GitHubPollBootstrapRecoveryStale            GitHubPollBootstrapRecoveryDisposition = "stale"
+	GitHubPollTerminalFailureResolved           GitHubPollTerminalFailureDisposition   = "resolved"
+	GitHubPollTerminalFailureRetryable          GitHubPollTerminalFailureDisposition   = "retryable"
+	GitHubPollTerminalFailureNeedsAttention     GitHubPollTerminalFailureDisposition   = "needs_attention"
 )
 
 func (s *Store) GitHubPollCursor(ctx context.Context, repository string) (GitHubPollCursor, error) {
@@ -269,9 +291,10 @@ func workflowInboxDeliveryPlanVersions(ctx context.Context, querier workflowQues
     SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
     WHERE p.repository = ? AND (`+workflowInboxPlanPredicate+`)
     UNION
-    SELECT recovery_question.version_id
+    SELECT provenance.value
     FROM inbox_delivery_recovery_questions recovery
     JOIN workflow_questions recovery_question ON recovery_question.question_id = recovery.question_id
+    JOIN json_each(recovery.plan_version_ids_json) provenance
     WHERE recovery_question.repository = ? AND recovery_question.state = 'open'
 ) ORDER BY version_id`, repository, repository)
 	if err != nil {
@@ -845,15 +868,15 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionFor
 	return err
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
 	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow)
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
 	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow)
 }
 
-func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (bool, error) {
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -861,18 +884,18 @@ func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Contex
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	defer tx.Rollback()
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
-		return false, err
+		return "", err
 	}
 	if recoveryPlanVersionID == "" || len(attemptedPlanVersionIDs) == 0 {
 		var persistedRecoveryPlanVersionID, attemptedJSON string
 		err = tx.QueryRowContext(ctx, `SELECT recovery_plan_version_id, attempted_plan_version_ids_json
 FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&persistedRecoveryPlanVersionID, &attemptedJSON)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return false, err
+			return "", err
 		}
 		if err == nil {
 			if recoveryPlanVersionID == "" {
@@ -880,40 +903,51 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&persistedRecov
 			}
 			if len(attemptedPlanVersionIDs) == 0 {
 				if err := json.Unmarshal([]byte(attemptedJSON), &attemptedPlanVersionIDs); err != nil {
-					return false, err
+					return "", err
 				}
 			}
 		}
 	}
 	completed, err := allAttemptedPlanVersionsCompletedTx(ctx, tx, attemptedPlanVersionIDs)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if completed {
 		if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
-			return false, err
+			return "", err
 		}
 		if err := tx.Commit(); err != nil {
-			return false, err
+			return "", err
 		}
-		return false, nil
+		return GitHubPollTerminalFailureResolved, nil
 	}
 	owned, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	frozenOwned, err := markFrozenAttemptedPlansPollRecoveryTx(ctx, tx, repository, attemptedPlanVersionIDs, now)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	owned = owned || frozenOwned
+	if !owned {
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]', updated_at = ?
+WHERE repository = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), repository); err != nil {
+			return "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return GitHubPollTerminalFailureRetryable, nil
+	}
 	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
-		return false, err
+		return "", err
 	}
 	if err := tx.Commit(); err != nil {
-		return false, err
+		return "", err
 	}
-	return true, nil
+	return GitHubPollTerminalFailureNeedsAttention, nil
 }
 
 func allAttemptedPlanVersionsCompletedTx(ctx context.Context, tx *sql.Tx, attemptedPlanVersionIDs []string) (bool, error) {
@@ -1271,7 +1305,7 @@ func workflowInboxProjectionGenerationTx(ctx context.Context, tx *sql.Tx, reposi
 func WorkflowQuestionProjections(questions []WorkflowQuestion) []plan.WorkflowQuestion {
 	projected := make([]plan.WorkflowQuestion, 0, len(questions))
 	for _, question := range questions {
-		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
+		projected = append(projected, plan.WorkflowQuestion{ID: question.ID, Prompt: question.Prompt, Repository: question.Repository, PlanNumber: question.RootNumber, PlanNumbers: question.PlanNumbers, TicketNumber: question.TicketNumber, PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics, Evidence: question.Evidence})
 	}
 	return projected
 }

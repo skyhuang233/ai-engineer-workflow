@@ -596,6 +596,58 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	}
 }
 
+func TestUncertainInboxRecoveryPreservesCompletePlanProvenance(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 4, 45, 0, 0, time.UTC)
+	firstVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	secondVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < maxDeliveryAttempts; attempt++ {
+		claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation unavailable", true, now); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(4 * time.Second)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.cancelPlanTx(ctx, tx, firstVersionID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.cancelPlanTx(ctx, tx, secondVersionID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, _, versionIDs, err := db.WorkflowInboxProjectionState(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedVersions := []string{firstVersionID, secondVersionID}
+	slices.Sort(expectedVersions)
+	if !slices.Equal(versionIDs, expectedVersions) {
+		t.Fatalf("recovery provenance versions = %v, want %v", versionIDs, expectedVersions)
+	}
+	if len(questions) != 1 || questions[0].Kind != "inbox_delivery_recovery" || questions[0].RootNumber != 0 || !slices.Equal(questions[0].PlanNumbers, []int64{1, 11}) {
+		t.Fatalf("repository recovery question = %#v", questions)
+	}
+}
+
 func TestTerminalInboxRecoveryDoesNotQualifyStaleQuestions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
