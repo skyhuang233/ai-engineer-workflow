@@ -462,6 +462,7 @@ WHERE operation = 'project_workflow_inbox'
 	if recovered.State != OutboxPending || !recovered.Uncertain {
 		t.Fatalf("recovered legacy Inbox delivery = %#v", recovered)
 	}
+	t.Logf("migration restored legacy recovery key %s with question %s; authoritative correction generation=%d remained ordered behind it", recoverableKeys[0], recoveryQuestionID, generation)
 }
 
 func TestMigrationBackupCanBeRestored(t *testing.T) {

@@ -780,6 +780,7 @@ func TestClaimedBootstrapRecoveryResumesExactVersionAfterRestart(t *testing.T) {
 	if cursor.NeedsAttention() || cursor.RecoveryState != store.GitHubPollRecoveryCompleted || cursor.ConsecutiveFailures != 0 {
 		t.Fatalf("recovery state = %#v, want completed", cursor)
 	}
+	t.Logf("after restart: recovered exact Plan version %s; bootstrap runs=%d; recovery=%s; failure budget=%d", versionID, bootstrapRuns, cursor.RecoveryState, cursor.ConsecutiveFailures)
 }
 
 func TestClaimedBootstrapRecoveryRateLimitHasBoundedDeferrals(t *testing.T) {

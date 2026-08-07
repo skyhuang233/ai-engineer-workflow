@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,118 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := "owner/repository"
+	snapshot := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Hour)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	deliveryKey := queued.IdempotencyKey
+	for attempt := 0; attempt < 8; attempt++ {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, deliveryKey, now)
+		if claimErr != nil {
+			db.Close()
+			t.Fatalf("claim attempt %d: %v", attempt+1, claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, deliveryKey, claim.ClaimToken, "remote observation unavailable", true, now); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		outbox, err := db.DeliveryOutbox(ctx, deliveryKey)
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if outbox.State == store.OutboxRejected {
+			break
+		}
+		now = now.Add(time.Minute)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	binaryPath := filepath.Join(t.TempDir(), "workflow-test.exe")
+	build := exec.Command("go", "build", "-o", binaryPath, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build workflow CLI: %v\n%s", err, output)
+	}
+	list := exec.Command(binaryPath, "recover-inbox-delivery", "--database", databasePath, "--repository", repository)
+	output, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list recoverable Inbox deliveries: %v\n%s", err, output)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 || fields[0] != deliveryKey {
+		t.Fatalf("recovery listing = %q, want delivery key and question id", output)
+	}
+	questionID := fields[1]
+	t.Logf("$ workflow recover-inbox-delivery --repository %s", repository)
+	t.Logf("%s %s", deliveryKey, questionID)
+
+	recoverCommand := exec.Command(binaryPath, "recover-inbox-delivery", "--database", databasePath, "--repository", repository, "--delivery", deliveryKey, "--question", questionID, "--answer", "retry")
+	if output, err := recoverCommand.CombinedOutput(); err != nil {
+		t.Fatalf("authorize Inbox recovery: %v\n%s", err, output)
+	}
+	t.Logf("$ workflow recover-inbox-delivery --repository %s --delivery %s --question %s --answer retry", repository, deliveryKey, questionID)
+
+	db, err = store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recovered, err := db.DeliveryOutbox(ctx, deliveryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != store.OutboxPending || !recovered.Uncertain || recovered.Attempts != 0 {
+		t.Fatalf("authorized recovery = %#v", recovered)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, time.Now().UTC().Add(time.Minute), 10)
+	if err != nil || len(keys) < 2 || keys[0] != deliveryKey {
+		t.Fatalf("ordered recovery queue = %v, %v", keys, err)
+	}
+	currentGenerations := make([]int64, 0, len(keys)-1)
+	for _, key := range keys[1:] {
+		current, err := db.DeliveryOutbox(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Request.InboxProjectionGeneration <= recovered.Request.InboxProjectionGeneration {
+			t.Fatalf("ordered generations = %d then %d", recovered.Request.InboxProjectionGeneration, current.Request.InboxProjectionGeneration)
+		}
+		currentGenerations = append(currentGenerations, current.Request.InboxProjectionGeneration)
+	}
+	t.Logf("authorized generation %d returned to the queue before current generations %v", recovered.Request.InboxProjectionGeneration, currentGenerations)
+}
 
 func TestShouldPauseGatewayForCredential(t *testing.T) {
 	for _, test := range []struct {

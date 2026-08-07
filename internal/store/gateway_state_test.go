@@ -420,6 +420,7 @@ func TestWorkflowInboxClaimsSerializeRepositoryGenerations(t *testing.T) {
 	if first.IdempotencyKey == second.IdempotencyKey || first.Request.InboxProjectionGeneration >= second.Request.InboxProjectionGeneration {
 		t.Fatalf("projection generations = %#v then %#v", first.Request, second.Request)
 	}
+	t.Logf("queued Workflow Inbox generations in order: %d then %d", first.Request.InboxProjectionGeneration, second.Request.InboxProjectionGeneration)
 	firstClaim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -427,12 +428,14 @@ func TestWorkflowInboxClaimsSerializeRepositoryGenerations(t *testing.T) {
 	if _, err := db.ClaimDeliveryOutbox(ctx, second.IdempotencyKey, now.Add(2*time.Second)); !errors.Is(err, ErrDeliveryInProgress) {
 		t.Fatalf("concurrent Inbox generation claim = %v, want in progress", err)
 	}
+	t.Logf("generation %d remained blocked while generation %d was in progress", second.Request.InboxProjectionGeneration, first.Request.InboxProjectionGeneration)
 	if err := db.FinishDeliveryOutbox(ctx, first.IdempotencyKey, firstClaim.ClaimToken, OutboxSucceeded, "", now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ClaimDeliveryOutbox(ctx, second.IdempotencyKey, now.Add(4*time.Second)); err != nil {
 		t.Fatalf("next Inbox generation claim = %v", err)
 	}
+	t.Logf("generation %d became claimable only after generation %d completed", second.Request.InboxProjectionGeneration, first.Request.InboxProjectionGeneration)
 }
 
 func TestWorkflowInboxClaimsFenceOlderUncertainGeneration(t *testing.T) {
@@ -509,6 +512,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if exhausted.State != OutboxRejected || !exhausted.Uncertain || exhausted.Attempts != maxDeliveryAttempts {
 		t.Fatalf("exhausted uncertain Inbox = %#v", exhausted)
 	}
+	t.Logf("uncertain generation %d exhausted after %d observations and exposed recovery key %s", queued.Request.InboxProjectionGeneration, exhausted.Attempts, queued.IdempotencyKey)
 	if !strings.Contains(exhausted.LastError, queued.IdempotencyKey) || !strings.Contains(exhausted.LastError, "workflow recover-inbox-delivery") {
 		t.Fatalf("exhausted uncertain Inbox recovery instructions = %q", exhausted.LastError)
 	}
@@ -537,6 +541,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if _, err := db.ClaimDeliveryOutbox(ctx, newer.IdempotencyKey, now); !errors.Is(err, ErrInboxDeliveryPending) {
 		t.Fatalf("newer Inbox claim while exhausted generation is unresolved = %v", err)
 	}
+	t.Logf("newer generation %d stayed fenced behind unresolved generation %d", newer.Request.InboxProjectionGeneration, queued.Request.InboxProjectionGeneration)
 	if _, err := db.db.ExecContext(ctx, `DELETE FROM delivery_outbox WHERE idempotency_key = ?`, newer.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
@@ -554,6 +559,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if recoveryProjection.State != OutboxPending || recoveryProjection.Request.InboxProjectionGeneration <= queued.Request.InboxProjectionGeneration {
 		t.Fatalf("recovery projection = %#v", recoveryProjection)
 	}
+	t.Logf("operator answered recovery question %s; queued current generation %d behind reconciliation", recoveryQuestionID, recoveryProjection.Request.InboxProjectionGeneration)
 	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
 	if err != nil {
 		t.Fatalf("recovered uncertain Inbox claim = %v", err)
@@ -561,6 +567,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if !claim.ReconcileOnly || !claim.Uncertain || claim.Attempts != 1 {
 		t.Fatalf("recovered uncertain Inbox = %#v", claim)
 	}
+	t.Logf("recovery resumed generation %d in reconcile-only mode before the queued current generation", claim.Request.InboxProjectionGeneration)
 	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation still unavailable", true, now); err != nil {
 		t.Fatal(err)
 	}
@@ -594,6 +601,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if authorizations != 2 {
 		t.Fatalf("recovery authorizations = %d, want 2 question-bound decisions", authorizations)
 	}
+	t.Logf("a repeated terminal cycle required a fresh question; recorded question-bound authorizations=%d", authorizations)
 }
 
 func TestUncertainInboxRecoveryPreservesCompletePlanProvenance(t *testing.T) {
