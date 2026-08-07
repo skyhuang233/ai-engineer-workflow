@@ -998,7 +998,7 @@ func TestAlreadyCompletedBootstrapFailureExhaustsRetryBudget(t *testing.T) {
 	}
 }
 
-func TestRouteInboxRecoveryAnswerReleasesRejectedDelivery(t *testing.T) {
+func TestPausedPollRoutesCompletedPlanRecoveryAnswerBeforeProjection(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -1006,7 +1006,7 @@ func TestRouteInboxRecoveryAnswerReleasesRejectedDelivery(t *testing.T) {
 	}
 	defer db.Close()
 	repository := "owner/repo"
-	activatePollerPlan(t, ctx, db, repository)
+	versionID := activatePollerPlan(t, ctx, db, repository)
 	now := time.Date(2026, 8, 7, 2, 0, 0, 0, time.UTC)
 	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
 	if err != nil {
@@ -1026,6 +1026,12 @@ func TestRouteInboxRecoveryAnswerReleasesRejectedDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverable(ctx, repository, now); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/owner/repo/issues":
@@ -1037,16 +1043,11 @@ func TestRouteInboxRecoveryAnswerReleasesRejectedDelivery(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	poller := Poller{Store: db, Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), Now: func() time.Time { return now }}
-	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := poller.routeInboxAnswers(leaseCtx, repository); err != nil {
-		t.Fatal(err)
-	}
-	if err := release(); err != nil {
-		t.Fatal(err)
+	projectionErr := errors.New("projection remains fenced")
+	pollNow := time.Now().UTC().Add(time.Minute)
+	poller := Poller{Store: db, Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), InboxProjector: errorInboxProjector{err: projectionErr}, Now: func() time.Time { return pollNow }}
+	if _, err := poller.Poll(ctx, repository); !errors.Is(err, projectionErr) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("paused recovery poll = %v", err)
 	}
 	recovered, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
 	if err != nil {

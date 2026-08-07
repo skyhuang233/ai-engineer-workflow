@@ -547,7 +547,7 @@ func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	if _, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, "unbound-question", "retry", now); !errors.Is(err, ErrInvalidClaim) {
 		t.Fatalf("unbound Inbox recovery = %v, want invalid claim", err)
 	}
-	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, repository, queued.IdempotencyKey, recoveryQuestionID, "retry", now)
+	recoveryProjection, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, repository, recoveryQuestionID, "retry", now)
 	if err != nil {
 		t.Fatal(err)
 	}

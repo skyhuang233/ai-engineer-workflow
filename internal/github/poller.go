@@ -373,10 +373,10 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 				if err := p.renewPollLease(ctx, repository); err != nil {
 					return PollResult{}, errors.Join(pausedErr, err)
 				}
-				if err := p.projectWorkflowInbox(ctx, repository); err != nil {
+				if err := p.routeInboxAnswers(ctx, repository); err != nil {
 					return PollResult{}, errors.Join(pausedErr, err)
 				}
-				if err := p.routeInboxAnswers(ctx, repository); err != nil {
+				if err := p.projectWorkflowInbox(ctx, repository); err != nil {
 					return PollResult{}, errors.Join(pausedErr, err)
 				}
 				refreshed, refreshErr := p.Store.GitHubPollCursor(ctx, repository)
@@ -423,12 +423,19 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 	if err != nil {
 		return PollResult{}, err
 	}
-	if len(activeBeforeControlVersionIDs) > 0 {
+	inboxEligible, err := p.Store.HasWorkflowInboxDeliveryPlan(ctx, repository)
+	if err != nil {
+		return PollResult{}, err
+	}
+	if inboxEligible {
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err
 		}
 		if err := p.routeInboxAnswers(ctx, repository); err != nil {
 			if isLocalPollStoreError(err) {
+				return PollResult{}, err
+			}
+			if len(activeBeforeControlVersionIDs) == 0 {
 				return PollResult{}, err
 			}
 			return p.recordFailureForPlans(ctx, repository, now, activeBeforeControlVersionIDs, err)

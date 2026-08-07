@@ -421,6 +421,64 @@ func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
 	}
 }
 
+func TestFrozenPlanDecisionRebasesActivePollFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 6, 30, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, versionID, []string{versionID}, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, versionID, int64(2), "closed pull request", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "closed_unmerged_impact", "choose", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 {
+		t.Fatalf("closed Plan questions = %#v", questions)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, repository, questions[0].ID, `{"action":"cancel-plan"}`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed || cursor.RecoveryPlanVersionID != "" {
+		t.Fatalf("rebased poll cursor = %#v", cursor)
+	}
+	var attemptedJSON string
+	if err := db.db.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&attemptedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if attemptedJSON != "[]" {
+		t.Fatalf("retired attempted Plan provenance = %s", attemptedJSON)
+	}
+}
+
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
