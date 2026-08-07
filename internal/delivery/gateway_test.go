@@ -326,7 +326,7 @@ func TestGatewayCompletesSupersededInboxGenerationWithoutRemoteWrite(t *testing.
 	}
 }
 
-func TestGatewayReconcilesUncertainInboxBeforeNewerGeneration(t *testing.T) {
+func TestGatewayCompletesSupersededUncertainInboxBeforeNewerGeneration(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)
 	defer db.Close()
@@ -349,20 +349,47 @@ func TestGatewayReconcilesUncertainInboxBeforeNewerGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true}, {}}}
+	remote := &fakeRemote{}
 	now = now.Add(2 * time.Second)
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
 	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
 		t.Fatalf("uncertain Inbox reconciliation = %v", err)
 	}
-	if remote.observeCalls != 1 || remote.applyCalls != 0 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != first.Request.InboxProjectionGeneration {
-		t.Fatalf("historical Inbox reconciliation = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	if remote.observeCalls != 0 || remote.applyCalls != 0 || len(remote.requests) != 0 {
+		t.Fatalf("superseded Inbox reconciliation = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
 	}
 	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
 		t.Fatalf("newer Inbox dispatch = %v", err)
 	}
-	if remote.observeCalls != 2 || remote.applyCalls != 1 || len(remote.requests) != 2 || remote.requests[1].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
+	if remote.observeCalls != 1 || remote.applyCalls != 1 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
 		t.Fatalf("authoritative Inbox dispatch = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayAppliesCurrentUnobservedUncertainInbox(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 45, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now.Add(2 * time.Second) }}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatalf("current uncertain Inbox dispatch = %v", err)
+	}
+	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || finished.State != store.OutboxSucceeded || remote.observeCalls != 1 || remote.applyCalls != 1 {
+		t.Fatalf("current uncertain Inbox = %#v, %v; observes=%d applies=%d", finished, err, remote.observeCalls, remote.applyCalls)
 	}
 }
 

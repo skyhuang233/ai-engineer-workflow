@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -356,6 +357,12 @@ func TestMigrationFromV34QueuesAuthoritativeLegacyInboxProjection(t *testing.T) 
 		db.Close()
 		t.Fatal(err)
 	}
+	if _, err := db.ExecContext(ctx, `UPDATE delivery_outbox
+SET request_json = json_remove(request_json, '$.inbox_projection_generation'), uncertain = 1
+WHERE operation = 'project_workflow_inbox'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?)`, version.ID, formatTimestamp(time.Now().UTC())); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -396,6 +403,16 @@ WHERE operation = 'project_workflow_inbox'
 	}
 	if corrections != 1 {
 		t.Fatalf("queued empty Inbox corrections = %d, want 1", corrections)
+	}
+	var correctionKey string
+	if err := migrated.db.QueryRowContext(ctx, `SELECT idempotency_key FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_extract(request_json, '$.repository') = ?
+  AND json_extract(request_json, '$.inbox_projection_generation') = 2`, snapshot.Repository).Scan(&correctionKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrated.ClaimDeliveryOutbox(ctx, correctionKey, time.Now().UTC()); !errors.Is(err, ErrInboxDeliveryPending) {
+		t.Fatalf("legacy uncertain Inbox fence = %v, want pending", err)
 	}
 }
 

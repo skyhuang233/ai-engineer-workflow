@@ -477,7 +477,7 @@ func TestWorkflowInboxClaimsFenceOlderUncertainGeneration(t *testing.T) {
 	}
 }
 
-func TestWorkflowInboxUncertaintyDoesNotExhaustBeforeReconciliation(t *testing.T) {
+func TestWorkflowInboxUncertaintyExhaustsAndFencesUntilRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -486,7 +486,7 @@ func TestWorkflowInboxUncertaintyDoesNotExhaustBeforeReconciliation(t *testing.T
 	defer db.Close()
 	repository := "owner/repository"
 	now := time.Date(2026, 8, 7, 4, 30, 0, 0, time.UTC)
-	activateWorkflowInboxPlan(t, ctx, db, repository)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
 	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
 	if err != nil {
 		t.Fatal(err)
@@ -501,12 +501,36 @@ func TestWorkflowInboxUncertaintyDoesNotExhaustBeforeReconciliation(t *testing.T
 		}
 		now = now.Add(4 * time.Second)
 	}
+	exhausted, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.State != OutboxRejected || !exhausted.Uncertain || exhausted.Attempts != maxDeliveryAttempts {
+		t.Fatalf("exhausted uncertain Inbox = %#v", exhausted)
+	}
+	projection, err := db.PlanProjectionAt(ctx, versionID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("projection after exhausted Inbox reconciliation = %#v", projection)
+	}
+	newer, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, newer.IdempotencyKey, now); !errors.Is(err, ErrInboxDeliveryPending) {
+		t.Fatalf("newer Inbox claim while exhausted generation is unresolved = %v", err)
+	}
+	if err := db.RecoverUncertainInboxDelivery(ctx, queued.IdempotencyKey, now); err != nil {
+		t.Fatal(err)
+	}
 	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
 	if err != nil {
-		t.Fatalf("uncertain Inbox reconciliation after retry budget = %v", err)
+		t.Fatalf("recovered uncertain Inbox claim = %v", err)
 	}
-	if !claim.ReconcileOnly || !claim.Uncertain || claim.Attempts != maxDeliveryAttempts+1 {
-		t.Fatalf("uncertain Inbox reconciliation claim = %#v", claim)
+	if !claim.ReconcileOnly || !claim.Uncertain || claim.Attempts != 1 {
+		t.Fatalf("recovered uncertain Inbox = %#v", claim)
 	}
 }
 

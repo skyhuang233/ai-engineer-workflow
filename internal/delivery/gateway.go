@@ -171,16 +171,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	if outbox.ReconcileOnly {
 		if outbox.Request.Operation == store.DeliveryProjectInbox {
-			result, err := g.Store.ReconcileDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
-				observation, observeErr := g.observe(operationCtx, request)
-				if observeErr != nil {
-					return store.DeliveryResult{}, observeErr
-				}
-				if !observation.Applied {
-					return store.DeliveryResult{}, fmt.Errorf("%w: uncertain Workflow Inbox delivery was not observed", store.ErrDeliveryRejected)
-				}
-				return resultFrom(observation), nil
-			})
+			result, err := g.Store.ReconcileDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, g.execute)
 			if leaseErr := stopDispatcher(); leaseErr != nil {
 				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 			}
@@ -204,45 +195,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 		return err
 	}
-	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
-		if request.Operation == store.DeliveryProjectPlan {
-			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
-			if projectionErr != nil {
-				return store.DeliveryResult{}, errors.Join(ErrGatewayStore, projectionErr)
-			}
-			request.PlanProjection = &projection
-		}
-		observation, observeErr := g.observe(operationCtx, request)
-		if observeErr != nil {
-			return store.DeliveryResult{}, observeErr
-		}
-		if observation.Applied {
-			return resultFrom(observation), nil
-		}
-		if request.ExpectRemoteAbsent && observation.RemoteExists {
-			return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
-		}
-		if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
-			return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
-		}
-		observation, applyErr := g.apply(operationCtx, request)
-		if applyErr != nil {
-			if retryAt(applyErr).After(g.now()) {
-				return store.DeliveryResult{}, applyErr
-			}
-			observed, observeErr := g.observe(operationCtx, request)
-			if observeErr == nil && observed.Applied {
-				observation = observed
-				applyErr = nil
-			} else {
-				applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
-			}
-		}
-		if applyErr != nil {
-			return store.DeliveryResult{}, applyErr
-		}
-		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
-	})
+	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, g.execute)
 	if leaseErr := stopDispatcher(); leaseErr != nil {
 		return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 	}
@@ -272,6 +225,46 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(outbox, err)
 	}
 	return g.succeed(outbox, result)
+}
+
+func (g Gateway) execute(ctx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+	if request.Operation == store.DeliveryProjectPlan {
+		projection, err := g.Store.PlanProjectionAt(ctx, request.PlanProjection.VersionID, g.now())
+		if err != nil {
+			return store.DeliveryResult{}, errors.Join(ErrGatewayStore, err)
+		}
+		request.PlanProjection = &projection
+	}
+	observation, err := g.observe(ctx, request)
+	if err != nil {
+		return store.DeliveryResult{}, err
+	}
+	if observation.Applied {
+		return resultFrom(observation), nil
+	}
+	if request.ExpectRemoteAbsent && observation.RemoteExists {
+		return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
+	}
+	if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
+		return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
+	}
+	observation, applyErr := g.apply(ctx, request)
+	if applyErr != nil {
+		if retryAt(applyErr).After(g.now()) {
+			return store.DeliveryResult{}, applyErr
+		}
+		observed, observeErr := g.observe(ctx, request)
+		if observeErr == nil && observed.Applied {
+			observation = observed
+			applyErr = nil
+		} else {
+			applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
+		}
+	}
+	if applyErr != nil {
+		return store.DeliveryResult{}, applyErr
+	}
+	return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 }
 
 func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
