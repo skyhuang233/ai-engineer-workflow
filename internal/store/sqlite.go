@@ -911,6 +911,30 @@ WHERE operation = 'project_workflow_inbox'
 GROUP BY json_extract(request_json, '$.repository')`); err != nil {
 			return fmt.Errorf("migration 35: %w", err)
 		}
+		rows, err := tx.QueryContext(ctx, `SELECT repository FROM workflow_inbox_projections WHERE projection_version = 'legacy-unfenced' ORDER BY repository`)
+		if err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		var repositories []string
+		for rows.Next() {
+			var repository string
+			if err := rows.Scan(&repository); err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 35: %w", err)
+			}
+			repositories = append(repositories, repository)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		for _, repository := range repositories {
+			if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, time.Now().UTC()); err != nil {
+				return fmt.Errorf("migration 35: %w", err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (35, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}

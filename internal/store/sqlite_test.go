@@ -319,7 +319,7 @@ func TestMigrationFromV33AddsBootstrapPlanProvenance(t *testing.T) {
 	}
 }
 
-func TestMigrationFromV34BackfillsLegacyInboxProjectionRepositories(t *testing.T) {
+func TestMigrationFromV34QueuesAuthoritativeLegacyInboxProjection(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	snapshot := testSnapshot()
@@ -356,6 +356,14 @@ func TestMigrationFromV34BackfillsLegacyInboxProjectionRepositories(t *testing.T
 		db.Close()
 		t.Fatal(err)
 	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?)`, version.ID, formatTimestamp(time.Now().UTC())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?)`, version.ID, StateCompleted, formatTimestamp(time.Now().UTC())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -372,23 +380,12 @@ func TestMigrationFromV34BackfillsLegacyInboxProjectionRepositories(t *testing.T
 	if err := migrated.db.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&generation, &projectionVersion, &planVersionIDs); err != nil {
 		t.Fatal(err)
 	}
-	if generation != 1 || projectionVersion != "legacy-unfenced" || planVersionIDs != "[]" {
-		t.Fatalf("migrated Inbox projection = %d/%q/%s", generation, projectionVersion, planVersionIDs)
-	}
-	for _, ticket := range snapshot.Children {
-		if err := migrated.MarkTicketDelivered(ctx, version.ID, ticket.ID); err != nil {
-			t.Fatal(err)
-		}
-	}
 	emptyVersion, err := workflowInboxProjectionVersion(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := migrated.db.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&generation, &projectionVersion, &planVersionIDs); err != nil {
-		t.Fatal(err)
-	}
 	if generation != 2 || projectionVersion != emptyVersion || planVersionIDs != "null" {
-		t.Fatalf("completed Inbox projection = %d/%q/%s, want generation 2 empty projection", generation, projectionVersion, planVersionIDs)
+		t.Fatalf("migrated Inbox projection = %d/%q/%s, want generation 2 empty projection", generation, projectionVersion, planVersionIDs)
 	}
 	var corrections int
 	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_outbox
