@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -124,10 +125,13 @@ func (g Gateway) Submit(ctx context.Context, request store.DeliveryRequest) (sto
 // Dispatch claims one outbox item and executes it. An external error remains
 // retryable unless an observation proves that the requested mutation already
 // happened.
-func (g Gateway) Dispatch(ctx context.Context, key string) error {
+func (g Gateway) Dispatch(ctx context.Context, key string) (dispatchErr error) {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
 	}
+	defer func() {
+		dispatchErr = g.decorateTerminalInboxError(key, dispatchErr)
+	}()
 	dispatcherToken := g.DispatcherToken
 	if dispatcherToken == "" {
 		dispatcherToken = "legacy-gateway-dispatcher"
@@ -225,6 +229,19 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(outbox, err)
 	}
 	return g.succeed(outbox, result)
+}
+
+func (g Gateway) decorateTerminalInboxError(key string, dispatchErr error) error {
+	if dispatchErr == nil || strings.Contains(dispatchErr.Error(), key) {
+		return dispatchErr
+	}
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	outbox, err := g.Store.DeliveryOutbox(ctx, key)
+	if err != nil || outbox.State != store.OutboxRejected || !outbox.Uncertain || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.RunID != "" {
+		return dispatchErr
+	}
+	return errors.Join(dispatchErr, fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError))
 }
 
 func (g Gateway) execute(ctx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {

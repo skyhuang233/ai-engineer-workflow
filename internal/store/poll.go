@@ -787,36 +787,14 @@ RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failu
 	return cursor, nil
 }
 
-func (s *Store) DeferGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+func (s *Store) DeferGitHubPollBootstrapRecoveryLeased(ctx context.Context, repository, recoveryPlanVersionID string, retryAt, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
 	if retryAt.IsZero() {
 		return GitHubPollCursor{}, ErrInvalidClaim
 	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	} else {
-		now = now.UTC()
+	if recoveryPlanVersionID == "" {
+		return GitHubPollCursor{}, ErrInvalidClaim
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return GitHubPollCursor{}, err
-	}
-	defer tx.Rollback()
-	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
-		return GitHubPollCursor{}, err
-	}
-	cursor, err := scanGitHubPollCursor(tx.QueryRowContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = consecutive_failures + 1,
-    next_attempt_at = CASE WHEN next_attempt_at > ? THEN next_attempt_at ELSE ? END, updated_at = ?
-WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id != ''
-RETURNING repository, last_success_at, last_full_reconcile_at, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at`,
-		formatTimestamp(retryAt), formatTimestamp(retryAt), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed))
-	if err != nil {
-		return GitHubPollCursor{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return GitHubPollCursor{}, err
-	}
-	return cursor, nil
+	return s.advanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, recoveryPlanVersionID, retryAt, leaseToken, leaseNow)
 }
 
 func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
@@ -1606,11 +1584,16 @@ func (s *Store) AdvanceGitHubPollFailure(ctx context.Context, repository string,
 }
 
 func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
+	return s.advanceGitHubPollFailureLeased(ctx, repository, now, kind, recoveryPlanVersionID, time.Time{}, leaseToken, leaseNow)
+}
+
+func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository string, now time.Time, kind GitHubPollFailureKind, recoveryPlanVersionID string, deferredUntil time.Time, leaseToken string, leaseNow time.Time) (GitHubPollCursor, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
+	deferredUntil = deferredUntil.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return GitHubPollCursor{}, err
@@ -1623,7 +1606,8 @@ func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository s
 	var existingKind GitHubPollFailureKind
 	var existingRecovery GitHubPollRecoveryState
 	var existingRecoveryPlanVersionID string
-	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &existingKind, &existingRecovery, &existingRecoveryPlanVersionID)
+	var existingNextAttemptText string
+	err = tx.QueryRowContext(ctx, `SELECT consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&failures, &existingKind, &existingRecovery, &existingRecoveryPlanVersionID, &existingNextAttemptText)
 	if errors.Is(err, sql.ErrNoRows) {
 		failures = 0
 	} else if err != nil {
@@ -1647,9 +1631,22 @@ func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository s
 		}
 	}
 	delay := time.Second << min(failures-1, 6)
+	nextAttempt := now.Add(delay)
+	if !deferredUntil.IsZero() {
+		nextAttempt = deferredUntil
+		if existingNextAttemptText != "" {
+			existingNextAttempt, parseErr := time.Parse(time.RFC3339Nano, existingNextAttemptText)
+			if parseErr != nil {
+				return GitHubPollCursor{}, parseErr
+			}
+			if existingNextAttempt.After(nextAttempt) {
+				nextAttempt = existingNextAttempt
+			}
+		}
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, recovery_plan_version_id = excluded.recovery_plan_version_id, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, kind, recovery, recoveryPlanVersionID, formatTimestamp(now.Add(delay)), formatTimestamp(now))
+ON CONFLICT(repository) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, recovery_plan_version_id = excluded.recovery_plan_version_id, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at`, repository, failures, kind, recovery, recoveryPlanVersionID, formatTimestamp(nextAttempt), formatTimestamp(now))
 	if err != nil {
 		return GitHubPollCursor{}, err
 	}

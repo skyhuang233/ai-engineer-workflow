@@ -2149,6 +2149,64 @@ func TestRecordFailureBoundsRepeatedRateLimits(t *testing.T) {
 	}
 }
 
+func TestColdStartBootstrapRateLimitPreservesRecoveryProvenance(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 7, 6, 0, 0, 0, time.UTC)
+	poller := Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 2,
+		Now:         func() time.Time { return now },
+	}
+	first := &delivery.HTTPError{StatusCode: http.StatusTooManyRequests, Message: "Gateway rate limited", RetryAt: now.Add(time.Minute)}
+	_, err = poller.PollWithBootstrap(ctx, repository, nil, func(context.Context, bool) (BootstrapControlResult, error) {
+		return BootstrapControlResult{AttemptedPlanVersionID: versionID}, first
+	})
+	if !errors.Is(err, first) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("first bootstrap rate limit = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryAvailable || cursor.RecoveryPlanVersionID != versionID || !cursor.NextAttemptAt.Equal(first.RetryAt) {
+		t.Fatalf("first deferred bootstrap cursor = %#v", cursor)
+	}
+	now = first.RetryAt
+	second := &delivery.HTTPError{StatusCode: http.StatusTooManyRequests, Message: "Gateway rate limited again", RetryAt: now.Add(time.Minute)}
+	_, err = poller.PollWithBootstrap(ctx, repository, nil, func(context.Context, bool) (BootstrapControlResult, error) {
+		return BootstrapControlResult{AttemptedPlanVersionID: versionID}, second
+	})
+	if !errors.Is(err, second) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("exhausted bootstrap rate limit = %v", err)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() || cursor.RecoveryPlanVersionID != versionID {
+		t.Fatalf("terminal bootstrap cursor = %#v", cursor)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		found = found || question.Kind == "poll_failure" && question.VersionID == versionID
+	}
+	if !found {
+		t.Fatalf("terminal bootstrap questions = %#v", questions)
+	}
+}
+
 func TestRateLimitConsumesExhaustedBootstrapRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

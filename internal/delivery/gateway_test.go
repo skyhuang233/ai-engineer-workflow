@@ -1088,6 +1088,32 @@ func TestGatewayDispatchPendingReportsFailingDeliveryKey(t *testing.T) {
 	}
 }
 
+func TestGatewayDispatchReportsTerminalUncertainInboxRecoveryKey(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 30, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if claimErr != nil {
+			t.Fatal(claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{applyErr: errors.New("remote unavailable")}, Now: func() time.Time { return now }}
+	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), queued.IdempotencyKey) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
+		t.Fatalf("terminal uncertain Inbox dispatch = %v", err)
+	}
+}
+
 func TestGatewayPersistsUncertaintyAndAcceptsAppliedObservationBeforePreconditions(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
