@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -914,9 +915,6 @@ func TestCompletedBootstrapProjectionExhaustionClearsAttemptedFailure(t *testing
 	if err := db.MarkActive(ctx, versionID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
-		t.Fatal(err)
-	}
 	now := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
 	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
 	projectionErr := errors.New("reconcile completed plan root: Gateway unavailable")
@@ -925,7 +923,7 @@ func TestCompletedBootstrapProjectionExhaustionClearsAttemptedFailure(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, failureErr := poller.recordBootstrapFailure(leaseCtx, repository, now, versionID, projectionErr)
+		_, failureErr := poller.recordBootstrapFailure(leaseCtx, repository, now, versionID, false, projectionErr)
 		failureErr = errors.Join(failureErr, release())
 		if attempt == 0 && !errors.Is(failureErr, projectionErr) {
 			t.Fatalf("projection failure %d = %v", attempt+1, failureErr)
@@ -935,6 +933,11 @@ func TestCompletedBootstrapProjectionExhaustionClearsAttemptedFailure(t *testing
 		}
 		if attempt == 1 && failureErr != nil {
 			t.Fatalf("second projection failure = %v, want completed attempt ignored", failureErr)
+		}
+		if attempt == 0 {
+			if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+				t.Fatal(err)
+			}
 		}
 		now = now.Add(2 * time.Second)
 	}
@@ -953,6 +956,107 @@ func TestCompletedBootstrapProjectionExhaustionClearsAttemptedFailure(t *testing
 		if question.VersionID == versionID && question.Kind == "poll_failure" {
 			t.Fatalf("completed attempted Plan received recovery question: %#v", question)
 		}
+	}
+}
+
+func TestAlreadyCompletedBootstrapFailureExhaustsRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	versionID := activatePollerPlan(t, ctx, db, repository)
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 7, 1, 30, 0, 0, time.UTC)
+	poller := Poller{Store: db, MaxFailures: 2, Now: func() time.Time { return now }}
+	projectionErr := errors.New("reconcile completed plan root: Gateway unavailable")
+	for attempt := range 2 {
+		leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, failureErr := poller.recordBootstrapFailure(leaseCtx, repository, now, versionID, true, projectionErr)
+		failureErr = errors.Join(failureErr, release())
+		if attempt == 0 && (!errors.Is(failureErr, projectionErr) || errors.Is(failureErr, store.ErrNeedsAttention)) {
+			t.Fatalf("first completed bootstrap failure = %v", failureErr)
+		}
+		if attempt == 1 && !errors.Is(failureErr, store.ErrNeedsAttention) {
+			t.Fatalf("terminal completed bootstrap failure = %v, want needs attention", failureErr)
+		}
+		now = now.Add(2 * time.Second)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() || cursor.ConsecutiveFailures != 2 {
+		t.Fatalf("completed bootstrap cursor = %#v, want bounded terminal failure", cursor)
+	}
+}
+
+func TestRouteInboxRecoveryAnswerReleasesRejectedDelivery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 7, 2, 0, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "observation unavailable", true, now); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(4 * time.Second)
+	}
+	questionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, repository, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/issues":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 10, "number": 10, "title": "Workflow Inbox", "body": "", "labels": []map[string]string{{"name": workflowInboxLabel}}, "user": map[string]string{"login": "owner", "type": "User"}}})
+		case "/repos/owner/repo/issues/10/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:" + questionID + ": retry", "user": map[string]string{"login": "owner", "type": "User"}}})
+		default:
+			t.Fatalf("unexpected GitHub request = %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	poller := Poller{Store: db, Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), Now: func() time.Time { return now }}
+	leaseCtx, release, err := poller.AcquireLease(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := poller.routeInboxAnswers(leaseCtx, repository); err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != store.OutboxPending || recovered.Attempts != 0 {
+		t.Fatalf("recovered Inbox delivery = %#v", recovered)
+	}
+	if _, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, repository, queued.IdempotencyKey); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("recovery question remained open: %v", err)
 	}
 }
 

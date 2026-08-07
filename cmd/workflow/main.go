@@ -590,6 +590,7 @@ func runPollGitHub(args []string) {
 		poller.Client = client
 		poller.LaunchReview = launcher
 		attemptedPlanVersionID := ""
+		attemptedPlanAlreadyComplete := false
 		bootstrap := func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
@@ -598,6 +599,7 @@ func runPollGitHub(args []string) {
 			activator := plan.Activator{Reader: client, Projector: projector, Store: db}
 			version, err := activator.Activate(ctx, *repository, activeRoot)
 			attemptedPlanVersionID = version.ID
+			attemptedPlanAlreadyComplete = version.State == store.StateCompleted
 			if err != nil {
 				return err
 			}
@@ -605,11 +607,14 @@ func runPollGitHub(args []string) {
 		}
 		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
 			controlResult := github.BootstrapControlResult{}
+			attemptedPlanVersionID = ""
+			attemptedPlanAlreadyComplete = false
 			var bootstrapErr error
 			if !bootstrapped {
 				bootstrapErr = bootstrap(ctx)
 			}
 			controlResult.AttemptedPlanVersionID = attemptedPlanVersionID
+			controlResult.AttemptedPlanAlreadyComplete = attemptedPlanAlreadyComplete
 			if bootstrapErr != nil {
 				return controlResult, bootstrapErr
 			}

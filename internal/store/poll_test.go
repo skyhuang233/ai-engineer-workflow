@@ -412,6 +412,13 @@ func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
 	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
 		t.Fatalf("cursor after frozen Plan decision = %#v", cursor)
 	}
+	var attemptedJSON string
+	if err := db.db.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&attemptedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if attemptedJSON != "[]" {
+		t.Fatalf("attempted Plan provenance after fresh retry budget = %s", attemptedJSON)
+	}
 }
 
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {

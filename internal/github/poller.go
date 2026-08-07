@@ -23,7 +23,8 @@ type PollResult struct {
 type ReviewLauncher func(context.Context, store.TicketClaim, string) error
 type ControlPass func(context.Context) error
 type BootstrapControlResult struct {
-	AttemptedPlanVersionID string
+	AttemptedPlanVersionID       string
+	AttemptedPlanAlreadyComplete bool
 }
 type BootstrapControlPass func(context.Context, bool) (BootstrapControlResult, error)
 
@@ -441,7 +442,7 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		}
 		controlResult, err = before(ctx, bootstrapped)
 		if err != nil {
-			return p.recordBootstrapFailure(ctx, repository, now, controlResult.AttemptedPlanVersionID, err)
+			return p.recordBootstrapFailure(ctx, repository, now, controlResult.AttemptedPlanVersionID, controlResult.AttemptedPlanAlreadyComplete, err)
 		}
 	}
 	if err := p.renewPollLease(ctx, repository); err != nil {
@@ -526,7 +527,7 @@ func (p Poller) resumeClaimedBootstrapRecovery(ctx context.Context, repository s
 		if _, resolveErr := p.Store.ResolveGitHubPollBootstrapRecoveryLeased(ctx, repository, p.maxFailures(), now, leaseToken, p.now()); resolveErr != nil {
 			return false, errors.Join(err, resolveErr)
 		}
-		_, failureErr := p.recordBootstrapFailure(ctx, repository, now, cursor.RecoveryPlanVersionID, err)
+		_, failureErr := p.recordBootstrapFailure(ctx, repository, now, cursor.RecoveryPlanVersionID, false, err)
 		return false, failureErr
 	}
 	recovered, err = p.Store.RecoverGitHubPollAfterBootstrapLeased(ctx, repository, now, leaseToken, p.now())
@@ -571,7 +572,10 @@ func (p Poller) recordFailureForPlans(ctx context.Context, repository string, no
 	return p.recordFailureWithKindForPlans(ctx, repository, now, "", "", attemptedPlanVersionIDs, cause)
 }
 
-func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, now time.Time, attemptedPlanVersionID string, cause error) (PollResult, error) {
+func (p Poller) recordBootstrapFailure(ctx context.Context, repository string, now time.Time, attemptedPlanVersionID string, attemptedPlanAlreadyComplete bool, cause error) (PollResult, error) {
+	if attemptedPlanAlreadyComplete {
+		attemptedPlanVersionID = ""
+	}
 	if attemptedPlanVersionID == "" || isLocalPollStoreError(cause) {
 		return p.recordFailure(ctx, repository, now, cause)
 	}
@@ -837,7 +841,13 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 			if !leased {
 				return wrapPollStoreError(store.ErrFencingConflict)
 			}
-			if _, err := p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now()); err != nil && !errors.Is(err, store.ErrNotFound) {
+			var err error
+			if question.Kind == "inbox_delivery_recovery" {
+				_, err = p.Store.RecoverUncertainInboxDeliveryQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
+			} else {
+				_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
+			}
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return wrapPollStoreError(err)
 			}
 		}

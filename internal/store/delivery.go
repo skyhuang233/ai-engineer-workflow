@@ -694,6 +694,18 @@ func (s *Store) RecoverUncertainInboxDelivery(ctx context.Context, repository, k
 	return outbox, errors.Join(recoveryErr, s.releaseGitHubPollMutationLease(ctx, repository, leaseToken))
 }
 
+func (s *Store) RecoverUncertainInboxDeliveryQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) (DeliveryOutbox, error) {
+	if repository == "" || questionID == "" || answer == "" {
+		return DeliveryOutbox{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	return s.recoverUncertainInboxDeliveryLeased(ctx, repository, "", questionID, answer, now, leaseToken, leaseNow)
+}
+
 func (s *Store) UncertainInboxDeliveryRecoveryQuestionID(ctx context.Context, repository, key string) (string, error) {
 	if repository == "" || key == "" {
 		return "", ErrInvalidClaim
@@ -715,6 +727,19 @@ func (s *Store) recoverUncertainInboxDeliveryLeased(ctx context.Context, reposit
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
+	byQuestion := key == ""
+	if byQuestion {
+		err = tx.QueryRowContext(ctx, `SELECT recovery.idempotency_key
+FROM inbox_delivery_recovery_questions recovery
+JOIN workflow_questions question ON question.question_id = recovery.question_id
+WHERE recovery.question_id = ? AND question.repository = ? AND question.kind = 'inbox_delivery_recovery'`, questionID, repository).Scan(&key)
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryOutbox{}, ErrNotFound
+		}
+		if err != nil {
+			return DeliveryOutbox{}, err
+		}
+	}
 	var state, priorAnswer string
 	err = tx.QueryRowContext(ctx, `SELECT question.state, question.answer
 FROM inbox_delivery_recovery_questions recovery
@@ -722,6 +747,9 @@ JOIN workflow_questions question ON question.question_id = recovery.question_id
 WHERE recovery.idempotency_key = ? AND recovery.question_id = ? AND question.repository = ? AND question.kind = 'inbox_delivery_recovery'`,
 		key, questionID, repository).Scan(&state, &priorAnswer)
 	if errors.Is(err, sql.ErrNoRows) {
+		if byQuestion {
+			return DeliveryOutbox{}, ErrNotFound
+		}
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
 	if err != nil {

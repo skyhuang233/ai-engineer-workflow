@@ -549,7 +549,7 @@ WHERE p.repository = ? AND v.version_id = ?`, repository, versionID).Scan(&planS
 	switch disposition {
 	case GitHubPollBootstrapRecoveryActive:
 		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = '', recovery_state = ?, next_attempt_at = ?, updated_at = ?
+SET consecutive_failures = 0, failure_kind = '', recovery_state = ?, attempted_plan_version_ids_json = '[]', next_attempt_at = ?, updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id = ?`,
 			GitHubPollRecoveryCompleted, formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
 	case GitHubPollBootstrapRecoveryProjecting:
@@ -558,7 +558,7 @@ WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recov
 			GitHubPollRecoveryClaimed, formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
 	case GitHubPollBootstrapRecoveryStale:
 		_, err = tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]', next_attempt_at = ?, updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?) AND recovery_plan_version_id = ?`,
 			GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, versionID)
 	}
@@ -595,7 +595,7 @@ func (s *Store) RecoverGitHubPollAfterBootstrapLeased(ctx context.Context, repos
 		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = '', recovery_state = ?, next_attempt_at = ?, updated_at = ?
+SET consecutive_failures = 0, failure_kind = '', recovery_state = ?, attempted_plan_version_ids_json = '[]', next_attempt_at = ?, updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND recovery_state = ?
 AND recovery_plan_version_id != ''
 AND EXISTS (
@@ -659,6 +659,7 @@ SET consecutive_failures = 0,
 failure_kind = CASE WHEN failure_kind = ? AND recovery_state = ? THEN failure_kind ELSE ? END,
 recovery_state = CASE WHEN failure_kind = ? AND recovery_state = ? THEN recovery_state ELSE ? END,
 recovery_plan_version_id = CASE WHEN failure_kind = ? AND recovery_state = ? THEN recovery_plan_version_id ELSE '' END,
+attempted_plan_version_ids_json = '[]',
 next_attempt_at = ?, updated_at = ?
 WHERE repository = ?`, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, GitHubPollFailureRetryable,
 		GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, GitHubPollRecoveryConsumed,
@@ -1358,7 +1359,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 		return err
 	}
 	if kind == "poll_failure" {
-		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, failure_kind = '', recovery_state = '', recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET consecutive_failures = 0, failure_kind = '', recovery_state = '', recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]', next_attempt_at = ?, updated_at = ? WHERE repository = ?`, formatTimestamp(now), formatTimestamp(now), repository); err != nil {
 			return err
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT t.issue_id, COALESCE(s.session_id, ''), COALESCE(s.accepted_commit, '')
@@ -1429,7 +1430,7 @@ ORDER BY generation DESC LIMIT 1`, repository, versionID).Scan(&pollQuestionID)
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = '', recovery_state = '', recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+SET consecutive_failures = 0, failure_kind = '', recovery_state = '', recovery_plan_version_id = '', attempted_plan_version_ids_json = '[]', next_attempt_at = ?, updated_at = ?
 WHERE repository = ? AND failure_kind = ? AND (recovery_plan_version_id = '' OR recovery_plan_version_id = ?)`,
 		formatTimestamp(now), formatTimestamp(now), repository, GitHubPollFailureUnrecoverable, versionID)
 	if err != nil {
@@ -1777,6 +1778,9 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 	}
 	previousFailures := failures
 	failures++
+	if previousFailures == 0 {
+		existingAttemptedJSON = ""
+	}
 	attemptedJSON, err := mergeAttemptedPlanVersionIDs(existingAttemptedJSON, attemptedPlanVersionIDs)
 	if err != nil {
 		return GitHubPollCursor{}, err
@@ -1829,9 +1833,13 @@ FROM github_poll_cursors WHERE repository = ?`, repository))
 
 func mergeAttemptedPlanVersionIDsTx(ctx context.Context, tx *sql.Tx, repository string, additions []string) (string, error) {
 	var existing string
-	err := tx.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&existing)
+	var failures int
+	err := tx.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json, consecutive_failures FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&existing, &failures)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", err
+	}
+	if failures == 0 {
+		existing = ""
 	}
 	return mergeAttemptedPlanVersionIDs(existing, additions)
 }
