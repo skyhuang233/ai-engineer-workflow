@@ -888,13 +888,19 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVe
 		return false, err
 	}
 	if !owned {
-		if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
+		completed, err := allCurrentPlanVersionsCompletedTx(ctx, tx, repository)
+		if err != nil {
 			return false, err
 		}
-		if err := tx.Commit(); err != nil {
-			return false, err
+		if completed {
+			if err := recordGitHubPollSuccessTx(ctx, tx, repository, now, false); err != nil {
+				return false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			return false, nil
 		}
-		return false, nil
 	}
 	if err := markGitHubPollFailureUnrecoverableTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
 		return false, err
@@ -903,6 +909,17 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&recoveryPlanVe
 		return false, err
 	}
 	return true, nil
+}
+
+func allCurrentPlanVersionsCompletedTx(ctx context.Context, tx *sql.Tx, repository string) (bool, error) {
+	var count, incomplete int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE
+    WHEN EXISTS (SELECT 1 FROM completed_plan_versions completed WHERE completed.version_id = v.version_id) THEN 0
+    ELSE 1
+END), 0)
+FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
+WHERE p.repository = ?`, repository).Scan(&count, &incomplete)
+	return count > 0 && incomplete == 0, err
 }
 
 func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) (bool, error) {

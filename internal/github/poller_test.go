@@ -2236,7 +2236,7 @@ func TestColdStartBootstrapRateLimitPreservesRecoveryProvenance(t *testing.T) {
 	}
 }
 
-func TestRateLimitClearsExhaustedUnownedBootstrapRecovery(t *testing.T) {
+func TestRateLimitTerminalizesExhaustedUnownedBootstrapRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -2250,16 +2250,60 @@ func TestRateLimitClearsExhaustedUnownedBootstrapRecovery(t *testing.T) {
 	}
 	retryAt := now.Add(time.Minute)
 	readyAt := now.Add(time.Second)
-	_, err = (Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return readyAt }}).RecordFailure(ctx, repository, &apiError{StatusCode: 403, RetryAt: retryAt})
-	if err != nil {
-		t.Fatalf("rate-limited exhausted poll = %v, want success", err)
+	rateLimit := &apiError{StatusCode: 403, RetryAt: retryAt}
+	_, err = (Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return readyAt }}).RecordFailure(ctx, repository, rateLimit)
+	if !errors.Is(err, rateLimit) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("rate-limited exhausted poll = %v, want rate limit and needs attention", err)
 	}
 	cursor, err := db.GitHubPollCursor(ctx, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.ConsecutiveFailures != 0 || cursor.NeedsAttention() || !cursor.LastSuccessAt.Equal(readyAt) {
-		t.Fatalf("cursor = %#v, want cleared unowned recovery", cursor)
+	if !cursor.NeedsAttention() || !cursor.LastSuccessAt.IsZero() {
+		t.Fatalf("cursor = %#v, want terminal unowned recovery", cursor)
+	}
+}
+
+func TestFrozenPlanFailureAtRetryLimitRemainsTerminalWithoutPollQuestion(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	versionID := activatePollerPlan(t, ctx, db, repository)
+	now := time.Date(2026, 8, 7, 8, 0, 0, 0, time.UTC)
+	frozen, err := db.FreezePlanForClosedPullRequest(ctx, versionID, 2, now)
+	if err != nil || !frozen {
+		t.Fatalf("freeze Plan = %t, %v", frozen, err)
+	}
+	cause := errors.New("GitHub read failed")
+	_, err = (Poller{Store: db, MaxFailures: 1, Now: func() time.Time { return now.Add(time.Second) }}).RecordFailure(ctx, repository, cause)
+	if !errors.Is(err, cause) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("frozen Plan failure = %v, want cause and needs attention", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil || !cursor.NeedsAttention() {
+		t.Fatalf("frozen Plan cursor = %#v, %v", cursor, err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundFreezeQuestion := false
+	for _, question := range questions {
+		foundFreezeQuestion = foundFreezeQuestion || question.Kind == "closed_unmerged_impact"
+		if question.Kind == "poll_failure" {
+			t.Fatalf("frozen Plan received poll failure question: %#v", question)
+		}
+	}
+	if !foundFreezeQuestion {
+		t.Fatalf("frozen Plan questions = %#v", questions)
+	}
+	frozen, err = db.FreezePlanForClosedPullRequest(ctx, versionID, 2, now.Add(2*time.Second))
+	if err != nil || frozen {
+		t.Fatalf("terminal transition changed freeze = %t, %v", frozen, err)
 	}
 }
 
