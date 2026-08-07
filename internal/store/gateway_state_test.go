@@ -434,6 +434,49 @@ func TestWorkflowInboxClaimsSerializeRepositoryGenerations(t *testing.T) {
 	}
 }
 
+func TestWorkflowInboxClaimsFenceOlderUncertainGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	first, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, first.IdempotencyKey, firstClaim.ClaimToken, "remote outcome unknown", true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "needs_attention", "retry the ticket", now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.QueueWorkflowInboxProjection(ctx, repository, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Request.InboxProjectionGeneration >= second.Request.InboxProjectionGeneration {
+		t.Fatalf("Inbox generations = %d then %d", first.Request.InboxProjectionGeneration, second.Request.InboxProjectionGeneration)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, second.IdempotencyKey, now.Add(4*time.Second)); !errors.Is(err, ErrInboxDeliveryPending) {
+		t.Fatalf("newer Inbox claim = %v, want pending", err)
+	}
+}
+
 func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

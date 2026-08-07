@@ -539,8 +539,12 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	if request.Operation == DeliveryProjectInbox {
 		var processing int
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox
-WHERE idempotency_key != ? AND operation = ? AND state = ?
-AND json_extract(request_json, '$.repository') = ? LIMIT 1`, key, DeliveryProjectInbox, OutboxProcessing, request.Repository).Scan(&processing)
+WHERE idempotency_key != ? AND operation = ?
+AND json_extract(request_json, '$.repository') = ?
+AND (state = ? OR (
+    state = ? AND uncertain != 0
+    AND CAST(json_extract(request_json, '$.inbox_projection_generation') AS INTEGER) < ?
+)) LIMIT 1`, key, DeliveryProjectInbox, request.Repository, OutboxProcessing, OutboxPending, request.InboxProjectionGeneration).Scan(&processing)
 		if err == nil {
 			return DeliveryOutbox{}, ErrInboxDeliveryPending
 		}

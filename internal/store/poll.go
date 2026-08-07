@@ -642,8 +642,15 @@ WHERE repository = ? AND failure_kind = ? AND recovery_state IN (?, ?)`, GitHubP
 
 func resetGitHubPollForCredentialTx(ctx context.Context, tx *sql.Tx, repository string, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
-SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
-WHERE repository = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), repository)
+SET consecutive_failures = 0,
+failure_kind = CASE WHEN failure_kind = ? AND recovery_state = ? THEN failure_kind ELSE ? END,
+recovery_state = CASE WHEN failure_kind = ? AND recovery_state = ? THEN recovery_state ELSE ? END,
+recovery_plan_version_id = CASE WHEN failure_kind = ? AND recovery_state = ? THEN recovery_plan_version_id ELSE '' END,
+next_attempt_at = ?, updated_at = ?
+WHERE repository = ?`, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, GitHubPollFailureRetryable,
+		GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, GitHubPollRecoveryConsumed,
+		GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed,
+		formatTimestamp(now), formatTimestamp(now), repository)
 	return err
 }
 
@@ -679,7 +686,15 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableLeased(ctx context.Context, re
 func markGitHubPollFailureUnrecoverableTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
 VALUES (?, 0, ?, ?, ?, ?, ?)
-ON CONFLICT(repository) DO UPDATE SET failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state, recovery_plan_version_id = excluded.recovery_plan_version_id, updated_at = excluded.updated_at`, repository, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, recoveryPlanVersionID, formatTimestamp(now), formatTimestamp(now))
+ON CONFLICT(repository) DO UPDATE SET failure_kind = excluded.failure_kind, recovery_state = excluded.recovery_state,
+recovery_plan_version_id = CASE
+    WHEN github_poll_cursors.failure_kind = excluded.failure_kind
+      AND github_poll_cursors.recovery_state = excluded.recovery_state
+      AND github_poll_cursors.recovery_plan_version_id != ''
+    THEN github_poll_cursors.recovery_plan_version_id
+    ELSE excluded.recovery_plan_version_id
+END,
+updated_at = excluded.updated_at`, repository, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed, recoveryPlanVersionID, formatTimestamp(now), formatTimestamp(now))
 	return err
 }
 
@@ -1617,6 +1632,7 @@ func (s *Store) AdvanceGitHubPollFailureLeased(ctx context.Context, repository s
 	recovery := GitHubPollRecoveryConsumed
 	if existingKind == GitHubPollFailureUnrecoverable && existingRecovery == GitHubPollRecoveryConsumed {
 		kind = GitHubPollFailureUnrecoverable
+		recoveryPlanVersionID = existingRecoveryPlanVersionID
 	} else if kind == GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" && (previousFailures == 0 || existingKind == GitHubPollFailurePreActivationInboxConflict && (existingRecovery == GitHubPollRecoveryAvailable || existingRecovery == GitHubPollRecoveryClaimed) && existingRecoveryPlanVersionID == recoveryPlanVersionID) {
 		recovery = GitHubPollRecoveryAvailable
 		if existingRecovery == GitHubPollRecoveryClaimed {

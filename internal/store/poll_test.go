@@ -175,6 +175,54 @@ WHEN NEW.state = 'needs_attention' BEGIN SELECT RAISE(ABORT, 'injected attention
 	}
 }
 
+func TestTerminalPollOwnerSurvivesAdmissionAndCredentialFailures(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx, repository, versionID, now, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(time.Second), GitHubPollFailureRetryable, "", "poll-lease", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverableLeased(ctx, repository, now.Add(2*time.Second), "poll-lease", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PauseGatewayWritesForGitHubPollCredential(ctx, repository, "poll-lease", "credential unavailable", now.Add(3*time.Second), now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != GitHubPollFailureUnrecoverable || cursor.RecoveryState != GitHubPollRecoveryConsumed || cursor.RecoveryPlanVersionID != versionID {
+		t.Fatalf("terminal cursor = %#v", cursor)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		found = found || question.VersionID == versionID && question.Kind == "poll_failure"
+	}
+	if !found {
+		t.Fatalf("terminal recovery questions = %#v", questions)
+	}
+}
+
 func TestSchedulerRootUsesConfiguredRootBeforeFirstActivation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

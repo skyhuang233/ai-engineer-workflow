@@ -139,7 +139,7 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
 			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
 		}
-		if errors.Is(err, store.ErrInboxDeliveryPending) {
+		if errors.Is(err, store.ErrDeliveryInProgress) {
 			queued, loadErr := g.Store.DeliveryOutbox(ctx, key)
 			if loadErr == nil && queued.Request.Operation == store.DeliveryProjectInbox {
 				return nil

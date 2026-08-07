@@ -356,6 +356,30 @@ func TestHTTPProjectorAcceptsDurableInboxSerializationContention(t *testing.T) {
 	}
 }
 
+func TestHTTPProjectorAcceptsSameInboxClaimContention(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, queued.IdempotencyKey, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	projector := delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}
+	if err := projector.ProjectWorkflowInbox(ctx, "owner/repo", nil); err != nil {
+		t.Fatalf("same Inbox contention = %v", err)
+	}
+}
+
 func TestGatewayRejectsClaimedInboxWhenCurrentPlanCompletes(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
