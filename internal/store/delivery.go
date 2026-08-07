@@ -534,6 +534,18 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	if err := json.Unmarshal([]byte(raw), &request); err != nil {
 		return DeliveryOutbox{}, err
 	}
+	if request.Operation == DeliveryProjectInbox {
+		var processing int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_outbox
+WHERE idempotency_key != ? AND operation = ? AND state = ?
+AND json_extract(request_json, '$.repository') = ? LIMIT 1`, key, DeliveryProjectInbox, OutboxProcessing, request.Repository).Scan(&processing)
+		if err == nil {
+			return DeliveryOutbox{}, ErrDeliveryInProgress
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return DeliveryOutbox{}, err
+		}
+	}
 	claimedDispatcherToken := ""
 	if request.RunID == "" {
 		var activeDispatcherToken, expiresText string

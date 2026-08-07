@@ -844,6 +844,14 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ct
 }
 
 func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
+	return s.markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, "", now, leaseToken, leaseNow)
+}
+
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
+	return s.markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, recoveryPlanVersionID, now, leaseToken, leaseNow)
+}
+
+func (s *Store) markGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -857,13 +865,14 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLea
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	var recoveryPlanVersionID string
-	err = tx.QueryRowContext(ctx, `SELECT CASE
+	if recoveryPlanVersionID == "" {
+		err = tx.QueryRowContext(ctx, `SELECT CASE
 WHEN failure_kind = ? AND recovery_state IN (?, ?) THEN recovery_plan_version_id
 ELSE '' END
 FROM github_poll_cursors WHERE repository = ?`, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollRecoveryClaimed, repository).Scan(&recoveryPlanVersionID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 	}
 	if err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now); err != nil {
 		return err

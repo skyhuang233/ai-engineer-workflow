@@ -781,6 +781,42 @@ func TestClaimedBootstrapRecoveryResumesExactVersionAfterRestart(t *testing.T) {
 	}
 }
 
+func TestClaimedBootstrapRecoveryPreservesProvenanceWhenRateLimited(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	failedAt := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	versionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	if err := db.RecordGitHubPollFailureWithKind(ctx, repository, failedAt, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+		t.Fatal(err)
+	}
+	now := failedAt.Add(time.Minute)
+	retryAt := now.Add(5 * time.Minute)
+	rateLimit := &apiError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
+	_, err = (Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 1,
+		Now:         func() time.Time { return now },
+	}).PollWithBootstrap(ctx, repository, func(context.Context) error {
+		return rateLimit
+	}, nil)
+	if !errors.Is(err, rateLimit) || errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("rate-limited recovery = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != store.GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != store.GitHubPollRecoveryClaimed || cursor.RecoveryPlanVersionID != versionID || !cursor.NextAttemptAt.Equal(retryAt) {
+		t.Fatalf("deferred recovery cursor = %#v", cursor)
+	}
+}
+
 func TestClaimedBootstrapRecoveryIgnoresUnrelatedProjectingPlan(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -1458,6 +1494,55 @@ func TestBootstrapFailurePreservesAttemptedPlanThroughRecoveryTerminalization(t 
 	}
 	if !foundAttempted {
 		t.Fatalf("workflow questions = %#v, want attempted Plan poll failure", questions)
+	}
+}
+
+func TestMixedBootstrapFailureTerminalizesAttemptedPlan(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	unrelatedVersionID := beginProjectingPollerPlan(t, ctx, db, repository)
+	attemptedVersionID := beginProjectingPollerPlanAt(t, ctx, db, repository, 11, 11, 12, 12)
+	failedAt := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	if err := db.RecordGitHubPollFailure(ctx, repository, failedAt); err != nil {
+		t.Fatal(err)
+	}
+	projectionErr := errors.New("project Plan root: Gateway unavailable")
+	_, err = (Poller{
+		Store:       db,
+		Client:      NewClient("http://example.invalid", "", nil).WithRepositoryOwner("owner"),
+		MaxFailures: 2,
+		Now:         func() time.Time { return failedAt.Add(time.Minute) },
+	}).PollWithBootstrap(ctx, repository, nil, func(context.Context, bool) (BootstrapControlResult, error) {
+		return BootstrapControlResult{AttemptedPlanVersionID: attemptedVersionID}, projectionErr
+	})
+	if !errors.Is(err, projectionErr) || !errors.Is(err, store.ErrNeedsAttention) {
+		t.Fatalf("mixed bootstrap failure = %v", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cursor.NeedsAttention() || cursor.RecoveryPlanVersionID != attemptedVersionID {
+		t.Fatalf("terminal cursor = %#v", cursor)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAttempted := false
+	for _, question := range questions {
+		foundAttempted = foundAttempted || question.VersionID == attemptedVersionID && question.Kind == "poll_failure"
+		if question.VersionID == unrelatedVersionID && question.Kind == "poll_failure" {
+			t.Fatalf("unrelated Plan received recovery question: %#v", question)
+		}
+	}
+	if !foundAttempted {
+		t.Fatalf("workflow questions = %#v", questions)
 	}
 }
 

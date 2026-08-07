@@ -356,6 +356,52 @@ func TestWorkflowInboxProjectionFencesCompleteActivePlanSet(t *testing.T) {
 	}
 }
 
+func TestWorkflowInboxClaimsSerializeRepositoryGenerations(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	first, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "needs_attention", "retry the ticket", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.QueueWorkflowInboxProjection(ctx, repository, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.IdempotencyKey == second.IdempotencyKey || first.Request.InboxProjectionGeneration >= second.Request.InboxProjectionGeneration {
+		t.Fatalf("projection generations = %#v then %#v", first.Request, second.Request)
+	}
+	firstClaim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, second.IdempotencyKey, now.Add(2*time.Second)); !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("concurrent Inbox generation claim = %v, want in progress", err)
+	}
+	if err := db.FinishDeliveryOutbox(ctx, first.IdempotencyKey, firstClaim.ClaimToken, OutboxSucceeded, "", now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, second.IdempotencyKey, now.Add(4*time.Second)); err != nil {
+		t.Fatalf("next Inbox generation claim = %v", err)
+	}
+}
+
 func TestWorkflowInboxAdmissionPersistsOnlyActiveQuestions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

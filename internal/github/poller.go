@@ -568,12 +568,23 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 	if errors.As(cause, &githubError) && githubError.RetryAt.After(now) {
 		var updated store.GitHubPollCursor
 		var err error
+		if recoveryPlanVersionID != "" {
+			cursor, cursorErr := p.Store.GitHubPollCursor(persistenceCtx, repository)
+			if cursorErr != nil {
+				return PollResult{}, errors.Join(cause, cursorErr)
+			}
+			if cursor.ConsecutiveFailures >= p.maxFailures() && cursor.FailureKind == store.GitHubPollFailurePreActivationInboxConflict &&
+				(cursor.RecoveryState == store.GitHubPollRecoveryAvailable || cursor.RecoveryState == store.GitHubPollRecoveryClaimed) && cursor.RecoveryPlanVersionID == recoveryPlanVersionID {
+				_, err = p.Store.DeferGitHubPollBootstrapRecoveryLeased(persistenceCtx, repository, githubError.RetryAt, now, leaseToken, p.now())
+				return PollResult{}, errors.Join(cause, err)
+			}
+		}
 		updated, err = p.Store.DeferGitHubPollWithCursorLeased(persistenceCtx, repository, githubError.RetryAt, now, leaseToken, p.now())
 		if err != nil {
 			return PollResult{}, errors.Join(cause, err)
 		}
 		if updated.ConsecutiveFailures >= p.maxFailures() {
-			return PollResult{}, p.finishExhaustedFailure(persistenceCtx, repository, now, cause)
+			return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
 		}
 		return PollResult{}, cause
 	}
@@ -598,7 +609,7 @@ func (p Poller) recordFailureWithKind(ctx context.Context, repository string, no
 				return PollResult{}, errors.Join(cause, consumeErr)
 			}
 		}
-		return PollResult{}, p.finishExhaustedFailure(persistenceCtx, repository, now, cause)
+		return PollResult{}, p.terminalFailureForPlan(persistenceCtx, repository, recoveryPlanVersionID, now, cause)
 	}
 	return PollResult{}, cause
 }
@@ -616,6 +627,10 @@ func isPollCredentialFailure(err error) bool {
 }
 
 func (p Poller) terminalFailure(ctx context.Context, repository string, now time.Time, causes ...error) error {
+	return p.terminalFailureForPlan(ctx, repository, "", now, causes...)
+}
+
+func (p Poller) terminalFailureForPlan(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, causes ...error) error {
 	persistenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	result := errors.Join(causes...)
@@ -623,7 +638,7 @@ func (p Poller) terminalFailure(ctx context.Context, repository string, now time
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	attentionErr := p.Store.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(persistenceCtx, repository, now, leaseToken, p.now())
+	attentionErr := p.Store.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(persistenceCtx, repository, recoveryPlanVersionID, now, leaseToken, p.now())
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
 		return result
