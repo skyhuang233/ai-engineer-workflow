@@ -3,6 +3,7 @@ package delivery_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1111,6 +1112,37 @@ func TestGatewayDispatchReportsTerminalUncertainInboxRecoveryKey(t *testing.T) {
 	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
 	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), queued.IdempotencyKey) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
 		t.Fatalf("terminal uncertain Inbox dispatch = %v", err)
+	}
+}
+
+func TestGatewayPreservesUncertainInboxFenceWhenReconciliationIsRejected(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 45, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{observeErrs: []error{fmt.Errorf("%w: owner guard changed", store.ErrDeliveryRejected)}}, Now: func() time.Time { return now }}
+	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
+		t.Fatalf("reconciliation rejection = %v", err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != store.OutboxRejected || !outbox.Uncertain || !strings.Contains(outbox.LastError, queued.IdempotencyKey) {
+		t.Fatalf("rejected uncertain outbox = %#v", outbox)
 	}
 }
 

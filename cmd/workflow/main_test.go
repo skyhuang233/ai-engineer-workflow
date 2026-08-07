@@ -37,6 +37,17 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 	}
 }
 
+func TestShouldLogNeedsAttentionErrorWithInboxRecoveryCommand(t *testing.T) {
+	plain := fmt.Errorf("poll exhausted: %w", store.ErrNeedsAttention)
+	if shouldLogNeedsAttentionError(plain) {
+		t.Fatal("plain Needs Attention error should remain suppressed")
+	}
+	actionable := errors.Join(plain, errors.New("workflow recover-inbox-delivery --repository owner/repo --delivery inbox-key"))
+	if !shouldLogNeedsAttentionError(actionable) {
+		t.Fatal("uncertain Inbox recovery command should be logged")
+	}
+}
+
 func TestGatewayControlURLUsesHostOverrideAndPreservesLegacyFallback(t *testing.T) {
 	workerURL := "http://host.docker.internal:8787"
 	if got := gatewayControlURL(workerURL, ""); got != workerURL {

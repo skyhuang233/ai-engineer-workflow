@@ -632,6 +632,10 @@ func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true, time.Time{})
 }
 
+func (s *Store) RejectDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxRejected, lastError, uncertain, now, true, time.Time{})
+}
+
 func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
 	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true, time.Time{})
 }
@@ -718,7 +722,12 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	if state == OutboxSucceeded || state == OutboxRejected {
 		completed = formatTimestamp(now)
 		if state == OutboxRejected {
-			if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
+			lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
+			if request.Operation == DeliveryProjectInbox && uncertain {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
+					return err
+				}
+			} else if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
 				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, lastError, now); err != nil {
 					return err
 				}

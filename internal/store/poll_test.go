@@ -47,6 +47,30 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	}
 }
 
+func TestGitHubPollFailureAdoptsVerifiedBootstrapProvenanceAfterGenericFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 6, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailureRetryable, "", "lease", now); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(time.Second), GitHubPollFailurePreActivationInboxConflict, "version-current", "lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 2 || cursor.FailureKind != GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != GitHubPollRecoveryAvailable || cursor.RecoveryPlanVersionID != "version-current" {
+		t.Fatalf("bootstrap cursor = %#v", cursor)
+	}
+}
+
 func TestGitHubPollLeaseAtomicallyFencesRepositoryReadiness(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

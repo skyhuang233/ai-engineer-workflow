@@ -651,6 +651,9 @@ func runPollGitHub(args []string) {
 				return controlResult, claimErr
 			}
 		})
+		if shouldLogNeedsAttentionError(err) {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
 			err = persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC())
 			fmt.Fprintln(os.Stderr, err)
@@ -680,6 +683,10 @@ func runPollGitHub(args []string) {
 		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func shouldLogNeedsAttentionError(err error) bool {
+	return errors.Is(err, store.ErrNeedsAttention) && strings.Contains(err.Error(), "workflow recover-inbox-delivery")
 }
 
 func gatewayControlURL(workerURL, controlURL string) string {

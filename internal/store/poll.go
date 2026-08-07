@@ -1619,9 +1619,9 @@ func (s *Store) advanceGitHubPollFailureLeased(ctx context.Context, repository s
 	if existingKind == GitHubPollFailureUnrecoverable && existingRecovery == GitHubPollRecoveryConsumed {
 		kind = GitHubPollFailureUnrecoverable
 		recoveryPlanVersionID = existingRecoveryPlanVersionID
-	} else if kind == GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" && (previousFailures == 0 || existingKind == GitHubPollFailurePreActivationInboxConflict && (existingRecovery == GitHubPollRecoveryAvailable || existingRecovery == GitHubPollRecoveryClaimed) && existingRecoveryPlanVersionID == recoveryPlanVersionID) {
+	} else if kind == GitHubPollFailurePreActivationInboxConflict && recoveryPlanVersionID != "" && (previousFailures == 0 || existingKind == GitHubPollFailureRetryable || existingKind == GitHubPollFailurePreActivationInboxConflict && (existingRecovery == GitHubPollRecoveryAvailable || existingRecovery == GitHubPollRecoveryClaimed) && existingRecoveryPlanVersionID == recoveryPlanVersionID) {
 		recovery = GitHubPollRecoveryAvailable
-		if existingRecovery == GitHubPollRecoveryClaimed {
+		if existingKind == GitHubPollFailurePreActivationInboxConflict && existingRecovery == GitHubPollRecoveryClaimed && existingRecoveryPlanVersionID == recoveryPlanVersionID {
 			recovery = GitHubPollRecoveryClaimed
 		}
 	} else {

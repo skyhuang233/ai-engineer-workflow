@@ -70,7 +70,7 @@ type gatewayStore interface {
 	CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error
 	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time) error
 	RecordDeliveryAudit(context.Context, store.DeliveryRequest, string, string, time.Time) error
-	FinishDeliveryOutbox(context.Context, string, string, string, string, time.Time) error
+	RejectDeliveryOutbox(context.Context, string, string, string, bool, time.Time) error
 	DeferDeliveryOutbox(context.Context, string, string, string, bool, time.Time, time.Time) error
 	PauseGatewayWrites(context.Context, string, time.Time) error
 }
@@ -474,7 +474,7 @@ func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", cause.Error(), g.now())
-	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, cause.Error(), g.now())
+	err := g.Store.RejectDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, g.now())
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
