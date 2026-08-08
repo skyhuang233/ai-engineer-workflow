@@ -114,7 +114,7 @@ type Poller struct {
 	InboxProjector        WorkflowInboxProjector
 	MaxFailures           int
 	MaxWorkerAttempts     int
-	AdmitTicket           func(context.Context, string, int64) error
+	ProvisionSession      store.SessionProvisioner
 	MaxParallelRuns       int
 	FullReconcileInterval time.Duration
 }
@@ -816,12 +816,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 				if err := p.renewPollLease(ctx, repository); err != nil {
 					return PollResult{}, err
 				}
-				if p.AdmitTicket != nil {
-					if err := p.AdmitTicket(ctx, delivery.VersionID, delivery.IssueID); err != nil {
-						return PollResult{}, err
-					}
-				}
-				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
+				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts, p.ProvisionSession)
 				if claimErr == nil {
 					if err := p.LaunchReview(ctx, claim, prompt); err != nil {
 						return PollResult{}, err

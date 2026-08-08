@@ -10,15 +10,15 @@ import (
 )
 
 type Dispatcher struct {
-	Store           *store.Store
-	Reader          plan.SnapshotReader
-	Projector       plan.RootProjector
-	MaxParallelRuns int
-	LeaseTTL        time.Duration
-	Now             func() time.Time
-	Recovery        RecoveryInspector
-	HostPressure    HostPressureInspector
-	AdmitTicket     func(context.Context, string, int64) error
+	Store            *store.Store
+	Reader           plan.SnapshotReader
+	Projector        plan.RootProjector
+	MaxParallelRuns  int
+	LeaseTTL         time.Duration
+	Now              func() time.Time
+	Recovery         RecoveryInspector
+	HostPressure     HostPressureInspector
+	ProvisionSession store.SessionProvisioner
 }
 
 type RecoveryInspector interface {
@@ -61,30 +61,14 @@ func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ti
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	if d.AdmitTicket != nil {
-		selectedTicketID := ticketID
-		if selectedTicketID == 0 {
-			frontier, err := d.Store.ReadyFrontier(ctx, version.ID, d.MaxParallelRuns, now)
-			if err != nil {
-				return store.TicketClaim{}, err
-			}
-			if len(frontier) == 0 {
-				return store.TicketClaim{}, store.ErrNoReadyTickets
-			}
-			selectedTicketID = frontier[0].IssueID
-		}
-		if err := d.AdmitTicket(ctx, version.ID, selectedTicketID); err != nil {
-			return store.TicketClaim{}, err
-		}
-		ticketID = selectedTicketID
-	}
 	claim, err := d.Store.ClaimReady(ctx, store.ClaimRequest{
-		VersionID:       version.ID,
-		TicketID:        ticketID,
-		Owner:           owner,
-		MaxParallelRuns: d.MaxParallelRuns,
-		LeaseTTL:        d.LeaseTTL,
-		Now:             now,
+		VersionID:        version.ID,
+		TicketID:         ticketID,
+		Owner:            owner,
+		MaxParallelRuns:  d.MaxParallelRuns,
+		LeaseTTL:         d.LeaseTTL,
+		Now:              now,
+		ProvisionSession: d.ProvisionSession,
 	})
 	if err != nil {
 		return store.TicketClaim{}, err

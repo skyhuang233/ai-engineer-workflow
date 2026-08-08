@@ -39,26 +39,52 @@ func (m WorkspaceManager) AdmitCodexAuthentication(ctx context.Context, db *stor
 	}
 	session, err := db.TicketSession(ctx, versionID, ticketID)
 	if err == nil {
-		statePath := session.CodexStatePath
-		if statePath == "" && session.SessionID != "" {
-			statePath = filepath.Join(m.CodexStateRoot, session.SessionID)
-		}
-		if statePath != "" {
-			statePath, err = managedPath(m.CodexStateRoot, statePath)
-			if err != nil {
-				return err
-			}
-			authPath := filepath.Join(statePath, codexauth.FileName)
-			if _, statErr := os.Stat(authPath); statErr == nil {
-				return codexauth.ValidateChatGPT(authPath)
-			} else if !errors.Is(statErr, os.ErrNotExist) {
-				return fmt.Errorf("inspect Ticket Session Codex authentication cache: %w", statErr)
-			}
-		}
+		return m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: session.SessionID, Existing: true, WorkspacePath: session.WorkspacePath, CodexStatePath: session.CodexStatePath})
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
+	if _, _, err := m.sessionPaths("admission"); err != nil {
+		return err
+	}
 	return codexauth.ValidateChatGPT(m.CodexAuthFile)
+}
+
+func (m WorkspaceManager) ProvisionCodexAuthentication(ctx context.Context, sessionID string, existing bool) error {
+	return m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: sessionID, Existing: existing})
+}
+
+func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning store.SessionProvisioning) error {
+	workspacePath, state, err := m.sessionPaths(provisioning.SessionID)
+	if err != nil {
+		return err
+	}
+	for _, persisted := range []struct {
+		name     string
+		value    string
+		expected string
+	}{{name: "Ticket Workspace", value: provisioning.WorkspacePath, expected: workspacePath}, {name: "Codex state", value: provisioning.CodexStatePath, expected: state}} {
+		if persisted.value == "" {
+			continue
+		}
+		canonical, err := canonicalPath(persisted.value)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(canonical, persisted.expected) {
+			return fmt.Errorf("persisted %s path does not match configured Session path", persisted.name)
+		}
+	}
+	authPath := filepath.Join(state, codexauth.FileName)
+	if provisioning.Existing {
+		if err := codexauth.ValidateChatGPT(authPath); err != nil {
+			return errors.New("Ticket Session Codex authentication cache is unavailable")
+		}
+		return nil
+	}
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		return fmt.Errorf("create Ticket Session Codex state: %w", err)
+	}
+	return codexauth.SeedNew(m.CodexAuthFile, state)
 }
 
 func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (bool, error) {
@@ -142,6 +168,59 @@ func managedPath(root, target string) (string, error) {
 	return target, nil
 }
 
+func canonicalPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	probe := filepath.Clean(absolute)
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return filepath.Clean(absolute), nil
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
+}
+
+func pathsOverlap(first, second string) bool {
+	contains := func(parent, child string) bool {
+		relative, err := filepath.Rel(parent, child)
+		return err == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+	}
+	return contains(first, second) || contains(second, first)
+}
+
+func (m WorkspaceManager) sessionPaths(sessionID string) (string, string, error) {
+	if sessionID == "" || m.RootDir == "" || m.CodexStateRoot == "" {
+		return "", "", errors.New("workspace configuration is incomplete")
+	}
+	workspacePath, err := canonicalPath(filepath.Join(m.RootDir, sessionID))
+	if err != nil {
+		return "", "", err
+	}
+	statePath, err := canonicalPath(filepath.Join(m.CodexStateRoot, sessionID))
+	if err != nil {
+		return "", "", err
+	}
+	if pathsOverlap(workspacePath, statePath) {
+		return "", "", errors.New("Ticket Workspace and Codex state paths overlap")
+	}
+	return workspacePath, statePath, nil
+}
+
 func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepository, branch string) (workspace, error) {
 	if m.RootDir == "" || m.CodexStateRoot == "" || sessionID == "" || sourceRepository == "" || branch == "" {
 		return workspace{}, errors.New("workspace configuration is incomplete")
@@ -150,8 +229,10 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 	if err != nil {
 		return workspace{}, err
 	}
-	path := filepath.Join(m.RootDir, sessionID)
-	state := filepath.Join(m.CodexStateRoot, sessionID)
+	path, state, err := m.sessionPaths(sessionID)
+	if err != nil {
+		return workspace{}, err
+	}
 	if err := os.MkdirAll(m.RootDir, 0o755); err != nil {
 		return workspace{}, err
 	}
@@ -181,11 +262,6 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 	}
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		return workspace{}, err
-	}
-	if m.CodexAuthFile != "" {
-		if err := codexauth.Seed(m.CodexAuthFile, state); err != nil {
-			return workspace{}, err
-		}
 	}
 	base, err := gitOutput(ctx, path, "rev-parse", "HEAD")
 	if err != nil {
@@ -262,20 +338,26 @@ func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit, bra
 	return strings.TrimSpace(commit), strings.TrimSpace(branch), strings.TrimSpace(status) == "", nil
 }
 
-func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, baseCommit, output, runErr string) (string, error) {
+func (m WorkspaceManager) authenticationRedactor(ws workspace) (codexauth.Redactor, error) {
+	if m.CodexAuthFile == "" {
+		return codexauth.Redactor{}, nil
+	}
+	return codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
+}
+
+func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, baseCommit, output, runErr string, redactor *codexauth.Redactor) (string, error) {
 	dir := filepath.Join(filepath.Dir(ws.CodexState), "diagnostics", runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, "report.txt")
-	redactor, err := codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
-	if err != nil && (!errors.Is(err, os.ErrNotExist) || m.CodexAuthFile != "") {
+	if redactor == nil {
 		body := "error: worker failed; detailed evidence omitted because Codex authentication could not be safely redacted\n" +
 			"head: unavailable\n" +
 			"base: " + baseCommit + "\n" +
 			"evidence: detailed evidence omitted\n"
 		if writeErr := os.WriteFile(path, []byte(body), 0o600); writeErr != nil {
-			return "", errors.Join(fmt.Errorf("prepare diagnostic credential redaction: %w", err), writeErr)
+			return "", writeErr
 		}
 		return path, nil
 	}
@@ -297,10 +379,10 @@ func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, b
 	if err := os.WriteFile(filepath.Join(dir, "head.txt"), redactor.Bytes([]byte(strings.TrimSpace(head)+"\nbase: "+baseCommit+"\n")), 0o600); err != nil {
 		return "", err
 	}
-	if err := m.copyResidue(ctx, ws, dir, false, redactor); err != nil {
+	if err := m.copyResidue(ctx, ws, dir, false, *redactor); err != nil {
 		return "", err
 	}
-	if err := m.copyResidue(ctx, ws, dir, true, redactor); err != nil {
+	if err := m.copyResidue(ctx, ws, dir, true, *redactor); err != nil {
 		return "", err
 	}
 	body := "error: " + runErr + "\nhead: " + strings.TrimSpace(head) + "\nbase: " + baseCommit + "\nstatus:\n" + status + "\noutput:\n" + output + "\nevidence: revision.patch, head.txt, residue/, and ignored/"

@@ -87,14 +87,32 @@ func (r Redactor) String(input string) string {
 	return string(r.Bytes([]byte(input)))
 }
 
+func (r Redactor) Merge(other Redactor) Redactor {
+	values := make([][]byte, 0, len(r.values)+len(other.values))
+	values = append(values, r.values...)
+	values = append(values, other.values...)
+	return Redactor{values: values}
+}
+
 // Seed copies the trusted host credential cache into a new CODEX_HOME. An
 // existing session cache is authoritative because Codex may have refreshed it.
 func Seed(source, codexHome string) error {
+	return seed(source, codexHome, true)
+}
+
+func SeedNew(source, codexHome string) error {
+	return seed(source, codexHome, false)
+}
+
+func seed(source, codexHome string, preserveExisting bool) error {
 	if !filepath.IsAbs(codexHome) {
 		return errors.New("Codex home must be an absolute path")
 	}
 	destination := filepath.Join(codexHome, FileName)
 	if info, err := os.Stat(destination); err == nil {
+		if !preserveExisting {
+			return errors.New("new Ticket Session Codex authentication cache already exists")
+		}
 		if !info.Mode().IsRegular() {
 			return errors.New("Ticket Session Codex authentication cache must be a regular file")
 		}
@@ -127,8 +145,10 @@ func Seed(source, codexHome string) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close Ticket Session Codex authentication cache: %w", err)
 	}
-	if err := os.Link(temporaryPath, destination); errors.Is(err, os.ErrExist) {
+	if err := os.Link(temporaryPath, destination); errors.Is(err, os.ErrExist) && preserveExisting {
 		return ValidateChatGPT(destination)
+	} else if errors.Is(err, os.ErrExist) {
+		return errors.New("new Ticket Session Codex authentication cache already exists")
 	} else if err != nil {
 		return fmt.Errorf("publish Ticket Session Codex authentication cache: %w", err)
 	}

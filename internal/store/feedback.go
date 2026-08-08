@@ -65,7 +65,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(version_id, issue_id, source, event_id)
 	return inserted, nil
 }
 
-func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxParallelRuns, maxAttempts int) (TicketClaim, string, error) {
+func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxParallelRuns, maxAttempts int, provisionSession ...SessionProvisioner) (TicketClaim, string, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if versionID == "" || issueID == 0 || maxParallelRuns <= 0 {
@@ -89,16 +89,16 @@ func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string,
 	} else if frozen {
 		return TicketClaim{}, "", ErrNotReady
 	}
-	var sessionID, owner, sessionState, runtimeState, currentRunID string
+	var sessionID, owner, sessionState, runtimeState, currentRunID, workspacePath, codexStatePath string
 	var ticketNumber int64
 	var ticketTitle string
 	var generation, recoveryEpoch int64
 	var consecutiveFailures int
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_run_id, s.current_lease_generation, rt.state, t.issue_number, t.title, s.consecutive_failures
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_run_id, s.current_lease_generation, rt.state, t.issue_number, t.title, s.consecutive_failures, s.workspace_path, s.codex_state_path
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-	WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &currentRunID, &generation, &runtimeState, &ticketNumber, &ticketTitle, &consecutiveFailures)
+	WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &currentRunID, &generation, &runtimeState, &ticketNumber, &ticketTitle, &consecutiveFailures, &workspacePath, &codexStatePath)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, "", ErrNotFound
 	}
@@ -214,6 +214,12 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 			return TicketClaim{}, "", err
 		}
 		return TicketClaim{}, "", ErrNotReady
+	}
+	if len(provisionSession) > 0 && provisionSession[0] != nil {
+		provisioning := SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath}
+		if err := provisionSession[0](ctx, provisioning); err != nil {
+			return TicketClaim{}, "", err
+		}
 	}
 	runID, err := randomID("run-")
 	if err != nil {

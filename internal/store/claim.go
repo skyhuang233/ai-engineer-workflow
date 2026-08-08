@@ -13,14 +13,24 @@ import (
 )
 
 type ClaimRequest struct {
-	VersionID       string
-	TicketID        int64
-	Owner           string
-	MaxParallelRuns int
-	MaxAttempts     int
-	LeaseTTL        time.Duration
-	Now             time.Time
+	VersionID        string
+	TicketID         int64
+	Owner            string
+	MaxParallelRuns  int
+	MaxAttempts      int
+	LeaseTTL         time.Duration
+	Now              time.Time
+	ProvisionSession SessionProvisioner
 }
+
+type SessionProvisioning struct {
+	SessionID      string
+	Existing       bool
+	WorkspacePath  string
+	CodexStatePath string
+}
+
+type SessionProvisioner func(context.Context, SessionProvisioning) error
 
 const DefaultMaxWorkerAttempts = 3
 
@@ -133,12 +143,14 @@ func (s *Store) ClaimReady(ctx context.Context, request ClaimRequest) (TicketCla
 		}
 	}
 
-	var sessionID, currentOwner, sessionState, currentRunID string
+	var sessionID, currentOwner, sessionState, currentRunID, workspacePath, codexStatePath string
 	var currentGeneration, recoveryEpoch int64
-	err = tx.QueryRowContext(ctx, `SELECT session_id, owner, state, COALESCE(current_run_id, ''), current_lease_generation
+	existingSession := true
+	err = tx.QueryRowContext(ctx, `SELECT session_id, owner, state, COALESCE(current_run_id, ''), current_lease_generation, workspace_path, codex_state_path
 FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, request.VersionID, selected.IssueID).
-		Scan(&sessionID, &currentOwner, &sessionState, &currentRunID, &currentGeneration)
+		Scan(&sessionID, &currentOwner, &sessionState, &currentRunID, &currentGeneration, &workspacePath, &codexStatePath)
 	if errors.Is(err, sql.ErrNoRows) {
+		existingSession = false
 		sessionID, err = randomID("ts-")
 		if err != nil {
 			return TicketClaim{}, err
@@ -235,6 +247,12 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 			return TicketClaim{}, err
 		}
 		return TicketClaim{}, ErrNotReady
+	}
+	if request.ProvisionSession != nil {
+		provisioning := SessionProvisioning{SessionID: sessionID, Existing: existingSession, WorkspacePath: workspacePath, CodexStatePath: codexStatePath}
+		if err := request.ProvisionSession(ctx, provisioning); err != nil {
+			return TicketClaim{}, err
+		}
 	}
 	runID, err := randomID("run-")
 	if err != nil {

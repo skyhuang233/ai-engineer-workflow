@@ -153,9 +153,9 @@ func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
 	dispatcher := scheduler.Dispatcher{
 		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{body: snapshot.Root.Body},
 		MaxParallelRuns: 1, LeaseTTL: time.Minute,
-		AdmitTicket: func(_ context.Context, versionID string, ticketID int64) error {
-			if versionID != version.ID || ticketID != 1 {
-				t.Fatalf("admission target = %q/%d, want %q/1", versionID, ticketID, version.ID)
+		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) error {
+			if provisioning.SessionID == "" || provisioning.Existing {
+				t.Fatalf("provisioning target = %q existing=%t, want a new Session", provisioning.SessionID, provisioning.Existing)
 			}
 			return admissionErr
 		},

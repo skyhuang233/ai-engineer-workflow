@@ -370,13 +370,10 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	if err := workspaceManager.AdmitCodexAuthentication(ctx, db, version.ID, *ticketID); err != nil {
-		fail(err)
-	}
 	if err := syncReviewFeedback(ctx, db, client, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
 		fail(err)
 	}
-	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, config.Runtime.MaxWorkerAttempts, time.Now().UTC())
+	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, config.Runtime.MaxWorkerAttempts, time.Now().UTC(), workspaceManager.ProvisionCodexSession)
 	if err != nil {
 		fail(err)
 	}
@@ -430,7 +427,7 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 	return err
 }
 
-func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, maxAttempts int, now time.Time) (store.TicketClaim, string, error) {
+func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, maxAttempts int, now time.Time, provisionSession ...store.SessionProvisioner) (store.TicketClaim, string, error) {
 	claim, err := db.CurrentClaim(ctx, versionID, ticketID)
 	if err == nil {
 		return claim, "", nil
@@ -438,7 +435,7 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 	if !errors.Is(err, store.ErrNotFound) {
 		return store.TicketClaim{}, "", err
 	}
-	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now, 1, maxAttempts)
+	revision, revisionPrompt, revisionErr := db.ClaimQueuedReviewRevision(ctx, versionID, ticketID, 30*time.Minute, now, 1, maxAttempts, provisionSession...)
 	if revisionErr == nil {
 		return revision, revisionPrompt, nil
 	}
@@ -450,18 +447,26 @@ func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, 
 		return store.TicketClaim{}, "", ownerErr
 	}
 	replacement, replacementErr := db.ClaimReady(ctx, store.ClaimRequest{
-		VersionID:       versionID,
-		TicketID:        ticketID,
-		Owner:           owner,
-		MaxParallelRuns: 1,
-		MaxAttempts:     maxAttempts,
-		LeaseTTL:        30 * time.Minute,
-		Now:             now,
+		VersionID:        versionID,
+		TicketID:         ticketID,
+		Owner:            owner,
+		MaxParallelRuns:  1,
+		MaxAttempts:      maxAttempts,
+		LeaseTTL:         30 * time.Minute,
+		Now:              now,
+		ProvisionSession: firstProvisioner(provisionSession),
 	})
 	if replacementErr != nil {
 		return store.TicketClaim{}, "", replacementErr
 	}
 	return replacement, "", nil
+}
+
+func firstProvisioner(provisioners []store.SessionProvisioner) store.SessionProvisioner {
+	if len(provisioners) == 0 {
+		return nil
+	}
+	return provisioners[0]
 }
 
 func runReconcileDelivered(args []string) {
@@ -584,9 +589,7 @@ func runPollGitHub(args []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
-		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns, AdmitTicket: func(ctx context.Context, versionID string, ticketID int64) error {
-			return workspaceManager.AdmitCodexAuthentication(ctx, db, versionID, ticketID)
-		}}
+		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns, ProvisionSession: workspaceManager.ProvisionCodexSession}
 		leasedCtx, releasePollLease, err := poller.AcquireLease(ctx, *repository)
 		if err != nil {
 			if errors.Is(err, store.ErrNotReady) {
@@ -649,9 +652,7 @@ func runPollGitHub(args []string) {
 			if err != nil {
 				return controlResult, err
 			}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}, AdmitTicket: func(ctx context.Context, versionID string, ticketID int64) error {
-				return workspaceManager.AdmitCodexAuthentication(ctx, db, versionID, ticketID)
-			}}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}, ProvisionSession: workspaceManager.ProvisionCodexSession}
 			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
 				return controlResult, err
 			}

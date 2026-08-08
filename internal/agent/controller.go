@@ -10,6 +10,7 @@ import (
 	"time"
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	toon "github.com/toon-format/toon-go"
@@ -57,6 +58,8 @@ type Candidate struct {
 	StructuredOutput []byte
 }
 
+const codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
+
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
 	if c.Store == nil || c.Runtime == nil {
 		return Candidate{}, errors.New("agent controller dependencies are incomplete")
@@ -80,15 +83,19 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return Candidate{}, err
 	}
+	preRunRedactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failRunWithRedactor(ctx, request, ws, session, ws.BaseCommit, codexAuthenticationFailure, "", nil)
+	}
 	baseCommit, currentBranch, clean, err := c.Workspace.status(ctx, ws)
 	if err != nil {
 		return Candidate{}, err
 	}
 	if currentBranch != ws.Branch {
-		return c.failRun(ctx, request, ws, session, baseCommit, "workspace branch changed before the worker started", "")
+		return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, "workspace branch changed before the worker started", "", &preRunRedactor)
 	}
 	if !clean {
-		return c.failRun(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "")
+		return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, "workspace was not clean before the worker started", "", &preRunRedactor)
 	}
 	imageDigest, toolVersions, err := c.activeWorkerRuntime(ctx)
 	if err != nil {
@@ -128,49 +135,54 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	defer cancelRun()
 	handoffCtx := context.WithoutCancel(ctx)
 	output := runtimeOutput(result)
+	postRunRedactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, codexAuthenticationFailure, "", nil)
+	}
+	runRedactor := preRunRedactor.Merge(postRunRedactor)
 	if err := c.Store.RecordWorkerAudit(handoffCtx, store.WorkerAudit{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, ContainerID: result.ContainerID, ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions}); err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
 	codexOutput := runtimeStdout(result)
 	codexSessionID, _ := parseSessionID(codexOutput, session.CodexSessionID)
 	if codexSessionID != "" && codexSessionID != session.CodexSessionID {
 		if err := c.Store.RecordCodexSession(handoffCtx, request.Claim.RunID, request.Claim.LeaseToken, codexSessionID); err != nil {
-			return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
+			return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 		}
 		session.CodexSessionID = codexSessionID
 	}
 	if runErr != nil || result.ExitCode != 0 {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(output), &runRedactor)
 	}
 	commit, currentBranch, clean, err := c.Workspace.status(handoffCtx, ws)
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
 	if currentBranch != ws.Branch {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, fmt.Sprintf("worker changed workspace branch to %q", currentBranch), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, fmt.Sprintf("worker changed workspace branch to %q", currentBranch), string(output), &runRedactor)
 	}
 	if !clean {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker completed with a dirty workspace", string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "worker completed with a dirty workspace", string(output), &runRedactor)
 	}
 	codexSessionID, structured, err := parseOutput(codexOutput, session.CodexSessionID)
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
 	if commit == baseCommit {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output), &runRedactor)
 	}
 	var candidateOutput struct {
 		Commit string `json:"commit"`
 	}
 	if err := json.Unmarshal(structured, &candidateOutput); err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(output), &runRedactor)
 	}
 	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output), &runRedactor)
 	}
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, "Gateway URL is required before candidate acceptance", string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Gateway URL is required before candidate acceptance", string(output), &runRedactor)
 	}
 	publication := request.Publication
 	if publication.Body == "" {
@@ -178,7 +190,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, ImageDigest: imageDigest, ToolVersions: toolVersions, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
 	if err != nil {
-		return c.failRun(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output))
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
 	session.AcceptedCommit = commit
 	session.AcceptedCandidateRunID = request.Claim.RunID
@@ -277,6 +289,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
+	preDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
+	}
 	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, c.now()); err != nil {
 		if errors.Is(err, store.ErrWorkerLaunched) {
 			return err
@@ -288,11 +304,16 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
+	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
+	}
+	deliveryRedactor := preDeliveryRedactor.Merge(postDeliveryRedactor)
 	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(errorText(deliveryErr, deliveryResult.ExitCode)))
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(errorText(deliveryErr, deliveryResult.ExitCode))))
 	}
 	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(err.Error())))
 	}
 	if err := c.Store.CompleteDeliveryController(finalizationCtx, deliveryClaim, c.now()); err != nil {
 		return err
@@ -357,7 +378,19 @@ func parseDeliveryTOON(output []byte) error {
 }
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {
-	diagnostic, diagnosticErr := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, baseCommit, output, reason)
+	redactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, reason, "", nil)
+	}
+	return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, reason, output, &redactor)
+}
+
+func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string, redactor *codexauth.Redactor) (Candidate, error) {
+	safeReason := codexAuthenticationFailure
+	if redactor != nil {
+		safeReason = redactor.String(reason)
+	}
+	diagnostic, diagnosticErr := c.Workspace.diagnostic(ctx, ws, request.Claim.RunID, baseCommit, output, safeReason, redactor)
 	restoreCommit := session.AcceptedCommit
 	if restoreCommit == "" {
 		restoreCommit = baseCommit
@@ -367,9 +400,19 @@ func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspac
 	})
 	var recordErr error
 	if diagnosticErr == nil {
-		recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: reason, Now: c.now()})
+		recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: safeReason, Now: c.now()})
 	}
-	return Candidate{}, errors.Join(errors.New(reason), diagnosticErr, restoreErr, recordErr)
+	return Candidate{}, errors.Join(errors.New(safeReason), redactFailureError(diagnosticErr, redactor), redactFailureError(restoreErr, redactor), redactFailureError(recordErr, redactor))
+}
+
+func redactFailureError(err error, redactor *codexauth.Redactor) error {
+	if err == nil {
+		return nil
+	}
+	if redactor == nil {
+		return errors.New("failure detail omitted because Codex authentication could not be safely redacted")
+	}
+	return errors.New(redactor.String(err.Error()))
 }
 
 func errorText(err error, exitCode int) string {
