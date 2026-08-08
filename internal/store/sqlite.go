@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 39
+	latestSchemaVersion = 40
 )
 
 var (
@@ -1074,6 +1074,32 @@ SET plan_version_ids_json = COALESCE((
 			return fmt.Errorf("migration 39: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (39, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 40 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS quality_gate_questions (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    issue_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL REFERENCES ticket_sessions(session_id),
+    delivery_run_id TEXT NOT NULL REFERENCES worker_runs(run_id),
+    source TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    finding_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL CHECK (action IN ('ask-user', 'skip')),
+    reason TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    allowed_answers_json TEXT NOT NULL,
+	consumed_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 40: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS quality_gate_questions_fingerprint_idx ON quality_gate_questions(version_id, issue_id, fingerprint)`); err != nil {
+			return fmt.Errorf("migration 40: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (40, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

@@ -278,6 +278,15 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
+	if gate, answer, err := c.Store.DeliveryQualityGateAnswer(ctx, session.SessionID); err == nil {
+		deliveryEnvironment["NO_MISTAKES_GATE_ID"] = gate.GateID
+		deliveryEnvironment["NO_MISTAKES_GATE_FINDING_ID"] = gate.FindingID
+		deliveryEnvironment["NO_MISTAKES_GATE_ANSWER"] = answer
+		deliveryEnvironment["NO_MISTAKES_GATE_ACTION"] = gate.Action
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("load quality gate answer: %w", err))
+	}
+	deliveryEnvironment["NO_MISTAKES_GATE_ENFORCED"] = "true"
 	deliverySpec := worker.Spec{
 		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
@@ -309,11 +318,19 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
 	deliveryRedactor := preDeliveryRedactor.Merge(postDeliveryRedactor)
-	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
+	if outcome, parseErr := parseDeliveryOutcome(runtimeStdout(deliveryResult)); parseErr == nil && outcome.Gate != nil {
+		if _, err := c.Store.PauseDeliveryControllerForQualityGate(finalizationCtx, deliveryClaim, *outcome.Gate, c.now()); err != nil {
+			return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
+		}
+		return nil
+	} else if deliveryErr != nil || deliveryResult.ExitCode != 0 {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(errorText(deliveryErr, deliveryResult.ExitCode))))
-	}
-	if err := parseDeliveryTOON(runtimeStdout(deliveryResult)); err != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(err.Error())))
+	} else if parseErr != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(parseErr.Error())))
+	} else if outcome.Gate != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New("Delivery Controller reported a human gate without pausing"))
+	} else if !outcome.Passed {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New("Delivery Controller did not pass"))
 	}
 	if err := c.Store.CompleteDeliveryController(finalizationCtx, deliveryClaim, c.now()); err != nil {
 		return err
@@ -356,26 +373,69 @@ func runtimeOutput(result worker.Result) []byte {
 	return append(append([]byte(nil), result.Stdout...), result.Stderr...)
 }
 
-func parseDeliveryTOON(output []byte) error {
+type deliveryOutcome struct {
+	Passed bool
+	Gate   *store.QualityGate
+}
+
+func parseDeliveryOutcome(output []byte) (deliveryOutcome, error) {
 	value, err := toon.Decode(output)
 	if err != nil {
-		return fmt.Errorf("Delivery Controller returned invalid TOON: %w", err)
+		return deliveryOutcome{}, fmt.Errorf("Delivery Controller returned invalid TOON: %w", err)
 	}
 	document, ok := value.(map[string]any)
 	if !ok {
-		return errors.New("Delivery Controller TOON must be an object")
+		return deliveryOutcome{}, errors.New("Delivery Controller TOON must be an object")
 	}
 	run, ok := document["run"].(map[string]any)
 	if !ok {
-		return errors.New("Delivery Controller TOON did not contain a run")
+		return deliveryOutcome{}, errors.New("Delivery Controller TOON did not contain a run")
 	}
-	if status, ok := run["status"].(string); !ok || strings.TrimSpace(status) != "completed" {
-		return errors.New("Delivery Controller TOON did not complete")
+	status, _ := run["status"].(string)
+	if gate, err := parseQualityGate(document); err != nil {
+		return deliveryOutcome{}, err
+	} else if gate != nil {
+		return deliveryOutcome{Gate: gate}, nil
+	}
+	if strings.TrimSpace(status) != "completed" {
+		return deliveryOutcome{}, errors.New("Delivery Controller TOON did not complete")
 	}
 	if outcome, ok := document["outcome"].(string); !ok || (strings.TrimSpace(outcome) != "passed" && strings.TrimSpace(outcome) != "checks-passed") {
-		return errors.New("Delivery Controller TOON did not pass")
+		return deliveryOutcome{}, errors.New("Delivery Controller TOON did not pass")
 	}
-	return nil
+	return deliveryOutcome{Passed: true}, nil
+}
+
+func parseQualityGate(document map[string]any) (*store.QualityGate, error) {
+	value, found := document["gate"]
+	if !found {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("Delivery Controller gate is invalid: %w", err)
+	}
+	var gate struct {
+		ID             string   `json:"id"`
+		Source         string   `json:"source"`
+		FindingID      string   `json:"finding_id"`
+		Action         string   `json:"action"`
+		Reason         string   `json:"reason"`
+		AllowedAnswers []string `json:"allowed_answers"`
+	}
+	if err := json.Unmarshal(encoded, &gate); err != nil {
+		return nil, fmt.Errorf("Delivery Controller gate is invalid: %w", err)
+	}
+	if gate.Action != store.QualityGateAskUser && gate.Action != store.QualityGateSkip {
+		if gate.Action == "auto-fix" && strings.TrimSpace(gate.FindingID) == "" {
+			return nil, errors.New("Delivery Controller auto-fix gate omitted its finding ID")
+		}
+		if gate.Action == "auto-fix" || gate.Action == "no-op" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("Delivery Controller gate has unsupported action %q", gate.Action)
+	}
+	return &store.QualityGate{Source: gate.Source, GateID: gate.ID, FindingID: gate.FindingID, Action: gate.Action, Reason: gate.Reason, AllowedAnswers: gate.AllowedAnswers}, nil
 }
 
 func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string) (Candidate, error) {

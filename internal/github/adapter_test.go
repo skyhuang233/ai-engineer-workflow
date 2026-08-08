@@ -439,7 +439,11 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "workflow-answer:needs-attention-pv-1-1-g1: cancel-plan", "user": map[string]string{"login": "reviewer", "type": "User"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "workflow-answer:needs-attention-pv-1-1-g1: proceed", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 3, "body": "workflow-answer:needs-attention-pv-1-1-g1: cancel-plan", "user": map[string]string{"login": "outsider", "type": "User"}}})
+		case "/repos/owner/repo/collaborators/reviewer":
+			w.WriteHeader(http.StatusNoContent)
+		case "/repos/owner/repo/collaborators/outsider":
+			w.WriteHeader(http.StatusNotFound)
 		default:
 			t.Fatalf("request = %s %s", r.Method, r.URL.String())
 		}
@@ -449,7 +453,7 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answers["needs-attention-pv-1-1-g1"] != "retry after restoring access" || len(answers) != 1 {
+	if answers["needs-attention-pv-1-1-g1"] != "proceed" || len(answers) != 1 {
 		t.Fatalf("answers = %#v", answers)
 	}
 }

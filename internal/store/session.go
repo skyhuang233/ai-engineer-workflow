@@ -687,6 +687,11 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), claim.VersionID, claim.TicketID); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `UPDATE quality_gate_questions SET consumed_at = ? WHERE session_id = ? AND consumed_at = '' AND question_id IN (
+    SELECT question_id FROM workflow_questions WHERE state = 'answered'
+)`, formatTimestamp(now), sessionID); err != nil {
+			return err
+		}
 	} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller failed: "+reason, now); err != nil {
 		return err
 	}

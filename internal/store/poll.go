@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -1354,6 +1355,23 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 	if eligible == 0 {
 		return ErrNotFound
 	}
+	if kind == "quality_gate" {
+		var resumable int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1
+    FROM quality_gate_questions gate
+    JOIN ticket_sessions s ON s.session_id = gate.session_id
+    JOIN ticket_runtime runtime ON runtime.version_id = gate.version_id AND runtime.issue_id = gate.issue_id
+    WHERE gate.question_id = ? AND gate.version_id = ? AND gate.issue_id = ?
+      AND s.state = ? AND s.accepted_commit != ''
+      AND runtime.state = ? AND runtime.delivered = 0
+)`, questionID, versionID, issueID, SessionRunning, plan.StateNeedsAttention).Scan(&resumable); err != nil {
+			return err
+		}
+		if resumable == 0 {
+			return ErrNotFound
+		}
+	}
 	if kind == "closed_unmerged_impact" {
 		var decision closedPlanDecision
 		if err := json.Unmarshal([]byte(answer), &decision); err != nil {
@@ -1425,6 +1443,25 @@ WHERE t.poll_question_id = ? AND t.version_id = ?`, questionID, versionID)
 		if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions SET state = 'answered', answer = ?, answered_at = ? WHERE state = 'open' AND question_id IN (
     SELECT ticket_question_id FROM poll_failure_targets WHERE poll_question_id = ?
 )`, "resolved by poll retry", formatTimestamp(now), questionID); err != nil {
+			return err
+		}
+	} else if kind == "quality_gate" {
+		var allowedJSON string
+		err := tx.QueryRowContext(ctx, `SELECT allowed_answers_json FROM quality_gate_questions WHERE question_id = ? AND version_id = ? AND issue_id = ?`, questionID, versionID, issueID).Scan(&allowedJSON)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		var allowed []string
+		if err := json.Unmarshal([]byte(allowedJSON), &allowed); err != nil || !slices.Contains(allowed, answer) {
+			return ErrInvalidClaim
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE version_id = ? AND issue_id = ?`, formatTimestamp(now), versionID, issueID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID); err != nil {
 			return err
 		}
 	} else if kind == "needs_attention" {

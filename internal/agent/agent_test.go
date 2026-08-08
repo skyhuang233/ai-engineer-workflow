@@ -1124,6 +1124,82 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  source: no-mistakes\n  finding_id: finding-42\n  action: ask-user\n  reason: choose the migration strategy\n  allowed_answers[2]: proceed, decline\n")
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("run with human gate: %v", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("quality gate questions = %#v, err=%v", questions, err)
+	}
+	question := questions[0]
+	if question.Kind != "quality_gate" || !strings.Contains(question.Prompt, "finding-42") || !strings.Contains(question.Prompt, "proceed, decline") || !strings.Contains(question.Prompt, "workflow-answer:"+question.ID) {
+		t.Fatalf("quality gate question = %#v", question)
+	}
+	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("manual Agent continuation bypassed active gate: %v", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "not-allowed", time.Now().UTC()); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("invalid quality gate answer = %v, want ErrInvalidClaim", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "proceed", time.Now().UTC()); err != nil {
+		t.Fatalf("answer quality gate: %v", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "proceed", time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("duplicate quality gate answer = %v, want ErrNotFound", err)
+	}
+	if _, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending gate retry = %#v, err=%v", pending, err)
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("retry answered gate: %v", err)
+	}
+	if len(retryRuntime.specs) != 1 || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ID"] != "gate-17" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_FINDING_ID"] != "finding-42" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ANSWER"] != "proceed" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ENFORCED"] != "true" {
+		t.Fatalf("quality gate retry environment = %#v", retryRuntime.specs)
+	}
+	if strings.Contains(strings.Join(retryRuntime.specs[0].Command, " "), "--yes") {
+		t.Fatalf("Delivery Controller used forbidden global approval: %#v", retryRuntime.specs[0].Command)
+	}
+}
+
+func TestControllerRejectsAnswerForStaleQualityGate(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	gateOutput := []byte("run:\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-stale\n  action: ask-user\n  reason: choose a migration strategy\n  allowed_answers[1]: proceed\n")
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("quality gate questions = %#v, err=%v", questions, err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "proceed", time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale quality gate answer = %v, want ErrNotFound", err)
+	}
+}
+
 func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryCycle, revisionRound, correlationID string) {
 	t.Helper()
 	if spec.Environment["NO_MISTAKES_WORKFLOW_MODE"] != "true" || spec.Environment["NO_MISTAKES_DELIVERY_CYCLE"] != deliveryCycle || spec.Environment["NO_MISTAKES_REVISION_ROUND"] != revisionRound || spec.Environment["NO_MISTAKES_CORRELATION_ID"] != correlationID {

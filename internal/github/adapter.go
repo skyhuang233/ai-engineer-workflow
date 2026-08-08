@@ -272,8 +272,21 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 		return nil, err
 	}
 	answers := make(map[string]string)
+	collaboratorCache := make(map[string]bool)
 	for _, comment := range comments {
-		if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
+		if strings.EqualFold(comment.User.Type, "bot") || strings.HasSuffix(strings.ToLower(comment.User.Login), "[bot]") {
+			continue
+		}
+		login := strings.TrimSpace(comment.User.Login)
+		allowed, cached := collaboratorCache[login]
+		if !cached {
+			allowed, err = c.workflowInboxCollaborator(ctx, repository, login)
+			if err != nil {
+				return nil, err
+			}
+			collaboratorCache[login] = allowed
+		}
+		if !allowed {
 			continue
 		}
 		for questionID, answer := range parseWorkflowInboxAnswers(comment.Body) {
@@ -283,6 +296,21 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 		}
 	}
 	return answers, nil
+}
+
+func (c *Client) workflowInboxCollaborator(ctx context.Context, repository, login string) (bool, error) {
+	if strings.EqualFold(strings.TrimSpace(login), strings.TrimSpace(c.RepositoryOwner)) {
+		return true, nil
+	}
+	if login == "" {
+		return false, nil
+	}
+	err := c.requestJSON(ctx, http.MethodGet, "/repos/"+repository+"/collaborators/"+url.PathEscape(login), nil, nil)
+	var apiErr *apiError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
