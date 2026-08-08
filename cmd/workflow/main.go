@@ -30,7 +30,10 @@ import (
 	"golang.org/x/term"
 )
 
-const defaultControlPlaneDatabase = "workflow.db"
+const (
+	defaultControlPlaneDatabase = "workflow.db"
+	doctorVerificationTimeout   = 10 * time.Minute
+)
 
 func defaultCodexAuthFile() string {
 	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
@@ -172,7 +175,7 @@ func runDoctor(args []string) {
 		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: admittedCredentials, Verification: verification},
 		doctor.GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: admittedCredentials},
 	}, Secrets: []string{secret}}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), doctorVerificationTimeout)
 	defer cancel()
 	report := runner.Run(ctx)
 	if *reportPath != "" {
