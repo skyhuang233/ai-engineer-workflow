@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
 )
 
 func TestReadPlanUsesNativeSubIssuesAndBlockedByEndpoints(t *testing.T) {
@@ -312,7 +313,7 @@ func TestHasPlanProjectionRejectsLegacyAndDuplicateStatusComments(t *testing.T) 
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(comments) }))
 		_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, projection)
 		server.Close()
-		if err == nil {
+		if !errors.Is(err, store.ErrDeliveryRejected) {
 			t.Fatalf("invalid status comments were accepted: %#v", comments)
 		}
 	}
@@ -328,7 +329,7 @@ func TestUpdatePlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T)
 	defer server.Close()
 
 	err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
-	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("UpdatePlanProjection error = %v", err)
 	}
 }
@@ -340,7 +341,7 @@ func TestHasPlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T) {
 	defer server.Close()
 
 	_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
-	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("HasPlanProjection error = %v", err)
 	}
 }

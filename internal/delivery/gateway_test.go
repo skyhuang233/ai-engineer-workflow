@@ -115,6 +115,39 @@ func TestGatewayPreservesWorkflowQuestionContext(t *testing.T) {
 	}
 }
 
+func TestGatewayMovesControlPlaneProjectionConflictToNeedsAttention(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 9, 1, 0, 0, 0, time.UTC)
+	projection, err := db.PlanProjectionAt(ctx, claim.VersionID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{applyErr: fmt.Errorf("%w: multiple workflow control-plane comments found", store.ErrDeliveryRejected)}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
+		Operation: store.DeliveryProjectPlan, Repository: "owner/repo", RootNumber: 10, PlanProjection: &projection,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("projection conflict = %v, want delivery rejection", err)
+	}
+	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || finished.State != store.OutboxRejected {
+		t.Fatalf("projection conflict outbox = %#v, %v", finished, err)
+	}
+	current, err := db.PlanProjectionAt(ctx, claim.VersionID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Tickets) != 1 || current.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("projection conflict projection = %#v, want ticket Needs Attention", current)
+	}
+}
+
 func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
 	ctx := context.Background()
 	db, _ := newAcceptedClaim(t, ctx)

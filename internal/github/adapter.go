@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
 )
 
 const apiVersion = "2022-11-28"
@@ -646,12 +647,12 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 				continue
 			}
 			if isLegacyPlanProjectionComment(comment) {
-				return false, fmt.Errorf("legacy workflow projection comment found")
+				return false, fmt.Errorf("%w: legacy workflow projection comment found", store.ErrDeliveryRejected)
 			}
 			if strings.Contains(comment.Body, planProjectionIdentity) {
 				statusComments++
 				if statusComments > 1 {
-					return false, fmt.Errorf("multiple workflow control-plane comments found")
+					return false, fmt.Errorf("%w: multiple workflow control-plane comments found", store.ErrDeliveryRejected)
 				}
 				if strings.Contains(comment.Body, marker) {
 					matched = true
@@ -687,11 +688,11 @@ func planProjectionStatusComment(comments []commentResponse, owner string) (*com
 			continue
 		}
 		if isLegacyPlanProjectionComment(comments[index]) {
-			return nil, fmt.Errorf("legacy workflow projection comment found")
+			return nil, fmt.Errorf("%w: legacy workflow projection comment found", store.ErrDeliveryRejected)
 		}
 		if strings.Contains(comments[index].Body, planProjectionIdentity) {
 			if status != nil {
-				return nil, fmt.Errorf("multiple workflow control-plane comments found")
+				return nil, fmt.Errorf("%w: multiple workflow control-plane comments found", store.ErrDeliveryRejected)
 			}
 			status = &comments[index]
 		}

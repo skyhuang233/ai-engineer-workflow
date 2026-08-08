@@ -951,6 +951,10 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
 					return err
 				}
+			} else if request.Operation == DeliveryProjectPlan && request.RunID == "" {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
+					return err
+				}
 			} else if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
 				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
 					return err
@@ -1056,7 +1060,18 @@ func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request Del
 
 func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, key string, uncertain bool, reason string, now time.Time) error {
 	if request.RunID == "" {
-		if request.Operation == DeliveryProjectInbox {
+		switch request.Operation {
+		case DeliveryProjectPlan:
+			if request.PlanProjection == nil || request.PlanProjection.VersionID == "" {
+				return ErrInvalidClaim
+			}
+			if err := markPlanNeedsAttentionTx(ctx, tx, request.PlanProjection.VersionID, reason, now); err != nil {
+				return err
+			}
+			if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, request.Repository, now); err != nil {
+				return err
+			}
+		case DeliveryProjectInbox:
 			versionIDs, err := workflowInboxDeliveryPlanVersions(ctx, tx, request.Repository)
 			if err != nil {
 				return err
