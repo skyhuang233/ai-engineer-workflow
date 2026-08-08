@@ -821,7 +821,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 					if err := p.LaunchReview(ctx, claim, prompt); err != nil {
 						return PollResult{}, err
 					}
-				} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
+				} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) && !store.IsSessionAuthenticationTerminalized(claimErr) {
 					return PollResult{}, wrapPollStoreError(claimErr)
 				}
 			}

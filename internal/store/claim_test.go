@@ -451,7 +451,7 @@ func TestDeliveryCompletionRequiresUnexpiredLease(t *testing.T) {
 	}
 }
 
-func TestExpiredCurrentAgentFailureTerminatesRun(t *testing.T) {
+func TestExpiredCurrentAgentFailureRemainsDiagnosticOnly(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -493,8 +493,49 @@ JOIN ticket_sessions s ON s.session_id = r.session_id
 WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures); err != nil {
 		t.Fatal(err)
 	}
-	if runState != "failed" || leaseState != "revoked" || failures != 1 {
+	if runState != RunRunning || leaseState != LeaseActive || failures != 0 {
 		t.Fatalf("late current agent failure left run=%q lease=%q failures=%d", runState, leaseState, failures)
+	}
+}
+
+func TestExpiredCurrentAuthenticationFailureTerminatesRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Cause: &SessionAuthenticationFailure{}, Now: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	var runState, leaseState, runtimeState string
+	var failures int
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state, s.consecutive_failures, rt.state
+FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures, &runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" || leaseState != "revoked" || failures != 1 || runtimeState != plan.StateNeedsAttention {
+		t.Fatalf("late authentication failure left run=%q lease=%q failures=%d runtime=%q", runState, leaseState, failures, runtimeState)
 	}
 }
 
@@ -809,7 +850,7 @@ func TestReviewAuthenticationFailureReleasesClaimedFeedback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordRunFailure(ctx, RunFailure{RunID: revision.RunID, LeaseToken: revision.LeaseToken, Error: ErrSessionAuthenticationUnavailable.Error(), Now: now.Add(2 * time.Second)}); err != nil {
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: revision.RunID, LeaseToken: revision.LeaseToken, Cause: &SessionAuthenticationFailure{}, Now: now.Add(2 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	var claimedRunID string
@@ -861,6 +902,9 @@ func TestEstablishedSessionAuthenticationFailureBlocksInitialReclaim(t *testing.
 	_, err = db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Second), ProvisionSession: provision})
 	if !errors.Is(err, ErrSessionAuthenticationUnavailable) {
 		t.Fatalf("established Session authentication error = %v", err)
+	}
+	if !IsSessionAuthenticationTerminalized(err) {
+		t.Fatalf("established Session authentication failure was not marked terminalized: %v", err)
 	}
 	var runtimeState string
 	var runCount int
@@ -920,6 +964,9 @@ func TestEstablishedSessionAuthenticationFailurePreservesQueuedFeedback(t *testi
 	_, _, err = db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Second), 1, DefaultMaxWorkerAttempts, provision)
 	if !errors.Is(err, ErrSessionAuthenticationUnavailable) {
 		t.Fatalf("queued review authentication error = %v", err)
+	}
+	if !IsSessionAuthenticationTerminalized(err) {
+		t.Fatalf("queued review authentication failure was not marked terminalized: %v", err)
 	}
 	var runtimeState, claimedRunID string
 	var runCount int

@@ -148,6 +148,7 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 						if err := tx.Commit(); err != nil {
 							return TicketClaim{}, "", errors.Join(provisionErr, err)
 						}
+						return TicketClaim{}, "", &sessionAuthenticationTerminalizedError{cause: provisionErr}
 					}
 					return TicketClaim{}, "", provisionErr
 				}
@@ -243,6 +244,7 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 				if err := tx.Commit(); err != nil {
 					return TicketClaim{}, "", errors.Join(provisionErr, err)
 				}
+				return TicketClaim{}, "", &sessionAuthenticationTerminalizedError{cause: provisionErr}
 			}
 			return TicketClaim{}, "", provisionErr
 		}

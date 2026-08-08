@@ -51,6 +51,23 @@ func (e *SessionAuthenticationFailure) Unwrap() error {
 	return ErrSessionAuthenticationUnavailable
 }
 
+type sessionAuthenticationTerminalizedError struct {
+	cause error
+}
+
+func (e *sessionAuthenticationTerminalizedError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *sessionAuthenticationTerminalizedError) Unwrap() error {
+	return e.cause
+}
+
+func IsSessionAuthenticationTerminalized(err error) bool {
+	var terminalized *sessionAuthenticationTerminalizedError
+	return errors.As(err, &terminalized)
+}
+
 const DefaultMaxWorkerAttempts = 3
 
 func maxWorkerAttempts(value int) int {
@@ -227,6 +244,7 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 					if err := tx.Commit(); err != nil {
 						return TicketClaim{}, errors.Join(provisionErr, err)
 					}
+					return TicketClaim{}, &sessionAuthenticationTerminalizedError{cause: provisionErr}
 				}
 				return TicketClaim{}, provisionErr
 			}
