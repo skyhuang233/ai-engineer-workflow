@@ -112,18 +112,31 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relativeObject := firstLooseObject(t, source)
-	sourceInfo, err := os.Stat(filepath.Join(source, ".git", "objects", relativeObject))
+	origin := exec.Command("git", "remote", "get-url", "origin")
+	origin.Dir = session.WorkspacePath
+	originOutput, err := origin.CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("workspace origin: %v (%s)", err, originOutput)
 	}
-	workspaceInfo, err := os.Stat(filepath.Join(session.WorkspacePath, ".git", "objects", relativeObject))
-	if err != nil {
-		t.Fatal(err)
+	originPath := strings.TrimSpace(string(originOutput))
+	if !filepath.IsAbs(originPath) || !strings.EqualFold(filepath.Clean(originPath), filepath.Clean(source)) {
+		t.Fatalf("workspace origin = %q, want absolute local source %q", originPath, source)
 	}
-	if os.SameFile(sourceInfo, workspaceInfo) {
-		t.Fatal("Ticket Workspace shares Git object hardlinks with its source repository")
+	relativeObjects := looseObjects(t, source)
+	for _, relativeObject := range relativeObjects {
+		sourceInfo, err := os.Stat(filepath.Join(source, ".git", "objects", relativeObject))
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspaceInfo, err := os.Stat(filepath.Join(session.WorkspacePath, ".git", "objects", relativeObject))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(sourceInfo, workspaceInfo) {
+			t.Fatalf("Ticket Workspace shares Git object %q with its source repository", relativeObject)
+		}
 	}
+	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
 }
 
 func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
@@ -716,11 +729,10 @@ func initRepository(t *testing.T) string {
 	return dir
 }
 
-func firstLooseObject(t *testing.T, repository string) string {
+func looseObjects(t *testing.T, repository string) []string {
 	t.Helper()
 	objects := filepath.Join(repository, ".git", "objects")
-	var relative string
-	stop := errors.New("stop after first loose Git object")
+	var relativeObjects []string
 	err := filepath.WalkDir(objects, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -731,17 +743,18 @@ func firstLooseObject(t *testing.T, repository string) string {
 			}
 			return nil
 		}
-		relative, err = filepath.Rel(objects, path)
+		relative, err := filepath.Rel(objects, path)
 		if err != nil {
 			return err
 		}
-		return stop
+		relativeObjects = append(relativeObjects, relative)
+		return nil
 	})
-	if err != nil && !errors.Is(err, stop) {
+	if err != nil {
 		t.Fatal(err)
 	}
-	if relative == "" {
+	if len(relativeObjects) == 0 {
 		t.Fatal("source repository has no loose Git objects")
 	}
-	return relative
+	return relativeObjects
 }
