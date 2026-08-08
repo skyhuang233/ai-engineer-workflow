@@ -4,6 +4,14 @@ This context describes the language used to plan, coordinate, and deliver softwa
 
 ## Language
 
+**Bootstrap Development Harness（引导开发工具链）**:
+The repository-external legacy agent workflow used locally to develop Agent Workflow until the product is complete; it has no authority over product runtime design or behavior.
+_Avoid_: Control Plane, product workflow, production entry point
+
+**Self-Hosting Cutover（自托管切换）**:
+The human-approved transition from the Bootstrap Development Harness to developing Agent Workflow through its own product workflow, permitted only after independent end-to-end production validation.
+_Avoid_: automatic rollout, release publication, completion inferred from closed issues or passing tests
+
 **Delivery Plan（交付计划）**:
 An approved intended outcome and the complete set of Executable Tickets that collectively deliver it.
 _Avoid_: Executable Ticket, dependency chain, pull request
