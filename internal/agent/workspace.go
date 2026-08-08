@@ -263,15 +263,22 @@ func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit, bra
 }
 
 func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, baseCommit, output, runErr string) (string, error) {
-	redactor, err := codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("prepare diagnostic credential redaction: %w", err)
-	}
 	dir := filepath.Join(filepath.Dir(ws.CodexState), "diagnostics", runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, "report.txt")
+	redactor, err := codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		body := "error: worker failed; detailed evidence omitted because Codex authentication could not be safely redacted\n" +
+			"head: unavailable\n" +
+			"base: " + baseCommit + "\n" +
+			"evidence: detailed evidence omitted\n"
+		if writeErr := os.WriteFile(path, []byte(body), 0o600); writeErr != nil {
+			return "", errors.Join(fmt.Errorf("prepare diagnostic credential redaction: %w", err), writeErr)
+		}
+		return path, nil
+	}
 	status, statusErr := gitOutput(ctx, ws.Path, "status", "--short")
 	if statusErr != nil {
 		status = "git status failed: " + statusErr.Error()

@@ -29,6 +29,7 @@ type fakeRuntime struct {
 	deliveryOutput   []byte
 	deliveryDeadline time.Time
 	workspaceContent string
+	corruptCodexAuth bool
 }
 
 type blockingFailureRuntime struct {
@@ -66,6 +67,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	}
 	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte(content), 0o644); err != nil {
 		return worker.Result{}, err
+	}
+	if r.corruptCodexAuth {
+		if err := os.WriteFile(filepath.Join(spec.CodexStatePath, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"truncated"}}`), 0o600); err != nil {
+			return worker.Result{}, err
+		}
 	}
 	if r.dirty {
 		if r.ignoredFile {
@@ -337,6 +343,50 @@ func TestWorkspaceManagerAdmitsExistingSessionAuthenticationWithoutHostSource(t 
 	}
 	if err := manager.AdmitCodexAuthentication(ctx, db, claim.VersionID, claim.TicketID); err != nil {
 		t.Fatalf("existing Ticket Session authentication was coupled to host source: %v", err)
+	}
+}
+
+func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedacted(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty: true, corruptCodexAuth: true, err: errors.New("worker failed"),
+		results: []worker.Result{{Output: []byte("sensitive worker output must be omitted"), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth corruption")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("failed Run did not record a minimal diagnostic: %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") || strings.Contains(string(report), "sensitive worker output") {
+		t.Fatalf("unsafe or incomplete minimal diagnostic:\n%s", report)
+	}
+	entries, err := os.ReadDir(filepath.Dir(diagnostic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "report.txt" {
+		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
 	}
 }
 
