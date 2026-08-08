@@ -7,12 +7,39 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestSQLiteCheckReportsBackupAndRecoveryMetrics(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPath := databasePath + ".backup"
+	if _, err := database.CreateOnlineBackup(ctx, backupPath, time.Now().UTC()); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DrillBackup(ctx, backupPath, time.Now().UTC()); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := (SQLiteCheck{Path: databasePath, BackupPath: backupPath}).Run(ctx)
+	if result.Status != Pass || !strings.Contains(result.Summary, "backup_age=") || !strings.Contains(result.Summary, "drill_succeeded=true") || !strings.Contains(result.Summary, "outbox_age=") || !strings.Contains(result.Summary, "reconcile_lag=") {
+		t.Fatalf("SQLite doctor backup metrics = %#v", result)
+	}
+}
 
 type memoryCredential struct{ secret string }
 

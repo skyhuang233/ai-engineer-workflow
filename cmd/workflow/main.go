@@ -79,6 +79,14 @@ func main() {
 		runAnswerInbox(os.Args[2:])
 	case "recover-inbox-delivery":
 		runRecoverInboxDelivery(os.Args[2:])
+	case "backup":
+		runBackup(os.Args[2:])
+	case "restore":
+		runRestore(os.Args[2:])
+	case "drill-backup":
+		runBackupDrill(os.Args[2:])
+	case "metrics":
+		runMetrics(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -95,6 +103,106 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow reconcile-delivered [options]")
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
 	fmt.Fprintln(os.Stderr, "  workflow recover-inbox-delivery [options]")
+	fmt.Fprintln(os.Stderr, "  workflow backup [--database path] [--output path]")
+	fmt.Fprintln(os.Stderr, "  workflow restore --backup path [--database path]")
+	fmt.Fprintln(os.Stderr, "  workflow drill-backup --backup path")
+	fmt.Fprintln(os.Stderr, "  workflow metrics [--database path] [--backup path]")
+}
+
+func runBackup(args []string) {
+	flags := flag.NewFlagSet("backup", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	outputPath := flags.String("output", "", "online SQLite backup destination")
+	_ = flags.Parse(args)
+	if *outputPath == "" {
+		*outputPath = *databasePath + ".backup"
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	metadata, err := db.CreateOnlineBackup(context.Background(), *outputPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, metadata)
+	writeStructuredLog("sqlite_backup", metadata)
+}
+
+func runRestore(args []string) {
+	flags := flag.NewFlagSet("restore", flag.ExitOnError)
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "restored SQLite control-plane database")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		fmt.Fprintln(os.Stderr, "restore requires backup")
+		os.Exit(2)
+	}
+	lock, err := startup.AcquireLock(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer lock.Close()
+	if err := store.RestoreBackup(context.Background(), *backupPath, *databasePath); err != nil {
+		fail(err)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	if err := db.ReconcileRestoredControlPlane(context.Background(), time.Now().UTC()); err != nil {
+		fail(err)
+	}
+	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+}
+
+func runBackupDrill(args []string) {
+	flags := flag.NewFlagSet("drill-backup", flag.ExitOnError)
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		fmt.Fprintln(os.Stderr, "drill-backup requires backup")
+		os.Exit(2)
+	}
+	drill, err := store.DrillBackup(context.Background(), *backupPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, drill)
+	writeStructuredLog("sqlite_backup_drill", drill)
+}
+
+func runMetrics(args []string) {
+	flags := flag.NewFlagSet("metrics", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		*backupPath = *databasePath + ".backup"
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	metrics, err := db.OperationalMetrics(context.Background(), *backupPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, metrics)
+	writeStructuredLog("sqlite_operational_metrics", metrics)
+}
+
+func writeJSON(destination *os.File, value any) {
+	if err := json.NewEncoder(destination).Encode(value); err != nil {
+		fail(err)
+	}
+}
+
+func writeStructuredLog(event string, value any) {
+	writeJSON(os.Stderr, map[string]any{"event": event, "data": value})
 }
 
 func runDoctor(args []string) {

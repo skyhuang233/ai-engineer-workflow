@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,7 +23,8 @@ import (
 )
 
 type SQLiteCheck struct {
-	Path string
+	Path       string
+	BackupPath string
 }
 
 func (SQLiteCheck) Name() string { return "SQLite durability and locking" }
@@ -42,7 +44,25 @@ func (c SQLiteCheck) Run(ctx context.Context) Result {
 		return Result{Status: Fail, Summary: fmt.Sprintf("journal=%s synchronous=%d foreign_keys=%t integrity=%s write_locking=%t",
 			health.JournalMode, health.Synchronous, health.ForeignKeys, health.Integrity, health.WriteLocking)}
 	}
-	return Result{Status: Pass, Summary: "WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified"}
+	backupPath := c.BackupPath
+	if backupPath == "" {
+		backupPath = c.Path + ".backup"
+	}
+	metrics, metricsErr := database.OperationalMetrics(ctx, backupPath, time.Now().UTC())
+	if metricsErr != nil {
+		if !os.IsNotExist(rootCause(metricsErr)) {
+			return Result{Status: Fail, Summary: fmt.Sprintf("read SQLite backup operations metrics: %v", metricsErr), Err: metricsErr}
+		}
+		return Result{Status: Pass, Summary: "WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified; backup=unavailable"}
+	}
+	return Result{Status: Pass, Summary: fmt.Sprintf("WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified; backup_age=%s drill_succeeded=%t outbox_age=%s reconcile_lag=%s", metrics.BackupAge.Round(time.Second), metrics.DrillSucceeded, metrics.OutboxAge.Round(time.Second), metrics.ReconcileLag.Round(time.Second))}
+}
+
+func rootCause(err error) error {
+	for next := errors.Unwrap(err); next != nil; next = errors.Unwrap(err) {
+		err = next
+	}
+	return err
 }
 
 type DockerCheck struct {

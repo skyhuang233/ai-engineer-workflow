@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 46
+	latestSchemaVersion = 47
 )
 
 var (
@@ -1256,6 +1256,33 @@ SET plan_version_ids_json = COALESCE((
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (46, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 47 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS control_plane_backups (
+    backup_path TEXT PRIMARY KEY,
+    checksum_sha256 TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS control_plane_backup_references (
+	backup_path TEXT NOT NULL REFERENCES control_plane_backups(backup_path),
+    kind TEXT NOT NULL CHECK (kind IN ('workspace', 'artifact')),
+    reference_path TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL DEFAULT '',
+    available INTEGER NOT NULL CHECK (available IN (0, 1)),
+    PRIMARY KEY (backup_path, kind, reference_path)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 47: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (47, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
