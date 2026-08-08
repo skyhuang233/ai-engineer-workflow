@@ -170,6 +170,7 @@ func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
 	if claim.Attempt != 1 {
 		t.Fatalf("first durable claim attempt = %d, want 1", claim.Attempt)
 	}
+	t.Logf("failed ChatGPT admission consumed no Worker attempt; the first durable claim remained attempt %d", claim.Attempt)
 }
 
 func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
@@ -212,11 +213,12 @@ func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	fingerprint, err := snapshot.Fingerprint()
 	if err != nil {
 		t.Fatal(err)
@@ -233,10 +235,12 @@ func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	provisionCalls := 0
 	dispatcher := scheduler.Dispatcher{
 		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{},
 		Recovery: recoveryInspector{workspaceReady: true}, Now: func() time.Time { return now.Add(time.Minute) },
 		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
+			provisionCalls++
 			if !provisioning.Existing || provisioning.CurrentRunID != claim.RunID {
 				t.Fatalf("recovery provisioning = %#v", provisioning)
 			}
@@ -256,4 +260,31 @@ func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *tes
 	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("authentication-corrupt recovery projection = %#v", projection.Tickets)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db = restarted
+	dispatcher.Store = restarted
+	dispatcher.Projector = &projector{}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if provisionCalls != 1 {
+		t.Fatalf("authentication provisioning repeated after restart: calls = %d, want 1", provisionCalls)
+	}
+	projection, err = restarted.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt projection after restart = %#v", projection.Tickets)
+	}
+	if _, err := restarted.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("authentication-corrupt Run became current after restart: %v", err)
+	}
+	t.Logf("after reopening SQLite and rerunning recovery: state=%s current_claim=false auth_provision_calls=%d", projection.Tickets[0].State, provisionCalls)
 }

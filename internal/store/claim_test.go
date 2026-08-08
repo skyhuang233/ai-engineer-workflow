@@ -867,6 +867,7 @@ func TestReviewAuthenticationFailureReleasesClaimedFeedback(t *testing.T) {
 	if projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("authentication-failed review projection = %#v", projection.Tickets)
 	}
+	t.Logf("review feedback was released from Run %s and the ticket projected %s", revision.RunID, projection.Tickets[0].State)
 }
 
 func TestEstablishedSessionAuthenticationFailureBlocksInitialReclaim(t *testing.T) {

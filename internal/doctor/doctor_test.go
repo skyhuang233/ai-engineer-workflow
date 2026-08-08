@@ -285,6 +285,7 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	if !strings.Contains(resumed, "codex exec resume") || !strings.Contains(resumed, "worker-session-7") {
 		t.Fatalf("resumed Worker Codex command = %q", resumed)
 	}
+	t.Logf("Doctor result: %s\ncreate: %s\nresume: %s", result.Summary, initial, resumed)
 }
 
 func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutput(t *testing.T) {

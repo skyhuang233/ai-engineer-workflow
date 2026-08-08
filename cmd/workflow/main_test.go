@@ -26,6 +26,7 @@ func TestDefaultCodexAuthFileFollowsCodexHome(t *testing.T) {
 	if got, want := defaultCodexAuthFile(), filepath.Join(home, "auth.json"); got != want {
 		t.Fatalf("defaultCodexAuthFile() = %q, want %q", got, want)
 	}
+	t.Logf("workflow commands defaulted --codex-auth-file to %s", filepath.Join(home, "auth.json"))
 }
 
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
@@ -499,6 +500,7 @@ func TestAcquireTicketClaimReplacesExpiredWorker(t *testing.T) {
 	if prompt != "" || replacement.SessionID != expired.SessionID || replacement.Attempt != expired.Attempt+1 || replacement.LeaseGeneration != expired.LeaseGeneration+1 {
 		t.Fatalf("replacement = %#v, prompt = %q", replacement, prompt)
 	}
+	t.Logf("run-ticket claim acquisition reused Ticket Session %s and advanced from attempt %d to %d", replacement.SessionID, expired.Attempt, replacement.Attempt)
 }
 
 func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T) {

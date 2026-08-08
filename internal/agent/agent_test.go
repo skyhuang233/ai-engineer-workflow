@@ -203,6 +203,7 @@ func TestControllerSeedsCodexAuthenticationBeforeFirstWorkerRun(t *testing.T) {
 	if string(got) != string(want) {
 		t.Fatalf("seeded auth = %q, want exact source bytes", got)
 	}
+	t.Logf("claim attempt=%d returned only after the host ChatGPT cache was seeded into Ticket Session %s", claim.Attempt, claim.SessionID)
 }
 
 func TestControllerPreservesExistingTicketSessionAuthentication(t *testing.T) {
@@ -239,6 +240,7 @@ func TestControllerPreservesExistingTicketSessionAuthentication(t *testing.T) {
 	if string(got) != string(want) {
 		t.Fatalf("existing Ticket Session auth was overwritten: got %q", got)
 	}
+	t.Logf("Ticket Session %s retained its refreshed auth cache instead of being overwritten from the host source", claim.SessionID)
 }
 
 func TestControllerRejectsNonChatGPTAuthenticationBeforeWorkerLaunch(t *testing.T) {
@@ -538,6 +540,7 @@ func TestExpiredRunWithMissingAuthenticationFailsDurably(t *testing.T) {
 	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(2 * time.Second), ProvisionSession: manager.ProvisionCodexSession}); !errors.Is(err, store.ErrFencingConflict) {
 		t.Fatalf("authentication-corrupt Session was reclaimed: %v", err)
 	}
+	t.Logf("corrupt authentication terminalized Run %s, removed its current claim, and blocked a replacement claim", claim.RunID)
 }
 
 func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedacted(t *testing.T) {
@@ -620,6 +623,7 @@ func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *tes
 	if _, err := db.RunDiagnostic(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("failed diagnostic path was persisted: %v", err)
 	}
+	t.Logf("Run %s left active state even though diagnostic storage was unavailable; no diagnostic record was required", claim.RunID)
 }
 
 func TestControllerOmitsDetailedDiagnosticsWhenWorkerDeletesCodexAuthentication(t *testing.T) {
