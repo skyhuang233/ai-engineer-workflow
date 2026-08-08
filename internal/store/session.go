@@ -738,12 +738,6 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, now, failure.RunID); err != nil {
 		return err
 	}
-	if failure.Error == ErrSessionAuthenticationUnavailable.Error() {
-		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, failure.Error, failure.Now); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
 	result, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, failure.RunID)
 	if err != nil {
 		return err
@@ -751,6 +745,12 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	claimedFeedback, err := result.RowsAffected()
 	if err != nil {
 		return err
+	}
+	if failure.Error == ErrSessionAuthenticationUnavailable.Error() {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, failure.Error, failure.Now); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if claimedFeedback > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?
