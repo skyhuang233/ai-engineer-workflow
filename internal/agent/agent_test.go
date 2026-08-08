@@ -96,6 +96,49 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	return result, nil
 }
 
+func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := exec.Command("git", "remote", "get-url", "origin")
+	origin.Dir = session.WorkspacePath
+	originOutput, err := origin.CombinedOutput()
+	if err != nil {
+		t.Fatalf("workspace origin: %v (%s)", err, originOutput)
+	}
+	originPath := strings.TrimSpace(string(originOutput))
+	if !filepath.IsAbs(originPath) || !strings.EqualFold(filepath.Clean(originPath), filepath.Clean(source)) {
+		t.Fatalf("workspace origin = %q, want absolute local source %q", originPath, source)
+	}
+	relativeObjects := looseObjects(t, source)
+	for _, relativeObject := range relativeObjects {
+		sourceInfo, err := os.Stat(filepath.Join(source, ".git", "objects", relativeObject))
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspaceInfo, err := os.Stat(filepath.Join(session.WorkspacePath, ".git", "objects", relativeObject))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(sourceInfo, workspaceInfo) {
+			t.Fatalf("Ticket Workspace shares Git object %q with its source repository", relativeObject)
+		}
+	}
+	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
+}
+
 func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -684,4 +727,34 @@ func initRepository(t *testing.T) string {
 	run("add", "README.md", ".gitignore")
 	run("commit", "-m", "base")
 	return dir
+}
+
+func looseObjects(t *testing.T, repository string) []string {
+	t.Helper()
+	objects := filepath.Join(repository, ".git", "objects")
+	var relativeObjects []string
+	err := filepath.WalkDir(objects, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if path != objects && (entry.Name() == "info" || entry.Name() == "pack") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relative, err := filepath.Rel(objects, path)
+		if err != nil {
+			return err
+		}
+		relativeObjects = append(relativeObjects, relative)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relativeObjects) == 0 {
+		t.Fatal("source repository has no loose Git objects")
+	}
+	return relativeObjects
 }
