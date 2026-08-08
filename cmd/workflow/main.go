@@ -414,7 +414,7 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 			return err
 		}
 		for _, event := range events {
-			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body, BatchID: event.BatchID, Debounce: event.Debounce})
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err

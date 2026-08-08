@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 38
+	latestSchemaVersion = 39
 )
 
 var (
@@ -1046,6 +1046,34 @@ SET plan_version_ids_json = COALESCE((
 			return fmt.Errorf("migration 38: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (38, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 39 {
+		for _, column := range []struct {
+			name       string
+			definition string
+		}{
+			{name: "batch_id", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "ready_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		} {
+			exists, err := tableHasColumnTx(ctx, tx, "review_feedback_events", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 39: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE review_feedback_events ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 39: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS review_feedback_ready_idx ON review_feedback_events(version_id, issue_id, claimed_run_id, ready_at, received_at)`); err != nil {
+			return fmt.Errorf("migration 39: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET batch_id = 'feedback:' || source || ':' || event_id WHERE batch_id = ''`); err != nil {
+			return fmt.Errorf("migration 39: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (39, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

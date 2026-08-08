@@ -805,7 +805,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 			}
 			feedback := make([]store.ReviewFeedback, 0, len(events))
 			for _, event := range events {
-				feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+				feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body, BatchID: event.BatchID, Debounce: event.Debounce})
 			}
 			inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
 			if err != nil {

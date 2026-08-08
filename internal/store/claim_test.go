@@ -711,6 +711,173 @@ func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	}
 }
 
+func TestInlineReviewFeedbackWaitsForStableDebounceWindow(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "inline-comment", EventID: "100", Author: "human", Body: "Add a test.", Debounce: true}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(inlineFeedbackDebounceWindow-time.Second), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim before debounce = %v, want not found", err)
+	}
+	secondAt := now.Add(inlineFeedbackDebounceWindow - 30*time.Second)
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "inline-comment", EventID: "101", Author: "human", Body: "Cover the error path.", Debounce: true}}, secondAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(inlineFeedbackDebounceWindow+time.Second), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim before extended debounce = %v, want not found", err)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, secondAt.Add(inlineFeedbackDebounceWindow), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.SessionID != claim.SessionID || !strings.Contains(prompt, "inline-comment/100") || !strings.Contains(prompt, "inline-comment/101") || !strings.Contains(prompt, "Do not resolve any review thread") {
+		t.Fatalf("revision = %#v, prompt = %q", revision, prompt)
+	}
+	inserted, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "inline-comment", EventID: "101", Author: "human", Body: "Cover the error path.", Debounce: true}}, secondAt.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 0 {
+		t.Fatalf("duplicate inline event inserted = %d, want 0", inserted)
+	}
+}
+
+func TestReviewSubmissionClaimsOnlyItsOwnBatch(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	feedback := []ReviewFeedback{
+		{Source: "review", EventID: "50", Author: "human", Body: "Submission one.", BatchID: "review-submission:50"},
+		{Source: "inline-comment", EventID: "51", Author: "human", Body: "Submission one detail.", BatchID: "review-submission:50"},
+		{Source: "review", EventID: "60", Author: "human", Body: "Submission two.", BatchID: "review-submission:60"},
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, feedback, now); err != nil {
+		t.Fatal(err)
+	}
+	_, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now, 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "review/50") || !strings.Contains(prompt, "inline-comment/51") || strings.Contains(prompt, "review/60") {
+		t.Fatalf("submission batch prompt = %q", prompt)
+	}
+}
+
+func TestPendingInlineFeedbackPromotesIntoSubmittedReviewBatch(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "inline-comment", EventID: "51", Author: "human", Body: "Draft detail.", Debounce: true}}, now); err != nil {
+		t.Fatal(err)
+	}
+	submittedAt := now.Add(time.Minute)
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{
+		{Source: "review", EventID: "50", Author: "human", Body: "Submitted review.", BatchID: "review-submission:50", Debounce: true},
+		{Source: "inline-comment", EventID: "51", Author: "human", Body: "Draft detail.", BatchID: "review-submission:50", Debounce: true},
+	}, submittedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, submittedAt.Add(inlineFeedbackDebounceWindow-time.Second), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim before submitted batch settles = %v, want not found", err)
+	}
+	_, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, submittedAt.Add(inlineFeedbackDebounceWindow), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "review/50") || !strings.Contains(prompt, "inline-comment/51") {
+		t.Fatalf("submitted batch prompt = %q", prompt)
+	}
+}
+
 func TestReviewRevisionsDoNotConsumeFailureRecoveryBudget(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

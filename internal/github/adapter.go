@@ -37,10 +37,12 @@ type RepositoryMetadata struct {
 }
 
 type PullRequestFeedback struct {
-	Source  string
-	EventID string
-	Author  string
-	Body    string
+	Source   string
+	EventID  string
+	Author   string
+	Body     string
+	BatchID  string
+	Debounce bool
 }
 
 func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository string, number int64) ([]PullRequestFeedback, error) {
@@ -66,12 +68,14 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 		SubmittedAt string `json:"submitted_at"`
 	}
 	type comment struct {
-		ID        int64  `json:"id"`
-		Body      string `json:"body"`
-		User      user   `json:"user"`
-		UpdatedAt string `json:"updated_at"`
+		ID                  int64  `json:"id"`
+		Body                string `json:"body"`
+		User                user   `json:"user"`
+		UpdatedAt           string `json:"updated_at"`
+		PullRequestReviewID int64  `json:"pull_request_review_id"`
 	}
 	var result []PullRequestFeedback
+	submittedReviewIDs := make(map[int64]struct{})
 	for page := 1; ; page++ {
 		var reviews []review
 		path := "/repos/" + repository + "/pulls/" + strconv.FormatInt(number, 10) + "/reviews?per_page=100&page=" + strconv.Itoa(page)
@@ -79,8 +83,12 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
-				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
+			submitted := value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body)
+			if submitted {
+				submittedReviewIDs[value.ID] = struct{}{}
+			}
+			if submitted && (full || changedSince(value.SubmittedAt, since)) {
+				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body), BatchID: reviewSubmissionBatchID(value.ID), Debounce: true})
 			}
 		}
 		if len(reviews) < 100 {
@@ -105,7 +113,14 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			}
 			for _, value := range comments {
 				if actionableComment(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
-					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
+					event := PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body}
+					if endpoint.source == "inline-comment" {
+						if _, submitted := submittedReviewIDs[value.PullRequestReviewID]; submitted {
+							event.BatchID = reviewSubmissionBatchID(value.PullRequestReviewID)
+						}
+						event.Debounce = true
+					}
+					result = append(result, event)
 				}
 			}
 			if len(comments) < 100 {
@@ -114,6 +129,10 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 		}
 	}
 	return result, nil
+}
+
+func reviewSubmissionBatchID(reviewID int64) string {
+	return "review-submission:" + strconv.FormatInt(reviewID, 10)
 }
 
 func changedSince(value string, since time.Time) bool {
