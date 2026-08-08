@@ -140,7 +140,7 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 			if len(provisionSession) > 0 && provisionSession[0] != nil {
 				_, provisionErr := provisionSession[0](ctx, SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, CurrentRunID: currentRunID})
 				if provisionErr != nil {
-					handled, failureErr := recordExpiredAuthenticationFailureTx(ctx, tx, versionID, issueID, currentRunID, provisionErr, now)
+					handled, failureErr := recordEstablishedSessionAuthenticationFailureTx(ctx, tx, versionID, issueID, currentRunID, provisionErr, now)
 					if failureErr != nil {
 						return TicketClaim{}, "", errors.Join(provisionErr, failureErr)
 					}
@@ -234,8 +234,17 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 	}
 	if !sessionProvisioned && len(provisionSession) > 0 && provisionSession[0] != nil {
 		provisioning := SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath}
-		if _, err := provisionSession[0](ctx, provisioning); err != nil {
-			return TicketClaim{}, "", err
+		if _, provisionErr := provisionSession[0](ctx, provisioning); provisionErr != nil {
+			handled, failureErr := recordEstablishedSessionAuthenticationFailureTx(ctx, tx, versionID, issueID, "", provisionErr, now)
+			if failureErr != nil {
+				return TicketClaim{}, "", errors.Join(provisionErr, failureErr)
+			}
+			if handled {
+				if err := tx.Commit(); err != nil {
+					return TicketClaim{}, "", errors.Join(provisionErr, err)
+				}
+			}
+			return TicketClaim{}, "", provisionErr
 		}
 	}
 	runID, err := randomID("run-")
