@@ -439,6 +439,81 @@ func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
 	}
 }
 
+func TestControllerRejectsCredentialBearingCandidateBeforePersistence(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	secret := "candidate-auth-secret"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	db, _, claim := createClaimWithProvisioner(t, ctx, root, manager.ProvisionCodexSession)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-secret", "implemented with "+secret), ContainerID: "container-secret"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement safely")); err == nil || !strings.Contains(err.Error(), store.ErrSessionAuthenticationUnavailable.Error()) {
+		t.Fatalf("credential-bearing Candidate error = %v", err)
+	}
+	if _, err := db.CandidateRevision(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("credential-bearing Candidate persisted: %v", err)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(report), secret) || !strings.Contains(string(report), "detailed evidence omitted") {
+		t.Fatalf("credential-bearing Candidate diagnostic = %q", report)
+	}
+	if len(runtime.specs) != 1 {
+		t.Fatalf("credential-bearing Candidate launched %d workers", len(runtime.specs))
+	}
+}
+
+func TestExpiredRunWithMissingAuthenticationFailsDurably(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("expired-auth-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	db, version, claim := createClaimWithProvisioner(t, ctx, root, manager.ProvisionCodexSession)
+	defer db.Close()
+	if err := os.Remove(filepath.Join(root, "codex", claim.SessionID, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(time.Second), ProvisionSession: manager.ProvisionCodexSession,
+	})
+	if !errors.Is(err, store.ErrSessionAuthenticationUnavailable) {
+		t.Fatalf("missing expired authentication error = %v", err)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("expired Run diagnostic = %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") {
+		t.Fatalf("expired Run diagnostic = %q", report)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expired Run remained current: %v", err)
+	}
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(2 * time.Second), ProvisionSession: manager.ProvisionCodexSession}); !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("authentication-corrupt Session was reclaimed: %v", err)
+	}
+}
+
 func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedacted(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

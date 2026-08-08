@@ -39,7 +39,8 @@ func (m WorkspaceManager) AdmitCodexAuthentication(ctx context.Context, db *stor
 	}
 	session, err := db.TicketSession(ctx, versionID, ticketID)
 	if err == nil {
-		return m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: session.SessionID, Existing: true, WorkspacePath: session.WorkspacePath, CodexStatePath: session.CodexStatePath})
+		_, err = m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: session.SessionID, Existing: true, WorkspacePath: session.WorkspacePath, CodexStatePath: session.CodexStatePath})
+		return err
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
@@ -50,13 +51,14 @@ func (m WorkspaceManager) AdmitCodexAuthentication(ctx context.Context, db *stor
 }
 
 func (m WorkspaceManager) ProvisionCodexAuthentication(ctx context.Context, sessionID string, existing bool) error {
-	return m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: sessionID, Existing: existing})
+	_, err := m.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: sessionID, Existing: existing})
+	return err
 }
 
-func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning store.SessionProvisioning) error {
+func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
 	workspacePath, state, err := m.sessionPaths(provisioning.SessionID)
 	if err != nil {
-		return err
+		return store.SessionProvisioningResult{}, err
 	}
 	for _, persisted := range []struct {
 		name     string
@@ -68,23 +70,58 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 		}
 		canonical, err := canonicalPath(persisted.value)
 		if err != nil {
-			return err
+			return store.SessionProvisioningResult{}, err
 		}
 		if !strings.EqualFold(canonical, persisted.expected) {
-			return fmt.Errorf("persisted %s path does not match configured Session path", persisted.name)
+			return store.SessionProvisioningResult{}, fmt.Errorf("persisted %s path does not match configured Session path", persisted.name)
 		}
 	}
 	authPath := filepath.Join(state, codexauth.FileName)
 	if provisioning.Existing {
 		if err := codexauth.ValidateChatGPT(authPath); err != nil {
-			return errors.New("Ticket Session Codex authentication cache is unavailable")
+			failure := &store.SessionAuthenticationFailure{}
+			if provisioning.CurrentRunID != "" {
+				failure.DiagnosticsPath = m.writeMinimalAuthenticationDiagnostic(provisioning.CurrentRunID)
+			}
+			return store.SessionProvisioningResult{}, failure
 		}
-		return nil
+		return store.SessionProvisioningResult{}, nil
 	}
 	if err := os.MkdirAll(state, 0o755); err != nil {
-		return fmt.Errorf("create Ticket Session Codex state: %w", err)
+		return store.SessionProvisioningResult{}, fmt.Errorf("create Ticket Session Codex state: %w", err)
 	}
-	return codexauth.SeedNew(m.CodexAuthFile, state)
+	if err := codexauth.SeedNew(m.CodexAuthFile, state); err != nil {
+		return store.SessionProvisioningResult{}, err
+	}
+	return store.SessionProvisioningResult{Rollback: func() error {
+		if err := os.Remove(authPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove uncommitted Ticket Session Codex authentication cache: %w", err)
+		}
+		if _, err := os.Stat(authPath); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				return errors.New("uncommitted Ticket Session Codex authentication cache still exists")
+			}
+			return fmt.Errorf("verify uncommitted Ticket Session Codex authentication cache removal: %w", err)
+		}
+		return nil
+	}}, nil
+}
+
+func (m WorkspaceManager) writeMinimalAuthenticationDiagnostic(runID string) string {
+	dir := filepath.Join(m.CodexStateRoot, "diagnostics", runID)
+	path := filepath.Join(dir, "report.txt")
+	if filepath.Base(runID) != runID {
+		return path
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return path
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return path
+	}
+	body := "error: " + store.ErrSessionAuthenticationUnavailable.Error() + "\nevidence: detailed evidence omitted\n"
+	_ = os.WriteFile(path, []byte(body), 0o600)
+	return path
 }
 
 func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (bool, error) {

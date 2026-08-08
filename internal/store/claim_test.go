@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -59,6 +60,61 @@ func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 2, LeaseTTL: time.Minute}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("blocked ticket claim error = %v, want ErrNotReady", err)
+	}
+}
+
+func TestClaimReadyCompensatesNewSessionProvisioningOnTransactionFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, err := Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER reject_worker_run BEFORE INSERT ON worker_runs BEGIN SELECT RAISE(ABORT, 'injected worker run failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	var authPath string
+	rolledBack := false
+	_, err = db.ClaimReady(ctx, ClaimRequest{
+		VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute,
+		ProvisionSession: func(_ context.Context, provisioning SessionProvisioning) (SessionProvisioningResult, error) {
+			authPath = filepath.Join(root, provisioning.SessionID, "auth.json")
+			if err := os.MkdirAll(filepath.Dir(authPath), 0o755); err != nil {
+				return SessionProvisioningResult{}, err
+			}
+			if err := os.WriteFile(authPath, []byte("credential"), 0o600); err != nil {
+				return SessionProvisioningResult{}, err
+			}
+			return SessionProvisioningResult{Rollback: func() error {
+				rolledBack = true
+				return os.Remove(authPath)
+			}}, nil
+		},
+	})
+	if err == nil {
+		t.Fatal("claim unexpectedly survived injected transaction failure")
+	}
+	if !rolledBack {
+		t.Fatal("new Session authentication was not compensated")
+	}
+	if _, err := os.Stat(authPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted authentication cache survived: %v", err)
+	}
+	if _, err := db.TicketSession(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed claim retained Session: %v", err)
 	}
 }
 

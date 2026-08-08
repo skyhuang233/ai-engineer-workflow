@@ -105,6 +105,7 @@ JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 	if err != nil {
 		return TicketClaim{}, "", err
 	}
+	sessionProvisioned := false
 	if currentRunID != "" {
 		var runKind, runState, leaseState, expiresText string
 		err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, l.expires_at
@@ -135,6 +136,22 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 					return TicketClaim{}, "", err
 				}
 				return TicketClaim{}, "", ErrNeedsAttention
+			}
+			if len(provisionSession) > 0 && provisionSession[0] != nil {
+				_, provisionErr := provisionSession[0](ctx, SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, CurrentRunID: currentRunID})
+				if provisionErr != nil {
+					handled, failureErr := recordExpiredAuthenticationFailureTx(ctx, tx, versionID, issueID, currentRunID, provisionErr, now)
+					if failureErr != nil {
+						return TicketClaim{}, "", errors.Join(provisionErr, failureErr)
+					}
+					if handled {
+						if err := tx.Commit(); err != nil {
+							return TicketClaim{}, "", errors.Join(provisionErr, err)
+						}
+					}
+					return TicketClaim{}, "", provisionErr
+				}
+				sessionProvisioned = true
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), currentRunID, RunRunning); err != nil {
 				return TicketClaim{}, "", err
@@ -215,9 +232,9 @@ WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' ORDER BY received_
 		}
 		return TicketClaim{}, "", ErrNotReady
 	}
-	if len(provisionSession) > 0 && provisionSession[0] != nil {
+	if !sessionProvisioned && len(provisionSession) > 0 && provisionSession[0] != nil {
 		provisioning := SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath}
-		if err := provisionSession[0](ctx, provisioning); err != nil {
+		if _, err := provisionSession[0](ctx, provisioning); err != nil {
 			return TicketClaim{}, "", err
 		}
 	}

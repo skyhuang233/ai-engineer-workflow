@@ -28,9 +28,28 @@ type SessionProvisioning struct {
 	Existing       bool
 	WorkspacePath  string
 	CodexStatePath string
+	CurrentRunID   string
 }
 
-type SessionProvisioner func(context.Context, SessionProvisioning) error
+type SessionProvisioningResult struct {
+	Rollback func() error
+}
+
+type SessionProvisioner func(context.Context, SessionProvisioning) (SessionProvisioningResult, error)
+
+var ErrSessionAuthenticationUnavailable = errors.New("Ticket Session Codex authentication cache is unavailable")
+
+type SessionAuthenticationFailure struct {
+	DiagnosticsPath string
+}
+
+func (e *SessionAuthenticationFailure) Error() string {
+	return ErrSessionAuthenticationUnavailable.Error()
+}
+
+func (e *SessionAuthenticationFailure) Unwrap() error {
+	return ErrSessionAuthenticationUnavailable
+}
 
 const DefaultMaxWorkerAttempts = 3
 
@@ -166,6 +185,7 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 		if sessionState == SessionClosed {
 			return TicketClaim{}, ErrNotReady
 		}
+		expiredAgentRunID := ""
 		if currentRunID != "" {
 			var runKind, runState, leaseState, expiresText string
 			if err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, l.expires_at
@@ -191,7 +211,27 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 					}
 					return TicketClaim{}, ErrNotReady
 				}
+				if runKind == RunAgent && runState == RunRunning && !live {
+					expiredAgentRunID = currentRunID
+				}
 			}
+		}
+		if request.ProvisionSession != nil {
+			_, provisionErr := request.ProvisionSession(ctx, SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, CurrentRunID: expiredAgentRunID})
+			if provisionErr != nil {
+				handled, failureErr := recordExpiredAuthenticationFailureTx(ctx, tx, request.VersionID, selected.IssueID, expiredAgentRunID, provisionErr, request.Now)
+				if failureErr != nil {
+					return TicketClaim{}, errors.Join(provisionErr, failureErr)
+				}
+				if handled {
+					if err := tx.Commit(); err != nil {
+						return TicketClaim{}, errors.Join(provisionErr, err)
+					}
+				}
+				return TicketClaim{}, provisionErr
+			}
+		}
+		if currentRunID != "" {
 			if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ? WHERE run_id = ? AND state = ?`, "superseded", currentRunID, RunRunning); err != nil {
 				return TicketClaim{}, err
 			}
@@ -248,41 +288,81 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 		}
 		return TicketClaim{}, ErrNotReady
 	}
-	if request.ProvisionSession != nil {
+	var provisioned SessionProvisioningResult
+	if !existingSession && request.ProvisionSession != nil {
 		provisioning := SessionProvisioning{SessionID: sessionID, Existing: existingSession, WorkspacePath: workspacePath, CodexStatePath: codexStatePath}
-		if err := request.ProvisionSession(ctx, provisioning); err != nil {
-			return TicketClaim{}, err
+		provisioned, err = request.ProvisionSession(ctx, provisioning)
+		if err != nil {
+			return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 		}
 	}
 	runID, err := randomID("run-")
 	if err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	leaseToken, err := randomID("lease-")
 	if err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	expiresAt := request.Now.Add(request.LeaseTTL)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, attempt, recoveryEpoch, currentGeneration, RunRunning, formatTimestamp(request.Now)); err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, currentGeneration, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(request.Now)); err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_run_id = ?, owner = ?, state = ?, current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, runID, request.Owner, SessionRunning, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
 VALUES (?, ?, ?, 0, ?)
 ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`, request.VersionID, selected.IssueID, plan.StateRunning, formatTimestamp(request.Now)); err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return TicketClaim{}, err
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
 	return TicketClaim{VersionID: request.VersionID, TicketID: selected.IssueID, TicketNumber: selected.Number, TicketTitle: selected.Title, Owner: request.Owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: currentGeneration, LeaseExpiresAt: expiresAt}, nil
+}
+
+func compensateSessionProvisioning(provisioning SessionProvisioningResult, cause error) error {
+	if provisioning.Rollback == nil {
+		return cause
+	}
+	return errors.Join(cause, provisioning.Rollback())
+}
+
+func recordExpiredAuthenticationFailureTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, runID string, provisionErr error, now time.Time) (bool, error) {
+	var authenticationFailure *SessionAuthenticationFailure
+	if runID == "" || !errors.As(provisionErr, &authenticationFailure) || authenticationFailure.DiagnosticsPath == "" {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), runID, RunRunning)
+	if err != nil {
+		return true, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated != 1 {
+		return true, errors.Join(err, ErrInvalidClaim)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND state = ?`, runID, LeaseActive); err != nil {
+		return true, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, authenticationFailure.DiagnosticsPath, ErrSessionAuthenticationUnavailable.Error(), formatTimestamp(now)); err != nil {
+		return true, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, runID); err != nil {
+		return true, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, formatTimestamp(now), runID); err != nil {
+		return true, err
+	}
+	if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, ErrSessionAuthenticationUnavailable.Error(), now); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int64) (TicketClaim, error) {

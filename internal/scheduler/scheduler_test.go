@@ -153,11 +153,11 @@ func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
 	dispatcher := scheduler.Dispatcher{
 		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{body: snapshot.Root.Body},
 		MaxParallelRuns: 1, LeaseTTL: time.Minute,
-		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) error {
+		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
 			if provisioning.SessionID == "" || provisioning.Existing {
 				t.Fatalf("provisioning target = %q existing=%t, want a new Session", provisioning.SessionID, provisioning.Existing)
 			}
-			return admissionErr
+			return store.SessionProvisioningResult{}, admissionErr
 		},
 	}
 	if _, err := dispatcher.Claim(ctx, snapshot.Repository, snapshot.Root.Number, 0, "agent-1"); !errors.Is(err, admissionErr) {

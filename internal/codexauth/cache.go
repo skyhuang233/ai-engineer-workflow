@@ -87,6 +87,15 @@ func (r Redactor) String(input string) string {
 	return string(r.Bytes([]byte(input)))
 }
 
+func (r Redactor) Contains(input []byte) bool {
+	for _, value := range r.values {
+		if bytes.Contains(input, value) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r Redactor) Merge(other Redactor) Redactor {
 	values := make([][]byte, 0, len(r.values)+len(other.values))
 	values = append(values, r.values...)
