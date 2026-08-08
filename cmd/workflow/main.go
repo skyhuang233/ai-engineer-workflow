@@ -25,6 +25,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/githubcontract"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/scheduler"
+	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	"golang.org/x/term"
@@ -532,16 +533,36 @@ func runPollGitHub(args []string) {
 		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and ChatGPT authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
-	config, err := doctor.LoadConfig(*configPath)
+	lock, err := startup.AcquireLock(*databasePath)
 	if err != nil {
 		fail(err)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	defer lock.Close()
+	db, err := store.OpenForStartup(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
+	if err := db.IntegrityCheck(context.Background()); err != nil {
+		fail(err)
+	}
+	if err := db.Migrate(context.Background()); err != nil {
+		fail(err)
+	}
+	config, err := doctor.LoadConfig(*configPath)
+	if err != nil {
+		fail(err)
+	}
 	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
+	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
+	if reason, err := runtime.Inspect(context.Background()); err != nil {
+		fail(err)
+	} else if reason != "" {
+		fail(errors.New(reason))
+	}
+	if _, err := workspaceManager.ReclaimClosed(context.Background(), db, *workspaceRetention, time.Now().UTC()); err != nil {
+		fail(err)
+	}
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -651,7 +672,6 @@ func runPollGitHub(args []string) {
 			if bootstrapErr != nil {
 				return controlResult, bootstrapErr
 			}
-			runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
 			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime, ProvisionSession: workspaceManager.ProvisionCodexSession}
 			paused, err := dispatcher.DispatchPaused(ctx, *repository)
 			if err != nil {

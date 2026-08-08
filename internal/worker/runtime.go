@@ -58,6 +58,13 @@ type ContainerInspector interface {
 	ContainerRunning(context.Context, string) (bool, error)
 }
 
+// ContainerIsolator stops every container belonging to an expired Worker Run.
+// It is deliberately distinct from inspection: recovery must revoke a stale
+// Run's compute before dispatching a replacement generation.
+type ContainerIsolator interface {
+	IsolateContainer(context.Context, string) error
+}
+
 func (s Spec) Validate() error {
 	if len(s.Command) == 0 || s.WorkspacePath == "" || s.CodexStatePath == "" || s.Branch == "" || s.AgentIdentity == "" {
 		return errors.New("worker spec is incomplete")
@@ -255,6 +262,26 @@ func (r DockerRuntime) ContainerRunning(ctx context.Context, runID string) (bool
 		return false, fmt.Errorf("inspect worker container: %w", err)
 	}
 	return strings.TrimSpace(string(output)) != "", nil
+}
+
+func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error {
+	if strings.TrimSpace(runID) == "" {
+		return errors.New("worker run ID is required")
+	}
+	name := r.Binary
+	if name == "" {
+		name = "docker"
+	}
+	output, err := exec.CommandContext(ctx, name, "container", "ls", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
+	if err != nil {
+		return fmt.Errorf("inspect expired worker container: %w", err)
+	}
+	for _, containerID := range strings.Fields(string(output)) {
+		if err := exec.CommandContext(ctx, name, "container", "kill", containerID).Run(); err != nil {
+			return fmt.Errorf("isolate expired worker container %s: %w", containerID, err)
+		}
+	}
+	return nil
 }
 
 func contains(values []string, target string) bool {

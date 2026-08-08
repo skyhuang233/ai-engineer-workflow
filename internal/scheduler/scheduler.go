@@ -24,6 +24,7 @@ type Dispatcher struct {
 
 type RecoveryInspector interface {
 	ContainerRunning(context.Context, string) (bool, error)
+	IsolateContainer(context.Context, string) error
 	WorkspaceAvailable(context.Context, store.TicketSession) (bool, error)
 }
 
@@ -177,51 +178,68 @@ func (d Dispatcher) Recover(ctx context.Context, repository string, rootNumber i
 	if d.Now != nil {
 		now = d.Now().UTC()
 	}
-	if d.Recovery != nil {
-		runs, err := d.Store.ActiveRecoveryRuns(ctx, version.ID, now)
-		if err != nil {
-			return err
-		}
-		for _, run := range runs {
-			containerRunning, err := d.Recovery.ContainerRunning(ctx, run.Claim.RunID)
-			if err != nil {
-				return fmt.Errorf("recover worker container %s: %w", run.Claim.RunID, err)
-			}
-			workspaceAvailable, err := d.Recovery.WorkspaceAvailable(ctx, run.Session)
-			if err != nil {
-				return fmt.Errorf("recover ticket workspace %s: %w", run.Claim.SessionID, err)
-			}
-			if containerRunning && workspaceAvailable {
-				continue
-			}
-			if d.ProvisionSession != nil && run.Kind == store.RunAgent {
-				_, provisionErr := d.ProvisionSession(ctx, store.SessionProvisioning{
-					SessionID: run.Claim.SessionID, Existing: true, WorkspacePath: run.Session.WorkspacePath,
-					CodexStatePath: run.Session.CodexStatePath, CurrentRunID: run.Claim.RunID,
-				})
-				if provisionErr != nil {
-					var authenticationFailure *store.SessionAuthenticationFailure
-					if !errors.As(provisionErr, &authenticationFailure) {
-						return fmt.Errorf("recover Ticket Session authentication %s: %w", run.Claim.SessionID, provisionErr)
-					}
-					if err := d.Store.RecordRecoveryAuthenticationFailure(ctx, run, authenticationFailure.DiagnosticsPath, now); err != nil {
-						return fmt.Errorf("record Ticket Session authentication failure %s: %w", run.Claim.SessionID, err)
-					}
-					continue
-				}
-			}
-			reason := "worker container is not running"
-			if !workspaceAvailable {
-				reason = "ticket workspace is unavailable"
-			}
-			if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now); err != nil {
-				return err
-			}
-		}
+	if err := d.reconcileVersionLocal(ctx, version.ID, now); err != nil {
+		return err
 	}
 	projection, err := d.Store.PlanProjectionAt(ctx, version.ID, now)
 	if err != nil {
 		return err
 	}
 	return d.Projector.ProjectPlan(ctx, repository, rootNumber, projection, "")
+}
+
+func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string, now time.Time) error {
+	if d.Recovery == nil {
+		return nil
+	}
+	expired, err := d.Store.ExpiredAgentRecoveryRuns(ctx, versionID, now)
+	if err != nil {
+		return err
+	}
+	for _, run := range expired {
+		if err := d.Recovery.IsolateContainer(ctx, run.Claim.RunID); err != nil {
+			return fmt.Errorf("isolate expired worker container %s: %w", run.Claim.RunID, err)
+		}
+		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
+			return err
+		}
+	}
+	runs, err := d.Store.ActiveRecoveryRuns(ctx, versionID, now)
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		containerRunning, err := d.Recovery.ContainerRunning(ctx, run.Claim.RunID)
+		if err != nil {
+			return fmt.Errorf("recover worker container %s: %w", run.Claim.RunID, err)
+		}
+		workspaceAvailable, err := d.Recovery.WorkspaceAvailable(ctx, run.Session)
+		if err != nil {
+			return fmt.Errorf("recover ticket workspace %s: %w", run.Claim.SessionID, err)
+		}
+		if containerRunning && workspaceAvailable {
+			continue
+		}
+		if d.ProvisionSession != nil && run.Kind == store.RunAgent {
+			_, provisionErr := d.ProvisionSession(ctx, store.SessionProvisioning{SessionID: run.Claim.SessionID, Existing: true, WorkspacePath: run.Session.WorkspacePath, CodexStatePath: run.Session.CodexStatePath, CurrentRunID: run.Claim.RunID})
+			if provisionErr != nil {
+				var authenticationFailure *store.SessionAuthenticationFailure
+				if !errors.As(provisionErr, &authenticationFailure) {
+					return fmt.Errorf("recover Ticket Session authentication %s: %w", run.Claim.SessionID, provisionErr)
+				}
+				if err := d.Store.RecordRecoveryAuthenticationFailure(ctx, run, authenticationFailure.DiagnosticsPath, now); err != nil {
+					return fmt.Errorf("record Ticket Session authentication failure %s: %w", run.Claim.SessionID, err)
+				}
+				continue
+			}
+		}
+		reason := "worker container is not running"
+		if !workspaceAvailable {
+			reason = "ticket workspace is unavailable"
+		}
+		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }

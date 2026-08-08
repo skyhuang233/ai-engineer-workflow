@@ -154,6 +154,36 @@ type RecoveryRun struct {
 	Session TicketSession
 }
 
+// ExpiredAgentRecoveryRuns lists the current Agent Runs whose Run Leases have
+// elapsed. Callers must isolate the corresponding container before using
+// ReconcileMissingRecoveryRun to release the ticket for a replacement Run.
+// The latter method repeats the current-run and Lease checks atomically, so a
+// stale recovery observation can never supersede a newer generation.
+func (s *Store) ExpiredAgentRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
+	if versionID == "" {
+		return nil, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
+s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit, s.accepted_candidate_run_id,
+l.lease_token, l.generation, l.expires_at
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at <= ?
+ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunRunning, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRecoveryRuns(rows)
+}
+
 func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
 	if versionID == "" {
 		return nil, ErrInvalidClaim
@@ -222,6 +252,20 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 		return nil, err
 	}
 	defer rows.Close()
+	runs, err := scanRecoveryRuns(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return runs, nil
+}
+
+func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
 	var runs []RecoveryRun
 	for rows.Next() {
 		var run RecoveryRun
@@ -242,16 +286,7 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 		}
 		runs = append(runs, run)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return runs, nil
+	return runs, rows.Err()
 }
 
 func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time) error {

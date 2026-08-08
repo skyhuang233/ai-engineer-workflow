@@ -65,9 +65,26 @@ func formatTimestamp(value time.Time) string {
 	return value.UTC().Format(timestampLayout)
 }
 
-// Open configures SQLite as the durable runtime store and runs all pending
-// migrations before returning a usable Store.
+// Open configures SQLite, checks its integrity, and runs all pending migrations.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	store, err := OpenForStartup(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.IntegrityCheck(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	if err := store.Migrate(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenForStartup configures SQLite without migrations so startup can make the
+// integrity-check then migration boundary explicit.
+func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
 	databasePath := ""
 	if dsn != ":memory:" && !strings.HasPrefix(dsn, "file:") {
 		databasePath = dsn
@@ -85,11 +102,18 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := store.Migrate(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
 	return store, nil
+}
+
+func (s *Store) IntegrityCheck(ctx context.Context) error {
+	var result string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		return fmt.Errorf("check sqlite integrity: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("check sqlite integrity: %s", result)
+	}
+	return nil
 }
 
 func (s *Store) configure(ctx context.Context) error {
