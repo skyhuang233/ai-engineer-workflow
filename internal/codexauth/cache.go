@@ -3,45 +3,88 @@
 package codexauth
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const FileName = "auth.json"
 
+type chatGPTCache struct {
+	AuthMode string `json:"auth_mode"`
+	APIKey   string `json:"OPENAI_API_KEY"`
+	Tokens   struct {
+		AccessToken  string `json:"access_token"`
+		AccountID    string `json:"account_id"`
+		IDToken      string `json:"id_token"`
+		RefreshToken string `json:"refresh_token"`
+	} `json:"tokens"`
+}
+
+type Redactor struct {
+	values [][]byte
+}
+
 // ValidateChatGPT verifies only the cache shape needed by this workflow. It
 // intentionally never returns credential values in an error.
 func ValidateChatGPT(source string) error {
-	_, err := readChatGPT(source)
+	_, _, err := readChatGPT(source)
 	return err
 }
 
-func readChatGPT(source string) ([]byte, error) {
+func readChatGPT(source string) ([]byte, chatGPTCache, error) {
+	var cache chatGPTCache
 	if !filepath.IsAbs(source) {
-		return nil, errors.New("Codex authentication source must be an absolute path")
+		return nil, cache, errors.New("Codex authentication source must be an absolute path")
 	}
 	info, err := os.Stat(source)
 	if err != nil {
-		return nil, fmt.Errorf("inspect Codex authentication source: %w", err)
+		return nil, cache, fmt.Errorf("inspect Codex authentication source: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("Codex authentication source must be a regular file")
+		return nil, cache, errors.New("Codex authentication source must be a regular file")
 	}
 	content, err := os.ReadFile(source)
 	if err != nil {
-		return nil, fmt.Errorf("read Codex authentication source: %w", err)
+		return nil, cache, fmt.Errorf("read Codex authentication source: %w", err)
 	}
-	var cache struct {
-		AuthMode string                     `json:"auth_mode"`
-		Tokens   map[string]json.RawMessage `json:"tokens"`
+	if json.Unmarshal(content, &cache) != nil || cache.AuthMode != "chatgpt" ||
+		strings.TrimSpace(cache.Tokens.AccessToken) == "" || strings.TrimSpace(cache.Tokens.AccountID) == "" ||
+		strings.TrimSpace(cache.Tokens.IDToken) == "" || strings.TrimSpace(cache.Tokens.RefreshToken) == "" {
+		return nil, cache, errors.New("Codex authentication source must contain a valid ChatGPT login cache")
 	}
-	if json.Unmarshal(content, &cache) != nil || cache.AuthMode != "chatgpt" || len(cache.Tokens) == 0 {
-		return nil, errors.New("Codex authentication source must contain a valid ChatGPT login cache")
+	return content, cache, nil
+}
+
+func NewRedactor(source string) (Redactor, error) {
+	_, cache, err := readChatGPT(source)
+	if err != nil {
+		return Redactor{}, err
 	}
-	return content, nil
+	values := []string{cache.APIKey, cache.Tokens.AccessToken, cache.Tokens.AccountID, cache.Tokens.IDToken, cache.Tokens.RefreshToken}
+	redactor := Redactor{values: make([][]byte, 0, len(values))}
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			redactor.values = append(redactor.values, []byte(value))
+		}
+	}
+	return redactor, nil
+}
+
+func (r Redactor) Bytes(input []byte) []byte {
+	result := append([]byte(nil), input...)
+	for _, value := range r.values {
+		result = bytes.ReplaceAll(result, value, []byte("[REDACTED]"))
+	}
+	return result
+}
+
+func (r Redactor) String(input string) string {
+	return string(r.Bytes([]byte(input)))
 }
 
 // Seed copies the trusted host credential cache into a new CODEX_HOME. An
@@ -59,7 +102,7 @@ func Seed(source, codexHome string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect Ticket Session Codex authentication cache: %w", err)
 	}
-	content, err := readChatGPT(source)
+	content, _, err := readChatGPT(source)
 	if err != nil {
 		return err
 	}

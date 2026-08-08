@@ -28,11 +28,16 @@ type fakeRuntime struct {
 	ignoredFile      bool
 	deliveryOutput   []byte
 	deliveryDeadline time.Time
+	workspaceContent string
 }
 
 type blockingFailureRuntime struct {
 	started chan<- struct{}
 	release <-chan struct{}
+}
+
+func testChatGPTAuth(accessToken string) []byte {
+	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
 }
 
 func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Result, error) {
@@ -55,7 +60,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	if len(spec.Command) > 2 && spec.Command[2] == "resume" {
 		marker = "resume"
 	}
-	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte("candidate "+marker+"\n"), 0o644); err != nil {
+	content := "candidate " + marker + "\n"
+	if r.workspaceContent != "" {
+		content = r.workspaceContent
+	}
+	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte(content), 0o644); err != nil {
 		return worker.Result{}, err
 	}
 	if r.dirty {
@@ -146,7 +155,7 @@ func TestControllerSeedsCodexAuthenticationBeforeFirstWorkerRun(t *testing.T) {
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	authSource := filepath.Join(root, "host-auth.json")
-	want := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-only"}}`)
+	want := testChatGPTAuth("test-only")
 	if err := os.WriteFile(authSource, want, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -179,14 +188,14 @@ func TestControllerPreservesExistingTicketSessionAuthentication(t *testing.T) {
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	authSource := filepath.Join(root, "host-auth.json")
-	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"host"}}`), 0o600); err != nil {
+	if err := os.WriteFile(authSource, testChatGPTAuth("host"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(root, "codex", claim.SessionID)
 	if err := os.MkdirAll(statePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	want := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"session-refreshed"}}`)
+	want := testChatGPTAuth("session-refreshed")
 	if err := os.WriteFile(filepath.Join(statePath, "auth.json"), want, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -232,6 +241,102 @@ func TestControllerRejectsNonChatGPTAuthenticationBeforeWorkerLaunch(t *testing.
 	}
 	if len(runtime.specs) != 0 {
 		t.Fatalf("worker launched with non-ChatGPT authentication: %#v", runtime.specs)
+	}
+}
+
+func TestControllerRejectsIncompleteChatGPTAuthenticationBeforeWorkerLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"chatgpt","tokens":{"junk":null}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("worker should not start"), results: []worker.Result{{ContainerID: "unexpected"}}}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "must not launch"))
+	if err == nil || !strings.Contains(err.Error(), "valid ChatGPT login cache") {
+		t.Fatalf("incomplete authentication error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with incomplete ChatGPT authentication: %#v", runtime.specs)
+	}
+}
+
+func TestControllerRedactsCodexCredentialsFromAllFailureDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	secret := "diagnostic-secret-token"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty: true, err: errors.New("worker failed"), workspaceContent: "copied credential: " + secret,
+		results: []worker.Result{{Output: []byte("worker output credential: " + secret), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail safely")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = filepath.WalkDir(filepath.Dir(diagnostic), func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(content), secret) {
+			t.Errorf("diagnostic artifact %s leaked a Codex credential", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkspaceManagerAdmitsExistingSessionAuthenticationWithoutHostSource(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	stateRoot := filepath.Join(root, "codex")
+	statePath := filepath.Join(stateRoot, claim.SessionID)
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(statePath, "auth.json"), testChatGPTAuth("session-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: stateRoot,
+		CodexAuthFile: filepath.Join(root, "missing-host-auth.json"),
+	}
+	if err := manager.AdmitCodexAuthentication(ctx, db, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatalf("existing Ticket Session authentication was coupled to host source: %v", err)
 	}
 }
 

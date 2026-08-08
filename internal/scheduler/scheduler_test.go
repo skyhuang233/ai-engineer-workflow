@@ -2,6 +2,7 @@ package scheduler_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -122,6 +123,52 @@ func TestDispatcherClaimsAndProjectsRunningTicket(t *testing.T) {
 	}
 	if recovered.RunID != claim.RunID || recovered.SessionID != claim.SessionID {
 		t.Fatalf("recovered claim = %#v, want run %q/session %q", recovered, claim.RunID, claim.SessionID)
+	}
+}
+
+func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	admissionErr := errors.New("ChatGPT authentication unavailable")
+	dispatcher := scheduler.Dispatcher{
+		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{body: snapshot.Root.Body},
+		MaxParallelRuns: 1, LeaseTTL: time.Minute,
+		AdmitTicket: func(_ context.Context, versionID string, ticketID int64) error {
+			if versionID != version.ID || ticketID != 1 {
+				t.Fatalf("admission target = %q/%d, want %q/1", versionID, ticketID, version.ID)
+			}
+			return admissionErr
+		},
+	}
+	if _, err := dispatcher.Claim(ctx, snapshot.Repository, snapshot.Root.Number, 0, "agent-1"); !errors.Is(err, admissionErr) {
+		t.Fatalf("Claim() error = %v, want admission failure", err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Attempt != 1 {
+		t.Fatalf("first durable claim attempt = %d, want 1", claim.Attempt)
 	}
 }
 

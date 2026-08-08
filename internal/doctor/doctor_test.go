@@ -5,6 +5,7 @@ import (
 	"debug/buildinfo"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -260,7 +261,7 @@ func TestCodexResumeCheckUsesReturnedSessionID(t *testing.T) {
 
 func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.T) {
 	authFile := filepath.Join(t.TempDir(), "auth.json")
-	if err := os.WriteFile(authFile, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-only"}}`), 0o600); err != nil {
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	executor := &recordingExecutor{outputs: [][]byte{
@@ -288,7 +289,7 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 
 func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutput(t *testing.T) {
 	authFile := filepath.Join(t.TempDir(), "auth.json")
-	if err := os.WriteFile(authFile, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-only"}}`), 0o600); err != nil {
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	executor := &recordingExecutor{
@@ -302,6 +303,10 @@ func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutpu
 	if strings.Contains(result.Summary, "secret-output") {
 		t.Fatalf("authentication report leaked Worker output: %q", result.Summary)
 	}
+}
+
+func doctorTestChatGPTAuth(accessToken string) []byte {
+	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
 }
 
 type checkFunc struct {

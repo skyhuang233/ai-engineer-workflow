@@ -33,6 +33,34 @@ type RecoveryInspector struct {
 	Workspace  WorkspaceManager
 }
 
+func (m WorkspaceManager) AdmitCodexAuthentication(ctx context.Context, db *store.Store, versionID string, ticketID int64) error {
+	if db == nil || versionID == "" || ticketID == 0 || !filepath.IsAbs(m.CodexStateRoot) {
+		return errors.New("Codex authentication admission is incomplete")
+	}
+	session, err := db.TicketSession(ctx, versionID, ticketID)
+	if err == nil {
+		statePath := session.CodexStatePath
+		if statePath == "" && session.SessionID != "" {
+			statePath = filepath.Join(m.CodexStateRoot, session.SessionID)
+		}
+		if statePath != "" {
+			statePath, err = managedPath(m.CodexStateRoot, statePath)
+			if err != nil {
+				return err
+			}
+			authPath := filepath.Join(statePath, codexauth.FileName)
+			if _, statErr := os.Stat(authPath); statErr == nil {
+				return codexauth.ValidateChatGPT(authPath)
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				return fmt.Errorf("inspect Ticket Session Codex authentication cache: %w", statErr)
+			}
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	return codexauth.ValidateChatGPT(m.CodexAuthFile)
+}
+
 func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (bool, error) {
 	if r.Containers == nil {
 		return false, errors.New("container recovery inspector is incomplete")
@@ -235,6 +263,10 @@ func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit, bra
 }
 
 func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, baseCommit, output, runErr string) (string, error) {
+	redactor, err := codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("prepare diagnostic credential redaction: %w", err)
+	}
 	dir := filepath.Join(filepath.Dir(ws.CodexState), "diagnostics", runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -252,26 +284,26 @@ func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, b
 	if diffErr != nil {
 		diff = "git diff failed: " + diffErr.Error()
 	}
-	if err := os.WriteFile(filepath.Join(dir, "revision.patch"), []byte(diff), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "revision.patch"), redactor.Bytes([]byte(diff)), 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(strings.TrimSpace(head)+"\nbase: "+baseCommit+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "head.txt"), redactor.Bytes([]byte(strings.TrimSpace(head)+"\nbase: "+baseCommit+"\n")), 0o600); err != nil {
 		return "", err
 	}
-	if err := m.copyResidue(ctx, ws, dir, false); err != nil {
+	if err := m.copyResidue(ctx, ws, dir, false, redactor); err != nil {
 		return "", err
 	}
-	if err := m.copyResidue(ctx, ws, dir, true); err != nil {
+	if err := m.copyResidue(ctx, ws, dir, true, redactor); err != nil {
 		return "", err
 	}
 	body := "error: " + runErr + "\nhead: " + strings.TrimSpace(head) + "\nbase: " + baseCommit + "\nstatus:\n" + status + "\noutput:\n" + output + "\nevidence: revision.patch, head.txt, residue/, and ignored/"
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(path, redactor.Bytes([]byte(body)), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func (m WorkspaceManager) copyResidue(ctx context.Context, ws workspace, dir string, ignored bool) error {
+func (m WorkspaceManager) copyResidue(ctx context.Context, ws workspace, dir string, ignored bool, redactor codexauth.Redactor) error {
 	args := []string{"ls-files", "--others", "--exclude-standard", "-z"}
 	destinationRoot := "residue"
 	if ignored {
@@ -302,7 +334,7 @@ func (m WorkspaceManager) copyResidue(ctx context.Context, ws workspace, dir str
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(destination, data, 0o600); err != nil {
+		if err := os.WriteFile(destination, redactor.Bytes(data), 0o600); err != nil {
 			return err
 		}
 	}
