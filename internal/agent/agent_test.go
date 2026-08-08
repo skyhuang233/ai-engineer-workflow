@@ -1395,6 +1395,41 @@ func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
+	outsideStatePath := filepath.Join(root, "outside", claim.SessionID)
+	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideStatePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: workspacePath, CodexStatePath: outsideStatePath, Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(2*time.Hour)); err == nil || reclaimed != 0 {
+		t.Fatalf("cleanup failure reclaim = %d, %v; want zero and an error", reclaimed, err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Delivered" {
+		t.Fatalf("ticket state after cleanup failure = %q, want Delivered", projection.Tickets[0].State)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("delivered current claim after cleanup failure = %v, want ErrNotFound", err)
+	}
+}
+
 func codexOutput(sessionID, summary string) []byte {
 	message, _ := json.Marshal(map[string]any{"summary": summary, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})

@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 40
+	latestSchemaVersion = 41
 )
 
 var (
@@ -1100,6 +1100,20 @@ SET plan_version_ids_json = COALESCE((
 			return fmt.Errorf("migration 40: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (40, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 41 {
+		exists, err := tableHasColumnTx(ctx, tx, "ticket_deliveries", "merge_commit")
+		if err != nil {
+			return fmt.Errorf("migration 41: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE ticket_deliveries ADD COLUMN merge_commit TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 41: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (41, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

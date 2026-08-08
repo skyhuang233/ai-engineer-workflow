@@ -119,6 +119,41 @@ func TestMigrationFromV39AddsQualityGateQuestions(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV40AddsTicketDeliveryMergeCommit(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 41"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_deliveries DROP COLUMN merge_commit"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "ticket_deliveries", "merge_commit") {
+		t.Fatal("migration did not add ticket_deliveries.merge_commit")
+	}
+}
+
 func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

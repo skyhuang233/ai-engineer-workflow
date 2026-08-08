@@ -16,6 +16,7 @@ import (
 
 type PollResult struct {
 	Deliveries int
+	Delivered  int
 	Feedback   int
 	Checks     int
 }
@@ -27,6 +28,7 @@ type BootstrapControlResult struct {
 	AttemptedPlanAlreadyComplete bool
 }
 type BootstrapControlPass func(context.Context, bool) (BootstrapControlResult, error)
+type DeliveredControlPass func(context.Context) error
 
 type WorkflowInboxProjector interface {
 	ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error
@@ -111,6 +113,7 @@ type Poller struct {
 	Client                *Client
 	Now                   func() time.Time
 	LaunchReview          ReviewLauncher
+	AfterDelivered        DeliveredControlPass
 	InboxProjector        WorkflowInboxProjector
 	MaxFailures           int
 	MaxWorkerAttempts     int
@@ -498,6 +501,14 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		}
 		return p.recordFailureForPlans(ctx, repository, now, attemptedActiveVersionIDs, err)
 	}
+	if result.Delivered > 0 && p.AfterDelivered != nil {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		if err := p.AfterDelivered(ctx); err != nil {
+			return p.recordFailureForPlans(ctx, repository, now, attemptedActiveVersionIDs, err)
+		}
+	}
 	if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
 		return PollResult{}, err
 	}
@@ -791,9 +802,13 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err
 		}
-		terminal, err := reconciler.ReconcileTicket(ctx, delivery)
+		state, err := reconciler.reconcileTicket(ctx, delivery)
 		if err != nil {
 			return PollResult{}, err
+		}
+		terminal := state != pullRequestPending
+		if state == pullRequestDelivered {
+			result.Delivered++
 		}
 		if !terminal {
 			if err := p.renewPollLease(ctx, repository); err != nil {

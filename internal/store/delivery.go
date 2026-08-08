@@ -114,6 +114,7 @@ type TicketDelivery struct {
 	CandidateCommit   string
 	Branch            string
 	RemoteHead        string
+	MergeCommit       string
 	ChecksETag        string
 }
 
@@ -127,11 +128,11 @@ func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID in
 
 func (s *Store) CandidateDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
 	var delivery TicketDelivery
-	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.checks_etag
+	err := s.db.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.merge_commit, d.checks_etag
 FROM ticket_deliveries d
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
 WHERE d.version_id = ? AND d.issue_id = ? AND s.accepted_commit != ''`, versionID, issueID).
-		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.ChecksETag)
+		Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.MergeCommit, &delivery.ChecksETag)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketDelivery{}, ErrNotFound
 	}
@@ -444,7 +445,7 @@ ORDER BY o.created_at, CASE o.operation WHEN ? THEN 0 ELSE 1 END, o.idempotency_
 }
 
 func (s *Store) PendingTicketDeliveries(ctx context.Context, repository string) ([]TicketDelivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.checks_etag
+	rows, err := s.db.QueryContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.merge_commit, d.checks_etag
 FROM ticket_deliveries d
 JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
 JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
@@ -459,7 +460,7 @@ AND `+currentActiveUnfrozenPlanPredicate, repository, plan.StateCancelled)
 	var deliveries []TicketDelivery
 	for rows.Next() {
 		var delivery TicketDelivery
-		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.ChecksETag); err != nil {
+		if err := rows.Scan(&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber, &delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.MergeCommit, &delivery.ChecksETag); err != nil {
 			return nil, err
 		}
 		deliveries = append(deliveries, delivery)

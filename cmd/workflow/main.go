@@ -638,7 +638,7 @@ func runPollGitHub(args []string) {
 			}
 			return nil
 		}
-		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
+		control := func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
 			controlResult := github.BootstrapControlResult{}
 			attemptedPlanVersionID = ""
 			attemptedPlanAlreadyComplete = false
@@ -687,7 +687,12 @@ func runPollGitHub(args []string) {
 				}
 				return controlResult, claimErr
 			}
-		})
+		}
+		poller.AfterDelivered = func(ctx context.Context) error {
+			_, err := control(ctx, true)
+			return err
+		}
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, control)
 		if shouldLogNeedsAttentionError(err) {
 			fmt.Fprintln(os.Stderr, err)
 		}

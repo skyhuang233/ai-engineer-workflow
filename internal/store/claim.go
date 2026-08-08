@@ -796,48 +796,85 @@ func planFrozenTx(ctx context.Context, tx frontierRows, versionID string) (bool,
 // tickets. The caller is expected to have already verified the merged revision
 // and reachability at the GitHub boundary.
 func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issueID int64) error {
+	_, err := s.markTicketDelivered(ctx, versionID, issueID, "")
+	return err
+}
+
+// MarkTicketDeliveredAtMerge records the merge revision with the Delivered
+// fact. A repeated reconciliation leaves the original delivery fact unchanged.
+func (s *Store) MarkTicketDeliveredAtMerge(ctx context.Context, versionID string, issueID int64, mergeCommit string) (bool, error) {
+	if mergeCommit == "" {
+		return false, ErrInvalidClaim
+	}
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit)
+}
+
+func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	nowText := formatTimestamp(now)
-	result, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
-SELECT version_id, issue_id, ?, 1, ? FROM plan_tickets WHERE version_id = ? AND issue_id = ?
-ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivered = 1, updated_at = excluded.updated_at`, plan.StateDelivered, nowText, versionID, issueID)
+	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, delivered = 1, updated_at = ?
+WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, nowText, versionID, issueID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
-		return ErrNotFound
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM plan_tickets WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		} else if err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if mergeCommit != "" {
+		result, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries SET merge_commit = ?, updated_at = ? WHERE version_id = ? AND issue_id = ?`, mergeCommit, nowText, versionID, issueID)
+		if err != nil {
+			return false, err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return false, ErrNotFound
+		}
 	}
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
 		if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
-			return err
+			return false, err
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
 	} else if err != nil {
-		return err
+		return false, err
 	}
 	if runID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "succeeded", nowText, runID, RunRunning); err != nil {
-			return err
+			return false, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND state = ?`, "revoked", runID, LeaseActive); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
