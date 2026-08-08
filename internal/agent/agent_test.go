@@ -96,6 +96,36 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	return result, nil
 }
 
+func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relativeObject := firstLooseObject(t, source)
+	sourceInfo, err := os.Stat(filepath.Join(source, ".git", "objects", relativeObject))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceInfo, err := os.Stat(filepath.Join(session.WorkspacePath, ".git", "objects", relativeObject))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(sourceInfo, workspaceInfo) {
+		t.Fatal("Ticket Workspace shares Git object hardlinks with its source repository")
+	}
+}
+
 func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -684,4 +714,34 @@ func initRepository(t *testing.T) string {
 	run("add", "README.md", ".gitignore")
 	run("commit", "-m", "base")
 	return dir
+}
+
+func firstLooseObject(t *testing.T, repository string) string {
+	t.Helper()
+	objects := filepath.Join(repository, ".git", "objects")
+	var relative string
+	stop := errors.New("stop after first loose Git object")
+	err := filepath.WalkDir(objects, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if path != objects && (entry.Name() == "info" || entry.Name() == "pack") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relative, err = filepath.Rel(objects, path)
+		if err != nil {
+			return err
+		}
+		return stop
+	})
+	if err != nil && !errors.Is(err, stop) {
+		t.Fatal(err)
+	}
+	if relative == "" {
+		t.Fatal("source repository has no loose Git objects")
+	}
+	return relative
 }

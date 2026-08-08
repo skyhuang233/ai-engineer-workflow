@@ -129,7 +129,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 		return workspace{}, err
 	}
 	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
-		if err := runGit(ctx, "", "clone", "--local", sourceRepository, path); err != nil {
+		if err := runGit(ctx, "", "clone", "--local", "--no-hardlinks", sourceRepository, path); err != nil {
 			return workspace{}, fmt.Errorf("clone ticket workspace: %w", err)
 		}
 		if err := runGit(ctx, path, "checkout", "-b", branch); err != nil {
