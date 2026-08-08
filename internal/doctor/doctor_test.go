@@ -5,6 +5,9 @@ import (
 	"debug/buildinfo"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -256,6 +259,57 @@ func TestCodexResumeCheckUsesReturnedSessionID(t *testing.T) {
 	}
 }
 
+func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingExecutor{outputs: [][]byte{
+		[]byte("{\"type\":\"thread.started\",\"thread_id\":\"worker-session-7\"}\n"),
+		[]byte("{\"type\":\"item.completed\",\"item\":{\"text\":\"worker-nonce-7\"}}\n"),
+	}}
+	result := (WorkerCodexSessionCheck{
+		Executor: executor, Image: "ghcr.io/owner/worker@sha256:bbbb", AuthFile: authFile, Nonce: "worker-nonce-7",
+	}).Run(context.Background())
+	if result.Status != Pass {
+		t.Fatalf("Run() = %#v, want PASS", result)
+	}
+	if len(executor.commands) != 2 {
+		t.Fatalf("commands = %#v, want initial and resumed Worker containers", executor.commands)
+	}
+	initial := strings.Join(executor.commands[0], " ")
+	resumed := strings.Join(executor.commands[1], " ")
+	if !strings.HasPrefix(initial, "docker run --rm") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec") {
+		t.Fatalf("initial Worker Codex command = %q", initial)
+	}
+	if !strings.Contains(resumed, "codex exec resume") || !strings.Contains(resumed, "worker-session-7") {
+		t.Fatalf("resumed Worker Codex command = %q", resumed)
+	}
+	t.Logf("Doctor result: %s\ncreate: %s\nresume: %s", result.Summary, initial, resumed)
+}
+
+func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutput(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingExecutor{
+		outputs: [][]byte{[]byte("401 Unauthorized: Missing bearer or basic authentication in header secret-output")},
+		errs:    []error{errors.New("exit status 1")},
+	}
+	result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "authentication was rejected") {
+		t.Fatalf("Run() = %#v, want redacted authentication failure", result)
+	}
+	if strings.Contains(result.Summary, "secret-output") {
+		t.Fatalf("authentication report leaked Worker output: %q", result.Summary)
+	}
+}
+
+func doctorTestChatGPTAuth(accessToken string) []byte {
+	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
+}
+
 type checkFunc struct {
 	name   string
 	result Result
@@ -271,6 +325,7 @@ type fakeExecutor struct {
 
 type recordingExecutor struct {
 	outputs  [][]byte
+	errs     []error
 	commands [][]string
 }
 
@@ -278,7 +333,12 @@ func (e *recordingExecutor) Run(_ context.Context, command []string) ([]byte, er
 	e.commands = append(e.commands, append([]string(nil), command...))
 	output := e.outputs[0]
 	e.outputs = e.outputs[1:]
-	return output, nil
+	var err error
+	if len(e.errs) > 0 {
+		err = e.errs[0]
+		e.errs = e.errs[1:]
+	}
+	return output, err
 }
 
 func (f fakeExecutor) Run(_ context.Context, command []string) ([]byte, error) {

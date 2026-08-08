@@ -2,6 +2,7 @@ package scheduler_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -125,6 +126,53 @@ func TestDispatcherClaimsAndProjectsRunningTicket(t *testing.T) {
 	}
 }
 
+func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	admissionErr := errors.New("ChatGPT authentication unavailable")
+	dispatcher := scheduler.Dispatcher{
+		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{body: snapshot.Root.Body},
+		MaxParallelRuns: 1, LeaseTTL: time.Minute,
+		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
+			if provisioning.SessionID == "" || provisioning.Existing {
+				t.Fatalf("provisioning target = %q existing=%t, want a new Session", provisioning.SessionID, provisioning.Existing)
+			}
+			return store.SessionProvisioningResult{}, admissionErr
+		},
+	}
+	if _, err := dispatcher.Claim(ctx, snapshot.Repository, snapshot.Root.Number, 0, "agent-1"); !errors.Is(err, admissionErr) {
+		t.Fatalf("Claim() error = %v, want admission failure", err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Attempt != 1 {
+		t.Fatalf("first durable claim attempt = %d, want 1", claim.Attempt)
+	}
+	t.Logf("failed ChatGPT admission consumed no Worker attempt; the first durable claim remained attempt %d", claim.Attempt)
+}
+
 func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
@@ -160,4 +208,83 @@ func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 	if replacement.RunID == claim.RunID {
 		t.Fatalf("recovery retained dead run %q", claim.RunID)
 	}
+}
+
+func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisionCalls := 0
+	dispatcher := scheduler.Dispatcher{
+		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{},
+		Recovery: recoveryInspector{workspaceReady: true}, Now: func() time.Time { return now.Add(time.Minute) },
+		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
+			provisionCalls++
+			if !provisioning.Existing || provisioning.CurrentRunID != claim.RunID {
+				t.Fatalf("recovery provisioning = %#v", provisioning)
+			}
+			return store.SessionProvisioningResult{}, &store.SessionAuthenticationFailure{}
+		},
+	}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("authentication-corrupt recovery Run remained active: %v", err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt recovery projection = %#v", projection.Tickets)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db = restarted
+	dispatcher.Store = restarted
+	dispatcher.Projector = &projector{}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if provisionCalls != 1 {
+		t.Fatalf("authentication provisioning repeated after restart: calls = %d, want 1", provisionCalls)
+	}
+	projection, err = restarted.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt projection after restart = %#v", projection.Tickets)
+	}
+	if _, err := restarted.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("authentication-corrupt Run became current after restart: %v", err)
+	}
+	t.Logf("after reopening SQLite and rerunning recovery: state=%s current_claim=false auth_provision_calls=%d", projection.Tickets[0].State, provisionCalls)
 }

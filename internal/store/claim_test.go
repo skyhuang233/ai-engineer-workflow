@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -62,6 +63,61 @@ func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
 	}
 }
 
+func TestClaimReadyCompensatesNewSessionProvisioningOnTransactionFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, err := Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER reject_worker_run BEFORE INSERT ON worker_runs BEGIN SELECT RAISE(ABORT, 'injected worker run failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	var authPath string
+	rolledBack := false
+	_, err = db.ClaimReady(ctx, ClaimRequest{
+		VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute,
+		ProvisionSession: func(_ context.Context, provisioning SessionProvisioning) (SessionProvisioningResult, error) {
+			authPath = filepath.Join(root, provisioning.SessionID, "auth.json")
+			if err := os.MkdirAll(filepath.Dir(authPath), 0o755); err != nil {
+				return SessionProvisioningResult{}, err
+			}
+			if err := os.WriteFile(authPath, []byte("credential"), 0o600); err != nil {
+				return SessionProvisioningResult{}, err
+			}
+			return SessionProvisioningResult{Rollback: func() error {
+				rolledBack = true
+				return os.Remove(authPath)
+			}}, nil
+		},
+	})
+	if err == nil {
+		t.Fatal("claim unexpectedly survived injected transaction failure")
+	}
+	if !rolledBack {
+		t.Fatal("new Session authentication was not compensated")
+	}
+	if _, err := os.Stat(authPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted authentication cache survived: %v", err)
+	}
+	if _, err := db.TicketSession(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed claim retained Session: %v", err)
+	}
+}
+
 func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -86,6 +142,45 @@ func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
 	}
 	if _, err := db.CurrentClaim(ctx, version.ID, 1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expired CurrentClaim error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecordRunFailureDoesNotRequireDiagnosticEvidence(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Error: "worker failed without evidence", Now: now.Add(time.Second)}); err != nil {
+		t.Fatalf("RecordRunFailure() = %v", err)
+	}
+	var runState string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM worker_runs WHERE run_id = ?`, claim.RunID).Scan(&runState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" {
+		t.Fatalf("Run state = %q, want failed", runState)
+	}
+	if _, err := db.RunDiagnostic(ctx, claim.RunID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing evidence unexpectedly created a diagnostic: %v", err)
 	}
 }
 
@@ -356,7 +451,7 @@ func TestDeliveryCompletionRequiresUnexpiredLease(t *testing.T) {
 	}
 }
 
-func TestExpiredAgentFailureRecordsDiagnosticsWithoutMutatingWorkflow(t *testing.T) {
+func TestExpiredCurrentAgentFailureRemainsDiagnosticOnly(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -399,7 +494,48 @@ WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures); err !
 		t.Fatal(err)
 	}
 	if runState != RunRunning || leaseState != LeaseActive || failures != 0 {
-		t.Fatalf("late agent failure mutated run=%q lease=%q failures=%d", runState, leaseState, failures)
+		t.Fatalf("late current agent failure left run=%q lease=%q failures=%d", runState, leaseState, failures)
+	}
+}
+
+func TestExpiredCurrentAuthenticationFailureTerminatesRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Cause: &SessionAuthenticationFailure{}, Now: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	var runState, leaseState, runtimeState string
+	var failures int
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state, s.consecutive_failures, rt.state
+FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures, &runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" || leaseState != "revoked" || failures != 1 || runtimeState != plan.StateNeedsAttention {
+		t.Fatalf("late authentication failure left run=%q lease=%q failures=%d runtime=%q", runState, leaseState, failures, runtimeState)
 	}
 }
 
@@ -671,6 +807,184 @@ func TestFailedReviewRevisionRequeuesItsFeedback(t *testing.T) {
 	}
 	if retry.Attempt != revision.Attempt+1 || !strings.Contains(prompt, "Please rename this.") {
 		t.Fatalf("retry = %#v, prompt = %q", retry, prompt)
+	}
+}
+
+func TestReviewAuthenticationFailureReleasesClaimedFeedback(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "auth-failure", Author: "human", Body: "Please revise."}}, now); err != nil {
+		t.Fatal(err)
+	}
+	revision, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(time.Second), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: revision.RunID, LeaseToken: revision.LeaseToken, Cause: &SessionAuthenticationFailure{}, Now: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	var claimedRunID string
+	if err := db.db.QueryRowContext(ctx, `SELECT claimed_run_id FROM review_feedback_events WHERE version_id = ? AND issue_id = ? AND source = ? AND event_id = ?`, version.ID, claim.TicketID, "review", "auth-failure").Scan(&claimedRunID); err != nil {
+		t.Fatal(err)
+	}
+	if claimedRunID != "" {
+		t.Fatalf("authentication-failed review feedback remained claimed by %q", claimedRunID)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-failed review projection = %#v", projection.Tickets)
+	}
+	t.Logf("review feedback was released from Run %s and the ticket projected %s", revision.RunID, projection.Tickets[0].State)
+}
+
+func TestEstablishedSessionAuthenticationFailureBlocksInitialReclaim(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Error: "worker failed", Now: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	provision := func(context.Context, SessionProvisioning) (SessionProvisioningResult, error) {
+		return SessionProvisioningResult{}, &SessionAuthenticationFailure{}
+	}
+	_, err = db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Second), ProvisionSession: provision})
+	if !errors.Is(err, ErrSessionAuthenticationUnavailable) {
+		t.Fatalf("established Session authentication error = %v", err)
+	}
+	if !IsSessionAuthenticationTerminalized(err) {
+		t.Fatalf("established Session authentication failure was not marked terminalized: %v", err)
+	}
+	var runtimeState string
+	var runCount int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ?`, claim.SessionID).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeState != plan.StateNeedsAttention || runCount != 1 {
+		t.Fatalf("authentication-corrupt initial reclaim state = %q, runs = %d", runtimeState, runCount)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "agent-3", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(3 * time.Second), ProvisionSession: provision}); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("authentication-corrupt initial reclaim repeated: %v", err)
+	}
+}
+
+func TestEstablishedSessionAuthenticationFailurePreservesQueuedFeedback(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_runtime SET state = ? WHERE version_id = ? AND issue_id = ?`, plan.StateWaitingReview, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "queued-auth-failure", Body: "Please revise."}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	provision := func(context.Context, SessionProvisioning) (SessionProvisioningResult, error) {
+		return SessionProvisioningResult{}, &SessionAuthenticationFailure{}
+	}
+	_, _, err = db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Second), 1, DefaultMaxWorkerAttempts, provision)
+	if !errors.Is(err, ErrSessionAuthenticationUnavailable) {
+		t.Fatalf("queued review authentication error = %v", err)
+	}
+	if !IsSessionAuthenticationTerminalized(err) {
+		t.Fatalf("queued review authentication failure was not marked terminalized: %v", err)
+	}
+	var runtimeState, claimedRunID string
+	var runCount int
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM ticket_runtime WHERE version_id = ? AND issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT claimed_run_id FROM review_feedback_events WHERE version_id = ? AND issue_id = ? AND event_id = ?`, version.ID, claim.TicketID, "queued-auth-failure").Scan(&claimedRunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ?`, claim.SessionID).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeState != plan.StateNeedsAttention || claimedRunID != "" || runCount != 1 {
+		t.Fatalf("authentication-corrupt review state = %q, claimed run = %q, runs = %d", runtimeState, claimedRunID, runCount)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(3*time.Second), 1, DefaultMaxWorkerAttempts, provision); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("authentication-corrupt review claim repeated: %v", err)
 	}
 }
 

@@ -126,6 +126,7 @@ type RunFailure struct {
 	LeaseToken      string
 	DiagnosticsPath string
 	Error           string
+	Cause           error
 	Now             time.Time
 }
 
@@ -695,7 +696,7 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if failure.RunID == "" || failure.LeaseToken == "" || failure.DiagnosticsPath == "" {
+	if failure.RunID == "" || failure.LeaseToken == "" {
 		return ErrInvalidClaim
 	}
 	if failure.Now.IsZero() {
@@ -708,11 +709,17 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 		return err
 	}
 	defer tx.Rollback()
-	var currentRunID, runState, leaseState, expiresText string
-	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id, r.state, l.state, l.expires_at
+	var authenticationFailure *SessionAuthenticationFailure
+	isAuthenticationFailure := errors.As(failure.Cause, &authenticationFailure)
+	if isAuthenticationFailure {
+		failure.Error = ErrSessionAuthenticationUnavailable.Error()
+	}
+	var currentRunID, runState, leaseState, expiresText, versionID string
+	var issueID int64
+	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id, r.state, l.state, l.expires_at, s.version_id, s.issue_id
 FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, failure.LeaseToken, RunAgent).Scan(&currentRunID, &runState, &leaseState, &expiresText)
+WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, failure.LeaseToken, RunAgent).Scan(&currentRunID, &runState, &leaseState, &expiresText, &versionID, &issueID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -720,14 +727,19 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 		return err
 	}
 	now := formatTimestamp(failure.Now)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
-		return err
+	if failure.DiagnosticsPath != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
+			return err
+		}
+	}
+	if currentRunID != failure.RunID || runState != RunRunning || leaseState != LeaseActive {
+		return tx.Commit()
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
 	if err != nil {
 		return err
 	}
-	if currentRunID != failure.RunID || runState != RunRunning || leaseState != LeaseActive || !expiresAt.After(failure.Now) {
+	if !expiresAt.After(failure.Now) && !isAuthenticationFailure {
 		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, now, failure.RunID, RunRunning); err != nil {
@@ -746,6 +758,12 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	claimedFeedback, err := result.RowsAffected()
 	if err != nil {
 		return err
+	}
+	if isAuthenticationFailure {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, ErrSessionAuthenticationUnavailable.Error(), failure.Now); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if claimedFeedback > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ?

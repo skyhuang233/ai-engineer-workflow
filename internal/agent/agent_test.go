@@ -28,11 +28,20 @@ type fakeRuntime struct {
 	ignoredFile      bool
 	deliveryOutput   []byte
 	deliveryDeadline time.Time
+	workspaceContent string
+	corruptCodexAuth bool
+	deleteCodexAuth  bool
+	blockDiagnostics bool
+	refreshedAuth    []byte
 }
 
 type blockingFailureRuntime struct {
 	started chan<- struct{}
 	release <-chan struct{}
+}
+
+func testChatGPTAuth(accessToken string) []byte {
+	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
 }
 
 func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Result, error) {
@@ -55,8 +64,32 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	if len(spec.Command) > 2 && spec.Command[2] == "resume" {
 		marker = "resume"
 	}
-	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte("candidate "+marker+"\n"), 0o644); err != nil {
+	content := "candidate " + marker + "\n"
+	if r.workspaceContent != "" {
+		content = r.workspaceContent
+	}
+	if err := os.WriteFile(filepath.Join(spec.WorkspacePath, "agent.txt"), []byte(content), 0o644); err != nil {
 		return worker.Result{}, err
+	}
+	if r.corruptCodexAuth {
+		if err := os.WriteFile(filepath.Join(spec.CodexStatePath, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"truncated"}}`), 0o600); err != nil {
+			return worker.Result{}, err
+		}
+	}
+	if len(r.refreshedAuth) > 0 {
+		if err := os.WriteFile(filepath.Join(spec.CodexStatePath, "auth.json"), r.refreshedAuth, 0o600); err != nil {
+			return worker.Result{}, err
+		}
+	}
+	if r.deleteCodexAuth {
+		if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
+			return worker.Result{}, err
+		}
+	}
+	if r.blockDiagnostics {
+		if err := os.WriteFile(filepath.Join(filepath.Dir(spec.CodexStatePath), "diagnostics"), []byte("not a directory"), 0o600); err != nil {
+			return worker.Result{}, err
+		}
 	}
 	if r.dirty {
 		if r.ignoredFile {
@@ -137,6 +170,508 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 		}
 	}
 	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
+}
+
+func TestControllerSeedsCodexAuthenticationBeforeFirstWorkerRun(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	want := testChatGPTAuth("test-only")
+	if err := os.WriteFile(authSource, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		CodexAuthFile: authSource,
+	}
+	db, version, claim := createClaimWithProvisioner(t, ctx, root, manager.ProvisionCodexSession)
+	defer db.Close()
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after auth observation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "observe auth")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(session.CodexStatePath, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("seeded auth = %q, want exact source bytes", got)
+	}
+	t.Logf("claim attempt=%d returned only after the host ChatGPT cache was seeded into Ticket Session %s", claim.Attempt, claim.SessionID)
+}
+
+func TestControllerPreservesExistingTicketSessionAuthentication(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "codex", claim.SessionID)
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := testChatGPTAuth("session-refreshed")
+	if err := os.WriteFile(filepath.Join(statePath, "auth.json"), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		CodexAuthFile: authSource,
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after auth observation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "observe auth")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	got, err := os.ReadFile(filepath.Join(statePath, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("existing Ticket Session auth was overwritten: got %q", got)
+	}
+	t.Logf("Ticket Session %s retained its refreshed auth cache instead of being overwritten from the host source", claim.SessionID)
+}
+
+func TestControllerRejectsNonChatGPTAuthenticationBeforeWorkerLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"api","OPENAI_API_KEY":"test-only"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("worker should not start"), results: []worker.Result{{ContainerID: "unexpected"}}}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err == nil || !strings.Contains(err.Error(), "valid ChatGPT login cache") {
+		t.Fatalf("invalid authentication provisioning error = %v", err)
+	}
+	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "must not launch"))
+	if err == nil || !strings.Contains(err.Error(), "authentication cache is unavailable") {
+		t.Fatalf("invalid authentication error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with non-ChatGPT authentication: %#v", runtime.specs)
+	}
+}
+
+func TestControllerRejectsIncompleteChatGPTAuthenticationBeforeWorkerLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"chatgpt","tokens":{"junk":null}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("worker should not start"), results: []worker.Result{{ContainerID: "unexpected"}}}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err == nil || !strings.Contains(err.Error(), "valid ChatGPT login cache") {
+		t.Fatalf("incomplete authentication provisioning error = %v", err)
+	}
+	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "must not launch"))
+	if err == nil || !strings.Contains(err.Error(), "authentication cache is unavailable") {
+		t.Fatalf("incomplete authentication error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with incomplete ChatGPT authentication: %#v", runtime.specs)
+	}
+}
+
+func TestControllerRedactsCodexCredentialsFromAllFailureDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	secret := "diagnostic-secret-token"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty: true, err: errors.New("worker failed"), workspaceContent: "copied credential: " + secret,
+		results: []worker.Result{{Output: []byte("worker output credential: " + secret), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail safely")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = filepath.WalkDir(filepath.Dir(diagnostic), func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(content), secret) {
+			t.Errorf("diagnostic artifact %s leaked a Codex credential", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkspaceManagerAdmitsExistingSessionAuthenticationWithoutHostSource(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	stateRoot := filepath.Join(root, "codex")
+	statePath := filepath.Join(stateRoot, claim.SessionID)
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(statePath, "auth.json"), testChatGPTAuth("session-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: stateRoot,
+		CodexAuthFile: filepath.Join(root, "missing-host-auth.json"),
+	}
+	if err := manager.AdmitCodexAuthentication(ctx, db, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatalf("existing Ticket Session authentication was coupled to host source: %v", err)
+	}
+}
+
+func TestWorkspaceManagerDoesNotReseedMissingEstablishedSessionAuthentication(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("host-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	if err := manager.ProvisionCodexAuthentication(ctx, "ts-established", true); err == nil {
+		t.Fatal("missing established Session authentication was reseeded")
+	}
+	if _, err := os.Stat(filepath.Join(root, "codex", "ts-established", "auth.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("established Session authentication was recreated: %v", err)
+	}
+}
+
+func TestWorkspaceManagerRejectsOverlappingWorkspaceAndCodexState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("host-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := filepath.Join(root, "shared")
+	manager := agent.WorkspaceManager{RootDir: sharedRoot, CodexStateRoot: sharedRoot, CodexAuthFile: authSource}
+	if err := manager.ProvisionCodexAuthentication(ctx, "ts-new", false); err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("overlapping workspace and state error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sharedRoot, "ts-new", "auth.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credentials were written into overlapping workspace: %v", err)
+	}
+}
+
+func TestWorkspaceManagerRollbackRemovesUncommittedSessionState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("host-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	result, err := manager.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: "ts-uncommitted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(root, "codex", "ts-uncommitted")
+	if err := os.WriteFile(filepath.Join(state, "uncommitted-state"), []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result.Rollback == nil {
+		t.Fatal("new Session provisioning did not return rollback")
+	}
+	if err := result.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted Session state survived rollback: %v", err)
+	}
+}
+
+func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	oldSecret := "credential-before-refresh"
+	newSecret := "credential-after-refresh"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(oldSecret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	if err := manager.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty:         true,
+		err:           errors.New("worker failed after refresh"),
+		refreshedAuth: testChatGPTAuth(newSecret),
+		results:       []worker.Result{{Output: []byte(oldSecret + " " + newSecret), ContainerID: "container-refreshed"}},
+	}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "refresh then fail")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(report), oldSecret) || strings.Contains(string(report), newSecret) {
+		t.Fatalf("refresh credentials leaked through diagnostic: %s", report)
+	}
+}
+
+func TestControllerAcceptsCredentialBearingCandidateInTrustedWorkflow(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	secret := "candidate-auth-secret"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	db, _, claim := createClaimWithProvisioner(t, ctx, root, manager.ProvisionCodexSession)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-secret", "implemented with "+secret), ContainerID: "container-secret"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement in trusted workflow")); err != nil {
+		t.Fatalf("credential-bearing Candidate was rejected: %v", err)
+	}
+	candidate, err := db.CandidateRevision(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("credential-bearing Candidate was not persisted: %v", err)
+	}
+	if !strings.Contains(string(candidate.StructuredOutput), secret) {
+		t.Fatalf("trusted Candidate output = %q, want preserved credential-bearing summary", candidate.StructuredOutput)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("credential-bearing Candidate launched %d containers, want Worker and Delivery Controller", len(runtime.specs))
+	}
+}
+
+func TestExpiredRunWithMissingAuthenticationFailsDurably(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("expired-auth-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	db, version, claim := createClaimWithProvisioner(t, ctx, root, manager.ProvisionCodexSession)
+	defer db.Close()
+	if err := os.Remove(filepath.Join(root, "codex", claim.SessionID, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(time.Second), ProvisionSession: manager.ProvisionCodexSession,
+	})
+	if !errors.Is(err, store.ErrSessionAuthenticationUnavailable) {
+		t.Fatalf("missing expired authentication error = %v", err)
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("expired Run diagnostic = %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") {
+		t.Fatalf("expired Run diagnostic = %q", report)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expired Run remained current: %v", err)
+	}
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(2 * time.Second), ProvisionSession: manager.ProvisionCodexSession}); !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("authentication-corrupt Session was reclaimed: %v", err)
+	}
+	t.Logf("corrupt authentication terminalized Run %s, removed its current claim, and blocked a replacement claim", claim.RunID)
+}
+
+func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedacted(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty: true, corruptCodexAuth: true, err: errors.New("worker failed"),
+		results: []worker.Result{{Output: []byte("sensitive worker output must be omitted"), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth corruption")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("failed Run did not record a minimal diagnostic: %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") || strings.Contains(string(report), "sensitive worker output") {
+		t.Fatalf("unsafe or incomplete minimal diagnostic:\n%s", report)
+	}
+	entries, err := os.ReadDir(filepath.Dir(diagnostic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "report.txt" {
+		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt Run projection = %#v", projection.Tickets)
+	}
+}
+
+func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		dirty: true, blockDiagnostics: true, err: errors.New("worker failed"),
+		results: []worker.Result{{Output: []byte("diagnostic storage unavailable"), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail without diagnostics")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Run remained active after diagnostic failure: %v", err)
+	}
+	if _, err := db.RunDiagnostic(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed diagnostic path was persisted: %v", err)
+	}
+	t.Logf("Run %s left active state even though diagnostic storage was unavailable; no diagnostic record was required", claim.RunID)
+}
+
+func TestControllerOmitsDetailedDiagnosticsWhenWorkerDeletesCodexAuthentication(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	secret := "deleted-auth-secret"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		deleteCodexAuth: true,
+		results:         []worker.Result{{Output: append(codexOutput("codex-clean", "implemented"), []byte("\ncredential read before deletion: "+secret)...), ContainerID: "container-clean"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth deletion")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("failed Run did not record a minimal diagnostic: %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") || strings.Contains(string(report), secret) {
+		t.Fatalf("deleted credential leaked through diagnostic:\n%s", report)
+	}
+	entries, err := os.ReadDir(filepath.Dir(diagnostic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "report.txt" {
+		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
+	}
 }
 
 func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
@@ -252,6 +787,10 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 }
 
 func createClaim(t *testing.T, ctx context.Context, root string) (*store.Store, store.PlanVersion, store.TicketClaim) {
+	return createClaimWithProvisioner(t, ctx, root, nil)
+}
+
+func createClaimWithProvisioner(t *testing.T, ctx context.Context, root string, provisioner store.SessionProvisioner) (*store.Store, store.PlanVersion, store.TicketClaim) {
 	t.Helper()
 	db, err := store.Open(ctx, filepath.Join(root, "workflow.db"))
 	if err != nil {
@@ -270,7 +809,7 @@ func createClaim(t *testing.T, ctx context.Context, root string) (*store.Store, 
 		t.Fatal(err)
 	}
 	activateTestWorker(t, ctx, db)
-	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC()})
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: time.Now().UTC(), ProvisionSession: provisioner})
 	if err != nil {
 		t.Fatal(err)
 	}

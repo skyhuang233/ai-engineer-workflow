@@ -114,6 +114,7 @@ type Poller struct {
 	InboxProjector        WorkflowInboxProjector
 	MaxFailures           int
 	MaxWorkerAttempts     int
+	ProvisionSession      store.SessionProvisioner
 	MaxParallelRuns       int
 	FullReconcileInterval time.Duration
 }
@@ -815,12 +816,12 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 				if err := p.renewPollLease(ctx, repository); err != nil {
 					return PollResult{}, err
 				}
-				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts)
+				claim, prompt, claimErr := p.Store.ClaimQueuedReviewRevision(ctx, delivery.VersionID, delivery.IssueID, 30*time.Minute, now, p.maxParallelRuns(), p.MaxWorkerAttempts, p.ProvisionSession)
 				if claimErr == nil {
 					if err := p.LaunchReview(ctx, claim, prompt); err != nil {
 						return PollResult{}, err
 					}
-				} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) {
+				} else if !errors.Is(claimErr, store.ErrNotReady) && !errors.Is(claimErr, store.ErrNotFound) && !store.IsSessionAuthenticationTerminalized(claimErr) {
 					return PollResult{}, wrapPollStoreError(claimErr)
 				}
 			}

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,14 +11,15 @@ import (
 )
 
 type Dispatcher struct {
-	Store           *store.Store
-	Reader          plan.SnapshotReader
-	Projector       plan.RootProjector
-	MaxParallelRuns int
-	LeaseTTL        time.Duration
-	Now             func() time.Time
-	Recovery        RecoveryInspector
-	HostPressure    HostPressureInspector
+	Store            *store.Store
+	Reader           plan.SnapshotReader
+	Projector        plan.RootProjector
+	MaxParallelRuns  int
+	LeaseTTL         time.Duration
+	Now              func() time.Time
+	Recovery         RecoveryInspector
+	HostPressure     HostPressureInspector
+	ProvisionSession store.SessionProvisioner
 }
 
 type RecoveryInspector interface {
@@ -57,13 +59,17 @@ func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ti
 	if d.Now != nil {
 		now = d.Now()
 	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	claim, err := d.Store.ClaimReady(ctx, store.ClaimRequest{
-		VersionID:       version.ID,
-		TicketID:        ticketID,
-		Owner:           owner,
-		MaxParallelRuns: d.MaxParallelRuns,
-		LeaseTTL:        d.LeaseTTL,
-		Now:             now,
+		VersionID:        version.ID,
+		TicketID:         ticketID,
+		Owner:            owner,
+		MaxParallelRuns:  d.MaxParallelRuns,
+		LeaseTTL:         d.LeaseTTL,
+		Now:              now,
+		ProvisionSession: d.ProvisionSession,
 	})
 	if err != nil {
 		return store.TicketClaim{}, err
@@ -116,6 +122,22 @@ func (d Dispatcher) Recover(ctx context.Context, repository string, rootNumber i
 			}
 			if containerRunning && workspaceAvailable {
 				continue
+			}
+			if d.ProvisionSession != nil && run.Kind == store.RunAgent {
+				_, provisionErr := d.ProvisionSession(ctx, store.SessionProvisioning{
+					SessionID: run.Claim.SessionID, Existing: true, WorkspacePath: run.Session.WorkspacePath,
+					CodexStatePath: run.Session.CodexStatePath, CurrentRunID: run.Claim.RunID,
+				})
+				if provisionErr != nil {
+					var authenticationFailure *store.SessionAuthenticationFailure
+					if !errors.As(provisionErr, &authenticationFailure) {
+						return fmt.Errorf("recover Ticket Session authentication %s: %w", run.Claim.SessionID, provisionErr)
+					}
+					if err := d.Store.RecordRecoveryAuthenticationFailure(ctx, run, authenticationFailure.DiagnosticsPath, now); err != nil {
+						return fmt.Errorf("record Ticket Session authentication failure %s: %w", run.Claim.SessionID, err)
+					}
+					continue
+				}
 			}
 			reason := "worker container is not running"
 			if !workspaceAvailable {

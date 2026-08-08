@@ -7,7 +7,9 @@ param(
   [int]$MaxParallelRuns = 1,
 
   [ValidateRange(1, 86400)]
-  [int]$IntervalSeconds = 60
+  [int]$IntervalSeconds = 60,
+
+  [string]$CodexAuthFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +134,13 @@ $gatewayControlUrl = "http://127.0.0.1:$gatewayPort"
 $gatewayListen = "0.0.0.0:$gatewayPort"
 $rootNumber = 2
 
+if (-not [string]::IsNullOrWhiteSpace($CodexAuthFile)) {
+  if (-not (Test-Path -LiteralPath $CodexAuthFile -PathType Leaf)) {
+    throw "ChatGPT Codex authentication cache not found: $CodexAuthFile"
+  }
+  $CodexAuthFile = (Resolve-Path -LiteralPath $CodexAuthFile).ProviderPath
+}
+
 foreach ($command in 'git', 'go', 'docker') {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
     throw "$command is required"
@@ -220,6 +229,9 @@ try {
       '--interval', "${IntervalSeconds}s",
       '--max-parallel-runs', $MaxParallelRuns
     )
+    if (-not [string]::IsNullOrWhiteSpace($CodexAuthFile)) {
+      $pollArguments += @('--codex-auth-file', $CodexAuthFile)
+    }
     Invoke-Native $binaryPath @pollArguments
 
     if ($iteration -lt $Iterations) {

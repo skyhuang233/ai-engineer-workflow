@@ -32,6 +32,10 @@ _Avoid_: Container filesystem, shared checkout, dependency cache
 The sole agent identity currently accountable for a Ticket Session and responsible for initial implementation and every subsequent review revision; responsibility may transfer only after the prior session is confirmed permanently unrecoverable.
 _Avoid_: Worker Run, replacement worker, coordinating agent
 
+**Codex Authentication Source（Codex 认证源）**:
+The trusted host's ChatGPT login cache used only to seed a Ticket Session's private Codex state before its first Worker Run; the Session copy then refreshes and persists independently.
+_Avoid_: Gateway Credential, Worker environment variable, repository secret
+
 **Control Plane（控制平面）**:
 The durable authority that schedules work and records execution ownership, leases, attempts, and runtime state.
 _Avoid_: Scheduler agent, coordinating agent, Agent/rules
