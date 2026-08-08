@@ -105,9 +105,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
 		return Candidate{}, fmt.Errorf("write Candidate output schema: %w", err)
 	}
-	command := []string{"codex", "exec", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", request.Prompt}
+	command := []string{"codex", "exec", "--sandbox", "danger-full-access", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", request.Prompt}
 	if session.CodexSessionID != "" {
-		command = []string{"codex", "exec", "resume", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
+		command = []string{"codex", "exec", "--sandbox", "danger-full-access", "resume", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
 	}
 	environment := map[string]string{
 		"CODEX_HOME": ws.CodexState,
@@ -328,13 +328,14 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	}
 	var releaseManifest struct {
 		CodexVersion      string `json:"codex_version"`
+		GoVersion         string `json:"go_version"`
 		NoMistakesVersion string `json:"no_mistakes_version"`
 	}
 	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
-		releaseManifest.CodexVersion == "" || releaseManifest.NoMistakesVersion == "" {
+		releaseManifest.CodexVersion == "" || releaseManifest.GoVersion == "" || releaseManifest.NoMistakesVersion == "" {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}
-	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
+	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "go": releaseManifest.GoVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {

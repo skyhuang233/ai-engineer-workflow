@@ -108,12 +108,14 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 }
 
 func workerCodexCommand(image, workspace, codexState string, command ...string) []string {
-	args := []string{
-		"docker", "run", "--rm", "--workdir", "/workspace",
-		"--mount", "type=bind,source=" + workspace + ",target=/workspace",
-		"--mount", "type=bind,source=" + codexState + ",target=/codex-state",
+	args := []string{"docker", "run", "--rm"}
+	args = append(args, worker.CodexSandboxDockerArgs()...)
+	args = append(args,
+		"--workdir", "/workspace",
+		"--mount", "type=bind,source="+workspace+",target=/workspace",
+		"--mount", "type=bind,source="+codexState+",target=/codex-state",
 		"--env", "CODEX_HOME=/codex-state", image, "codex",
-	}
+	)
 	return append(args, command...)
 }
 
@@ -179,18 +181,21 @@ printf worker > /workspace/container-marker
 curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_PROBE_TOKEN}" "http://host.docker.internal:${WORKFLOW_GATEWAY_PROBE_PORT}/health"
 printf "\nmount=ok\n"
 codex --version
+go version
 no-mistakes --version
 env | cut -d= -f1`
-	output, err := executor.Run(ctx, []string{
-		"docker", "run", "--rm",
+	dockerCommand := []string{"docker", "run", "--rm"}
+	dockerCommand = append(dockerCommand, worker.CodexSandboxDockerArgs()...)
+	dockerCommand = append(dockerCommand,
 		"--add-host", "host.docker.internal:host-gateway",
-		"--mount", "type=bind,src=" + workspace + ",dst=/workspace",
-		"--mount", "type=bind,src=" + codexState + ",dst=/codex-state",
+		"--mount", "type=bind,src="+workspace+",dst=/workspace",
+		"--mount", "type=bind,src="+codexState+",dst=/codex-state",
 		"--env", "CODEX_HOME=/codex-state",
-		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN=" + token,
+		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN="+token,
 		"--env", fmt.Sprintf("WORKFLOW_GATEWAY_PROBE_PORT=%d", port),
 		image, "sh", "-ceu", script,
-	})
+	)
+	output, err := executor.Run(ctx, dockerCommand)
 	text := string(output)
 	if err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe: %v (%s)", err, strings.TrimSpace(text))}
@@ -204,7 +209,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, c.Manifest.NoMistakesVersion}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}

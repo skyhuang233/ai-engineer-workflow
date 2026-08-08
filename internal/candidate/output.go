@@ -10,10 +10,10 @@ import (
 
 const Schema = `{
   "type": "object",
-  "required": ["summary", "checks"],
+  "required": ["summary", "commit", "checks"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
-    "commit": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
     "checks": {
       "type": "array",
       "minItems": 1,
@@ -56,10 +56,10 @@ func Validate(output []byte) error {
 	if err := json.Unmarshal(summary, &summaryText); err != nil || jsonNull(summary) || strings.TrimSpace(summaryText) == "" {
 		return errors.New("structured result requires a nonempty summary")
 	}
-	if commit, ok := fields["commit"]; ok {
+	if commit, ok := fields["commit"]; ok && !jsonNull(commit) {
 		var commitText string
-		if err := json.Unmarshal(commit, &commitText); err != nil || jsonNull(commit) {
-			return errors.New("structured result commit must be a string")
+		if err := json.Unmarshal(commit, &commitText); err != nil {
+			return errors.New("structured result commit must be a string or null")
 		}
 	}
 	checks, ok := fields["checks"]

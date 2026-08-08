@@ -1,7 +1,11 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "codex": {
     "version": "0.146.0"
+  },
+  "go": {
+    "version": "1.25.12",
+    "linux_amd64_sha256": "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"
   },
   "no_mistakes": {
     "version": "v1.41.2",

@@ -19,6 +19,8 @@ type WorkerReleaseManifest struct {
 	SourceCommit                 string `json:"source_commit"`
 	Image                        string `json:"image"`
 	CodexVersion                 string `json:"codex_version"`
+	GoVersion                    string `json:"go_version"`
+	GoLinuxAMD64SHA256           string `json:"go_linux_amd64_sha256"`
 	NoMistakesVersion            string `json:"no_mistakes_version"`
 	NoMistakesUpstreamRepository string `json:"no_mistakes_upstream_repository"`
 	NoMistakesCommit             string `json:"no_mistakes_commit"`
@@ -34,6 +36,7 @@ type workerBuildInputs struct {
 	DeployWorkerTree          string        `json:"deploy_worker_tree"`
 	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
 	Codex                     ToolPin       `json:"codex"`
+	Go                        GoPin         `json:"go"`
 	NoMistakes                NoMistakesPin `json:"no_mistakes"`
 	Worker                    WorkerPin     `json:"worker"`
 }
@@ -43,6 +46,7 @@ type canonicalWorkerBuildInputs struct {
 	DeployWorkerTree          string        `json:"deploy_worker_tree"`
 	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
 	Codex                     ToolPin       `json:"codex"`
+	Go                        GoPin         `json:"go"`
 	NoMistakes                NoMistakesPin `json:"no_mistakes"`
 	Worker                    WorkerPin     `json:"worker"`
 }
@@ -204,7 +208,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 
 func (m WorkerReleaseManifest) Validate(config Config) error {
 	switch {
-	case m.SchemaVersion != 2:
+	case m.SchemaVersion != 3:
 		return errors.New("unsupported Worker Release Manifest schema")
 	case m.WorkerVersion != config.Worker.Version:
 		return errors.New("Worker Release version does not match toolchain")
@@ -214,6 +218,8 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 		return errors.New("Worker Release image does not match the immutable toolchain repository")
 	case m.CodexVersion != config.Codex.Version:
 		return errors.New("Worker Release Codex version does not match toolchain")
+	case m.GoVersion != config.Go.Version || m.GoLinuxAMD64SHA256 != config.Go.LinuxAMD64SHA256:
+		return errors.New("Worker Release Go pin does not match toolchain")
 	case m.NoMistakesVersion != config.NoMistakes.Version || m.NoMistakesUpstreamRepository != config.NoMistakes.UpstreamRepository ||
 		m.NoMistakesCommit != config.NoMistakes.UpstreamCommit ||
 		m.NoMistakesForkRepository != config.NoMistakes.ForkRepository || m.NoMistakesForkRelease != config.NoMistakes.ForkRelease ||
@@ -300,10 +306,11 @@ func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tre
 
 func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
 	inputs := workerBuildInputs{
-		SchemaVersion:             2,
+		SchemaVersion:             3,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
+		Go:                        config.Go,
 		NoMistakes:                config.NoMistakes,
 		Worker:                    config.Worker,
 	}
@@ -319,6 +326,10 @@ func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuil
 		PublishWorkerWorkflowBlob: base64.StdEncoding.EncodeToString([]byte(inputs.PublishWorkerWorkflowBlob)),
 		Codex: ToolPin{
 			Version: base64.StdEncoding.EncodeToString([]byte(inputs.Codex.Version)),
+		},
+		Go: GoPin{
+			Version:          base64.StdEncoding.EncodeToString([]byte(inputs.Go.Version)),
+			LinuxAMD64SHA256: base64.StdEncoding.EncodeToString([]byte(inputs.Go.LinuxAMD64SHA256)),
 		},
 		NoMistakes: NoMistakesPin{
 			Version:            base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.Version)),

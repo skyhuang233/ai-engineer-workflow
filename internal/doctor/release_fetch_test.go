@@ -29,11 +29,13 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	publisherWorkflowBlob := strings.Repeat("b", 40)
 	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob)
 	manifestData, err := json.Marshal(WorkerReleaseManifest{
-		SchemaVersion:                2,
+		SchemaVersion:                3,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 sourceSHA,
 		Image:                        config.Worker.ImageRepository + "@sha256:" + strings.Repeat("b", 64),
 		CodexVersion:                 config.Codex.Version,
+		GoVersion:                    config.Go.Version,
+		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
 		NoMistakesVersion:            config.NoMistakes.Version,
 		NoMistakesUpstreamRepository: config.NoMistakes.UpstreamRepository,
 		NoMistakesCommit:             config.NoMistakes.UpstreamCommit,

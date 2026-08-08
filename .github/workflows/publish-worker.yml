@@ -61,6 +61,8 @@ jobs:
           echo "image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "worker_release_repository=$(jq -r .worker.release_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_upstream_repository=$(jq -r .no_mistakes.upstream_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
@@ -101,7 +103,7 @@ jobs:
           identity_json="$(jq --compact-output \
             --arg deploy_worker_tree "$deploy_worker_tree" \
             --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
-            '{schema_version:2,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
+            '{schema_version:3,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
             config/toolchain.json)"
           identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
           [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || {
@@ -121,8 +123,8 @@ jobs:
             required=true
           else
             git show "${BEFORE_SHA}:config/toolchain.json" |
-              jq --sort-keys '{codex,no_mistakes,worker}' > /tmp/worker-inputs-before.json
-            jq --sort-keys '{codex,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
+              jq --sort-keys '{codex,go,no_mistakes,worker}' > /tmp/worker-inputs-before.json
+            jq --sort-keys '{codex,go,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
             if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
                ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker .github/workflows/publish-worker.yml; then
               required=true
@@ -164,6 +166,8 @@ jobs:
               --arg source_commit "$GITHUB_SHA" \
               --arg image_repository "${{ steps.pins.outputs.image_repository }}" \
               --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+              --arg go_version "${{ steps.pins.outputs.go_version }}" \
+              --arg go_linux_amd64_sha256 "${{ steps.pins.outputs.go_sha256 }}" \
               --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
               --arg no_mistakes_upstream_repository "${{ steps.pins.outputs.no_mistakes_upstream_repository }}" \
               --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
@@ -171,13 +175,15 @@ jobs:
               --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
               --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
               --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
-              '(.schema_version == 2) and
+              '(.schema_version == 3) and
                (.worker_version == $worker_version) and
                (.source_commit == $source_commit) and
                (.image | type == "string") and
                (.image | startswith($image_repository + "@sha256:")) and
                (.image | test("^.+@sha256:[0-9a-f]{64}$")) and
                (.codex_version == $codex_version) and
+               (.go_version == $go_version) and
+               (.go_linux_amd64_sha256 == $go_linux_amd64_sha256) and
                (.no_mistakes_version == $no_mistakes_version) and
                (.no_mistakes_upstream_repository == $no_mistakes_upstream_repository) and
                (.no_mistakes_commit == $no_mistakes_commit) and
@@ -246,6 +252,8 @@ jobs:
           tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}
           build-args: |
             CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
+            GO_VERSION=${{ steps.pins.outputs.go_version }}
+            GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}
             NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
             NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}
             NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}
@@ -262,6 +270,8 @@ jobs:
             --arg source_commit "${GITHUB_SHA}" \
             --arg image "${{ steps.pins.outputs.image_repository }}@${IMAGE_DIGEST}" \
             --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+            --arg go_version "${{ steps.pins.outputs.go_version }}" \
+            --arg go_linux_amd64_sha256 "${{ steps.pins.outputs.go_sha256 }}" \
             --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
             --arg no_mistakes_upstream_repository "${{ steps.pins.outputs.no_mistakes_upstream_repository }}" \
             --arg no_mistakes_commit "${{ steps.pins.outputs.no_mistakes_commit }}" \
@@ -270,8 +280,9 @@ jobs:
             --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
             --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
             --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
-            '{schema_version:2, worker_version:$worker_version, source_commit:$source_commit,
-              image:$image, codex_version:$codex_version, no_mistakes_version:$no_mistakes_version,
+            '{schema_version:3, worker_version:$worker_version, source_commit:$source_commit,
+              image:$image, codex_version:$codex_version, go_version:$go_version,
+              go_linux_amd64_sha256:$go_linux_amd64_sha256, no_mistakes_version:$no_mistakes_version,
               no_mistakes_upstream_repository:$no_mistakes_upstream_repository, no_mistakes_commit:$no_mistakes_commit,
               no_mistakes_fork_repository:$no_mistakes_fork_repository,
               no_mistakes_fork_release:$no_mistakes_fork_release,

@@ -4,6 +4,8 @@
 `workflow doctor`. Every executable version and artifact is immutable:
 
 - Codex CLI is pinned to an exact package version.
+- Go is pinned to an exact Linux amd64 archive version and official SHA-256
+  checksum. Doctor verifies `go version` inside the exact Worker image.
 - `no-mistakes` is pinned to an upstream release, verified commit, fork
   repository, fork release, and Linux release-asset checksum. Doctor reads the
   installed executable's full immutable Go `vcs.revision` build metadata, so
@@ -70,6 +72,14 @@ overwritten.
 Ticket Agents are trusted with this cache. [ADR-0039](../adr/0039-seed-ticket-sessions-from-host-chatgpt-auth.md)
 owns the credential threat model, redaction boundary, and terminal corruption
 recovery contract.
+
+Codex runs with `danger-full-access` inside the trusted, run-scoped Docker
+boundary so it can write both the Ticket Workspace files and that Workspace's
+`.git` metadata. The container still receives no raw GitHub write credential;
+all external writes remain fenced by the Gateway. Ticket Workspace clones pin
+their repository-local Git settings to `core.autocrlf=false` and `core.eol=lf`,
+including recovery resets, so a Windows host cannot turn the Linux Worker view
+into an all-files CRLF diff.
 
 Doctor performs a real create-and-resume request inside the pinned Worker
 image using a temporary copy of this cache. A version-only Codex check is not
