@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -108,27 +107,57 @@ type ProcessRuntime struct {
 // and Codex state mounts are host-owned, so --rm only destroys compute after a
 // run and never the Ticket Session's durable state.
 type DockerRuntime struct {
-	Binary string
+	Binary                 string
+	DiskPath               string
+	MemoryThresholdPercent float64
+	DiskThresholdPercent   float64
 }
 
 func (r DockerRuntime) Unsafe(ctx context.Context) (bool, error) {
+	reason, err := r.Inspect(ctx)
+	return reason != "", err
+}
+
+// Inspect is a dispatch-only host safety gate. Any unavailable Docker health
+// probe is unsafe because the controller cannot verify that it can launch a
+// new Worker Run; it never changes existing containers.
+func (r DockerRuntime) Inspect(ctx context.Context) (string, error) {
 	binary := r.Binary
 	if binary == "" {
 		binary = "docker"
 	}
-	output, err := exec.CommandContext(ctx, binary, "stats", "--all", "--no-stream", "--format", "{{.MemPerc}}").Output()
+	if _, err := exec.CommandContext(ctx, binary, "info", "--format", "{{.ServerVersion}}").Output(); err != nil {
+		return "Docker health check failed", nil
+	}
+	memoryUsage, err := hostMemoryUsage(ctx)
 	if err != nil {
-		return false, err
+		return "host memory pressure could not be inspected", nil
 	}
-	var total float64
-	for _, field := range strings.Fields(string(output)) {
-		percent, err := strconv.ParseFloat(strings.TrimSuffix(field, "%"), 64)
-		if err != nil {
-			return false, err
-		}
-		total += percent
+	if memoryUsage >= r.memoryThreshold() {
+		return fmt.Sprintf("host memory usage %.1f%% reached the %.0f%% threshold", memoryUsage, r.memoryThreshold()), nil
 	}
-	return total >= 85, nil
+	diskUsage, err := hostDiskUsage(r.DiskPath)
+	if err != nil {
+		return "host disk pressure could not be inspected", nil
+	}
+	if diskUsage >= r.diskThreshold() {
+		return fmt.Sprintf("host disk usage %.1f%% reached the %.0f%% threshold", diskUsage, r.diskThreshold()), nil
+	}
+	return "", nil
+}
+
+func (r DockerRuntime) memoryThreshold() float64 {
+	if r.MemoryThresholdPercent > 0 {
+		return r.MemoryThresholdPercent
+	}
+	return 85
+}
+
+func (r DockerRuntime) diskThreshold() float64 {
+	if r.DiskThresholdPercent > 0 {
+		return r.DiskThresholdPercent
+	}
+	return 90
 }
 
 func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {

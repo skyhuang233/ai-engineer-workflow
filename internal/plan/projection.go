@@ -7,10 +7,11 @@ import (
 )
 
 type Projection struct {
-	VersionID string             `json:"version_id"`
-	State     string             `json:"state"`
-	Tickets   []ProjectionTicket `json:"tickets"`
-	Questions []WorkflowQuestion `json:"questions,omitempty"`
+	VersionID      string             `json:"version_id"`
+	State          string             `json:"state"`
+	DispatchPaused string             `json:"dispatch_paused,omitempty"`
+	Tickets        []ProjectionTicket `json:"tickets"`
+	Questions      []WorkflowQuestion `json:"questions,omitempty"`
 }
 
 type WorkflowQuestion struct {
@@ -71,6 +72,9 @@ func renderBlock(projection Projection) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", ProjectionStart)
 	fmt.Fprintf(&b, "### Control Plane\n\n- state: `%s`\n- plan version: `%s`\n\n", projection.State, projection.VersionID)
+	if projection.DispatchPaused != "" {
+		fmt.Fprintf(&b, "- new dispatches: paused — %s\n\n", escapeCell(projection.DispatchPaused))
+	}
 	if len(tickets) == 0 {
 		b.WriteString("No executable tickets.\n")
 	} else {

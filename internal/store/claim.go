@@ -21,6 +21,12 @@ type ClaimRequest struct {
 	LeaseTTL         time.Duration
 	Now              time.Time
 	ProvisionSession SessionProvisioner
+
+	// fairness fields are populated only by ClaimNextReady. Keeping them
+	// private prevents explicit ticket claims from perturbing global turns.
+	fairnessRepository  string
+	fairnessRootIssueID int64
+	fairnessRootNumber  int64
 }
 
 type SessionProvisioning struct {
@@ -79,6 +85,7 @@ func maxWorkerAttempts(value int) int {
 
 type TicketClaim struct {
 	VersionID       string
+	PlanRootNumber  int64
 	TicketID        int64
 	TicketNumber    int64
 	TicketTitle     string
@@ -115,6 +122,10 @@ func (s *Store) ReadyFrontier(ctx context.Context, versionID string, maxParallel
 func (s *Store) ClaimReady(ctx context.Context, request ClaimRequest) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	return s.claimReady(ctx, request)
+}
+
+func (s *Store) claimReady(ctx context.Context, request ClaimRequest) (TicketClaim, error) {
 	if request.VersionID == "" || request.Owner == "" || request.MaxParallelRuns <= 0 {
 		return TicketClaim{}, ErrInvalidClaim
 	}
@@ -339,10 +350,17 @@ VALUES (?, ?, ?, 0, ?)
 ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`, request.VersionID, selected.IssueID, plan.StateRunning, formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
+	if err := recordDispatchFairnessTx(ctx, tx, request.fairnessRepository, request.fairnessRootIssueID, request.Now); err != nil {
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
-	return TicketClaim{VersionID: request.VersionID, TicketID: selected.IssueID, TicketNumber: selected.Number, TicketTitle: selected.Title, Owner: request.Owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: currentGeneration, LeaseExpiresAt: expiresAt}, nil
+	claim := TicketClaim{VersionID: request.VersionID, TicketID: selected.IssueID, TicketNumber: selected.Number, TicketTitle: selected.Title, Owner: request.Owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: currentGeneration, LeaseExpiresAt: expiresAt}
+	if request.fairnessRepository != "" {
+		claim.PlanRootNumber = request.fairnessRootNumber
+	}
+	return claim, nil
 }
 
 func compensateSessionProvisioning(provisioning SessionProvisioningResult, cause error) error {

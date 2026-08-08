@@ -651,13 +651,23 @@ func runPollGitHub(args []string) {
 			if bootstrapErr != nil {
 				return controlResult, bootstrapErr
 			}
-			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime, ProvisionSession: workspaceManager.ProvisionCodexSession}
+			paused, err := dispatcher.DispatchPaused(ctx, *repository)
 			if err != nil {
 				return controlResult, err
 			}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}, ProvisionSession: workspaceManager.ProvisionCodexSession}
-			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
+			if paused {
+				return controlResult, nil
+			}
+			roots, err := db.ActivePlanRoots(ctx, *repository)
+			if err != nil {
 				return controlResult, err
+			}
+			for _, root := range roots {
+				if err := dispatcher.Recover(ctx, *repository, root.RootIssueNumber); err != nil {
+					return controlResult, err
+				}
 			}
 			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
 				return controlResult, err
@@ -674,7 +684,7 @@ func runPollGitHub(args []string) {
 				return controlResult, err
 			}
 			for {
-				claim, claimErr := dispatcher.Claim(ctx, *repository, activeRoot, 0, "workflow-control-plane")
+				claim, claimErr := dispatcher.ClaimNext(ctx, *repository, "workflow-control-plane")
 				if claimErr == nil {
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {

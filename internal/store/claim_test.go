@@ -1508,6 +1508,110 @@ func TestConcurrentClaimsHaveOneWinnerAndOneFencingConflict(t *testing.T) {
 	}
 }
 
+func TestClaimNextReadyRoundRobinsActivePlansAndPersistsTheFairnessCursor(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	for _, snapshot := range []plan.Snapshot{
+		{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "a-1", Labels: []string{plan.TicketLabel}, State: "open"}, {ID: 2, Number: 12, Title: "a-2", Labels: []string{plan.TicketLabel}, State: "open"}}},
+		{Repository: "owner/repo", Root: plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 3, Number: 21, Title: "b-1", Labels: []string{plan.TicketLabel}, State: "open"}, {ID: 4, Number: 22, Title: "b-2", Labels: []string{plan.TicketLabel}, State: "open"}}},
+	} {
+		fingerprint, err := snapshot.Fingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.MarkActive(ctx, version.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, err := db.ClaimNextReady(ctx, "owner/repo", "agent", 4, 0, time.Hour, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.ClaimNextReady(ctx, "owner/repo", "agent", 4, 0, time.Hour, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PlanRootNumber != 10 || second.PlanRootNumber != 20 {
+		t.Fatalf("first two global claims roots = %d, %d; want 10, 20", first.PlanRootNumber, second.PlanRootNumber)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	third, err := restarted.ClaimNextReady(ctx, "owner/repo", "agent", 4, 0, time.Hour, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.PlanRootNumber != 10 {
+		t.Fatalf("claim after restart root = %d, want 10", third.PlanRootNumber)
+	}
+	frontier, err := restarted.GlobalReadyFrontier(ctx, "owner/repo", 4, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frontier) != 1 || frontier[0].RootIssueNumber != 20 {
+		t.Fatalf("remaining global frontier = %#v, want plan root 20", frontier)
+	}
+}
+
+func TestClaimNextReadyNeverExceedsGlobalCapacityUnderCompetition(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, snapshot := range []plan.Snapshot{
+		{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "a", Labels: []string{plan.TicketLabel}, State: "open"}}},
+		{Repository: "owner/repo", Root: plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 21, Title: "b", Labels: []string{plan.TicketLabel}, State: "open"}}},
+	} {
+		fingerprint, err := snapshot.Fingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.MarkActive(ctx, version.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := db.ClaimNextReady(ctx, "owner/repo", "agent", 1, 0, time.Hour, time.Now().UTC(), nil)
+			results <- err
+		}()
+	}
+	winners := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			winners++
+		} else if !errors.Is(err, ErrCapacity) {
+			t.Fatalf("concurrent claim error = %v, want ErrCapacity", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("successful global claims = %d, want 1", winners)
+	}
+}
+
 func TestCapacityComparisonUsesFixedWidthLeaseTimestamps(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

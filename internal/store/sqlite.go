@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 41
+	latestSchemaVersion = 42
 )
 
 var (
@@ -1114,6 +1114,18 @@ SET plan_version_ids_json = COALESCE((
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (41, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 42 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS dispatch_fairness (
+    repository TEXT PRIMARY KEY,
+    last_root_issue_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 42: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (42, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
