@@ -1619,6 +1619,19 @@ WHERE t.version_id = ? AND t.issue_id = ? AND p.repository = ? AND r.delivered =
 	if replacementVersionID == versionID {
 		return ErrInvalidClaim
 	}
+	var reusesCancelledTicket int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1
+    FROM plan_tickets source
+    JOIN ticket_runtime runtime ON runtime.version_id = source.version_id AND runtime.issue_id = source.issue_id
+    JOIN plan_tickets replacement ON replacement.issue_id = source.issue_id
+    WHERE source.version_id = ? AND runtime.delivered = 0 AND replacement.version_id = ?
+)`, versionID, replacementVersionID).Scan(&reusesCancelledTicket); err != nil {
+		return err
+	}
+	if reusesCancelledTicket != 0 {
+		return ErrInvalidClaim
+	}
 	replacementJSON, err := json.Marshal(replacement)
 	if err != nil {
 		return err
