@@ -29,6 +29,13 @@ func TestDefaultCodexAuthFileFollowsCodexHome(t *testing.T) {
 	t.Logf("workflow commands defaulted --codex-auth-file to %s", filepath.Join(home, "auth.json"))
 }
 
+func TestDoctorVerificationBudgetAllowsColdWorkerPullAndCodexResume(t *testing.T) {
+	if doctorVerificationTimeout != 10*time.Minute {
+		t.Fatalf("doctorVerificationTimeout = %s, want 10m", doctorVerificationTimeout)
+	}
+	t.Logf("workflow doctor verification budget = %s", doctorVerificationTimeout)
+}
+
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "workflow.db")
