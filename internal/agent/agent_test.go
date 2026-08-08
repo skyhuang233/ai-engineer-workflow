@@ -30,6 +30,7 @@ type fakeRuntime struct {
 	deliveryDeadline time.Time
 	workspaceContent string
 	corruptCodexAuth bool
+	deleteCodexAuth  bool
 }
 
 type blockingFailureRuntime struct {
@@ -70,6 +71,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	}
 	if r.corruptCodexAuth {
 		if err := os.WriteFile(filepath.Join(spec.CodexStatePath, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"truncated"}}`), 0o600); err != nil {
+			return worker.Result{}, err
+		}
+	}
+	if r.deleteCodexAuth {
+		if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
 			return worker.Result{}, err
 		}
 	}
@@ -380,6 +386,51 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	}
 	if !strings.Contains(string(report), "detailed evidence omitted") || strings.Contains(string(report), "sensitive worker output") {
 		t.Fatalf("unsafe or incomplete minimal diagnostic:\n%s", report)
+	}
+	entries, err := os.ReadDir(filepath.Dir(diagnostic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "report.txt" {
+		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
+	}
+}
+
+func TestControllerOmitsDetailedDiagnosticsWhenWorkerDeletesCodexAuthentication(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	secret := "deleted-auth-secret"
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		dirty: true, deleteCodexAuth: true, err: errors.New("worker failed"),
+		results: []worker.Result{{Output: []byte("credential read before deletion: " + secret), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth deletion")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	if err != nil {
+		t.Fatalf("failed Run did not record a minimal diagnostic: %v", err)
+	}
+	report, err := os.ReadFile(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "detailed evidence omitted") || strings.Contains(string(report), secret) {
+		t.Fatalf("deleted credential leaked through diagnostic:\n%s", report)
 	}
 	entries, err := os.ReadDir(filepath.Dir(diagnostic))
 	if err != nil {

@@ -269,7 +269,7 @@ func (m WorkspaceManager) diagnostic(ctx context.Context, ws workspace, runID, b
 	}
 	path := filepath.Join(dir, "report.txt")
 	redactor, err := codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err != nil && (!errors.Is(err, os.ErrNotExist) || m.CodexAuthFile != "") {
 		body := "error: worker failed; detailed evidence omitted because Codex authentication could not be safely redacted\n" +
 			"head: unavailable\n" +
 			"base: " + baseCommit + "\n" +
