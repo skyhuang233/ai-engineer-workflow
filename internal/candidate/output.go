@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+// Schema is the strict contract supplied to OpenAI structured output. Every
+// property is required, with null representing an unavailable commit.
 const Schema = `{
   "type": "object",
   "required": ["summary", "commit", "checks"],
@@ -31,6 +33,7 @@ const Schema = `{
   "additionalProperties": false
 }`
 
+// Validate also accepts legacy output that omitted commit.
 func Validate(output []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	var fields map[string]json.RawMessage
