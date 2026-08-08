@@ -45,6 +45,106 @@ type PullRequestFeedback struct {
 	Debounce bool
 }
 
+type PullRequestRevision struct {
+	BaseBranch string
+	BaseCommit string
+	HeadCommit string
+}
+
+type DefaultBranchRevision struct{ Name, Head string }
+
+func (c *Client) CandidateIncludesDefaultBranch(ctx context.Context, repository, candidateCommit, defaultBranchHead string) (bool, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return false, err
+	}
+	if candidateCommit == "" || defaultBranchHead == "" {
+		return false, fmt.Errorf("candidate and default branch commits are required")
+	}
+	var comparison struct {
+		Status string `json:"status"`
+	}
+	path := "/repos/" + repository + "/compare/" + url.PathEscape(defaultBranchHead) + "..." + url.PathEscape(candidateCommit)
+	if err := c.getJSON(ctx, path, &comparison); err != nil {
+		return false, err
+	}
+	return comparison.Status == "ahead" || comparison.Status == "identical", nil
+}
+
+func (c *Client) PullRequestApproved(ctx context.Context, repository string, number int64, candidateCommit string) (bool, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return false, err
+	}
+	if number <= 0 || candidateCommit == "" {
+		return false, fmt.Errorf("pull request number and candidate commit are required")
+	}
+	var reviews []struct {
+		State    string       `json:"state"`
+		CommitID string       `json:"commit_id"`
+		User     userResponse `json:"user"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10)+"/reviews?per_page=100", &reviews); err != nil {
+		return false, err
+	}
+	for _, review := range reviews {
+		if actionableAuthor(c.RepositoryOwner, review.User.Login, review.User.Type) && review.State == "APPROVED" && review.CommitID == candidateCommit {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Client) DefaultBranchHead(ctx context.Context, repository string) (DefaultBranchRevision, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	var metadata struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository, &metadata); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	if metadata.DefaultBranch == "" {
+		return DefaultBranchRevision{}, fmt.Errorf("default branch is required")
+	}
+	var branch struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/git/ref/heads/"+url.PathEscape(metadata.DefaultBranch), &branch); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	if branch.Object.SHA == "" {
+		return DefaultBranchRevision{}, fmt.Errorf("default branch head is required")
+	}
+	return DefaultBranchRevision{Name: metadata.DefaultBranch, Head: branch.Object.SHA}, nil
+}
+
+func (c *Client) PullRequestRevision(ctx context.Context, repository string, number int64) (PullRequestRevision, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return PullRequestRevision{}, err
+	}
+	if number <= 0 {
+		return PullRequestRevision{}, fmt.Errorf("pull request number is required")
+	}
+	var pull struct {
+		Base struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"base"`
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10), &pull); err != nil {
+		return PullRequestRevision{}, err
+	}
+	if pull.Base.Ref == "" || pull.Base.SHA == "" || pull.Head.SHA == "" {
+		return PullRequestRevision{}, fmt.Errorf("pull request revision is incomplete")
+	}
+	return PullRequestRevision{BaseBranch: pull.Base.Ref, BaseCommit: pull.Base.SHA, HeadCommit: pull.Head.SHA}, nil
+}
+
 func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository string, number int64) ([]PullRequestFeedback, error) {
 	return c.ActionablePullRequestFeedbackSince(ctx, repository, number, time.Time{}, true)
 }
@@ -83,7 +183,7 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			return nil, err
 		}
 		for _, value := range reviews {
-			submitted := value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body)
+			submitted := value.State != "PENDING" && value.State != "APPROVED" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body)
 			if submitted {
 				submittedReviewIDs[value.ID] = struct{}{}
 			}

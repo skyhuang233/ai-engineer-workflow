@@ -275,6 +275,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 			if err != nil {
 				return TicketClaim{}, err
 			}
+			claimedRevalidations, err := releaseMergeReadyRevalidationsTx(ctx, tx, currentRunID)
+			if err != nil {
+				return TicketClaim{}, err
+			}
+			claimedFeedback += claimedRevalidations
 			if claimedFeedback > 0 {
 				if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(request.Now), request.VersionID, selected.IssueID); err != nil {
 					return TicketClaim{}, err
@@ -393,6 +398,9 @@ func recordEstablishedSessionAuthenticationFailureTx(ctx context.Context, tx *sq
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, runID); err != nil {
+			return true, err
+		}
+		if _, err := releaseMergeReadyRevalidationsTx(ctx, tx, runID); err != nil {
 			return true, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, formatTimestamp(now), runID); err != nil {

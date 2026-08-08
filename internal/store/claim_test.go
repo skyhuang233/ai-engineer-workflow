@@ -711,6 +711,116 @@ func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	}
 }
 
+func TestBaseAdvanceQueuesRevisionOnTheSameTicketSession(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{
+		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "candidate-1",
+		StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test ./...","outcome":"passed"}]}`),
+		Now:              now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"},
+	}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteDeliveryController(ctx, deliveryClaim, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.CandidateDelivery(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.ObserveMergeReady(ctx, delivery, MergeReadyObservation{DefaultBranch: "main", DefaultBranchHead: "main-1", BaseBranch: "main", BaseCommit: "main-1", CandidateHead: "candidate-1", CandidateIncludesDefault: true, ChecksPassed: true, HumanReviewed: true}, now.Add(2*time.Second))
+	if err != nil || first {
+		t.Fatalf("initial observation invalidated=%t err=%v", first, err)
+	}
+	if duplicate, err := db.ObserveMergeReady(ctx, delivery, MergeReadyObservation{DefaultBranch: "main", DefaultBranchHead: "main-1", BaseBranch: "main", BaseCommit: "main-1", CandidateHead: "candidate-1", CandidateIncludesDefault: true, ChecksPassed: true, HumanReviewed: true}, now.Add(2*time.Second)); err != nil || duplicate {
+		t.Fatalf("unchanged observation invalidated=%t err=%v", duplicate, err)
+	}
+	invalidated, err := db.ObserveMergeReady(ctx, delivery, MergeReadyObservation{DefaultBranch: "main", DefaultBranchHead: "main-2", BaseBranch: "main", BaseCommit: "main-2", CandidateHead: "candidate-1", CandidateIncludesDefault: true, ChecksPassed: true, HumanReviewed: true}, now.Add(3*time.Second))
+	if err != nil || !invalidated {
+		t.Fatalf("advanced base invalidated=%t err=%v", invalidated, err)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(4*time.Second), 1, DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.SessionID != claim.SessionID || revision.Attempt != claim.Attempt+1 {
+		t.Fatalf("revision = %#v; want same session %q and next agent attempt", revision, claim.SessionID)
+	}
+	if !strings.Contains(prompt, "Default branch main advanced from main-1 to main-2") || !strings.Contains(prompt, "integration-base/base:main-1:main-2") {
+		t.Fatalf("revalidation prompt = %q", prompt)
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil || session.Branch != "ticket-1" || session.CodexSessionID != "codex" {
+		t.Fatalf("preserved Ticket Session = %#v, %v", session, err)
+	}
+}
+
+func TestUnobservedCandidateBehindMainQueuesRevalidation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "candidate-1", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteDeliveryController(ctx, deliveryClaim, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.CandidateDelivery(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidated, err := db.ObserveMergeReady(ctx, delivery, MergeReadyObservation{DefaultBranch: "main", DefaultBranchHead: "main-2", BaseBranch: "main", BaseCommit: "main-2", CandidateHead: "candidate-1", ChecksPassed: true, HumanReviewed: true}, now.Add(2*time.Second))
+	if err != nil || !invalidated {
+		t.Fatalf("unobserved stale candidate invalidated=%t err=%v", invalidated, err)
+	}
+}
+
 func TestInlineReviewFeedbackWaitsForStableDebounceWindow(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

@@ -128,8 +128,23 @@ func TestActionablePullRequestFeedbackIncludesOwnerEventsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 4 || events[0].Source != "review" || events[1].Source != "review" || events[1].Author != "owner" || events[1].Body != "Review submitted with state: APPROVED" || events[2].Source != "inline-comment" || events[3].Source != "conversation-comment" {
+	if len(events) != 3 || events[0].Source != "review" || events[1].Source != "inline-comment" || events[2].Source != "conversation-comment" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestPullRequestApprovalMustMatchCurrentCandidate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo/pulls/7/reviews" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"state": "APPROVED", "commit_id": "old-candidate", "user": map[string]string{"login": "owner", "type": "User"}}})
+	}))
+	defer server.Close()
+	approved, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").PullRequestApproved(context.Background(), "owner/repo", 7, "rebased-candidate")
+	if err != nil || approved {
+		t.Fatalf("stale approval approved=%t err=%v", approved, err)
 	}
 }
 

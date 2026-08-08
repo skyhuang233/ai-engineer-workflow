@@ -797,6 +797,16 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		return PollResult{}, wrapPollStoreError(err)
 	}
 	result := PollResult{Deliveries: len(deliveries)}
+	defaultBranch := DefaultBranchRevision{}
+	if len(deliveries) > 0 {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		defaultBranch, err = p.Client.DefaultBranchHead(ctx, repository)
+		if err != nil {
+			return PollResult{}, err
+		}
+	}
 	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
 	for _, delivery := range deliveries {
 		if err := p.renewPollLease(ctx, repository); err != nil {
@@ -810,7 +820,59 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		if state == pullRequestDelivered {
 			result.Delivered++
 		}
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
+		if err != nil {
+			return PollResult{}, err
+		}
+		if changed {
+			updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
+			if err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			if err := p.Store.RecordPullRequestChecksETag(ctx, delivery.VersionID, delivery.IssueID, etag); err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			result.Checks += updated
+		}
 		if !terminal {
+			if err := p.renewPollLease(ctx, repository); err != nil {
+				return PollResult{}, err
+			}
+			revision, err := p.Client.PullRequestRevision(ctx, repository, delivery.PullRequestNumber)
+			if err != nil {
+				return PollResult{}, err
+			}
+			candidateIncludesDefault, err := p.Client.CandidateIncludesDefaultBranch(ctx, repository, delivery.CandidateCommit, defaultBranch.Head)
+			if err != nil {
+				return PollResult{}, err
+			}
+			humanReviewed, err := p.Client.PullRequestApproved(ctx, repository, delivery.PullRequestNumber, delivery.CandidateCommit)
+			if err != nil {
+				return PollResult{}, err
+			}
+			checksPassed, err := p.Store.PullRequestChecksPassed(ctx, delivery.VersionID, delivery.IssueID, delivery.CandidateCommit)
+			if err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			invalidated, err := p.Store.ObserveMergeReady(ctx, delivery, store.MergeReadyObservation{
+				DefaultBranch:            defaultBranch.Name,
+				DefaultBranchHead:        defaultBranch.Head,
+				BaseBranch:               revision.BaseBranch,
+				BaseCommit:               revision.BaseCommit,
+				CandidateHead:            revision.HeadCommit,
+				CandidateIncludesDefault: candidateIncludesDefault,
+				ChecksPassed:             checksPassed,
+				HumanReviewed:            humanReviewed,
+			}, now)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			if invalidated {
+				result.Feedback++
+			}
 			if err := p.renewPollLease(ctx, repository); err != nil {
 				return PollResult{}, err
 			}
@@ -840,23 +902,6 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 					return PollResult{}, wrapPollStoreError(claimErr)
 				}
 			}
-		}
-		if err := p.renewPollLease(ctx, repository); err != nil {
-			return PollResult{}, err
-		}
-		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
-		if err != nil {
-			return PollResult{}, err
-		}
-		if changed {
-			updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
-			if err != nil {
-				return PollResult{}, wrapPollStoreError(err)
-			}
-			if err := p.Store.RecordPullRequestChecksETag(ctx, delivery.VersionID, delivery.IssueID, etag); err != nil {
-				return PollResult{}, wrapPollStoreError(err)
-			}
-			result.Checks += updated
 		}
 	}
 	return result, nil

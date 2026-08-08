@@ -296,6 +296,9 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, run.Claim.RunID); err != nil {
 		return err
 	}
+	if _, err := releaseMergeReadyRevalidationsTx(ctx, tx, run.Claim.RunID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateQueued, formatTimestamp(now), run.Claim.VersionID, run.Claim.TicketID); err != nil {
 		return err
 	}
@@ -557,7 +560,8 @@ SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = 
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO ticket_deliveries(version_id, issue_id, repository, branch, remote_head, created_at, updated_at)
 SELECT version_id, issue_id, ?, ?, ?, ?, ? FROM ticket_sessions WHERE session_id = ?
-ON CONFLICT(version_id, issue_id) DO UPDATE SET repository = excluded.repository, branch = excluded.branch, remote_head = excluded.remote_head, updated_at = excluded.updated_at`, candidate.Publication.Repository, candidate.Publication.Branch, remoteHead, now, now, sessionID); err != nil {
+ON CONFLICT(version_id, issue_id) DO UPDATE SET repository = excluded.repository, branch = excluded.branch, remote_head = excluded.remote_head,
+validated_base_commit = '', validated_head_commit = '', checks_etag = '', updated_at = excluded.updated_at`, candidate.Publication.Repository, candidate.Publication.Branch, remoteHead, now, now, sessionID); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = (SELECT version_id FROM ticket_sessions WHERE session_id = ?) AND issue_id = (SELECT issue_id FROM ticket_sessions WHERE session_id = ?) AND delivered = 0`, plan.StateWaitingReview, now, sessionID, sessionID); err != nil {
@@ -764,6 +768,11 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	if err != nil {
 		return err
 	}
+	claimedRevalidations, err := releaseMergeReadyRevalidationsTx(ctx, tx, failure.RunID)
+	if err != nil {
+		return err
+	}
+	claimedFeedback += claimedRevalidations
 	if isAuthenticationFailure {
 		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, ErrSessionAuthenticationUnavailable.Error(), failure.Now); err != nil {
 			return err

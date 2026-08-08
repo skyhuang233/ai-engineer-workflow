@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 42
+	latestSchemaVersion = 44
 )
 
 var (
@@ -1126,6 +1126,51 @@ SET plan_version_ids_json = COALESCE((
 			return fmt.Errorf("migration 42: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (42, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 43 {
+		for _, column := range []struct {
+			name       string
+			definition string
+		}{
+			{name: "validated_base_commit", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "validated_head_commit", definition: "TEXT NOT NULL DEFAULT ''"},
+		} {
+			exists, err := tableHasColumnTx(ctx, tx, "ticket_deliveries", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 43: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE ticket_deliveries ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 43: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (43, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 44 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS merge_ready_revalidations (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    claimed_run_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (version_id, issue_id, event_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE INDEX IF NOT EXISTS merge_ready_revalidations_unclaimed_idx ON merge_ready_revalidations(version_id, issue_id, claimed_run_id, received_at)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 44: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (44, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

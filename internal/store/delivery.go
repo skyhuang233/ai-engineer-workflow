@@ -118,6 +118,21 @@ type TicketDelivery struct {
 	ChecksETag        string
 }
 
+// MergeReadyObservation is the non-terminal evidence used to determine
+// whether a Waiting Review candidate remains eligible for a human merge.
+// It deliberately records delivery facts instead of a persisted Merge-Ready
+// business state.
+type MergeReadyObservation struct {
+	DefaultBranch            string
+	DefaultBranchHead        string
+	BaseBranch               string
+	BaseCommit               string
+	CandidateHead            string
+	CandidateIncludesDefault bool
+	ChecksPassed             bool
+	HumanReviewed            bool
+}
+
 func (s *Store) TicketDelivery(ctx context.Context, versionID string, issueID int64) (TicketDelivery, error) {
 	delivery, err := s.CandidateDelivery(ctx, versionID, issueID)
 	if errors.Is(err, ErrNotFound) || (err == nil && delivery.PullRequestNumber == 0) {
@@ -466,6 +481,100 @@ AND `+currentActiveUnfrozenPlanPredicate, repository, plan.StateCancelled)
 		deliveries = append(deliveries, delivery)
 	}
 	return deliveries, rows.Err()
+}
+
+// ObserveMergeReady records the current base and candidate facts for an open
+// delivery. When a previously observed Merge-Ready candidate no longer has
+// the same current base or head, it atomically queues a revision on the
+// existing Ticket Session. Delivered or unrelated tickets cannot enter this
+// path because the update is constrained to an active Waiting Review ticket.
+func (s *Store) ObserveMergeReady(ctx context.Context, delivery TicketDelivery, observation MergeReadyObservation, now time.Time) (bool, error) {
+	if delivery.VersionID == "" || delivery.IssueID == 0 || observation.DefaultBranch == "" || observation.DefaultBranchHead == "" || observation.BaseBranch == "" || observation.BaseCommit == "" || observation.CandidateHead == "" {
+		return false, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var previousBase, previousHead, acceptedCommit, runtimeState string
+	var delivered int
+	err = tx.QueryRowContext(ctx, `SELECT d.validated_base_commit, d.validated_head_commit, s.accepted_commit, r.state, r.delivered
+FROM ticket_deliveries d
+JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
+JOIN ticket_runtime r ON r.version_id = d.version_id AND r.issue_id = d.issue_id
+JOIN plan_versions v ON v.version_id = d.version_id
+JOIN plans p ON p.id = v.plan_id
+WHERE d.version_id = ? AND d.issue_id = ? AND `+currentActiveUnfrozenPlanPredicate,
+		delivery.VersionID, delivery.IssueID).Scan(&previousBase, &previousHead, &acceptedCommit, &runtimeState, &delivered)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	if delivered != 0 || runtimeState != plan.StateWaitingReview {
+		return false, tx.Commit()
+	}
+
+	currentBaseAndHead := observation.BaseBranch == observation.DefaultBranch && observation.BaseCommit == observation.DefaultBranchHead && observation.CandidateHead == acceptedCommit && observation.CandidateIncludesDefault
+	validCurrentObservation := currentBaseAndHead && observation.ChecksPassed && observation.HumanReviewed
+	if previousBase == "" && !validCurrentObservation && currentBaseAndHead {
+		return false, tx.Commit()
+	}
+	if previousBase == "" && validCurrentObservation {
+		_, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries
+SET validated_base_commit = ?, validated_head_commit = ?, updated_at = ?
+WHERE version_id = ? AND issue_id = ?`, observation.DefaultBranchHead, observation.CandidateHead, formatTimestamp(now), delivery.VersionID, delivery.IssueID)
+		if err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	if validCurrentObservation && previousBase == observation.DefaultBranchHead && previousHead == observation.CandidateHead {
+		return false, tx.Commit()
+	}
+
+	eventID := "candidate:" + previousHead + ":" + observation.CandidateHead
+	body := fmt.Sprintf("Candidate head changed from %s to %s. Rebase the existing branch onto current main %s, rerun the complete quality chain, update the existing pull request, and request re-review.", previousHead, observation.CandidateHead, observation.DefaultBranchHead)
+	if previousBase != observation.DefaultBranchHead {
+		eventID = "base:" + previousBase + ":" + observation.DefaultBranchHead
+		body = fmt.Sprintf("Default branch %s advanced from %s to %s after this candidate was validated. Rebase the existing branch, rerun the complete quality chain, update the existing pull request, and request re-review.", observation.DefaultBranch, previousBase, observation.DefaultBranchHead)
+	} else if observation.BaseBranch != observation.DefaultBranch || observation.BaseCommit != observation.DefaultBranchHead {
+		eventID = "base:" + observation.BaseCommit + ":" + observation.DefaultBranchHead
+		body = fmt.Sprintf("The pull request base %s no longer matches current main %s. Rebase the existing branch, rerun the complete quality chain, update the existing pull request, and request re-review.", observation.BaseCommit, observation.DefaultBranchHead)
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE ticket_deliveries
+SET validated_base_commit = ?, validated_head_commit = ?, updated_at = ?
+WHERE version_id = ? AND issue_id = ?`, observation.DefaultBranchHead, observation.CandidateHead, formatTimestamp(now), delivery.VersionID, delivery.IssueID)
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO merge_ready_revalidations(version_id, issue_id, event_id, body, received_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(version_id, issue_id, event_id) DO NOTHING`, delivery.VersionID, delivery.IssueID, eventID, body, formatTimestamp(now))
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return inserted == 1, tx.Commit()
+}
+
+func (s *Store) PullRequestChecksPassed(ctx context.Context, versionID string, issueID int64, candidateCommit string) (bool, error) {
+	if versionID == "" || issueID == 0 || candidateCommit == "" {
+		return false, ErrInvalidClaim
+	}
+	var total, incomplete int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN status != 'completed' OR conclusion NOT IN ('success', 'neutral', 'skipped') THEN 1 ELSE 0 END), 0) FROM pull_request_checks WHERE version_id = ? AND issue_id = ? AND head_sha = ?`, versionID, issueID, candidateCommit).Scan(&total, &incomplete)
+	return total > 0 && incomplete == 0, err
 }
 
 func (s *Store) RecordPullRequestChecksETag(ctx context.Context, versionID string, issueID int64, etag string) error {

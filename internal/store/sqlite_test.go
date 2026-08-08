@@ -154,6 +154,45 @@ func TestMigrationFromV40AddsTicketDeliveryMergeCommit(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV42AddsMergeReadyObservationColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 43"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	for _, column := range []string{"validated_base_commit", "validated_head_commit"} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_deliveries DROP COLUMN "+column); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for _, column := range []string{"validated_base_commit", "validated_head_commit"} {
+		if !hasColumn(t, ctx, migrated.db, "ticket_deliveries", column) {
+			t.Fatalf("migration did not add ticket_deliveries.%s", column)
+		}
+	}
+}
+
 func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

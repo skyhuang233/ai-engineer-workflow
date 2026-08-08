@@ -25,6 +25,14 @@ const (
 	inlineFeedbackDebounceBatch  = "inline-debounce"
 )
 
+func releaseMergeReadyRevalidationsTx(ctx context.Context, tx *sql.Tx, runID string) (int64, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE merge_ready_revalidations SET claimed_run_id = '' WHERE claimed_run_id = ?`, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *Store) RecordReviewFeedback(ctx context.Context, versionID string, issueID int64, feedback []ReviewFeedback, now time.Time) (int, error) {
 	if versionID == "" || issueID == 0 {
 		return 0, ErrInvalidClaim
@@ -206,6 +214,9 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 			if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, currentRunID); err != nil {
 				return TicketClaim{}, "", err
 			}
+			if _, err := releaseMergeReadyRevalidationsTx(ctx, tx, currentRunID); err != nil {
+				return TicketClaim{}, "", err
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
 				return TicketClaim{}, "", err
 			}
@@ -229,50 +240,69 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 	if activeRuns >= maxParallelRuns {
 		return TicketClaim{}, "", ErrCapacity
 	}
-	var batchID string
-	err = tx.QueryRowContext(ctx, `SELECT batch_id FROM review_feedback_events
-WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' AND (ready_at = '' OR ready_at <= ?)
-ORDER BY received_at, source, event_id LIMIT 1`, versionID, issueID, formatTimestamp(now)).Scan(&batchID)
+	var eventKind, batchID string
+	err = tx.QueryRowContext(ctx, `SELECT event_kind, batch_id FROM (
+    SELECT 'feedback' AS event_kind, batch_id, received_at, source, event_id
+    FROM review_feedback_events
+    WHERE version_id = ? AND issue_id = ? AND claimed_run_id = '' AND (ready_at = '' OR ready_at <= ?)
+    UNION ALL
+    SELECT 'revalidation' AS event_kind, event_id AS batch_id, received_at, '' AS source, event_id
+    FROM merge_ready_revalidations
+    WHERE version_id = ? AND issue_id = ? AND claimed_run_id = ''
+) ORDER BY received_at, source, event_id LIMIT 1`, versionID, issueID, formatTimestamp(now), versionID, issueID).Scan(&eventKind, &batchID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, "", ErrNotFound
 	}
 	if err != nil {
 		return TicketClaim{}, "", err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT source, event_id, author, body FROM review_feedback_events
-WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' AND (ready_at = '' OR ready_at <= ?) ORDER BY received_at, source, event_id`, versionID, issueID, batchID, formatTimestamp(now))
-	if err != nil {
-		return TicketClaim{}, "", err
-	}
-	defer rows.Close()
 	var eventKeys []string
 	var prompt strings.Builder
-	for rows.Next() {
-		var source, eventID, author, body string
-		if err := rows.Scan(&source, &eventID, &author, &body); err != nil {
+	if eventKind == "feedback" {
+		rows, err := tx.QueryContext(ctx, `SELECT source, event_id, author, body FROM review_feedback_events
+WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' AND (ready_at = '' OR ready_at <= ?) ORDER BY received_at, source, event_id`, versionID, issueID, batchID, formatTimestamp(now))
+		if err != nil {
 			return TicketClaim{}, "", err
 		}
-		eventKeys = append(eventKeys, source+"\x00"+eventID)
-		if prompt.Len() > 0 {
-			prompt.WriteString("\n\n")
+		for rows.Next() {
+			var source, eventID, author, body string
+			if err := rows.Scan(&source, &eventID, &author, &body); err != nil {
+				rows.Close()
+				return TicketClaim{}, "", err
+			}
+			eventKeys = append(eventKeys, source+"\x00"+eventID)
+			if prompt.Len() > 0 {
+				prompt.WriteString("\n\n")
+			}
+			feedbackID := source + "/" + eventID
+			if author == "" {
+				fmt.Fprintf(&prompt, "Review feedback ID %s (%s):\n%s", feedbackID, source, body)
+			} else {
+				fmt.Fprintf(&prompt, "Review feedback ID %s from %s (%s):\n%s", feedbackID, author, source, body)
+			}
 		}
-		feedbackID := source + "/" + eventID
-		if author == "" {
-			fmt.Fprintf(&prompt, "Review feedback ID %s (%s):\n%s", feedbackID, source, body)
-		} else {
-			fmt.Fprintf(&prompt, "Review feedback ID %s from %s (%s):\n%s", feedbackID, author, source, body)
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return TicketClaim{}, "", err
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return TicketClaim{}, "", err
-	}
-	if err := rows.Close(); err != nil {
-		return TicketClaim{}, "", err
+		if err := rows.Close(); err != nil {
+			return TicketClaim{}, "", err
+		}
+	} else {
+		var body string
+		if err := tx.QueryRowContext(ctx, `SELECT body FROM merge_ready_revalidations WHERE version_id = ? AND issue_id = ? AND event_id = ? AND claimed_run_id = ''`, versionID, issueID, batchID).Scan(&body); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return TicketClaim{}, "", ErrNotFound
+			}
+			return TicketClaim{}, "", err
+		}
+		eventKeys = append(eventKeys, batchID)
+		fmt.Fprintf(&prompt, "Merge-Ready revalidation ID integration-base/%s:\n%s", batchID, body)
 	}
 	if len(eventKeys) == 0 {
 		return TicketClaim{}, "", ErrNotFound
 	}
-	prompt.WriteString("\n\nWhen replying on the existing pull request, include the feedback IDs above, the resulting commit SHA, and complete verification evidence; request re-review. Do not resolve any review thread.")
+	prompt.WriteString("\n\nWhen replying on the existing pull request, include the IDs above, the resulting commit SHA, and complete verification evidence; request re-review. Do not resolve any review thread.")
 	generation++
 	var attempt int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {
@@ -319,9 +349,15 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' A
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, generation, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(now)); err != nil {
 		return TicketClaim{}, "", err
 	}
-	for _, key := range eventKeys {
-		parts := strings.SplitN(key, "\x00", 2)
-		if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = ? WHERE version_id = ? AND issue_id = ? AND source = ? AND event_id = ? AND claimed_run_id = ''`, runID, versionID, issueID, parts[0], parts[1]); err != nil {
+	if eventKind == "feedback" {
+		for _, key := range eventKeys {
+			parts := strings.SplitN(key, "\x00", 2)
+			if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = ? WHERE version_id = ? AND issue_id = ? AND source = ? AND event_id = ? AND claimed_run_id = ''`, runID, versionID, issueID, parts[0], parts[1]); err != nil {
+				return TicketClaim{}, "", err
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE merge_ready_revalidations SET claimed_run_id = ? WHERE version_id = ? AND issue_id = ? AND event_id = ? AND claimed_run_id = ''`, runID, versionID, issueID, batchID); err != nil {
 			return TicketClaim{}, "", err
 		}
 	}
