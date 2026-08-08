@@ -53,8 +53,25 @@ go run ./cmd/workflow doctor `
   --config config/toolchain.json `
   --workflow-repository skyhuang233/workflow `
   --database C:\ProgramData\workflow\workflow.db `
+  --codex-auth-file $env:USERPROFILE\.codex\auth.json `
   --report docs/operations/doctor-report.md
 ```
+
+The Control Plane authenticates Ticket Agents with the trusted operator's
+existing ChatGPT login cache. Run `codex login status` before starting the
+workflow and complete `codex login` if necessary. `doctor`, `run-ticket`, and
+`poll-github` default to `CODEX_HOME\auth.json`, or
+`$env:USERPROFILE\.codex\auth.json` when `CODEX_HOME` is unset; use
+`--codex-auth-file` to select another absolute cache path. The cache must use
+ChatGPT authentication. It is atomically copied only when a Ticket Session has
+no `auth.json`, so a Session-local cache refreshed by Codex is never
+overwritten.
+
+Doctor performs a real create-and-resume request inside the pinned Worker
+image using a temporary copy of this cache. A version-only Codex check is not
+sufficient: missing or rejected authentication fails the report before the
+Worker image is activated. The temporary copy is removed after the probe, and
+credential contents are never included in the report.
 
 `--workflow-repository` is the independently supplied repository that contains
 the publisher workflow. Doctor requires it to exactly match

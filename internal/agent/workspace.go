@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -17,6 +18,7 @@ import (
 type WorkspaceManager struct {
 	RootDir        string
 	CodexStateRoot string
+	CodexAuthFile  string
 }
 
 type workspace struct {
@@ -151,6 +153,11 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 	}
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		return workspace{}, err
+	}
+	if m.CodexAuthFile != "" {
+		if err := codexauth.Seed(m.CodexAuthFile, state); err != nil {
+			return workspace{}, err
+		}
 	}
 	base, err := gitOutput(ctx, path, "rev-parse", "HEAD")
 	if err != nil {

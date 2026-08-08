@@ -20,6 +20,14 @@ import (
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
+func TestDefaultCodexAuthFileFollowsCodexHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codex-home")
+	t.Setenv("CODEX_HOME", home)
+	if got, want := defaultCodexAuthFile(), filepath.Join(home, "auth.json"); got != want {
+		t.Fatalf("defaultCodexAuthFile() = %q, want %q", got, want)
+	}
+}
+
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "workflow.db")

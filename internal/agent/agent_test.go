@@ -139,6 +139,102 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
 }
 
+func TestControllerSeedsCodexAuthenticationBeforeFirstWorkerRun(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	want := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-only"}}`)
+	if err := os.WriteFile(authSource, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		CodexAuthFile: authSource,
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after auth observation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "observe auth")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(session.CodexStatePath, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("seeded auth = %q, want exact source bytes", got)
+	}
+}
+
+func TestControllerPreservesExistingTicketSessionAuthentication(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"host"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "codex", claim.SessionID)
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"session-refreshed"}}`)
+	if err := os.WriteFile(filepath.Join(statePath, "auth.json"), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		CodexAuthFile: authSource,
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after auth observation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "observe auth")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	got, err := os.ReadFile(filepath.Join(statePath, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("existing Ticket Session auth was overwritten: got %q", got)
+	}
+}
+
+func TestControllerRejectsNonChatGPTAuthenticationBeforeWorkerLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, []byte(`{"auth_mode":"api","OPENAI_API_KEY":"test-only"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("worker should not start"), results: []worker.Result{{ContainerID: "unexpected"}}}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "must not launch"))
+	if err == nil || !strings.Contains(err.Error(), "ChatGPT") {
+		t.Fatalf("invalid authentication error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with non-ChatGPT authentication: %#v", runtime.specs)
+	}
+}
+
 func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

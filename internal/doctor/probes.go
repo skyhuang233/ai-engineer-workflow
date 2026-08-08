@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	githubapi "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -46,6 +47,82 @@ func (c SQLiteCheck) Run(ctx context.Context) Result {
 
 type DockerCheck struct {
 	Manifest WorkerReleaseManifest
+}
+
+type WorkerCodexSessionCheck struct {
+	Executor Executor
+	Image    string
+	AuthFile string
+	Nonce    string
+}
+
+func (WorkerCodexSessionCheck) Name() string { return "Worker Codex authentication and session resume" }
+
+func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
+	if c.Executor == nil || strings.TrimSpace(c.Image) == "" || strings.TrimSpace(c.AuthFile) == "" {
+		return Result{Status: Fail, Summary: "Worker Codex authentication check is incomplete"}
+	}
+	root, err := os.MkdirTemp("", "workflow-doctor-codex-*")
+	if err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	defer os.RemoveAll(root)
+	workspace := filepath.Join(root, "workspace")
+	codexState := filepath.Join(root, "codex-state")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	if err := os.MkdirAll(codexState, 0o700); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	if err := codexauth.Seed(c.AuthFile, codexState); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	nonce := c.Nonce
+	if nonce == "" {
+		nonce, err = randomToken()
+		if err != nil {
+			return Result{Status: Fail, Summary: err.Error()}
+		}
+	}
+	initial, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
+		"exec", "--skip-git-repo-check", "--json", "--sandbox", "read-only",
+		"Remember this nonce for the next turn: "+nonce+". Reply with exactly: phase-one"))
+	if err != nil {
+		return workerCodexFailure("create authenticated Worker Codex session", initial, err)
+	}
+	sessionID := jsonEventString(initial, "thread.started", "thread_id")
+	if sessionID == "" {
+		return Result{Status: Fail, Summary: "Worker Codex did not emit a persistent session ID"}
+	}
+	resumed, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
+		"exec", "resume", "--json", "--skip-git-repo-check", sessionID,
+		"Reply with only the nonce I gave you in the previous turn."))
+	if err != nil {
+		return workerCodexFailure("resume authenticated Worker Codex session", resumed, err)
+	}
+	if !strings.Contains(string(resumed), nonce) {
+		return Result{Status: Fail, Summary: "resumed Worker Codex session did not recall prior-turn context"}
+	}
+	return Result{Status: Pass, Summary: "pinned Worker authenticated with the host ChatGPT cache and resumed persisted context"}
+}
+
+func workerCodexCommand(image, workspace, codexState string, command ...string) []string {
+	args := []string{
+		"docker", "run", "--rm", "--workdir", "/workspace",
+		"--mount", "type=bind,source=" + workspace + ",target=/workspace",
+		"--mount", "type=bind,source=" + codexState + ",target=/codex-state",
+		"--env", "CODEX_HOME=/codex-state", image, "codex",
+	}
+	return append(args, command...)
+}
+
+func workerCodexFailure(action string, output []byte, err error) Result {
+	lower := strings.ToLower(string(output))
+	if strings.Contains(lower, "401 unauthorized") || strings.Contains(lower, "missing bearer or basic authentication") {
+		return Result{Status: Fail, Summary: "Worker Codex authentication was rejected"}
+	}
+	return Result{Status: Fail, Summary: fmt.Sprintf("%s: %v", action, err)}
 }
 
 func (DockerCheck) Name() string { return "Docker Worker contract" }

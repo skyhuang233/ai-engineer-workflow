@@ -7,7 +7,9 @@ param(
   [int]$MaxParallelRuns = 1,
 
   [ValidateRange(1, 86400)]
-  [int]$IntervalSeconds = 60
+  [int]$IntervalSeconds = 60,
+
+  [string]$CodexAuthFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +134,20 @@ $gatewayControlUrl = "http://127.0.0.1:$gatewayPort"
 $gatewayListen = "0.0.0.0:$gatewayPort"
 $rootNumber = 2
 
+if ([string]::IsNullOrWhiteSpace($CodexAuthFile)) {
+  $codexHome = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
+    $env:CODEX_HOME
+  }
+  else {
+    Join-Path $env:USERPROFILE '.codex'
+  }
+  $CodexAuthFile = Join-Path $codexHome 'auth.json'
+}
+if (-not (Test-Path -LiteralPath $CodexAuthFile -PathType Leaf)) {
+  throw "ChatGPT Codex authentication cache not found: $CodexAuthFile"
+}
+$CodexAuthFile = (Resolve-Path -LiteralPath $CodexAuthFile).ProviderPath
+
 foreach ($command in 'git', 'go', 'docker') {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
     throw "$command is required"
@@ -214,6 +230,7 @@ try {
       '--source', $projectRoot,
       '--workspace-root', $workspaceRoot,
       '--state-root', $stateRoot,
+      '--codex-auth-file', $CodexAuthFile,
       '--gateway-url', $gatewayUrl,
       '--gateway-control-url', $gatewayControlUrl,
       '--once',
