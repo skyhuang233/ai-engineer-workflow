@@ -3,6 +3,9 @@ package delivery_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +30,15 @@ type fakeRemote struct {
 type completionFailingStore struct {
 	*store.Store
 	err error
+}
+
+type enqueueFailingStore struct {
+	*store.Store
+	err error
+}
+
+func (s enqueueFailingStore) EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error) {
+	return store.DeliveryOutbox{}, s.err
 }
 
 func (s completionFailingStore) CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error {
@@ -120,8 +132,88 @@ func TestGatewayQueuesCredentialRecoveryInboxProjection(t *testing.T) {
 		t.Fatalf("credential recovery outbox keys = %#v, %v", keys, err)
 	}
 	outbox, err := db.DeliveryOutbox(ctx, keys[0])
-	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.WorkflowQuestions != nil {
+	if err != nil || outbox.Request.Operation != store.DeliveryProjectInbox || len(outbox.Request.WorkflowQuestions) == 0 {
 		t.Fatalf("credential recovery outbox = %#v, %v", outbox, err)
+	}
+}
+
+func TestGatewayCredentialInboxQueueIgnoresInactiveRepositories(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.PauseGatewayWrites(ctx, "credential unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	gateway := delivery.Gateway{Store: db, Now: func() time.Time { return now.Add(time.Second) }}
+	if err := gateway.QueueGatewayCredentialInboxProjections(ctx); err != nil {
+		t.Fatalf("queue inactive credential Inbox = %v", err)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Second), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		outbox, err := db.DeliveryOutbox(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(outbox.Request.WorkflowQuestions) != 0 {
+			t.Fatalf("inactive credential Inbox projection = %#v", outbox.Request)
+		}
+	}
+}
+
+func TestGatewayStoreFailureHasStructuredHTTPClassification(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gateway := delivery.Gateway{Store: enqueueFailingStore{Store: db, err: errors.New("sqlite is busy")}, Remote: &fakeRemote{}}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err = (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusInternalServerError || httpErr.Code != delivery.ErrorCodeRetryableStore || !httpErr.PollStoreFailure() {
+		t.Fatalf("Gateway store HTTP error = %#v, %v", httpErr, err)
+	}
+}
+
+func TestGatewayWritesPausedHasStructuredHTTPClassification(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.PauseGatewayWrites(ctx, "rotate credential", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err := (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusServiceUnavailable || httpErr.Code != delivery.ErrorCodeGatewayWritesPaused || !httpErr.AuthenticationFailure() {
+		t.Fatalf("paused Gateway HTTP error = %#v, %v", httpErr, err)
+	}
+}
+
+func TestGatewayRateLimitHasStructuredHTTPRetryTime(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	retryAt := now.Add(5 * time.Minute)
+	remote := &fakeRemote{applyErr: &githubapi.APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}}
+	server := httptest.NewServer(delivery.HTTPHandler(delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	err := (delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}).ProjectWorkflowInbox(ctx, "owner/repo", nil)
+	var httpErr *delivery.HTTPError
+	if !errors.As(err, &httpErr) || !httpErr.RetryAtTime().Equal(retryAt) {
+		t.Fatalf("Gateway rate-limit HTTP error = %#v, %v", httpErr, err)
 	}
 }
 
@@ -149,15 +241,20 @@ func TestGatewayResolvesCredentialRecoveryInboxAtDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := gateway.Dispatch(ctx, keys[0]); err != nil {
+		t.Fatalf("stale credential projection = %v", err)
+	}
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
 		t.Fatal(err)
 	}
 	remote := gateway.Remote.(*fakeRemote)
-	if len(remote.requests) != 0 {
-		t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+	for _, request := range remote.requests {
+		if len(request.WorkflowQuestions) != 0 {
+			t.Fatalf("dispatched stale credential recovery questions: %#v", remote.requests)
+		}
 	}
 }
 
-func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
+func TestGatewayNormalizesWorkflowInboxProjectionIntents(t *testing.T) {
 	ctx := context.Background()
 	db, claim := newAcceptedClaim(t, ctx)
 	defer db.Close()
@@ -176,13 +273,13 @@ func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if stale.IdempotencyKey != current.IdempotencyKey || stale.Request.InboxProjectionVersion == "superseded" {
+		t.Fatalf("normalized stale projection = %#v; current key=%q", stale, current.IdempotencyKey)
+	}
 	remote := &fakeRemote{}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
 	if err := gateway.Dispatch(ctx, stale.IdempotencyKey); err != nil {
 		t.Fatal(err)
-	}
-	if len(remote.requests) != 0 {
-		t.Fatalf("stale projection reached remote: %#v", remote.requests)
 	}
 	if err := gateway.Dispatch(ctx, current.IdempotencyKey); err != nil {
 		t.Fatal(err)
@@ -194,6 +291,476 @@ func TestGatewayFencesStaleWorkflowInboxProjectionIntents(t *testing.T) {
 		if question.ID == "stale" {
 			t.Fatalf("current projection retained stale question: %#v", remote.requests)
 		}
+	}
+}
+
+func TestGatewayCompletesSupersededInboxGenerationWithoutRemoteWrite(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 0, 0, 0, time.UTC)
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Request.InboxProjectionGeneration >= second.Request.InboxProjectionGeneration {
+		t.Fatalf("Inbox generations = %d then %d", first.Request.InboxProjectionGeneration, second.Request.InboxProjectionGeneration)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("superseded Inbox dispatch = %v", err)
+	}
+	completed, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || completed.State != store.OutboxSucceeded {
+		t.Fatalf("superseded Inbox outbox = %#v, %v", completed, err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("superseded Inbox reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
+func TestGatewayObservesSupersededUncertainInboxBeforeNewerGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 30, 0, 0, time.UTC)
+	first, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, first.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{observations: []delivery.Observation{{Applied: true}}}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("uncertain Inbox reconciliation = %v", err)
+	}
+	if remote.observeCalls != 1 || remote.applyCalls != 0 || len(remote.requests) != 1 || remote.requests[0].InboxProjectionGeneration != first.Request.InboxProjectionGeneration {
+		t.Fatalf("superseded Inbox reconciliation = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
+		t.Fatalf("newer Inbox dispatch = %v", err)
+	}
+	if remote.observeCalls != 2 || remote.applyCalls != 1 || len(remote.requests) != 2 || remote.requests[1].InboxProjectionGeneration != second.Request.InboxProjectionGeneration {
+		t.Fatalf("authoritative Inbox dispatch = observes %d applies %d requests %#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayFencesUnobservedSupersededUncertainInboxUntilAuthorizedRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 35, 0, 0, time.UTC)
+	first, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, first.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); !errors.Is(err, store.ErrDeliverySuperseded) {
+		t.Fatalf("unobserved superseded Inbox reconciliation = %v", err)
+	}
+	retained, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || retained.State != store.OutboxPending || !retained.Uncertain || remote.observeCalls != 1 || remote.applyCalls != 0 {
+		t.Fatalf("retained superseded Inbox = %#v, %v; observes=%d applies=%d", retained, err, remote.observeCalls, remote.applyCalls)
+	}
+	if err := gateway.Dispatch(ctx, newer.IdempotencyKey); err != nil {
+		t.Fatalf("deferred newer Inbox dispatch = %v", err)
+	}
+	blocked, err := db.DeliveryOutbox(ctx, newer.IdempotencyKey)
+	if err != nil || blocked.State != store.OutboxPending || remote.observeCalls != 1 || remote.applyCalls != 0 {
+		t.Fatalf("fenced newer Inbox = %#v, %v; observes=%d applies=%d", blocked, err, remote.observeCalls, remote.applyCalls)
+	}
+	now = now.Add(time.Hour)
+	claim, err = db.ClaimDeliveryOutbox(ctx, first.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RejectDeliveryOutbox(ctx, first.IdempotencyKey, claim.ClaimToken, "operator review required", true, now); err != nil {
+		t.Fatal(err)
+	}
+	recoveryQuestionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(ctx, "owner/repo", first.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryProjection, err := db.RecoverUncertainInboxDelivery(ctx, "owner/repo", first.IdempotencyKey, recoveryQuestionID, "retry", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); err != nil {
+		t.Fatalf("authorized historical Inbox resolution = %v", err)
+	}
+	resolved, err := db.DeliveryOutbox(ctx, first.IdempotencyKey)
+	if err != nil || resolved.State != store.OutboxSucceeded || resolved.Uncertain || remote.observeCalls != 2 || remote.applyCalls != 0 {
+		t.Fatalf("resolved historical Inbox = %#v, %v; observes=%d applies=%d", resolved, err, remote.observeCalls, remote.applyCalls)
+	}
+	if err := gateway.Dispatch(ctx, recoveryProjection.IdempotencyKey); err != nil {
+		t.Fatalf("authorized current Inbox dispatch = %v", err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("authorized recovery applies = %d, want current projection only", remote.applyCalls)
+	}
+}
+
+func TestGatewayAppliesCurrentUnobservedUncertainInbox(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 2, 45, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now.Add(2 * time.Second) }}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatalf("current uncertain Inbox dispatch = %v", err)
+	}
+	finished, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || finished.State != store.OutboxSucceeded || remote.observeCalls != 1 || remote.applyCalls != 1 {
+		t.Fatalf("current uncertain Inbox = %#v, %v; observes=%d applies=%d", finished, err, remote.observeCalls, remote.applyCalls)
+	}
+}
+
+func TestGatewayPreservesUncertainInboxAcrossCredentialPreflightFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "transient", err: errors.New("credential store unavailable")},
+		{name: "rejected", err: delivery.ErrGatewayCredentialRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _ := newAcceptedClaim(t, ctx)
+			defer db.Close()
+			now := time.Date(2026, 8, 7, 2, 50, 0, 0, time.UTC)
+			queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+				t.Fatal(err)
+			}
+			remote := &fakeRemote{credentialErr: test.err}
+			gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now.Add(2 * time.Second) }}
+			if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err == nil {
+				t.Fatal("credential preflight failure returned nil")
+			}
+			outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+			if err != nil || outbox.State != store.OutboxPending || !outbox.Uncertain {
+				t.Fatalf("uncertain Inbox after credential preflight = %#v, %v", outbox, err)
+			}
+			if remote.observeCalls != 0 || remote.applyCalls != 0 {
+				t.Fatalf("credential preflight reached remote: observes=%d applies=%d", remote.observeCalls, remote.applyCalls)
+			}
+		})
+	}
+}
+
+func TestHTTPProjectorAcceptsDurableInboxSerializationContention(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 3, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkRepositoryNeedsAttention(ctx, "owner/repo", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, first.IdempotencyKey, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	projector := delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}
+	if err := projector.ProjectWorkflowInbox(ctx, "owner/repo", nil); err != nil {
+		t.Fatalf("serialized Inbox projection = %v", err)
+	}
+}
+
+func TestHTTPProjectorAcceptsSameInboxClaimContention(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, queued.IdempotencyKey, "legacy-gateway-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: "control-token"}))
+	defer server.Close()
+	projector := delivery.HTTPProjector{URL: server.URL, ControlPlaneToken: "control-token", Client: &http.Client{Timeout: time.Second}}
+	if err := projector.ProjectWorkflowInbox(ctx, "owner/repo", nil); err != nil {
+		t.Fatalf("same Inbox contention = %v", err)
+	}
+}
+
+func TestGatewayRejectsClaimedInboxWhenCurrentPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	outbox, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("completed-plan dispatch error = %v, want no active delivery plan", err)
+	}
+	if remote.observeCalls != 0 || remote.applyCalls != 0 {
+		t.Fatalf("inactive Inbox reached remote: observe=%d apply=%d", remote.observeCalls, remote.applyCalls)
+	}
+}
+
+func TestRejectedInactiveInboxKeyDoesNotPoisonReplacementPlan(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	first, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Request.InboxPlanVersionID != claim.VersionID {
+		t.Fatalf("first Inbox plan version = %q, want %q", first.Request.InboxPlanVersionID, claim.VersionID)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, first.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("inactive first dispatch = %v", err)
+	}
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}, UpdatedAt: "replacement"},
+		Children:   []plan.Issue{{ID: 2, Number: 12, Title: "replacement", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.BeginActivation(ctx, snapshot, fingerprint, "replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	now = time.Now().UTC()
+	second, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.IdempotencyKey == first.IdempotencyKey || second.Request.InboxPlanVersionID != replacement.ID {
+		t.Fatalf("replacement Inbox = %#v; first key=%q", second, first.IdempotencyKey)
+	}
+	if err := gateway.Dispatch(ctx, second.IdempotencyKey); err != nil {
+		t.Fatalf("replacement Inbox dispatch = %v", err)
+	}
+	if remote.applyCalls != 1 {
+		t.Fatalf("replacement Inbox apply calls = %d, want 1", remote.applyCalls)
+	}
+}
+
+func TestGatewayClearsUncertainInboxReplayWhenCurrentPlanCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Now().UTC()
+	outbox, err := db.EnqueueDelivery(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureGatewayDispatcher(ctx, "old-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutboxForDispatcher(ctx, outbox.IdempotencyKey, "old-dispatcher", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: "new-dispatcher", Now: func() time.Time { return now.Add(time.Hour) }}
+	if err := gateway.Dispatch(ctx, outbox.IdempotencyKey); !errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+		t.Fatalf("inactive uncertain replay error = %v", err)
+	}
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	if remote.observeCalls != 1 || remote.applyCalls != 1 || len(remote.requests) != 1 || len(remote.requests[0].WorkflowQuestions) != 0 {
+		t.Fatalf("durable inactive Inbox projection: observe=%d apply=%d requests=%#v", remote.observeCalls, remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayCorrectsInboxWhenPlanCompletesDuringApply(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	peer, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	advanced := false
+	remote := &advancingRemote{fakeRemote: fakeRemote{}, advance: func() {
+		if !advanced {
+			advanced = true
+			if err := peer.MarkTicketDelivered(ctx, version.ID, 2); err != nil {
+				t.Error(err)
+			}
+		}
+	}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 2 || len(remote.requests) < 2 || len(remote.requests[len(remote.requests)-1].WorkflowQuestions) != 0 {
+		t.Fatalf("durable Inbox delivery = applies %d requests %#v", remote.applyCalls, remote.requests)
+	}
+}
+
+func TestGatewayQueuesEmptyInboxWhenPlanCompletesDuringAppliedObservation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	peer, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "observation-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	remote := &observingAdvanceRemote{fakeRemote: fakeRemote{observations: []delivery.Observation{{Applied: true}}}, advance: func() {
+		if err := peer.MarkTicketDelivered(ctx, version.ID, 2); err != nil {
+			t.Error(err)
+		}
+	}}
+	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.Dispatch(ctx, queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := gateway.DispatchPending(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	if remote.applyCalls != 1 || len(remote.requests) < 2 || len(remote.requests[len(remote.requests)-1].WorkflowQuestions) != 0 {
+		t.Fatalf("durable observation correction = applies %d requests %#v", remote.applyCalls, remote.requests)
 	}
 }
 
@@ -221,9 +788,21 @@ type advancingRemote struct {
 	advance func()
 }
 
+type observingAdvanceRemote struct {
+	fakeRemote
+	advance func()
+}
+
 func (r *advancingRemote) Apply(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
 	r.advance()
 	return r.fakeRemote.Apply(ctx, request)
+}
+
+func (r *observingAdvanceRemote) Observe(ctx context.Context, request store.DeliveryRequest) (delivery.Observation, error) {
+	advance := r.advance
+	r.advance = func() {}
+	advance()
+	return r.fakeRemote.Observe(ctx, request)
 }
 
 func (r *blockingRemote) Observe(context.Context, store.DeliveryRequest) (delivery.Observation, error) {
@@ -562,6 +1141,79 @@ func TestGatewayDispatchPendingPublishesAcceptedCandidateInOrder(t *testing.T) {
 	}
 	if remote.applyCalls != 2 {
 		t.Fatalf("apply calls = %d", remote.applyCalls)
+	}
+}
+
+func TestGatewayDispatchPendingReportsFailingDeliveryKey(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 0, 0, 0, time.UTC)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{applyErr: errors.New("remote unavailable")}, Now: func() time.Time { return now }}
+	queued, err := gateway.Submit(ctx, store.DeliveryRequest{Operation: store.DeliveryProjectInbox, Repository: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gateway.DispatchPending(ctx, 1)
+	if err == nil || !strings.Contains(err.Error(), queued.IdempotencyKey) {
+		t.Fatalf("dispatch error = %v, want delivery key %q", err, queued.IdempotencyKey)
+	}
+}
+
+func TestGatewayDispatchReportsTerminalUncertainInboxRecoveryKey(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 30, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+		if claimErr != nil {
+			t.Fatal(claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{applyErr: errors.New("remote unavailable")}, Now: func() time.Time { return now }}
+	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), queued.IdempotencyKey) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
+		t.Fatalf("terminal uncertain Inbox dispatch = %v", err)
+	}
+}
+
+func TestGatewayPreservesUncertainInboxFenceWhenReconciliationIsRejected(t *testing.T) {
+	ctx := context.Background()
+	db, _ := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 5, 45, 0, 0, time.UTC)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, "owner/repo", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequeueDeliveryOutboxClaim(ctx, queued.IdempotencyKey, claim.ClaimToken, "remote outcome unknown", true, now); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	gateway := delivery.Gateway{Store: db, Remote: &fakeRemote{observeErrs: []error{fmt.Errorf("%w: owner guard changed", store.ErrDeliveryRejected)}}, Now: func() time.Time { return now }}
+	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
+		t.Fatalf("reconciliation rejection = %v", err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.State != store.OutboxRejected || !outbox.Uncertain || !strings.Contains(outbox.LastError, queued.IdempotencyKey) {
+		t.Fatalf("rejected uncertain outbox = %#v", outbox)
 	}
 }
 
@@ -1003,7 +1655,7 @@ func TestOutboxProcessingLeaseCanBeReclaimedAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reclaimed.Attempts != 2 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly {
+	if reclaimed.Attempts != 2 || reclaimed.State != store.OutboxProcessing || !reclaimed.ReconcileOnly || !reclaimed.Uncertain {
 		t.Fatalf("reclaimed outbox = %#v", reclaimed)
 	}
 }

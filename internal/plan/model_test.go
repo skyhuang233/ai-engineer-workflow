@@ -31,6 +31,15 @@ func TestRenderWorkflowInboxIncludesDeliveryContext(t *testing.T) {
 	}
 }
 
+func TestRenderWorkflowInboxIncludesEveryOriginatingPlan(t *testing.T) {
+	content := RenderWorkflowInbox([]WorkflowQuestion{{ID: "q-1", Prompt: "recover", Repository: "owner/repo", PlanNumbers: []int64{10, 20}}})
+	for _, expected := range []string{"issues/10", "issues/20"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("inbox content omitted %q: %s", expected, content)
+		}
+	}
+}
+
 func TestSnapshotValidateAcceptsTypedAcyclicGraph(t *testing.T) {
 	if err := validSnapshot().Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)

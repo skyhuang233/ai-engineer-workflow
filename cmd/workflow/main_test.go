@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,118 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := "owner/repository"
+	snapshot := plan.Snapshot{
+		Repository: repository,
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Hour)
+	queued, err := db.QueueWorkflowInboxProjection(ctx, repository, now)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	deliveryKey := queued.IdempotencyKey
+	for attempt := 0; attempt < 8; attempt++ {
+		claim, claimErr := db.ClaimDeliveryOutbox(ctx, deliveryKey, now)
+		if claimErr != nil {
+			db.Close()
+			t.Fatalf("claim attempt %d: %v", attempt+1, claimErr)
+		}
+		if err := db.RequeueDeliveryOutboxClaim(ctx, deliveryKey, claim.ClaimToken, "remote observation unavailable", true, now); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		outbox, err := db.DeliveryOutbox(ctx, deliveryKey)
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if outbox.State == store.OutboxRejected {
+			break
+		}
+		now = now.Add(time.Minute)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	binaryPath := filepath.Join(t.TempDir(), "workflow-test.exe")
+	build := exec.Command("go", "build", "-o", binaryPath, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build workflow CLI: %v\n%s", err, output)
+	}
+	list := exec.Command(binaryPath, "recover-inbox-delivery", "--database", databasePath, "--repository", repository)
+	output, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list recoverable Inbox deliveries: %v\n%s", err, output)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 || fields[0] != deliveryKey {
+		t.Fatalf("recovery listing = %q, want delivery key and question id", output)
+	}
+	questionID := fields[1]
+	t.Logf("$ workflow recover-inbox-delivery --repository %s", repository)
+	t.Logf("%s %s", deliveryKey, questionID)
+
+	recoverCommand := exec.Command(binaryPath, "recover-inbox-delivery", "--database", databasePath, "--repository", repository, "--delivery", deliveryKey, "--question", questionID, "--answer", "retry")
+	if output, err := recoverCommand.CombinedOutput(); err != nil {
+		t.Fatalf("authorize Inbox recovery: %v\n%s", err, output)
+	}
+	t.Logf("$ workflow recover-inbox-delivery --repository %s --delivery %s --question %s --answer retry", repository, deliveryKey, questionID)
+
+	db, err = store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recovered, err := db.DeliveryOutbox(ctx, deliveryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != store.OutboxPending || !recovered.Uncertain || recovered.Attempts != 0 {
+		t.Fatalf("authorized recovery = %#v", recovered)
+	}
+	keys, err := db.DueDeliveryOutboxKeys(ctx, time.Now().UTC().Add(time.Minute), 10)
+	if err != nil || len(keys) < 2 || keys[0] != deliveryKey {
+		t.Fatalf("ordered recovery queue = %v, %v", keys, err)
+	}
+	currentGenerations := make([]int64, 0, len(keys)-1)
+	for _, key := range keys[1:] {
+		current, err := db.DeliveryOutbox(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Request.InboxProjectionGeneration <= recovered.Request.InboxProjectionGeneration {
+			t.Fatalf("ordered generations = %d then %d", recovered.Request.InboxProjectionGeneration, current.Request.InboxProjectionGeneration)
+		}
+		currentGenerations = append(currentGenerations, current.Request.InboxProjectionGeneration)
+	}
+	t.Logf("authorized generation %d returned to the queue before current generations %v", recovered.Request.InboxProjectionGeneration, currentGenerations)
+}
 
 func TestShouldPauseGatewayForCredential(t *testing.T) {
 	for _, test := range []struct {
@@ -34,6 +148,17 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 				t.Fatalf("should pause = %t, want %t", got, test.want)
 			}
 		})
+	}
+}
+
+func TestShouldLogNeedsAttentionErrorWithInboxRecoveryCommand(t *testing.T) {
+	plain := fmt.Errorf("poll exhausted: %w", store.ErrNeedsAttention)
+	if shouldLogNeedsAttentionError(plain) {
+		t.Fatal("plain Needs Attention error should remain suppressed")
+	}
+	actionable := errors.Join(plain, errors.New("workflow recover-inbox-delivery --repository owner/repo --delivery inbox-key"))
+	if !shouldLogNeedsAttentionError(actionable) {
+		t.Fatal("uncertain Inbox recovery command should be logged")
 	}
 }
 
@@ -205,6 +330,111 @@ func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *test
 	paused, _, err := db.GatewayWritesPaused(ctx)
 	if err != nil || paused {
 		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+}
+
+func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "missing credential", err: credential.ErrNotFound},
+		{name: "rejected by GitHub", err: &github.APIError{StatusCode: http.StatusUnauthorized}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "workflow.db")
+			db, err := store.Open(ctx, dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			repository := "owner/repo"
+			now := time.Now().UTC()
+			snapshot := plan.Snapshot{
+				Repository: repository,
+				Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+				Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}},
+			}
+			fingerprint, err := snapshot.Fingerprint()
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.MarkActive(ctx, version.ID); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.RecordGitHubPollFailureWithKind(ctx, repository, now, store.GitHubPollFailurePreActivationInboxConflict); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			admissionErr := persistGatewayCredentialAdmissionError(ctx, db, test.err, now.Add(time.Second))
+			err = recordPollAdmissionFailure(ctx, github.Poller{Store: db, MaxFailures: 5, Now: func() time.Time { return now.Add(time.Second) }}, repository, admissionErr)
+			if !errors.Is(err, test.err) && !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+				db.Close()
+				t.Fatalf("credential admission failure = %v", err)
+			}
+			paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+			cursor, cursorErr := db.GitHubPollCursor(ctx, repository)
+			current, claimErr := db.CurrentClaim(ctx, version.ID, claim.TicketID)
+			if pauseErr != nil || !paused || cursorErr != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed || claimErr != nil || current.RunID != claim.RunID {
+				db.Close()
+				t.Fatalf("credential state paused=%t cursor=%#v claim=%#v errors=%v/%v/%v", paused, cursor, current, pauseErr, cursorErr, claimErr)
+			}
+			questions, questionErr := db.OpenWorkflowQuestions(ctx, repository, 0)
+			if questionErr != nil || len(questions) != 1 || questions[0].Kind != "gateway_credential" {
+				db.Close()
+				t.Fatalf("credential questions = %#v, %v", questions, questionErr)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := store.Open(ctx, dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			cursor, err = restarted.GitHubPollCursor(ctx, repository)
+			if err != nil || cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != store.GitHubPollFailureRetryable || cursor.RecoveryState != store.GitHubPollRecoveryConsumed {
+				t.Fatalf("restarted credential cursor = %#v, %v", cursor, err)
+			}
+		})
+	}
+}
+
+func TestPollAdmissionHonorsNextAttemptBeforeCredentialAccess(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repo"
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.DeferGitHubPoll(ctx, repository, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	authenticated := false
+	_, err = admitPollGitHubCredential(ctx, github.Poller{Store: db, Now: func() time.Time { return now }}, db, repository, func(string) error {
+		authenticated = true
+		return nil
+	})
+	if !errors.Is(err, store.ErrNotReady) || authenticated {
+		t.Fatalf("deferred admission error=%v authenticated=%t", err, authenticated)
+	}
+	paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || paused {
+		t.Fatalf("deferred admission paused=%t error=%v", paused, pauseErr)
 	}
 }
 

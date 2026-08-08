@@ -30,6 +30,14 @@ type WorkflowInboxItem struct {
 }
 
 func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.Time) error {
+	return s.pauseGatewayWrites(ctx, "", "", reason, now, time.Time{})
+}
+
+func (s *Store) PauseGatewayWritesForGitHubPollCredential(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
+	return s.pauseGatewayWrites(ctx, repository, leaseToken, reason, now, leaseNow)
+}
+
+func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, reason string, now, leaseNow time.Time) error {
 	if reason == "" {
 		return errors.New("Gateway pause reason is required")
 	}
@@ -39,6 +47,14 @@ func (s *Store) PauseGatewayWrites(ctx context.Context, reason string, now time.
 		return err
 	}
 	defer tx.Rollback()
+	if leaseToken != "" {
+		if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
+			return err
+		}
+		if err := resetGitHubPollForCredentialTx(ctx, tx, repository, now); err != nil {
+			return err
+		}
+	}
 	timestamp := now.Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, `UPDATE gateway_runtime SET writes_paused = 1, reason = ?, updated_at = ? WHERE singleton = 1`, reason, timestamp); err != nil {
 		return err
@@ -172,7 +188,7 @@ func (s *Store) ResumeGatewayWrites(ctx context.Context, rotation GatewayCredent
 		return err
 	}
 	for _, repository := range repositories {
-		if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now); err != nil {
+		if _, err := s.queueWorkflowInboxProjectionIfActiveTx(ctx, tx, repository, now); err != nil {
 			return err
 		}
 	}

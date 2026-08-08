@@ -60,6 +60,8 @@ func main() {
 		runReconcileDelivered(os.Args[2:])
 	case "answer-inbox":
 		runAnswerInbox(os.Args[2:])
+	case "recover-inbox-delivery":
+		runRecoverInboxDelivery(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -75,6 +77,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow poll-github [options]")
 	fmt.Fprintln(os.Stderr, "  workflow reconcile-delivered [options]")
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
+	fmt.Fprintln(os.Stderr, "  workflow recover-inbox-delivery [options]")
 }
 
 func runDoctor(args []string) {
@@ -549,47 +552,83 @@ func runPollGitHub(args []string) {
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
-	poll := func() error {
+	poll := func() (resultErr error) {
+		defer func() {
+			resultErr = github.ClassifyPollError(resultErr)
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
 		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns}
+		leasedCtx, releasePollLease, err := poller.AcquireLease(ctx, *repository)
+		if err != nil {
+			if errors.Is(err, store.ErrNotReady) {
+				return nil
+			}
+			return err
+		}
+		ctx = leasedCtx
+		defer func() {
+			resultErr = errors.Join(resultErr, releasePollLease())
+		}()
+		if err := poller.PrepareAdmission(ctx, *repository); err != nil {
+			return err
+		}
 		var client *github.Client
-		_, err := admitGatewayCredential(ctx, db, func(token string) error {
+		_, err = admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
 		if err != nil {
-			if shouldPauseGatewayForCredential(err) {
-				fmt.Fprintln(os.Stderr, err)
-				return err
+			if errors.Is(err, store.ErrNotReady) {
+				return nil
 			}
-			_, err = poller.RecordFailure(ctx, *repository, err)
+			err = recordPollAdmissionFailure(ctx, poller, *repository, err)
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
 		poller.Client = client
 		poller.LaunchReview = launcher
-		result, err := poller.PollWith(ctx, *repository, func(ctx context.Context) error {
+		attemptedPlanVersionID := ""
+		attemptedPlanAlreadyComplete := false
+		bootstrap := func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			if err != nil {
 				return err
 			}
 			activator := plan.Activator{Reader: client, Projector: projector, Store: db}
-			if _, err := activator.Activate(ctx, *repository, activeRoot); err != nil {
-				return err
-			}
-			activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			version, err := activator.Activate(ctx, *repository, activeRoot)
+			attemptedPlanVersionID = version.ID
+			attemptedPlanAlreadyComplete = version.State == store.StateCompleted
 			if err != nil {
 				return err
+			}
+			return nil
+		}
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
+			controlResult := github.BootstrapControlResult{}
+			attemptedPlanVersionID = ""
+			attemptedPlanAlreadyComplete = false
+			var bootstrapErr error
+			if !bootstrapped {
+				bootstrapErr = bootstrap(ctx)
+			}
+			controlResult.AttemptedPlanVersionID = attemptedPlanVersionID
+			controlResult.AttemptedPlanAlreadyComplete = attemptedPlanAlreadyComplete
+			if bootstrapErr != nil {
+				return controlResult, bootstrapErr
+			}
+			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			if err != nil {
+				return controlResult, err
 			}
 			workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot}
 			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}}
 			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
-				return err
+				return controlResult, err
 			}
 			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
-				return err
+				return controlResult, err
 			}
 			var deliveryWorkers *sync.WaitGroup
 			if *once {
@@ -600,23 +639,26 @@ func runPollGitHub(args []string) {
 				workerError = errors.Join(workerError, err)
 				workerErrorMu.Unlock()
 			}); err != nil {
-				return err
+				return controlResult, err
 			}
 			for {
 				claim, claimErr := dispatcher.Claim(ctx, *repository, activeRoot, 0, "workflow-control-plane")
 				if claimErr == nil {
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
-						return err
+						return controlResult, err
 					}
 					continue
 				}
 				if errors.Is(claimErr, store.ErrNoReadyTickets) || errors.Is(claimErr, store.ErrCapacity) || errors.Is(claimErr, store.ErrNotReady) {
-					return nil
+					return controlResult, nil
 				}
-				return claimErr
+				return controlResult, claimErr
 			}
 		})
+		if shouldLogNeedsAttentionError(err) {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
 			err = persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC())
 			fmt.Fprintln(os.Stderr, err)
@@ -641,9 +683,15 @@ func runPollGitHub(args []string) {
 		return
 	}
 	for {
-		_ = poll()
+		if err := poll(); errors.Is(err, github.ErrLocalPollStore) {
+			fail(err)
+		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func shouldLogNeedsAttentionError(err error) bool {
+	return errors.Is(err, store.ErrNeedsAttention) && strings.Contains(err.Error(), "workflow recover-inbox-delivery")
 }
 
 func gatewayControlURL(workerURL, controlURL string) string {
@@ -726,6 +774,49 @@ func runAnswerInbox(args []string) {
 	defer db.Close()
 	ctx := context.Background()
 	if _, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+		fail(err)
+	}
+}
+
+func runRecoverInboxDelivery(args []string) {
+	flags := flag.NewFlagSet("recover-inbox-delivery", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	repository := flags.String("repository", "", "GitHub owner/repository")
+	deliveryKey := flags.String("delivery", "", "rejected uncertain Workflow Inbox delivery key")
+	questionID := flags.String("question", "", "stable Workflow Inbox recovery question ID")
+	answer := flags.String("answer", "", "human recovery authorization")
+	_ = flags.Parse(args)
+	if *repository == "" {
+		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository")
+		os.Exit(2)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	if *deliveryKey == "" {
+		keys, err := db.RecoverableUncertainInboxDeliveryKeys(context.Background(), *repository)
+		if err != nil {
+			fail(err)
+		}
+		if len(keys) == 0 {
+			fail(fmt.Errorf("%w: no rejected uncertain Workflow Inbox deliveries for %s", store.ErrNotFound, *repository))
+		}
+		for _, key := range keys {
+			questionID, err := db.UncertainInboxDeliveryRecoveryQuestionID(context.Background(), *repository, key)
+			if err != nil {
+				fail(err)
+			}
+			fmt.Fprintln(os.Stdout, key, questionID)
+		}
+		return
+	}
+	if *questionID == "" || *answer == "" {
+		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires question and answer when delivery is provided")
+		os.Exit(2)
+	}
+	if _, err := db.RecoverUncertainInboxDelivery(context.Background(), *repository, *deliveryKey, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 }
@@ -829,11 +920,47 @@ func gatewayCredentialVerificationError(err error) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("%w: Gateway Credential has no persisted verification", delivery.ErrGatewayCredentialRejected)
 	}
-	return fmt.Errorf("read Gateway Credential verification: %w", err)
+	return gatewayCredentialVerificationStoreError{err: fmt.Errorf("read Gateway Credential verification: %w", err)}
 }
+
+type gatewayCredentialVerificationStoreError struct {
+	err error
+}
+
+func (e gatewayCredentialVerificationStoreError) Error() string          { return e.err.Error() }
+func (e gatewayCredentialVerificationStoreError) Unwrap() error          { return e.err }
+func (e gatewayCredentialVerificationStoreError) PollStoreFailure() bool { return true }
 
 func shouldPauseGatewayForCredential(err error) bool {
 	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
+}
+
+func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
+	if shouldPauseGatewayForCredential(admissionErr) && !errors.Is(admissionErr, delivery.ErrGatewayCredentialRejected) {
+		admissionErr = fmt.Errorf("%w: Gateway Credential is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
+	}
+	_, err := poller.RecordAdmissionFailure(ctx, repository, admissionErr)
+	return err
+}
+
+func admitPollGitHubCredential(ctx context.Context, poller github.Poller, database *store.Store, repository string, authenticate func(string) error) (string, error) {
+	if err := poller.Ready(ctx, repository); err != nil {
+		return "", err
+	}
+	token, err := verifiedGatewayCredential(ctx, database)
+	if err == nil && authenticate != nil {
+		err = authenticate(token)
+	}
+	if err != nil {
+		var authenticationFailure interface{ AuthenticationFailure() bool }
+		if errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
+			err = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, err)
+		} else if errors.Is(err, credential.ErrNotFound) {
+			err = fmt.Errorf("%w: Gateway Credential is missing: %w", delivery.ErrGatewayCredentialRejected, err)
+		}
+		return "", err
+	}
+	return token, nil
 }
 
 func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {

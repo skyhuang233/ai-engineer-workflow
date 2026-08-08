@@ -14,16 +14,17 @@ type Projection struct {
 }
 
 type WorkflowQuestion struct {
-	ID           string `json:"id"`
-	Prompt       string `json:"prompt"`
-	Repository   string `json:"repository,omitempty"`
-	PlanNumber   int64  `json:"plan_number,omitempty"`
-	TicketNumber int64  `json:"ticket_number,omitempty"`
-	PullRequest  int64  `json:"pull_request,omitempty"`
-	Commit       string `json:"commit,omitempty"`
-	Finding      string `json:"finding,omitempty"`
-	Diagnostics  string `json:"diagnostics,omitempty"`
-	Evidence     string `json:"evidence,omitempty"`
+	ID           string  `json:"id"`
+	Prompt       string  `json:"prompt"`
+	Repository   string  `json:"repository,omitempty"`
+	PlanNumber   int64   `json:"plan_number,omitempty"`
+	PlanNumbers  []int64 `json:"plan_numbers,omitempty"`
+	TicketNumber int64   `json:"ticket_number,omitempty"`
+	PullRequest  int64   `json:"pull_request,omitempty"`
+	Commit       string  `json:"commit,omitempty"`
+	Finding      string  `json:"finding,omitempty"`
+	Diagnostics  string  `json:"diagnostics,omitempty"`
+	Evidence     string  `json:"evidence,omitempty"`
 }
 
 type ProjectionTicket struct {
@@ -130,7 +131,11 @@ func workflowQuestionContext(question WorkflowQuestion) []string {
 	}
 	base := "https://github.com/" + question.Repository
 	context := make([]string, 0, 7)
-	if question.PlanNumber > 0 {
+	if len(question.PlanNumbers) > 0 {
+		for _, number := range question.PlanNumbers {
+			context = append(context, fmt.Sprintf("[plan/spec #%d](%s/issues/%d)", number, base, number))
+		}
+	} else if question.PlanNumber > 0 {
 		context = append(context, fmt.Sprintf("[plan/spec #%d](%s/issues/%d)", question.PlanNumber, base, question.PlanNumber))
 	}
 	if question.TicketNumber > 0 {

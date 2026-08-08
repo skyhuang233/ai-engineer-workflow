@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
@@ -55,6 +57,22 @@ func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	}
 	if recovered.ID != first.ID || recovered.State != StateActive {
 		t.Fatalf("recovered = %#v, want persisted active version", recovered)
+	}
+}
+
+func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	version, err := store.schemaVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != latestSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, latestSchemaVersion)
 	}
 }
 
@@ -126,6 +144,325 @@ func TestMigrationFromV29AddsRotationFencingColumns(t *testing.T) {
 			t.Fatalf("migration did not add gateway_runtime.%s", column)
 		}
 	}
+}
+
+func TestMigrationFromV30AddsGitHubPollFailureKind(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 31"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN failure_kind"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "failure_kind") {
+		t.Fatal("migration did not add github_poll_cursors.failure_kind")
+	}
+	backup, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "github_poll_cursors", "failure_kind") {
+		t.Fatal("migration backup includes the v31 GitHub poll failure column")
+	}
+}
+
+func TestMigrationFromV31AddsGitHubPollRecoveryState(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	repository := "owner/repo"
+	now := time.Now().UTC().Add(24 * time.Hour)
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO github_poll_cursors(repository, consecutive_failures, failure_kind, recovery_state, recovery_plan_version_id, next_attempt_at, updated_at)
+VALUES (?, 99, ?, ?, '', ?, ?)`, repository, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, formatTimestamp(now), formatTimestamp(now)); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 32"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN recovery_state"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "recovery_state") {
+		t.Fatal("migration did not add github_poll_cursors.recovery_state")
+	}
+	cursor, err := migrated.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 || cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed {
+		t.Fatalf("migrated recovery = %#v, want reset retry budget with safely consumed legacy provenance", cursor)
+	}
+	if cursor.NextAttemptAt.IsZero() || cursor.NextAttemptAt.After(time.Now().UTC()) {
+		t.Fatalf("migrated next attempt = %v, want immediately ready", cursor.NextAttemptAt)
+	}
+	backup, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if hasColumn(t, ctx, backup, "github_poll_cursors", "recovery_state") {
+		t.Fatal("migration backup includes the v32 GitHub poll recovery column")
+	}
+}
+
+func TestMigrationFromV32AddsGitHubPollLeaseColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 33"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	for _, column := range []string{"lease_token", "lease_expires_at"} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN "+column); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for _, column := range []string{"lease_token", "lease_expires_at"} {
+		if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", column) {
+			t.Fatalf("migration did not add github_poll_cursors.%s", column)
+		}
+	}
+}
+
+func TestMigrationFromV33AddsBootstrapPlanProvenance(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 34"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE github_poll_cursors DROP COLUMN recovery_plan_version_id"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := dbPath + ".migration.bak"
+	if err := os.Remove(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "github_poll_cursors", "recovery_plan_version_id") {
+		t.Fatal("migration did not add github_poll_cursors.recovery_plan_version_id")
+	}
+}
+
+func TestMigrationFromV34QueuesAuthoritativeLegacyInboxProjection(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	snapshot := testSnapshot()
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := store.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueueWorkflowInboxProjection(ctx, snapshot.Repository, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 35"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE workflow_inbox_projections"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE delivery_outbox
+	SET request_json = json_remove(request_json, '$.inbox_projection_generation', '$.inbox_projection_version', '$.inbox_plan_version_id', '$.inbox_plan_version_ids'), uncertain = 1,
+	    state = 'rejected', last_error = 'legacy rejection', completed_at = updated_at
+	WHERE operation = 'project_workflow_inbox'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?)`, version.ID, formatTimestamp(time.Now().UTC())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?)`, version.ID, StateCompleted, formatTimestamp(time.Now().UTC())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + ".migration.bak"); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var generation int64
+	var projectionVersion, planVersionIDs string
+	if err := migrated.db.QueryRowContext(ctx, `SELECT generation, projection_version, plan_version_ids_json FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&generation, &projectionVersion, &planVersionIDs); err != nil {
+		t.Fatal(err)
+	}
+	emptyVersion, err := workflowInboxProjectionVersion(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generation != 2 || projectionVersion != emptyVersion || planVersionIDs != "null" {
+		t.Fatalf("migrated Inbox projection = %d/%q/%s, want generation 2 empty projection", generation, projectionVersion, planVersionIDs)
+	}
+	var corrections int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_extract(request_json, '$.repository') = ?
+  AND json_extract(request_json, '$.inbox_projection_generation') = 2`, snapshot.Repository).Scan(&corrections); err != nil {
+		t.Fatal(err)
+	}
+	if corrections != 1 {
+		t.Fatalf("queued empty Inbox corrections = %d, want 1", corrections)
+	}
+	recoverableKeys, err := migrated.RecoverableUncertainInboxDeliveryKeys(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoverableKeys) != 1 {
+		t.Fatalf("recoverable legacy Inbox deliveries = %v, want one key", recoverableKeys)
+	}
+	var correctionKey string
+	if err := migrated.db.QueryRowContext(ctx, `SELECT idempotency_key FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_extract(request_json, '$.repository') = ?
+  AND json_extract(request_json, '$.inbox_projection_generation') = 2`, snapshot.Repository).Scan(&correctionKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrated.ClaimDeliveryOutbox(ctx, correctionKey, time.Now().UTC()); !errors.Is(err, ErrInboxDeliveryPending) {
+		t.Fatalf("legacy uncertain Inbox fence = %v, want pending", err)
+	}
+	recoveryQuestionID, err := migrated.UncertainInboxDeliveryRecoveryQuestionID(ctx, snapshot.Repository, recoverableKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	questions, err := migrated.WorkflowInboxQuestions(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 || questions[0].ID != recoveryQuestionID || questions[0].RootNumber != 0 || len(questions[0].PlanNumbers) != 0 {
+		t.Fatalf("legacy repository-scoped recovery question = %#v", questions)
+	}
+	if _, err := migrated.RecoverUncertainInboxDelivery(ctx, snapshot.Repository, recoverableKeys[0], recoveryQuestionID, "retry", time.Now().UTC()); err != nil {
+		t.Fatalf("recover discoverable legacy Inbox delivery: %v", err)
+	}
+	recovered, err := migrated.DeliveryOutbox(ctx, recoverableKeys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != OutboxPending || !recovered.Uncertain {
+		t.Fatalf("recovered legacy Inbox delivery = %#v", recovered)
+	}
+	t.Logf("migration restored legacy recovery key %s with question %s; authoritative correction generation=%d remained ordered behind it", recoverableKeys[0], recoveryQuestionID, generation)
 }
 
 func TestMigrationBackupCanBeRestored(t *testing.T) {

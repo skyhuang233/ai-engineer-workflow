@@ -69,14 +69,31 @@ updates, CI, and the review-driven revision cycle. `run-ticket` never
 dispatches GitHub mutations itself; it requires the credential-isolated Gateway
 URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
-applies retry backoff, reconciles every active ticket pull request, and
-deduplicates newly observed reviews and comments before the owning Ticket
-Session is resumed. `--review-feedback` and `workflow answer-inbox` are
+applies retry backoff, and acquires a fenced per-repository SQLite poll lease
+before loading the Gateway Credential or making GitHub requests. Concurrent
+pollers therefore cannot both pass the same `NextAttemptAt` boundary. It runs
+the approved Plan Root control pass before
+projecting the repository Workflow Inbox, so an eligible Delivery Plan is
+active before the Gateway admits that projection. It then reconciles every
+active ticket pull request and deduplicates newly observed reviews and comments
+before the owning Ticket Session is resumed. `--review-feedback`,
+`workflow answer-inbox`, and `workflow recover-inbox-delivery` are
 privileged local Control Plane operations: run them only on the trusted Control
 Plane host. `answer-inbox` forwards the resulting inbox projection through the
 Gateway control-plane credential; that transport credential is not the local
-operator authorization boundary. They use the same durable queue for manual
-routing and decisions. `workflow reconcile-delivered` checks merged pull requests
+operator authorization boundary. If an uncertain Workflow Inbox delivery
+exhausts reconciliation, recover the rejected generation with the delivery key
+shown in its Needs Attention prompt or Gateway recovery log. Run `workflow
+recover-inbox-delivery --repository owner/repository` to list recoverable keys
+with their stable Workflow Inbox question ids, including legacy rejected
+deliveries, then run `workflow recover-inbox-delivery
+--repository owner/repository --delivery delivery-key --question question-id
+--answer retry` only after confirming
+that the historical projection is absent or safe to resolve. The recovery
+records that authorization, re-observes without replaying a superseded
+projection, and atomically queues the current Needs Attention projection behind
+it. They use the same durable queue for manual routing and decisions.
+`workflow reconcile-delivered` checks merged pull requests
 for reachability from `main` and freezes the plan in Needs Attention when a
 pull request closes without merge.
 

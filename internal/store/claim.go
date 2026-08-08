@@ -643,10 +643,11 @@ func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issue
 		return err
 	}
 	defer tx.Rollback()
-	now := formatTimestamp(time.Now())
+	now := time.Now().UTC()
+	nowText := formatTimestamp(now)
 	result, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
 SELECT version_id, issue_id, ?, 1, ? FROM plan_tickets WHERE version_id = ? AND issue_id = ?
-ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivered = 1, updated_at = excluded.updated_at`, plan.StateDelivered, now, versionID, issueID)
+ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivered = 1, updated_at = excluded.updated_at`, plan.StateDelivered, nowText, versionID, issueID)
 	if err != nil {
 		return err
 	}
@@ -655,7 +656,7 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivere
 	}
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
-		if err := markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+		if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -663,23 +664,23 @@ ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivere
 		return err
 	}
 	if runID != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "succeeded", now, runID, RunRunning); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "succeeded", nowText, runID, RunRunning); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND state = ?`, "revoked", runID, LeaseActive); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, now, sessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
 		return err
 	}
-	if err := markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID, now string) error {
+func (s *Store) markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
 	var remaining, liveRuns int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID).Scan(&remaining); err != nil {
 		return err
@@ -688,11 +689,21 @@ func markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID, now string)
 		return err
 	}
 	if remaining == 0 && liveRuns == 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, now); err != nil {
+		result, err := tx.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, formatTimestamp(now))
+		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, StateCompleted, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, StateCompleted, formatTimestamp(now)); err != nil {
 			return err
+		}
+		if count, _ := result.RowsAffected(); count > 0 {
+			var repository string
+			if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions v ON v.plan_id = p.id WHERE v.version_id = ?`, versionID).Scan(&repository); err != nil {
+				return err
+			}
+			if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -10,6 +10,32 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 )
 
+func TestGitHubPollCursorBootstrapRecoveryCandidateRequiresBoundExhaustedState(t *testing.T) {
+	cursor := GitHubPollCursor{
+		ConsecutiveFailures:   3,
+		FailureKind:           GitHubPollFailurePreActivationInboxConflict,
+		RecoveryState:         GitHubPollRecoveryAvailable,
+		RecoveryPlanVersionID: "version-1",
+	}
+	if !cursor.HasBootstrapRecoveryCandidate(3) {
+		t.Fatal("bound exhausted cursor was not a bootstrap recovery candidate")
+	}
+	for name, mutate := range map[string]func(*GitHubPollCursor){
+		"below limit":        func(candidate *GitHubPollCursor) { candidate.ConsecutiveFailures = 2 },
+		"missing Plan":       func(candidate *GitHubPollCursor) { candidate.RecoveryPlanVersionID = "" },
+		"wrong failure kind": func(candidate *GitHubPollCursor) { candidate.FailureKind = GitHubPollFailureRetryable },
+		"consumed recovery":  func(candidate *GitHubPollCursor) { candidate.RecoveryState = GitHubPollRecoveryConsumed },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cursor
+			mutate(&candidate)
+			if candidate.HasBootstrapRecoveryCandidate(3) {
+				t.Fatalf("cursor = %#v, want ineligible", candidate)
+			}
+		})
+	}
+}
+
 func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -44,6 +70,419 @@ func TestGitHubPollCursorPersistsBackoffAndRecovery(t *testing.T) {
 	cursor, err = db.GitHubPollCursor(ctx, "owner/repo")
 	if err != nil || !cursor.LastFullReconcileAt.Equal(now.Add(time.Minute)) {
 		t.Fatalf("incremental cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestGitHubPollFailureAdoptsVerifiedBootstrapProvenanceAfterGenericFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 7, 6, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailureRetryable, "", "lease", now); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(time.Second), GitHubPollFailurePreActivationInboxConflict, "version-current", "lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 2 || cursor.FailureKind != GitHubPollFailurePreActivationInboxConflict || cursor.RecoveryState != GitHubPollRecoveryAvailable || cursor.RecoveryPlanVersionID != "version-current" {
+		t.Fatalf("bootstrap cursor = %#v", cursor)
+	}
+}
+
+func TestGitHubPollLeaseAtomicallyFencesRepositoryReadiness(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "first", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "second", now, time.Minute); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("concurrent lease error = %v, want not ready", err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "second", now); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("foreign release error = %v, want fencing conflict", err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "first", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeferGitHubPoll(ctx, repository, now.Add(time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "third", now, time.Minute); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("backoff lease error = %v, want not ready", err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "third", now.Add(time.Minute), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGitHubPollLeaseRejectsMutationAfterExpiry(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(30*time.Second), GitHubPollFailureRetryable, "", "lease", now.Add(2*time.Minute))
+	if !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("expired lease mutation = %v, want fencing conflict", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("expired lease persisted failures = %d", cursor.ConsecutiveFailures)
+	}
+}
+
+func TestUnleasedGitHubPollMutationCannotBypassActiveLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	repository := "owner/repo"
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-owner", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordGitHubPollFailure(ctx, repository, now); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("unleased mutation error = %v, want fencing conflict", err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("unleased mutation persisted %d failures", cursor.ConsecutiveFailures)
+	}
+}
+
+func TestPollTerminalTransitionIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 1, Number: 1, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 2, Number: 2, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER fail_poll_attention BEFORE UPDATE OF state ON ticket_runtime
+WHEN NEW.state = 'needs_attention' BEGIN SELECT RAISE(ABORT, 'injected attention failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	if err := db.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx, snapshot.Repository, now); err == nil {
+		t.Fatal("terminal transition succeeded despite injected failure")
+	}
+	cursor, err := db.GitHubPollCursor(ctx, snapshot.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != "" {
+		t.Fatalf("terminal state survived rollback: %#v", cursor)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 0 {
+		t.Fatalf("recovery questions survived rollback: %#v", questions)
+	}
+}
+
+func TestTerminalPollOwnerSurvivesAdmissionAndCredentialFailures(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, versionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx, repository, versionID, now, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureLeased(ctx, repository, now.Add(time.Second), GitHubPollFailureRetryable, "", "poll-lease", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkGitHubPollFailureUnrecoverableLeased(ctx, repository, now.Add(2*time.Second), "poll-lease", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PauseGatewayWritesForGitHubPollCredential(ctx, repository, "poll-lease", "credential unavailable", now.Add(3*time.Second), now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FailureKind != GitHubPollFailureUnrecoverable || cursor.RecoveryState != GitHubPollRecoveryConsumed || cursor.RecoveryPlanVersionID != versionID {
+		t.Fatalf("terminal cursor = %#v", cursor)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, question := range questions {
+		found = found || question.VersionID == versionID && question.Kind == "poll_failure"
+	}
+	if !found {
+		t.Fatalf("terminal recovery questions = %#v", questions)
+	}
+}
+
+func TestTerminalPollFallbackUsesOnlyAttemptedCompletedPlans(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 5, 0, 0, 0, time.UTC)
+	completedVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, completedVersionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now, "poll-lease", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != GitHubPollTerminalFailureRetryable {
+		t.Fatalf("ownerless failure disposition = %q, want retryable", disposition)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 || cursor.FailureKind != GitHubPollFailureRetryable {
+		t.Fatalf("ownerless retry cursor = %#v", cursor)
+	}
+	disposition, err = db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{completedVersionID}, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != GitHubPollTerminalFailureResolved {
+		t.Fatalf("completed Plan failure disposition = %q, want resolved", disposition)
+	}
+	cursor, err = db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("completed attempted Plan cursor = %#v", cursor)
+	}
+}
+
+func TestTerminalPollFallbackUsesPersistedAttemptedPlansAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 5, 30, 0, 0, time.UTC)
+	completedVersionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.MarkTicketDelivered(ctx, completedVersionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, GitHubPollFailureRetryable, "", []string{completedVersionID}, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", nil, now.Add(time.Second), "poll-lease", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != GitHubPollTerminalFailureResolved {
+		t.Fatalf("persisted completed Plan disposition = %q, want resolved", disposition)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("persisted completed Plan cursor = %#v", cursor)
+	}
+}
+
+func TestFrozenAttemptedPlanDecisionResumesTerminalPolling(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 6, 0, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, versionID, int64(2), "closed pull request", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "closed_unmerged_impact", "choose", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := db.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx, repository, "", []string{versionID}, now, "poll-lease", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != GitHubPollTerminalFailureNeedsAttention {
+		t.Fatalf("frozen attempted Plan disposition = %q, want needs attention", disposition)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closedQuestionID string
+	foundPollRecovery := false
+	for _, question := range questions {
+		if question.Kind == "closed_unmerged_impact" {
+			closedQuestionID = question.ID
+		}
+		foundPollRecovery = foundPollRecovery || question.Kind == "poll_failure"
+	}
+	if closedQuestionID == "" || !foundPollRecovery {
+		t.Fatalf("frozen Plan recovery questions = %#v", questions)
+	}
+	var frozen int
+	if err := db.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM plan_freezes WHERE version_id = ?)`, versionID).Scan(&frozen); err != nil || frozen == 0 {
+		t.Fatalf("freeze before decision = %d, %v", frozen, err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, repository, closedQuestionID, `{"action":"cancel-plan"}`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NeedsAttention() || cursor.ConsecutiveFailures != 0 {
+		t.Fatalf("cursor after frozen Plan decision = %#v", cursor)
+	}
+	var attemptedJSON string
+	if err := db.db.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&attemptedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if attemptedJSON != "[]" {
+		t.Fatalf("attempted Plan provenance after fresh retry budget = %s", attemptedJSON)
+	}
+}
+
+func TestFrozenPlanDecisionRebasesActivePollFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := "owner/repository"
+	now := time.Date(2026, 8, 7, 6, 30, 0, 0, time.UTC)
+	versionID := activateWorkflowInboxPlanAt(t, ctx, db, repository, 1, 1, 2, 2)
+	if err := db.AcquireGitHubPollLease(ctx, repository, "poll-lease", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AdvanceGitHubPollFailureForPlanAttemptsLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, versionID, []string{versionID}, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, repository, "poll-lease", now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, versionID, int64(2), "closed pull request", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 2, "closed_unmerged_impact", "choose", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.WorkflowInboxQuestions(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 {
+		t.Fatalf("closed Plan questions = %#v", questions)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, repository, questions[0].ID, `{"action":"cancel-plan"}`, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := db.GitHubPollCursor(ctx, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.ConsecutiveFailures != 1 || cursor.FailureKind != GitHubPollFailureRetryable || cursor.RecoveryState != GitHubPollRecoveryConsumed || cursor.RecoveryPlanVersionID != "" {
+		t.Fatalf("rebased poll cursor = %#v", cursor)
+	}
+	var attemptedJSON string
+	if err := db.db.QueryRowContext(ctx, `SELECT attempted_plan_version_ids_json FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&attemptedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if attemptedJSON != "[]" {
+		t.Fatalf("retired attempted Plan provenance = %s", attemptedJSON)
 	}
 }
 
@@ -105,11 +544,84 @@ func TestClosedUnmergedQuestionRequiresTypedPlanDecision(t *testing.T) {
 	if err != nil || question.State != "open" {
 		t.Fatalf("invalid answer changed question = %#v, %v", question, err)
 	}
-	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, `{"action":"cancel-plan"}`, now); err != nil {
+	outbox, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, snapshot.Repository, questions[0].ID, `{"action":"cancel-plan"}`, now)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if outbox.IdempotencyKey == "" || len(outbox.Request.WorkflowQuestions) != 0 || outbox.Request.InboxProjectionGeneration == 0 {
+		t.Fatalf("cancelled plan Inbox projection = %#v", outbox)
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Second)}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("cancelled plan claim = %v, want not ready", err)
+	}
+}
+
+func TestAnswerWorkflowQuestionRejectsSupersededPlanVersion(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, "needs_attention", "stale question", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("questions = %#v, %v", questions, err)
+	}
+	tx, err = db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.cancelPlanTx(ctx, tx, version.ID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	replacementSnapshot := plan.Snapshot{
+		Repository: snapshot.Repository,
+		Root:       plan.Issue{ID: 200, Number: 20, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 201, Number: 21, Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	replacementFingerprint, err := replacementSnapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.BeginActivation(ctx, replacementSnapshot, replacementFingerprint, "revision-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, questions[0].ID, "retry", now.Add(time.Second)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("superseded question answer = %v, want not found", err)
+	}
+	question, err := db.WorkflowQuestion(ctx, snapshot.Repository, questions[0].ID)
+	if err != nil || question.State != "open" || question.Answer != "" {
+		t.Fatalf("superseded question changed = %#v, %v", question, err)
 	}
 }
 
@@ -554,6 +1066,60 @@ func TestPollFailureAnswerRetriesAcceptedCandidateWithDeliveryLease(t *testing.T
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2*time.Hour + 2*time.Second)}); !errors.Is(err, ErrFencingConflict) {
 		t.Fatalf("Agent recovery after poll failure = %v, want ErrFencingConflict", err)
+	}
+}
+
+func TestWorkflowQuestionAnswerCannotRaceRepositoryPollLease(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.MarkRepositoryNeedsAttention(ctx, snapshot.Repository, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pollFailure WorkflowQuestion
+	for _, question := range questions {
+		if question.Kind == "poll_failure" {
+			pollFailure = question
+		}
+	}
+	if pollFailure.ID == "" {
+		t.Fatal("poll failure question was not created")
+	}
+	if err := db.AcquireGitHubPollLease(ctx, snapshot.Repository, "active-poller", now.Add(time.Second), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(2*time.Second)); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("concurrent answer = %v, want fencing conflict", err)
+	}
+	question, err := db.WorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID)
+	if err != nil || question.State != "open" {
+		t.Fatalf("question after fenced answer = %#v, %v", question, err)
+	}
+	if err := db.ReleaseGitHubPollLease(ctx, snapshot.Repository, "active-poller", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, pollFailure.ID, "retry", now.Add(3*time.Second)); err != nil {
+		t.Fatalf("answer after lease release = %v", err)
 	}
 }
 

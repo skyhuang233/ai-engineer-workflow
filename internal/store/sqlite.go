@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,14 +13,14 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 30
+	latestSchemaVersion = 38
 )
 
 var (
@@ -35,6 +36,11 @@ var (
 	ErrWorkerLaunched      = errors.New("worker run has already been launched")
 	ErrNeedsAttention      = errors.New("workflow needs attention")
 )
+
+func IsDatabaseError(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) || errors.Is(err, sql.ErrConnDone) || errors.Is(err, sql.ErrTxDone)
+}
 
 const (
 	SessionRunning = "running"
@@ -815,6 +821,234 @@ SELECT question_id, version_id, retired_issue_id, replacement, state, approved_a
 			return err
 		}
 	}
+	if applied < 31 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "failure_kind")
+		if err != nil {
+			return fmt.Errorf("migration 31: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN failure_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 31: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (31, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 32 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "recovery_state")
+		if err != nil {
+			return fmt.Errorf("migration 32: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN recovery_state TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 32: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET recovery_state = CASE WHEN failure_kind = ? THEN ? WHEN failure_kind = ? THEN ? ELSE recovery_state END`, GitHubPollFailurePreActivationInboxConflict, GitHubPollRecoveryAvailable, GitHubPollFailureUnrecoverable, GitHubPollRecoveryConsumed); err != nil {
+			return fmt.Errorf("migration 32: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (32, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 33 {
+		columns := []struct {
+			name       string
+			definition string
+		}{
+			{name: "lease_token", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "lease_expires_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 33: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE github_poll_cursors ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 33: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (33, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 34 {
+		now := time.Now().UTC()
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "recovery_plan_version_id")
+		if err != nil {
+			return fmt.Errorf("migration 34: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN recovery_plan_version_id TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 34: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors
+SET consecutive_failures = 0, failure_kind = ?, recovery_state = ?, recovery_plan_version_id = '', next_attempt_at = ?, updated_at = ?
+WHERE failure_kind = ?`, GitHubPollFailureRetryable, GitHubPollRecoveryConsumed, formatTimestamp(now), formatTimestamp(now), GitHubPollFailurePreActivationInboxConflict); err != nil {
+			return fmt.Errorf("migration 34: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (34, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 35 {
+		statements := []string{`CREATE TABLE IF NOT EXISTS workflow_inbox_projections (
+    repository TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    projection_version TEXT NOT NULL,
+    plan_version_ids_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+		)`, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
+    idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    plan_version_ids_json TEXT NOT NULL DEFAULT '[]'
+)`}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 35: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_inbox_projections(repository, generation, projection_version, plan_version_ids_json, updated_at)
+SELECT json_extract(request_json, '$.repository'), 1, 'legacy-unfenced', '[]', MAX(updated_at)
+FROM delivery_outbox
+WHERE operation = 'project_workflow_inbox'
+  AND json_valid(request_json)
+  AND TRIM(COALESCE(json_extract(request_json, '$.repository'), '')) != ''
+GROUP BY json_extract(request_json, '$.repository')`); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT repository FROM workflow_inbox_projections WHERE projection_version = 'legacy-unfenced' ORDER BY repository`)
+		if err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		var repositories []string
+		for rows.Next() {
+			var repository string
+			if err := rows.Scan(&repository); err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 35: %w", err)
+			}
+			repositories = append(repositories, repository)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration 35: %w", err)
+		}
+		for _, repository := range repositories {
+			if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, time.Now().UTC()); err != nil {
+				return fmt.Errorf("migration 35: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (35, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 36 {
+		exists, err := tableHasColumnTx(ctx, tx, "inbox_delivery_recovery_questions", "plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE inbox_delivery_recovery_questions ADD COLUMN plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS inbox_delivery_recovery_questions (
+    idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key),
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    plan_version_ids_json TEXT NOT NULL DEFAULT '[]'
+)`); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT idempotency_key, request_json, last_error FROM delivery_outbox
+WHERE operation = ? AND state = ? AND uncertain != 0
+  AND NOT EXISTS (SELECT 1 FROM inbox_delivery_recovery_questions recovery WHERE recovery.idempotency_key = delivery_outbox.idempotency_key)
+ORDER BY idempotency_key`, DeliveryProjectInbox, OutboxRejected)
+		if err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		type legacyRecovery struct {
+			key, raw, reason string
+		}
+		var recoveries []legacyRecovery
+		for rows.Next() {
+			var recovery legacyRecovery
+			if err := rows.Scan(&recovery.key, &recovery.raw, &recovery.reason); err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 36: %w", err)
+			}
+			recoveries = append(recoveries, recovery)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration 36: %w", err)
+		}
+		for _, recovery := range recoveries {
+			var request DeliveryRequest
+			if err := json.Unmarshal([]byte(recovery.raw), &request); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+			if err := ensureUncertainInboxRecoveryQuestionTx(ctx, tx, request, recovery.key, recovery.reason, time.Now().UTC()); err != nil {
+				return fmt.Errorf("migration 36: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (36, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 37 {
+		exists, err := tableHasColumnTx(ctx, tx, "github_poll_cursors", "attempted_plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 37: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE github_poll_cursors ADD COLUMN attempted_plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 37: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (37, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 38 {
+		exists, err := tableHasColumnTx(ctx, tx, "inbox_delivery_recovery_questions", "plan_version_ids_json")
+		if err != nil {
+			return fmt.Errorf("migration 38: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE inbox_delivery_recovery_questions ADD COLUMN plan_version_ids_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+				return fmt.Errorf("migration 38: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE inbox_delivery_recovery_questions AS recovery
+SET plan_version_ids_json = COALESCE((
+    SELECT CASE
+        WHEN json_valid(outbox.request_json)
+         AND json_type(outbox.request_json, '$.inbox_plan_version_ids') = 'array'
+         AND json_array_length(outbox.request_json, '$.inbox_plan_version_ids') > 0
+            THEN json_extract(outbox.request_json, '$.inbox_plan_version_ids')
+        WHEN TRIM(COALESCE(json_extract(outbox.request_json, '$.inbox_plan_version_id'), '')) != ''
+            THEN json_array(json_extract(outbox.request_json, '$.inbox_plan_version_id'))
+        ELSE '[]'
+    END
+    FROM delivery_outbox outbox
+    WHERE outbox.idempotency_key = recovery.idempotency_key
+), '[]')`); err != nil {
+			return fmt.Errorf("migration 38: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (38, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -1004,6 +1238,7 @@ VALUES (?, ?, ?, ?, ?)`, versionID, ticket.ID, runtimeState, boolInt(ticket.IsDe
 }
 
 func (s *Store) MarkActive(ctx context.Context, versionID string) error {
+	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1025,7 +1260,7 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, formatTimestamp(time.Now()), versionID, StateProjecting)
+	result, err = tx.ExecContext(ctx, `UPDATE plans SET state = ?, updated_at = ? WHERE current_version_id = ? AND state = ?`, StateActive, formatTimestamp(now), versionID, StateProjecting)
 	if err != nil {
 		return err
 	}
@@ -1041,7 +1276,14 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	if err := markPlanCompletedTx(ctx, tx, versionID, formatTimestamp(time.Now())); err != nil {
+	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+		return err
+	}
+	var repository string
+	if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions v ON v.plan_id = p.id WHERE v.version_id = ?`, versionID).Scan(&repository); err != nil {
+		return err
+	}
+	if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
 		return err
 	}
 	return tx.Commit()

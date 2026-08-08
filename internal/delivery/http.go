@@ -17,6 +17,39 @@ import (
 
 const controlPlaneTokenHeader = "X-Workflow-Control-Token"
 
+const errorCodeHeader = "X-Workflow-Error-Code"
+
+const retryAtHeader = "X-Workflow-Retry-At"
+
+const (
+	ErrorCodeNoActiveDeliveryPlan = "no_active_delivery_plan"
+	ErrorCodeRetryableStore       = "retryable_store"
+	ErrorCodeGatewayWritesPaused  = "gateway_writes_paused"
+)
+
+type HTTPError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	RetryAt    time.Time
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("control-plane gateway returned %d: %s", e.StatusCode, e.Message)
+}
+
+func (e *HTTPError) PollStoreFailure() bool {
+	return e.Code == ErrorCodeRetryableStore
+}
+
+func (e *HTTPError) AuthenticationFailure() bool {
+	return e.Code == ErrorCodeGatewayWritesPaused
+}
+
+func (e *HTTPError) RetryAtTime() time.Time {
+	return e.RetryAt
+}
+
 type HTTPOptions struct {
 	ControlPlaneToken string
 }
@@ -69,7 +102,8 @@ func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryReques
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
-		return fmt.Errorf("control-plane gateway returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		retryAt, _ := time.Parse(time.RFC3339Nano, response.Header.Get(retryAtHeader))
+		return &HTTPError{StatusCode: response.StatusCode, Code: response.Header.Get(errorCodeHeader), Message: strings.TrimSpace(string(message)), RetryAt: retryAt}
 	}
 	return nil
 }
@@ -111,14 +145,26 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 		}
 		if err != nil {
 			status := http.StatusInternalServerError
+			if retryAt := retryAt(err); !retryAt.IsZero() {
+				writer.Header().Set(retryAtHeader, retryAt.UTC().Format(time.RFC3339Nano))
+			}
 			if errors.Is(err, store.ErrDeliveryRejected) || errors.Is(err, store.ErrInvalidClaim) || errors.Is(err, store.ErrFencingConflict) {
 				status = http.StatusConflict
+			}
+			if errors.Is(err, ErrGatewayWritesPaused) {
+				status = http.StatusServiceUnavailable
+				writer.Header().Set(errorCodeHeader, ErrorCodeGatewayWritesPaused)
+			} else if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+				writer.Header().Set(errorCodeHeader, ErrorCodeNoActiveDeliveryPlan)
+			} else if errors.Is(err, ErrGatewayStore) || store.IsDatabaseError(err) {
+				writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
 			}
 			http.Error(writer, err.Error(), status)
 			return
 		}
 		outbox, err = gateway.Store.DeliveryOutbox(request.Context(), outbox.IdempotencyKey)
 		if err != nil {
+			writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}

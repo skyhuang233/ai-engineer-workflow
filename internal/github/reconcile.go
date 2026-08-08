@@ -24,7 +24,7 @@ func (r DeliveredReconciler) Reconcile(ctx context.Context, repository string) (
 	}
 	deliveries, err := r.Store.PendingTicketDeliveries(ctx, repository)
 	if err != nil {
-		return 0, err
+		return 0, wrapPollStoreError(err)
 	}
 	marked := 0
 	for _, delivery := range deliveries {
@@ -58,11 +58,11 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 	switch state {
 	case pullRequestDelivered:
 		if err := r.Store.MarkTicketDelivered(ctx, delivery.VersionID, delivery.IssueID); err != nil {
-			return pullRequestPending, err
+			return pullRequestPending, wrapPollStoreError(err)
 		}
 	case pullRequestClosedUnmerged:
 		if _, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, time.Now().UTC()); err != nil {
-			return pullRequestPending, err
+			return pullRequestPending, wrapPollStoreError(err)
 		}
 	}
 	return state, nil

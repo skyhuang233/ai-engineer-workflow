@@ -95,8 +95,12 @@ func TestActivatorLeavesVersionProjectingWhenGitHubProjectionFails(t *testing.T)
 	}}
 	projector := &fakeProjector{body: reader.snapshot.Root.Body, err: errors.New("timeout")}
 	store := &fakeStore{}
-	if _, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10); err == nil {
+	version, err := (Activator{Reader: reader, Projector: projector, Store: store}).Activate(context.Background(), "owner/repo", 10)
+	if err == nil {
 		t.Fatal("Activate() succeeded despite projection failure")
+	}
+	if version.ID != "pv-test" || version.State != "projecting" {
+		t.Fatalf("Activate() version = %#v, want persisted projecting version", version)
 	}
 	if store.marked != "" || store.version.State != "projecting" {
 		t.Fatalf("store = %#v, marked = %q; incomplete activation became active", store.version, store.marked)

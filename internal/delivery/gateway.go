@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -17,6 +18,7 @@ import (
 var (
 	ErrGatewayCredentialRejected = errors.New("Gateway Credential was rejected")
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
+	ErrGatewayStore              = errors.New("Gateway persistence is temporarily unavailable")
 )
 
 const (
@@ -55,10 +57,11 @@ type gatewayStore interface {
 	EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error)
 	EnsureGatewayDispatcher(context.Context, string, time.Time) error
 	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
-	ExecuteDelivery(context.Context, store.DeliveryRequest, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
+	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
+	ReconcileDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
-	WorkflowInboxProjection(context.Context, string) ([]store.WorkflowQuestion, string, error)
 	QueueWorkflowInboxProjection(context.Context, string, time.Time) (store.DeliveryOutbox, error)
+	QueueWorkflowInboxProjectionIfActive(context.Context, string, time.Time) (store.DeliveryOutbox, error)
 	DeliveryOutbox(context.Context, string) (store.DeliveryOutbox, error)
 	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
 	GatewayCredentialAttentionRepositories(context.Context) ([]string, error)
@@ -67,7 +70,7 @@ type gatewayStore interface {
 	CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error
 	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time) error
 	RecordDeliveryAudit(context.Context, store.DeliveryRequest, string, string, time.Time) error
-	FinishDeliveryOutbox(context.Context, string, string, string, string, time.Time) error
+	RejectDeliveryOutbox(context.Context, string, string, string, bool, time.Time) error
 	DeferDeliveryOutbox(context.Context, string, string, string, bool, time.Time, time.Time) error
 	PauseGatewayWrites(context.Context, string, time.Time) error
 }
@@ -112,16 +115,23 @@ func (g Gateway) Submit(ctx context.Context, request store.DeliveryRequest) (sto
 	if g.Store == nil {
 		return store.DeliveryOutbox{}, errors.New("delivery gateway store is missing")
 	}
-	return g.Store.EnqueueDelivery(ctx, request, g.now())
+	outbox, err := g.Store.EnqueueDelivery(ctx, request, g.now())
+	if err != nil && !errors.Is(err, store.ErrDeliveryRejected) && !errors.Is(err, store.ErrInvalidClaim) && !errors.Is(err, store.ErrFencingConflict) {
+		return store.DeliveryOutbox{}, errors.Join(ErrGatewayStore, err)
+	}
+	return outbox, err
 }
 
 // Dispatch claims one outbox item and executes it. An external error remains
 // retryable unless an observation proves that the requested mutation already
 // happened.
-func (g Gateway) Dispatch(ctx context.Context, key string) error {
+func (g Gateway) Dispatch(ctx context.Context, key string) (dispatchErr error) {
 	if g.Store == nil || g.Remote == nil {
 		return errors.New("delivery gateway dependencies are incomplete")
 	}
+	defer func() {
+		dispatchErr = g.decorateTerminalInboxError(key, dispatchErr)
+	}()
 	dispatcherToken := g.DispatcherToken
 	if dispatcherToken == "" {
 		dispatcherToken = "legacy-gateway-dispatcher"
@@ -134,6 +144,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
 			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
 		}
+		if errors.Is(err, store.ErrDeliveryInProgress) {
+			queued, loadErr := g.Store.DeliveryOutbox(ctx, key)
+			if loadErr == nil && queued.Request.Operation == store.DeliveryProjectInbox {
+				return nil
+			}
+		}
 		return err
 	}
 	if outbox.State == store.OutboxSucceeded {
@@ -144,12 +160,12 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 	}
 	operationCtx, stopDispatcher, err := g.controlPlaneDispatchContext(ctx, outbox, dispatcherToken)
 	if err != nil {
-		return errors.Join(err, g.requeueClaim(outbox, err, false))
+		return errors.Join(err, g.requeueClaim(outbox, err, outbox.Uncertain))
 	}
 	if remote, ok := g.Remote.(credentialAwareRemote); ok {
 		if err := g.credentialAvailable(operationCtx, outbox.Request, remote); err != nil {
 			if leaseErr := stopDispatcher(); leaseErr != nil {
-				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, false))
+				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, outbox.Uncertain))
 			}
 			if isCredentialRejection(err) {
 				return g.pauseForCredential(outbox, err)
@@ -158,74 +174,44 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		}
 	}
 	if outbox.ReconcileOnly {
+		if outbox.Request.Operation == store.DeliveryProjectInbox {
+			result, err := g.Store.ReconcileDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, g.execute)
+			if leaseErr := stopDispatcher(); leaseErr != nil {
+				return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
+			}
+			if err != nil {
+				if isCredentialRejection(err) {
+					return g.pauseForCredential(outbox, err)
+				}
+				if errors.Is(err, store.ErrNoActiveDeliveryPlan) {
+					return errors.Join(err, g.succeed(outbox, store.DeliveryResult{}))
+				}
+				if errors.Is(err, store.ErrDeliverySuperseded) {
+					return errors.Join(err, g.markUncertain(outbox, err))
+				}
+				if errors.Is(err, store.ErrDeliveryRejected) {
+					return g.reject(outbox, err)
+				}
+				return errors.Join(err, g.markUncertain(outbox, err))
+			}
+			return g.succeed(outbox, result)
+		}
 		err := g.reconcileOnly(operationCtx, outbox)
 		if leaseErr := stopDispatcher(); leaseErr != nil {
 			return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 		}
 		return err
 	}
-	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, g.now, func(operationCtx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
-		if request.Operation == store.DeliveryProjectPlan {
-			projection, projectionErr := g.Store.PlanProjectionAt(operationCtx, request.PlanProjection.VersionID, g.now())
-			if projectionErr != nil {
-				return store.DeliveryResult{}, projectionErr
-			}
-			request.PlanProjection = &projection
-		} else if request.Operation == store.DeliveryProjectInbox {
-			questions, version, questionsErr := g.Store.WorkflowInboxProjection(operationCtx, request.Repository)
-			if questionsErr != nil {
-				return store.DeliveryResult{}, questionsErr
-			}
-			if request.InboxProjectionVersion != "" && request.InboxProjectionVersion != version {
-				return store.DeliveryResult{}, nil
-			}
-			request.WorkflowQuestions = make([]plan.WorkflowQuestion, 0, len(questions))
-			for _, question := range questions {
-				request.WorkflowQuestions = append(request.WorkflowQuestions, plan.WorkflowQuestion{
-					ID: question.ID, Prompt: question.Prompt, Repository: question.Repository,
-					PlanNumber: question.RootNumber, TicketNumber: question.TicketNumber,
-					PullRequest: question.PullRequest, Commit: question.Commit, Finding: question.Kind, Diagnostics: question.Diagnostics,
-					Evidence: question.Evidence,
-				})
-			}
-		}
-		observation, observeErr := g.observe(operationCtx, request)
-		if observeErr != nil {
-			return store.DeliveryResult{}, observeErr
-		}
-		if observation.Applied {
-			return resultFrom(observation), nil
-		}
-		if request.ExpectRemoteAbsent && observation.RemoteExists {
-			return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
-		}
-		if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
-			return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
-		}
-		observation, applyErr := g.apply(operationCtx, request)
-		if applyErr != nil {
-			if retryAt(applyErr).After(g.now()) {
-				return store.DeliveryResult{}, applyErr
-			}
-			observed, observeErr := g.observe(operationCtx, request)
-			if observeErr == nil && observed.Applied {
-				observation = observed
-				applyErr = nil
-			} else {
-				applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
-			}
-		}
-		if applyErr != nil {
-			return store.DeliveryResult{}, applyErr
-		}
-		return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
-	})
+	result, err := g.Store.ExecuteDelivery(operationCtx, outbox.Request, outbox.ClaimToken, g.now, g.execute)
 	if leaseErr := stopDispatcher(); leaseErr != nil {
 		return errors.Join(err, leaseErr, g.requeueClaim(outbox, leaseErr, true))
 	}
 	if err != nil {
 		if isCredentialRejection(err) {
 			return g.pauseForCredential(outbox, err)
+		}
+		if errors.Is(err, store.ErrDeliverySuperseded) {
+			return g.succeed(outbox, store.DeliveryResult{})
 		}
 		if errors.Is(err, store.ErrDeliveryRejected) {
 			return g.reject(outbox, err)
@@ -246,6 +232,62 @@ func (g Gateway) Dispatch(ctx context.Context, key string) error {
 		return g.retry(outbox, err)
 	}
 	return g.succeed(outbox, result)
+}
+
+func (g Gateway) decorateTerminalInboxError(key string, dispatchErr error) error {
+	if dispatchErr == nil || strings.Contains(dispatchErr.Error(), key) {
+		return dispatchErr
+	}
+	ctx, cancel := g.cleanupContext()
+	defer cancel()
+	outbox, err := g.Store.DeliveryOutbox(ctx, key)
+	if err != nil || outbox.State != store.OutboxRejected || !outbox.Uncertain || outbox.Request.Operation != store.DeliveryProjectInbox || outbox.Request.RunID != "" {
+		return dispatchErr
+	}
+	return errors.Join(dispatchErr, fmt.Errorf("%w: %s", store.ErrDeliveryRejected, outbox.LastError))
+}
+
+func (g Gateway) execute(ctx context.Context, request store.DeliveryRequest) (store.DeliveryResult, error) {
+	if request.Operation == store.DeliveryProjectPlan {
+		projection, err := g.Store.PlanProjectionAt(ctx, request.PlanProjection.VersionID, g.now())
+		if err != nil {
+			return store.DeliveryResult{}, errors.Join(ErrGatewayStore, err)
+		}
+		request.PlanProjection = &projection
+	}
+	observation, err := g.observe(ctx, request)
+	if err != nil {
+		return store.DeliveryResult{}, err
+	}
+	if observation.Applied {
+		return resultFrom(observation), nil
+	}
+	if request.InboxProjectionSuperseded {
+		return store.DeliveryResult{}, store.ErrDeliverySuperseded
+	}
+	if request.ExpectRemoteAbsent && observation.RemoteExists {
+		return store.DeliveryResult{}, fmt.Errorf("%w: remote branch already exists at %q", store.ErrDeliveryRejected, observation.RemoteHead)
+	}
+	if request.ExpectedRemoteHead != "" && (!observation.RemoteExists || observation.RemoteHead != request.ExpectedRemoteHead) {
+		return store.DeliveryResult{}, fmt.Errorf("%w: remote head %q does not match expected %q", store.ErrDeliveryRejected, observation.RemoteHead, request.ExpectedRemoteHead)
+	}
+	observation, applyErr := g.apply(ctx, request)
+	if applyErr != nil {
+		if retryAt(applyErr).After(g.now()) {
+			return store.DeliveryResult{}, applyErr
+		}
+		observed, observeErr := g.observe(ctx, request)
+		if observeErr == nil && observed.Applied {
+			observation = observed
+			applyErr = nil
+		} else {
+			applyErr = &uncertainWriteError{applyErr: applyErr, observeErr: observeErr}
+		}
+	}
+	if applyErr != nil {
+		return store.DeliveryResult{}, applyErr
+	}
+	return store.DeliveryResult{RemoteHead: observation.RemoteHead, PullRequestNumber: observation.PullRequestNumber, PullRequestNodeID: observation.PullRequestNodeID}, nil
 }
 
 func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
@@ -270,7 +312,7 @@ func (g Gateway) DispatchPending(ctx context.Context, limit int) error {
 			}
 			progressed = true
 			if err != nil {
-				dispatchErr = errors.Join(dispatchErr, err)
+				dispatchErr = errors.Join(dispatchErr, fmt.Errorf("delivery %s: %w", key, err))
 			}
 		}
 		if !progressed {
@@ -289,7 +331,7 @@ func (g Gateway) QueueGatewayCredentialInboxProjections(ctx context.Context) err
 		return err
 	}
 	for _, repository := range repositories {
-		if _, err := g.Store.QueueWorkflowInboxProjection(ctx, repository, g.now()); err != nil {
+		if _, err := g.Store.QueueWorkflowInboxProjectionIfActive(ctx, repository, g.now()); err != nil {
 			return err
 		}
 	}
@@ -398,6 +440,7 @@ func (g Gateway) renewDispatcher(dispatcherToken string) error {
 func (g Gateway) requeueClaim(outbox store.DeliveryOutbox, cause error, uncertain bool) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
+	uncertain = uncertain || outbox.Uncertain
 	err := g.Store.RequeueDeliveryOutboxClaim(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), uncertain, g.now())
 	if errors.Is(err, store.ErrFencingConflict) {
 		return nil
@@ -437,7 +480,7 @@ func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", cause.Error(), g.now())
-	err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxRejected, cause.Error(), g.now())
+	err := g.Store.RejectDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, g.now())
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
@@ -450,9 +493,9 @@ func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 	now := g.now()
 	var err error
 	if retryAfter := retryAt(cause); retryAfter.After(now) {
-		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), false, retryAfter, now)
+		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, retryAfter, now)
 	} else {
-		err = g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, cause.Error(), now)
+		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, time.Time{}, now)
 	}
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
@@ -470,7 +513,7 @@ func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) er
 	if err := g.QueueGatewayCredentialInboxProjections(ctx); err != nil {
 		return errors.Join(fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
-	if err := g.Store.FinishDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, store.OutboxPending, reason, g.now()); err != nil {
+	if err := g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, reason, outbox.Uncertain, time.Time{}, g.now()); err != nil {
 		return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err, g.requeueClaim(outbox, cause, false))
 	}
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)
