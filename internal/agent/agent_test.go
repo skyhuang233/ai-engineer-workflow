@@ -1066,7 +1066,7 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	}
 }
 
-func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
+func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1081,14 +1081,11 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 		t.Fatalf("Candidate acceptance was not durable: %v", err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
-	if err != nil || len(questions) != 1 || !strings.Contains(questions[0].Prompt, "Delivery Controller failed") {
-		t.Fatalf("Delivery Controller recovery question = %#v, err = %v", questions, err)
+	if err != nil || len(questions) != 0 {
+		t.Fatalf("Delivery Controller should retry before Needs Attention: %#v, err = %v", questions, err)
 	}
 	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
 		t.Fatalf("review claim after failed delivery = %v, want not ready", err)
-	}
-	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "retry", time.Now().UTC()); err != nil {
-		t.Fatal(err)
 	}
 	if _, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC()); err != nil {
 		t.Fatal(err)

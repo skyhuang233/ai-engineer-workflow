@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -296,6 +297,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 		}
 	}
 
+	if ready, err := infrastructureRetryReadyTx(ctx, tx, sessionID, request.Now); err != nil {
+		return TicketClaim{}, err
+	} else if !ready {
+		return TicketClaim{}, ErrNotReady
+	}
 	if currentGeneration == 0 {
 		currentGeneration = 1
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
@@ -314,7 +320,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= maxWorkerAttempts(request.MaxAttempts) {
-		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, "worker retry budget exhausted", request.Now); err != nil {
+		reason, err := noProgressReasonTx(ctx, tx, sessionID, attemptsInEpoch)
+		if err != nil {
+			return TicketClaim{}, err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, reason, request.Now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -530,7 +540,8 @@ JOIN plans p ON p.id = v.plan_id
 WHERE p.repository = ? AND p.current_version_id = s.version_id
 AND s.state = ? AND s.accepted_commit != '' AND s.delivery_retry_pending = 1
 AND rt.state = ? AND rt.delivered = 0
-ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.StateWaitingReview, available)
+AND NOT EXISTS (SELECT 1 FROM infrastructure_retry_backoffs backoff WHERE backoff.session_id = s.session_id AND backoff.retry_at > ?)
+ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.StateWaitingReview, formatTimestamp(now), available)
 	if err != nil {
 		return nil, err
 	}
@@ -733,21 +744,27 @@ func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issue
 		return TicketClaim{}, ErrNotReady
 	}
 	var sessionID, owner, sessionState, runtimeState string
+	var deliveryRetryPending int
 	var ticketNumber int64
 	var ticketTitle string
 	var generation, recoveryEpoch int64
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, s.delivery_retry_pending, rt.state, t.issue_number, t.title
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle)
+WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &deliveryRetryPending, &runtimeState, &ticketNumber, &ticketTitle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound
 	}
 	if err != nil {
 		return TicketClaim{}, err
 	}
-	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
+	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" || deliveryRetryPending != 0 {
+		return TicketClaim{}, ErrNotReady
+	}
+	if ready, err := infrastructureRetryReadyTx(ctx, tx, sessionID, now); err != nil {
+		return TicketClaim{}, err
+	} else if !ready {
 		return TicketClaim{}, ErrNotReady
 	}
 	activeRuns, err := activeRunCountTx(ctx, tx, now)
@@ -774,7 +791,11 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= limit {
-		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "worker retry budget exhausted", now); err != nil {
+		reason, err := noProgressReasonTx(ctx, tx, sessionID, attemptsInEpoch)
+		if err != nil {
+			return TicketClaim{}, err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -816,6 +837,43 @@ func planFrozenTx(ctx context.Context, tx frontierRows, versionID string) (bool,
 		return false, nil
 	}
 	return err == nil, err
+}
+
+func infrastructureRetryReadyTx(ctx context.Context, tx *sql.Tx, sessionID string, now time.Time) (bool, error) {
+	var retryText string
+	err := tx.QueryRowContext(ctx, `SELECT retry_at FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID).Scan(&retryText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, retryText)
+	if err != nil {
+		return false, err
+	}
+	return !retryAt.After(now), nil
+}
+
+func noProgressReasonTx(ctx context.Context, tx *sql.Tx, sessionID string, attempts int) (string, error) {
+	reason := fmt.Sprintf("worker retry budget exhausted after %d attempts without a new accepted Candidate Revision", attempts)
+	var latest string
+	err := tx.QueryRowContext(ctx, `SELECT failure.reason
+FROM run_failures failure
+JOIN worker_runs run ON run.run_id = failure.run_id
+WHERE run.session_id = ?
+ORDER BY failure.recorded_at DESC, failure.run_id DESC
+LIMIT 1`, sessionID).Scan(&latest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reason, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(latest) != "" {
+		reason += ": " + latest
+	}
+	return reason, nil
 }
 
 // MarkTicketDelivered records the durable delivery fact that unlocks dependent

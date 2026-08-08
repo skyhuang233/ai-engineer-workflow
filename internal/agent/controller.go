@@ -152,7 +152,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		session.CodexSessionID = codexSessionID
 	}
 	if runErr != nil || result.ExitCode != 0 {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(output), &runRedactor)
+		return c.failRunWithFailureClass(handoffCtx, request, ws, session, baseCommit, errorText(runErr, result.ExitCode), string(output), &runRedactor, failureClass(runErr))
 	}
 	commit, currentBranch, clean, err := c.Workspace.status(handoffCtx, ws)
 	if err != nil {
@@ -336,9 +336,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		}
 		return nil
 	} else if deliveryErr != nil || deliveryResult.ExitCode != 0 {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(errorText(deliveryErr, deliveryResult.ExitCode))))
+		return c.failDeliveryControllerWithClass(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(errorText(deliveryErr, deliveryResult.ExitCode))), failureClass(deliveryErr))
 	} else if parseErr != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(parseErr.Error())))
+		return c.failDeliveryControllerWithClass(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(parseErr.Error())), store.FailureCodeQuality)
 	} else if outcome.Gate != nil {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New("Delivery Controller reported a human gate without pausing"))
 	} else if !outcome.Passed {
@@ -369,6 +369,10 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
 	return errors.Join(cause, c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now()))
+}
+
+func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
+	return errors.Join(cause, c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now()))
 }
 
 func runtimeStdout(result worker.Result) []byte {
@@ -459,6 +463,10 @@ func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspac
 }
 
 func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string, redactor *codexauth.Redactor) (Candidate, error) {
+	return c.failRunWithFailureClass(ctx, request, ws, session, baseCommit, reason, output, redactor, store.FailureCodeQuality)
+}
+
+func (c Controller) failRunWithFailureClass(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string, redactor *codexauth.Redactor, class store.FailureClass) (Candidate, error) {
 	safeReason := codexAuthenticationFailure
 	if redactor != nil {
 		safeReason = redactor.String(reason)
@@ -476,8 +484,15 @@ func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest,
 	if redactor == nil {
 		cause = &store.SessionAuthenticationFailure{}
 	}
-	recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: safeReason, Cause: cause, Now: c.now()})
+	recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: safeReason, Class: class, Cause: cause, Now: c.now()})
 	return Candidate{}, errors.Join(errors.New(safeReason), redactFailureError(diagnosticErr, redactor), redactFailureError(restoreErr, redactor), redactFailureError(recordErr, redactor))
+}
+
+func failureClass(err error) store.FailureClass {
+	if worker.IsInfrastructureFailure(err) {
+		return store.FailureInfrastructure
+	}
+	return store.FailureCodeQuality
 }
 
 func redactFailureError(err error, redactor *codexauth.Redactor) error {

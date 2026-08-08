@@ -13,6 +13,20 @@ import (
 
 var ErrGitHubCredential = errors.New("worker spec contains a GitHub write credential")
 
+// InfrastructureError marks failures to start or communicate with the Worker
+// runtime. It lets the Control Plane back off without treating an unavailable
+// host as a Ticket Agent implementation failure.
+type InfrastructureError struct{ Err error }
+
+func (e InfrastructureError) Error() string               { return e.Err.Error() }
+func (e InfrastructureError) Unwrap() error               { return e.Err }
+func (e InfrastructureError) InfrastructureFailure() bool { return true }
+
+func IsInfrastructureFailure(err error) bool {
+	var failure interface{ InfrastructureFailure() bool }
+	return errors.As(err, &failure) && failure.InfrastructureFailure()
+}
+
 const GatewayHostMapping = "host.docker.internal:host-gateway"
 
 // CodexSandboxDockerArgs returns the Docker permissions required by Codex's
@@ -177,15 +191,15 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	cidfile, err := os.CreateTemp("", "workflow-worker-cid-*")
 	if err != nil {
-		return Result{}, fmt.Errorf("create worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("create worker container id file: %w", err)}
 	}
 	cidfilePath := cidfile.Name()
 	if err := cidfile.Close(); err != nil {
 		_ = os.Remove(cidfilePath)
-		return Result{}, fmt.Errorf("close worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("close worker container id file: %w", err)}
 	}
 	if err := os.Remove(cidfilePath); err != nil {
-		return Result{}, fmt.Errorf("prepare worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("prepare worker container id file: %w", err)}
 	}
 	defer os.Remove(cidfilePath)
 	args := dockerArgs(spec)
@@ -198,7 +212,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	output := append(append([]byte(nil), stdout.Bytes()...), stderr.Bytes()...)
 	containerID, readErr := os.ReadFile(cidfilePath)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return Result{Output: output}, fmt.Errorf("read worker container id: %w", readErr)
+		return Result{Output: output}, InfrastructureError{Err: fmt.Errorf("read worker container id: %w", readErr)}
 	}
 	result := Result{Output: output, Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ContainerID: strings.TrimSpace(string(containerID))}
 	if err != nil {
@@ -206,6 +220,11 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
+			if result.ExitCode == 125 {
+				return result, InfrastructureError{Err: err}
+			}
+		} else {
+			return result, InfrastructureError{Err: err}
 		}
 	}
 	return result, err

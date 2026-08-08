@@ -655,6 +655,169 @@ func TestClaimReadyStopsAfterConfiguredAttemptLimit(t *testing.T) {
 	}
 }
 
+func TestInfrastructureFailuresBackOffBeforeRetryingSameTicketSession(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Error: "Docker daemon unavailable", Class: FailureInfrastructure, Now: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(30 * time.Second)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("early infrastructure retry = %v, want ErrNotReady", err)
+	}
+	retry, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Minute + time.Second)})
+	if err != nil {
+		t.Fatalf("retry after backoff: %v", err)
+	}
+	if retry.SessionID != claim.SessionID {
+		t.Fatalf("retry session = %q, want same Session %q", retry.SessionID, claim.SessionID)
+	}
+}
+
+func TestDeliveryInfrastructureFailureBacksOffAtAcceptedCandidateBoundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	agentClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryControllerWithClass(ctx, deliveryClaim, "Docker daemon unavailable", FailureInfrastructure, now.Add(time.Second)); err != nil {
+		t.Fatalf("record delivery infrastructure failure: %v", err)
+	}
+	claims, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(30*time.Second))
+	if err != nil || len(claims) != 0 {
+		t.Fatalf("early delivery retry = %#v, %v", claims, err)
+	}
+	claims, err = db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(time.Minute+time.Second))
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("delivery retry after backoff = %#v, %v", claims, err)
+	}
+	if claims[0].SessionID != agentClaim.SessionID || claims[0].RunID == deliveryClaim.RunID {
+		t.Fatalf("delivery retry = %#v, want replacement Delivery Run for Session %q", claims[0], agentClaim.SessionID)
+	}
+	if err := db.CompleteDeliveryController(ctx, claims[0], now.Add(time.Minute+2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := db.ClaimReviewRevision(ctx, version.ID, agentClaim.TicketID, time.Hour, now.Add(2*time.Minute), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextDelivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: revision.RunID, LeaseToken: revision.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted-b", StructuredOutput: []byte(`{"summary":"candidate b","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now.Add(2 * time.Minute), Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectedRemoteHead: "accepted", Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryControllerWithClass(ctx, nextDelivery, "quality check failed", FailureCodeQuality, now.Add(2*time.Minute+time.Second)); err != nil {
+		t.Fatalf("first delivery failure after accepted-head advance: %v", err)
+	}
+	claims, err = db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(2*time.Minute+2*time.Second))
+	if err != nil || len(claims) != 1 || claims[0].SessionID != agentClaim.SessionID {
+		t.Fatalf("new accepted-head delivery retry = %#v, %v", claims, err)
+	}
+}
+
+func TestNoProgressEscalationKeepsOneFingerprintQuestionWithSafeRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	for attempt := 0; attempt < 2; attempt++ {
+		claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, MaxAttempts: 2, LeaseTTL: time.Hour, Now: now.Add(time.Duration(attempt) * time.Minute)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Error: "go test ./... failed", Class: FailureCodeQuality, Now: now.Add(time.Duration(attempt)*time.Minute + time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, MaxAttempts: 2, LeaseTTL: time.Hour, Now: now.Add(3 * time.Minute)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("exhausted retry = %v, want ErrNotReady", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("Needs Attention questions = %#v, %v", questions, err)
+	}
+	if !strings.Contains(questions[0].Prompt, "go test ./... failed") || !strings.Contains(questions[0].Prompt, "Safe recovery") {
+		t.Fatalf("Needs Attention prompt = %q", questions[0].Prompt)
+	}
+	var storedFingerprint string
+	if err := db.db.QueryRowContext(ctx, `SELECT fingerprint FROM needs_attention_fingerprints WHERE question_id = ?`, questions[0].ID).Scan(&storedFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if storedFingerprint != noProgressFingerprint(version.ID, 1, "") {
+		t.Fatalf("no-progress fingerprint = %q", storedFingerprint)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markTicketNeedsAttentionTx(ctx, tx, version.ID, 1, "go test ./... failed", now.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err = db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("duplicate Needs Attention questions = %#v, %v", questions, err)
+	}
+}
+
 func TestReviewFeedbackDeduplicatesAndBatchesOneRevision(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

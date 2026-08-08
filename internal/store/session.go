@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -126,9 +127,20 @@ type RunFailure struct {
 	LeaseToken      string
 	DiagnosticsPath string
 	Error           string
+	Class           FailureClass
 	Cause           error
 	Now             time.Time
 }
+
+// FailureClass determines whether a replacement Worker Run may start
+// immediately. Code and quality failures return to the same Ticket Agent;
+// infrastructure failures wait behind a bounded exponential backoff.
+type FailureClass string
+
+const (
+	FailureCodeQuality    FailureClass = "code_quality"
+	FailureInfrastructure FailureClass = "infrastructure"
+)
 
 type WorkerAuditRecord struct {
 	RunID                  string
@@ -586,7 +598,10 @@ SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = 
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, candidate.RunID, candidate.LeaseToken, LeaseActive); err != nil {
 		return TicketClaim{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, accepted_candidate_run_id = ?, consecutive_failures = 0, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, candidate.RunID, now, sessionID, candidate.CodexSessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET codex_session_id = CASE WHEN codex_session_id = '' THEN ? ELSE codex_session_id END, accepted_commit = ?, accepted_candidate_run_id = ?, consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE session_id = ? AND (codex_session_id = '' OR codex_session_id = ?)`, candidate.CodexSessionID, candidate.CommitSHA, candidate.RunID, now, sessionID, candidate.CodexSessionID); err != nil {
+		return TicketClaim{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID); err != nil {
 		return TicketClaim{}, err
 	}
 	remoteHead := candidate.Publication.ExpectedRemoteHead
@@ -658,14 +673,21 @@ WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.
 }
 
 func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, "", now)
+	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, now)
 }
 
 func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, now)
+	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, now)
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
+// FailDeliveryControllerWithClass releases the failed Delivery Controller and
+// schedules a fenced retry of its accepted Candidate Revision. The bounded
+// retry count is per recovery epoch; escalation remains the explicit fallback.
+func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, now)
+}
+
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry bool, now time.Time) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -675,6 +697,12 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
+	}
+	if class == "" {
+		class = FailureCodeQuality
+	}
+	if class != FailureCodeQuality && class != FailureInfrastructure {
+		return ErrInvalidClaim
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -731,6 +759,31 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 )`, formatTimestamp(now), sessionID); err != nil {
 			return err
 		}
+	} else if retry {
+		if err := recordRunFailureDetailTx(ctx, tx, claim.RunID, class, reason, now); err != nil {
+			return err
+		}
+		if err := updateInfrastructureRetryTx(ctx, tx, claim.RunID, class, now); err != nil {
+			return err
+		}
+		var recoveryEpoch int64
+		if err := tx.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE session_id = ?`, sessionID).Scan(&recoveryEpoch); err != nil {
+			return err
+		}
+		var attempts int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ? AND run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
+			return err
+		}
+		if attempts < DefaultMaxWorkerAttempts {
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), claim.VersionID, claim.TicketID); err != nil {
+				return err
+			}
+		} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, fmt.Sprintf("Delivery Controller retry budget exhausted after %d attempts: %s", attempts, reason), now); err != nil {
+			return err
+		}
 	} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller failed: "+reason, now); err != nil {
 		return err
 	}
@@ -757,6 +810,12 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 	isAuthenticationFailure := errors.As(failure.Cause, &authenticationFailure)
 	if isAuthenticationFailure {
 		failure.Error = ErrSessionAuthenticationUnavailable.Error()
+	}
+	if failure.Class == "" {
+		failure.Class = FailureCodeQuality
+	}
+	if failure.Class != FailureCodeQuality && failure.Class != FailureInfrastructure {
+		return ErrInvalidClaim
 	}
 	var currentRunID, runState, leaseState, expiresText, versionID string
 	var issueID int64
@@ -795,6 +854,12 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, now, failure.RunID); err != nil {
 		return err
 	}
+	if err := recordRunFailureDetailTx(ctx, tx, failure.RunID, failure.Class, failure.Error, failure.Now); err != nil {
+		return err
+	}
+	if err := updateInfrastructureRetryTx(ctx, tx, failure.RunID, failure.Class, failure.Now); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, failure.RunID)
 	if err != nil {
 		return err
@@ -821,4 +886,45 @@ WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs
 		}
 	}
 	return tx.Commit()
+}
+
+func recordRunFailureDetailTx(ctx context.Context, tx *sql.Tx, runID string, class FailureClass, reason string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO run_failures(run_id, class, reason, recorded_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(run_id) DO NOTHING`, runID, class, reason, formatTimestamp(now))
+	return err
+}
+
+func updateInfrastructureRetryTx(ctx context.Context, tx *sql.Tx, runID string, class FailureClass, now time.Time) error {
+	var sessionID string
+	if err := tx.QueryRowContext(ctx, `SELECT session_id FROM worker_runs WHERE run_id = ?`, runID).Scan(&sessionID); err != nil {
+		return err
+	}
+	if class != FailureInfrastructure {
+		_, err := tx.ExecContext(ctx, `DELETE FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID)
+		return err
+	}
+	var failures int
+	err := tx.QueryRowContext(ctx, `SELECT consecutive_failures FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID).Scan(&failures)
+	if errors.Is(err, sql.ErrNoRows) {
+		failures = 0
+	} else if err != nil {
+		return err
+	}
+	failures++
+	_, err = tx.ExecContext(ctx, `INSERT INTO infrastructure_retry_backoffs(session_id, consecutive_failures, retry_at)
+VALUES (?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET consecutive_failures = excluded.consecutive_failures, retry_at = excluded.retry_at`,
+		sessionID, failures, formatTimestamp(now.Add(infrastructureRetryDelay(failures))))
+	return err
+}
+
+func infrastructureRetryDelay(failures int) time.Duration {
+	if failures <= 1 {
+		return time.Minute
+	}
+	if failures >= 6 {
+		return 30 * time.Minute
+	}
+	return time.Minute * time.Duration(1<<(failures-1))
 }

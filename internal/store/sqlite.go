@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 45
+	latestSchemaVersion = 46
 )
 
 var (
@@ -1228,6 +1228,34 @@ SET plan_version_ids_json = COALESCE((
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (45, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 46 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS run_failures (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    class TEXT NOT NULL CHECK (class IN ('code_quality', 'infrastructure')),
+    reason TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS infrastructure_retry_backoffs (
+    session_id TEXT PRIMARY KEY REFERENCES ticket_sessions(session_id),
+    consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures > 0),
+    retry_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS needs_attention_fingerprints (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    fingerprint TEXT NOT NULL
+)`,
+			`CREATE INDEX IF NOT EXISTS needs_attention_fingerprints_lookup_idx ON needs_attention_fingerprints(fingerprint)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 46: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (46, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

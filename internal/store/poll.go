@@ -1738,11 +1738,17 @@ func recoverNeedsAttentionTicketTx(ctx context.Context, tx *sql.Tx, versionID st
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID)
 		return err
 	}
 	if sessionID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = 0, recovery_epoch = recovery_epoch + 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID); err != nil {
 			return err
 		}
 	}
@@ -1772,11 +1778,13 @@ ON CONFLICT(repository, version_id, issue_id, kind, generation) DO NOTHING`, que
 func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time) error {
 	var repository string
 	var number int64
-	err := tx.QueryRowContext(ctx, `SELECT p.repository, t.issue_number
+	var acceptedCommit string
+	err := tx.QueryRowContext(ctx, `SELECT p.repository, t.issue_number, COALESCE(s.accepted_commit, '')
 FROM plan_tickets t
 JOIN plan_versions v ON v.version_id = t.version_id
 JOIN plans p ON p.id = v.plan_id
-WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository, &number)
+LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
+WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository, &number, &acceptedCommit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -1805,8 +1813,65 @@ WHERE t.version_id = ? AND t.issue_id = ?`, versionID, issueID).Scan(&repository
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = ? AND session_id = (SELECT session_id FROM ticket_sessions WHERE version_id = ? AND issue_id = ?)`, LeaseActive, versionID, issueID); err != nil {
 		return err
 	}
-	prompt := fmt.Sprintf("Ticket #%d needs attention: %s Reply with an id-addressed retry decision after resolving the cause.", number, reason)
-	return ensureWorkflowQuestionTx(ctx, tx, repository, versionID, issueID, "needs_attention", prompt, now)
+	fingerprint := noProgressFingerprint(versionID, issueID, acceptedCommit)
+	prompt := needsAttentionPrompt(number, reason, acceptedCommit)
+	return ensureNeedsAttentionQuestionTx(ctx, tx, repository, versionID, issueID, fingerprint, prompt, now)
+}
+
+// A no-progress fingerprint intentionally follows the durable delivery
+// boundary rather than volatile diagnostics. Repeated failures before a new
+// accepted Candidate Revision, or against the same accepted head, therefore
+// converge on one human decision.
+func noProgressFingerprint(versionID string, issueID int64, acceptedCommit string) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", versionID, issueID, acceptedCommit)))
+	return hex.EncodeToString(digest[:])
+}
+
+func needsAttentionPrompt(ticketNumber int64, reason, acceptedCommit string) string {
+	boundary := "the Ticket Session's confirmed workspace boundary"
+	if acceptedCommit != "" {
+		boundary = "the accepted Candidate Revision " + acceptedCommit
+	}
+	return fmt.Sprintf("Ticket #%d needs attention: %s Already tried: bounded automated recovery made no progress at %s. Safe recovery: restore the environment or correct the cause, then reply with an id-addressed retry decision; the Control Plane will acquire a fresh lease and resume from %s without bypassing delivery gates.", ticketNumber, reason, boundary, boundary)
+}
+
+func ensureNeedsAttentionQuestionTx(ctx context.Context, tx *sql.Tx, repository, versionID string, issueID int64, fingerprint, prompt string, now time.Time) error {
+	var questionID string
+	err := tx.QueryRowContext(ctx, `SELECT question.question_id
+FROM workflow_questions question
+JOIN needs_attention_fingerprints fingerprint ON fingerprint.question_id = question.question_id
+WHERE question.repository = ? AND question.version_id = ? AND question.issue_id = ?
+  AND question.kind = 'needs_attention' AND question.state = 'open' AND fingerprint.fingerprint = ?
+ORDER BY question.generation DESC LIMIT 1`, repository, versionID, issueID, fingerprint).Scan(&questionID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	err = tx.QueryRowContext(ctx, `SELECT question.question_id FROM workflow_questions question
+WHERE question.repository = ? AND question.version_id = ? AND question.issue_id = ?
+  AND question.kind = 'needs_attention' AND question.state = 'open'
+  AND NOT EXISTS (SELECT 1 FROM needs_attention_fingerprints fingerprint WHERE fingerprint.question_id = question.question_id)
+ORDER BY question.generation DESC LIMIT 1`, repository, versionID, issueID).Scan(&questionID)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO needs_attention_fingerprints(question_id, fingerprint) VALUES (?, ?)`, questionID, fingerprint)
+		return err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var generation int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) + 1 FROM workflow_questions WHERE repository = ? AND version_id = ? AND issue_id = ? AND kind = 'needs_attention'`, repository, versionID, issueID).Scan(&generation); err != nil {
+		return err
+	}
+	questionID = fmt.Sprintf("needs-attention-%s-%d-g%d", versionID, issueID, generation)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_questions(question_id, repository, version_id, issue_id, kind, generation, prompt, state, created_at)
+VALUES (?, ?, ?, ?, 'needs_attention', ?, ?, 'open', ?)`, questionID, repository, versionID, issueID, generation, prompt, formatTimestamp(now)); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO needs_attention_fingerprints(question_id, fingerprint) VALUES (?, ?)`, questionID, fingerprint)
+	return err
 }
 
 func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time) error {
