@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +62,7 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 		return worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}, nil
 	}
 	marker := "initial"
-	if len(spec.Command) > 2 && spec.Command[2] == "resume" {
+	if slices.Contains(spec.Command, "resume") {
 		marker = "resume"
 	}
 	content := "candidate " + marker + "\n"
@@ -170,6 +171,105 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 		}
 	}
 	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
+}
+
+func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	globalConfig := filepath.Join(root, "global.gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[core]\n\tautocrlf = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme, err := os.ReadFile(filepath.Join(session.WorkspacePath, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(readme), "\r\n") {
+		t.Fatalf("Ticket Workspace README uses CRLF: %q", readme)
+	}
+	for key, want := range map[string]string{"core.autocrlf": "false", "core.eol": "lf"} {
+		command := exec.Command("git", "config", "--local", "--get", key)
+		command.Dir = session.WorkspacePath
+		output, err := command.CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != want {
+			t.Fatalf("Ticket Workspace %s = %q, err=%v; want %q", key, output, err, want)
+		}
+	}
+}
+
+func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	globalConfig := filepath.Join(root, "global.gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[core]\n\tautocrlf = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	workspacePath := filepath.Join(root, "workspaces", claim.SessionID)
+	if err := os.MkdirAll(filepath.Dir(workspacePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"clone", "--local", "--no-hardlinks", source, workspacePath}, {"-C", workspacePath, "checkout", "-b", "ticket-1"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	readmePath := filepath.Join(workspacePath, "README.md")
+	before, err := os.ReadFile(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), "\r\n") {
+		t.Fatalf("test setup did not create CRLF: %q", before)
+	}
+
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "recover the workspace")); err == nil || !strings.Contains(err.Error(), "workspace was not clean") {
+		t.Fatalf("CRLF recovery error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatal("Worker launched before CRLF workspace recovery")
+	}
+	after, err := os.ReadFile(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), "\r\n") {
+		t.Fatalf("recovered Ticket Workspace still uses CRLF: %q", after)
+	}
+	status := exec.Command("git", "status", "--porcelain")
+	status.Dir = workspacePath
+	output, err := status.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(output)) != "" {
+		t.Fatalf("recovered Ticket Workspace status = %q, err=%v", output, err)
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil || session.WorkspacePath != workspacePath {
+		t.Fatalf("Ticket Session = %#v, err=%v", session, err)
+	}
 }
 
 func TestControllerSeedsCodexAuthenticationBeforeFirstWorkerRun(t *testing.T) {
@@ -875,9 +975,9 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if len(first.specs) != 2 || strings.Join(first.specs[1].Command, " ") != "no-mistakes axi run --intent implement the ticket" {
 		t.Fatalf("first worker spec = %#v", first.specs)
 	}
-	if command := first.specs[0].Command; len(command) != 7 || command[0] != "codex" || command[1] != "exec" || command[2] != "--json" || command[3] != "--output-schema" || command[5] != "--skip-git-repo-check" || command[6] != "implement the ticket" {
+	if command := first.specs[0].Command; len(command) != 9 || command[0] != "codex" || command[1] != "exec" || command[2] != "--sandbox" || command[3] != "danger-full-access" || command[4] != "--json" || command[5] != "--output-schema" || command[7] != "--skip-git-repo-check" || command[8] != "implement the ticket" {
 		t.Fatalf("Codex command = %#v", command)
-	} else if schema, err := os.ReadFile(command[4]); err != nil || !strings.Contains(string(schema), `"summary"`) {
+	} else if schema, err := os.ReadFile(command[6]); err != nil || !strings.Contains(string(schema), `"summary"`) {
 		t.Fatalf("Candidate output schema = %q, err = %v", schema, err)
 	}
 	if first.specs[0].AgentIdentity == "" || len(first.specs[0].Mounts) != 2 || first.specs[0].Environment["GITHUB_TOKEN"] != "" {
@@ -919,7 +1019,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 		t.Fatalf("review worker specs = %#v", second.specs)
 	}
 	assertWorkflowDeliveryEnvironment(t, second.specs[1], claim.SessionID, revision.RunID, second.specs[1].RunID)
-	if command := second.specs[0].Command; len(command) != 9 || command[0] != "codex" || command[1] != "exec" || command[2] != "resume" || command[3] != "--json" || command[4] != "--output-schema" || command[6] != "--skip-git-repo-check" || command[7] != "codex-session-1" || command[8] != "address the review feedback" {
+	if command := second.specs[0].Command; len(command) != 11 || command[0] != "codex" || command[1] != "exec" || command[2] != "--sandbox" || command[3] != "danger-full-access" || command[4] != "resume" || command[5] != "--json" || command[6] != "--output-schema" || command[8] != "--skip-git-repo-check" || command[9] != "codex-session-1" || command[10] != "address the review feedback" {
 		t.Fatalf("resumed Codex command = %#v", command)
 	}
 	if !json.Valid(candidate.StructuredOutput) {
@@ -1001,7 +1101,7 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
 		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","no_mistakes_version":"v2.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1235,7 +1335,7 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 		Version:        "0.1.0",
 		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","no_mistakes_version":"v1.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)

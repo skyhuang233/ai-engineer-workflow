@@ -178,7 +178,7 @@ Delivery Cycle 覆盖 Ticket 从首次执行到 Delivered/Cancelled。每个 Rev
 - `internal/runtime` 为每个 Ticket Session 建立固定 workspace 与 Codex state 目录；记录规范化绝对路径、repo identity、branch、last accepted commit 和 dirty-state hash，禁止路径逃逸。
 - 首次运行从已记录 baseline 创建分支和 workspace；后续容器只挂载该 workspace、Codex state、只读源码/工具配置和必要缓存。GitHub 写 token 不进入容器；GitHub read token 若需要则使用 read-only scope。
 - 容器命令、镜像 digest、mount、environment allowlist 和 tool versions 全部写 audit。容器停止/丢失不删除 Ticket Session 或 workspace。
-- 首次 Agent turn 执行 `codex exec --json --output-schema <schema>` 并持久化返回 session ID；后续执行 `codex exec resume <session-id> --json --output-schema <schema> <prompt>`。禁止 `--ephemeral`。
+- Codex turn 使用 ADR-0024 定义的持久 `exec`/`exec resume` 会话，并遵守 ADR-0004 的可信 sandbox 边界；禁止 `--ephemeral`。
 - feedback prompt 只传增量信息：Question answer 或一批 Review Feedback、current branch/head、要求的证据；不重新灌入完整历史。Codex 自身 session 和 workspace 承担上下文连续性。
 - 每轮结束执行 workspace checkpoint：
   - 正常：工作树 clean、所有修改 committed，记录 commit/hash。

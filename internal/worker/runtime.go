@@ -16,6 +16,13 @@ var ErrGitHubCredential = errors.New("worker spec contains a GitHub write creden
 
 const GatewayHostMapping = "host.docker.internal:host-gateway"
 
+// CodexSandboxDockerArgs returns the Docker permissions required by Codex's
+// nested bubblewrap sandbox. Both SYS_ADMIN and an unconfined seccomp profile
+// are required: the former permits namespace setup and the latter pivot_root.
+func CodexSandboxDockerArgs() []string {
+	return []string{"--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"}
+}
+
 type Mount struct {
 	Source   string
 	Target   string
@@ -169,7 +176,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 }
 
 func dockerArgs(spec Spec) []string {
-	args := []string{"run", "--rm", "--workdir", "/workspace"}
+	args := []string{"run", "--rm"}
+	args = append(args, CodexSandboxDockerArgs()...)
+	args = append(args, "--workdir", "/workspace")
 	if spec.RunID != "" {
 		args = append(args, "--label", "workflow.run_id="+spec.RunID)
 	}

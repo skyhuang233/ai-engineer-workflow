@@ -20,7 +20,7 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	if !strings.Contains(string(workflow), "-- deploy/worker .github/workflows/publish-worker.yml") {
 		t.Fatal("publisher workflow changes do not require a Worker release")
 	}
-	if !strings.Contains(string(workflow), "schema_version:2") || !strings.Contains(string(workflow), "@base64") {
+	if !strings.Contains(string(workflow), "schema_version:3") || !strings.Contains(string(workflow), "@base64") {
 		t.Fatal("publisher workflow does not use the canonical base64 Worker input encoding")
 	}
 	if !strings.Contains(string(workflow), "worker-v${{ steps.pins.outputs.worker_version }}-$identity") {
@@ -43,6 +43,9 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	}
 	if !strings.Contains(string(workflow), "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}") {
 		t.Fatal("publisher workflow does not pass the complete no-mistakes commit to the Worker build")
+	}
+	if !strings.Contains(string(workflow), "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}") {
+		t.Fatal("publisher workflow does not pass the pinned Go checksum to the Worker build")
 	}
 }
 

@@ -17,8 +17,8 @@ func TestWorkerBuildInputIdentityUsesCanonicalBase64JSON(t *testing.T) {
 	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	b64 := base64.StdEncoding.EncodeToString
-	canonical := fmt.Sprintf(`{"schema_version":2,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
-		b64([]byte(workerTree)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.NoMistakes.Version)),
+	canonical := fmt.Sprintf(`{"schema_version":3,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
+		b64([]byte(workerTree)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.Go.Version)), b64([]byte(config.Go.LinuxAMD64SHA256)), b64([]byte(config.NoMistakes.Version)),
 		b64([]byte(config.NoMistakes.UpstreamRepository)), b64([]byte(config.NoMistakes.UpstreamCommit)),
 		b64([]byte(config.NoMistakes.ForkRepository)), b64([]byte(config.NoMistakes.ForkRelease)),
 		b64([]byte(config.NoMistakes.LinuxAMD64SHA256)), b64([]byte(config.Worker.Version)),
@@ -54,7 +54,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	filter := `{schema_version:2,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
+	filter := `{schema_version:3,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
 	command := exec.Command(jq, "--compact-output", "--arg", "deploy_worker_tree", workerTree, "--arg", "publish_worker_workflow_blob", publisherWorkflow, filter)
 	command.Stdin = bytes.NewReader(configJSON)
 	publisherJSON, err := command.Output()
@@ -63,10 +63,11 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	}
 	publisherCanonicalJSON := strings.TrimRight(string(publisherJSON), "\r\n")
 	goJSON, err := json.Marshal(canonicalizeWorkerBuildInputs(workerBuildInputs{
-		SchemaVersion:             2,
+		SchemaVersion:             3,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
+		Go:                        config.Go,
 		NoMistakes:                config.NoMistakes,
 		Worker:                    config.Worker,
 	}))
@@ -85,11 +86,13 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
 	manifest := WorkerReleaseManifest{
-		SchemaVersion:                2,
+		SchemaVersion:                3,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		CodexVersion:                 config.Codex.Version,
+		GoVersion:                    config.Go.Version,
+		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
 		NoMistakesVersion:            config.NoMistakes.Version,
 		NoMistakesUpstreamRepository: config.NoMistakes.UpstreamRepository,
 		NoMistakesCommit:             config.NoMistakes.UpstreamCommit,

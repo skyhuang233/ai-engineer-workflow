@@ -4,6 +4,8 @@
 `workflow doctor`. Every executable version and artifact is immutable:
 
 - Codex CLI is pinned to an exact package version.
+- Go is pinned to an exact Linux amd64 archive version and official SHA-256
+  checksum. Doctor verifies `go version` inside the exact Worker image.
 - `no-mistakes` is pinned to an upstream release, verified commit, fork
   repository, fork release, and Linux release-asset checksum. Doctor reads the
   installed executable's full immutable Go `vcs.revision` build metadata, so
@@ -70,6 +72,11 @@ overwritten.
 Ticket Agents are trusted with this cache. [ADR-0039](../adr/0039-seed-ticket-sessions-from-host-chatgpt-auth.md)
 owns the credential threat model, redaction boundary, and terminal corruption
 recovery contract.
+
+[ADR-0004](../adr/0004-centralize-external-writes.md) owns the trusted Worker
+container's Codex sandbox, Docker privilege, and GitHub credential boundary.
+[ADR-0008](../adr/0008-persist-workspaces-per-ticket-session.md) owns Ticket
+Workspace persistence and its repository-local LF policy.
 
 Doctor performs a real create-and-resume request inside the pinned Worker
 image using a temporary copy of this cache. A version-only Codex check is not
@@ -158,9 +165,11 @@ and record its result in Issue #7.
 
 Never edit only one version string. A toolchain upgrade is accepted only after:
 
-1. recording the new upstream release and full verified commit;
-2. publishing a new immutable fork release;
-3. verifying release-asset checksums before use;
+1. recording the selected tool's exact upstream version and, for
+   `no-mistakes`, its full verified commit and immutable fork release;
+2. recording and verifying the official or release-asset SHA-256 for every
+   downloaded archive;
+3. updating the machine pins and immutable Worker build inputs together;
 4. building and testing on the PR without publishing;
 5. having the owner accept and merge the PR to main;
 6. letting GitHub Actions publish the image and authoritative Release Manifest;

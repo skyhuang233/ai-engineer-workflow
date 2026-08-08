@@ -37,6 +37,12 @@ func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	if !containsArgs(args, "--label", "workflow.run_id=run-1") {
 		t.Fatalf("docker args omit run label: %#v", args)
 	}
+	if !containsArgs(args, "--cap-add", "SYS_ADMIN") {
+		t.Fatalf("docker args omit bubblewrap namespace capability: %#v", args)
+	}
+	if !containsArgs(args, "--security-opt", "seccomp=unconfined") {
+		t.Fatalf("docker args omit bubblewrap-compatible seccomp policy: %#v", args)
+	}
 }
 
 func containsArgs(args []string, first, second string) bool {

@@ -315,7 +315,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 		return workspace{}, err
 	}
 	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
-		if err := runGit(ctx, "", "clone", "--local", "--no-hardlinks", sourceRepository, path); err != nil {
+		if err := runGit(ctx, "", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--local", "--no-hardlinks", sourceRepository, path); err != nil {
 			return workspace{}, fmt.Errorf("clone ticket workspace: %w", err)
 		}
 		if err := runGit(ctx, path, "checkout", "-b", branch); err != nil {
@@ -331,6 +331,9 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 		if strings.TrimSpace(current) != branch {
 			return workspace{}, fmt.Errorf("workspace branch is %q, want %q", strings.TrimSpace(current), branch)
 		}
+	}
+	if err := configureTicketWorkspaceLineEndings(ctx, path); err != nil {
+		return workspace{}, err
 	}
 	if err := validateLocalRemotes(ctx, path); err != nil {
 		return workspace{}, err
@@ -509,6 +512,9 @@ func (m WorkspaceManager) restore(ctx context.Context, ws workspace, commit stri
 	if commit == "" {
 		return errors.New("restore commit is empty")
 	}
+	if err := configureTicketWorkspaceLineEndings(ctx, ws.Path); err != nil {
+		return err
+	}
 	if err := runGit(ctx, ws.Path, "reset", "--hard"); err != nil {
 		return err
 	}
@@ -516,6 +522,16 @@ func (m WorkspaceManager) restore(ctx context.Context, ws workspace, commit stri
 		return err
 	}
 	return runGit(ctx, ws.Path, "clean", "-fdx")
+}
+
+func configureTicketWorkspaceLineEndings(ctx context.Context, path string) error {
+	if err := runGit(ctx, path, "config", "--local", "core.autocrlf", "false"); err != nil {
+		return fmt.Errorf("configure Ticket Workspace autocrlf: %w", err)
+	}
+	if err := runGit(ctx, path, "config", "--local", "core.eol", "lf"); err != nil {
+		return fmt.Errorf("configure Ticket Workspace line ending: %w", err)
+	}
+	return nil
 }
 
 func runGit(ctx context.Context, dir string, args ...string) error {

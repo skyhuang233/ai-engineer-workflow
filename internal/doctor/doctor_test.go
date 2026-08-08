@@ -210,8 +210,9 @@ func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Codex:         ToolPin{Version: "0.146.0"},
+		Go:            GoPin{Version: "1.25.12", LinuxAMD64SHA256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"},
 		NoMistakes: NoMistakesPin{
 			Version:            "v1.41.2",
 			UpstreamRepository: "kunchenguid/no-mistakes",
@@ -281,6 +282,11 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	resumed := strings.Join(executor.commands[1], " ")
 	if !strings.HasPrefix(initial, "docker run --rm") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec") {
 		t.Fatalf("initial Worker Codex command = %q", initial)
+	}
+	for _, command := range []string{initial, resumed} {
+		if !strings.Contains(command, "--cap-add SYS_ADMIN") || !strings.Contains(command, "--security-opt seccomp=unconfined") {
+			t.Fatalf("Worker Codex command omits bubblewrap sandbox permissions: %q", command)
+		}
 	}
 	if !strings.Contains(resumed, "codex exec resume") || !strings.Contains(resumed, "worker-session-7") {
 		t.Fatalf("resumed Worker Codex command = %q", resumed)

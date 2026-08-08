@@ -8,12 +8,14 @@ import (
 	"strings"
 )
 
+// Schema is the strict contract supplied to OpenAI structured output. Every
+// property is required, with null representing an unavailable commit.
 const Schema = `{
   "type": "object",
-  "required": ["summary", "checks"],
+  "required": ["summary", "commit", "checks"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
-    "commit": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
     "checks": {
       "type": "array",
       "minItems": 1,
@@ -31,6 +33,7 @@ const Schema = `{
   "additionalProperties": false
 }`
 
+// Validate also accepts legacy output that omitted commit.
 func Validate(output []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	var fields map[string]json.RawMessage
@@ -56,10 +59,10 @@ func Validate(output []byte) error {
 	if err := json.Unmarshal(summary, &summaryText); err != nil || jsonNull(summary) || strings.TrimSpace(summaryText) == "" {
 		return errors.New("structured result requires a nonempty summary")
 	}
-	if commit, ok := fields["commit"]; ok {
+	if commit, ok := fields["commit"]; ok && !jsonNull(commit) {
 		var commitText string
-		if err := json.Unmarshal(commit, &commitText); err != nil || jsonNull(commit) {
-			return errors.New("structured result commit must be a string")
+		if err := json.Unmarshal(commit, &commitText); err != nil {
+			return errors.New("structured result commit must be a string or null")
 		}
 	}
 	checks, ok := fields["checks"]
