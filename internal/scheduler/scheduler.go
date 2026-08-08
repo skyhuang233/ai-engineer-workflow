@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -121,6 +122,22 @@ func (d Dispatcher) Recover(ctx context.Context, repository string, rootNumber i
 			}
 			if containerRunning && workspaceAvailable {
 				continue
+			}
+			if d.ProvisionSession != nil && run.Kind == store.RunAgent {
+				_, provisionErr := d.ProvisionSession(ctx, store.SessionProvisioning{
+					SessionID: run.Claim.SessionID, Existing: true, WorkspacePath: run.Session.WorkspacePath,
+					CodexStatePath: run.Session.CodexStatePath, CurrentRunID: run.Claim.RunID,
+				})
+				if provisionErr != nil {
+					var authenticationFailure *store.SessionAuthenticationFailure
+					if !errors.As(provisionErr, &authenticationFailure) {
+						return fmt.Errorf("recover Ticket Session authentication %s: %w", run.Claim.SessionID, provisionErr)
+					}
+					if err := d.Store.RecordRecoveryAuthenticationFailure(ctx, run, authenticationFailure.DiagnosticsPath, now); err != nil {
+						return fmt.Errorf("record Ticket Session authentication failure %s: %w", run.Claim.SessionID, err)
+					}
+					continue
+				}
 			}
 			reason := "worker container is not running"
 			if !workspaceAvailable {

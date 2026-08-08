@@ -695,7 +695,7 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if failure.RunID == "" || failure.LeaseToken == "" || failure.DiagnosticsPath == "" {
+	if failure.RunID == "" || failure.LeaseToken == "" {
 		return ErrInvalidClaim
 	}
 	if failure.Now.IsZero() {
@@ -720,8 +720,10 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 		return err
 	}
 	now := formatTimestamp(failure.Now)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
-		return err
+	if failure.DiagnosticsPath != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, failure.RunID, failure.DiagnosticsPath, failure.Error, now); err != nil {
+			return err
+		}
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
 	if err != nil {

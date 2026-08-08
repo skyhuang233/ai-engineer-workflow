@@ -208,3 +208,52 @@ func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 		t.Fatalf("recovery retained dead run %q", claim.RunID)
 	}
 }
+
+func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := scheduler.Dispatcher{
+		Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{},
+		Recovery: recoveryInspector{workspaceReady: true}, Now: func() time.Time { return now.Add(time.Minute) },
+		ProvisionSession: func(_ context.Context, provisioning store.SessionProvisioning) (store.SessionProvisioningResult, error) {
+			if !provisioning.Existing || provisioning.CurrentRunID != claim.RunID {
+				t.Fatalf("recovery provisioning = %#v", provisioning)
+			}
+			return store.SessionProvisioningResult{}, &store.SessionAuthenticationFailure{}
+		},
+	}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("authentication-corrupt recovery Run remained active: %v", err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) != 1 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt recovery projection = %#v", projection.Tickets)
+	}
+}

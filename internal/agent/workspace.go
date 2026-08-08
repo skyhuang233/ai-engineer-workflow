@@ -81,7 +81,7 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 		if err := codexauth.ValidateChatGPT(authPath); err != nil {
 			failure := &store.SessionAuthenticationFailure{}
 			if provisioning.CurrentRunID != "" {
-				failure.DiagnosticsPath = m.writeMinimalAuthenticationDiagnostic(provisioning.CurrentRunID)
+				failure.DiagnosticsPath, _ = m.writeMinimalAuthenticationDiagnostic(provisioning.CurrentRunID)
 			}
 			return store.SessionProvisioningResult{}, failure
 		}
@@ -107,21 +107,59 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 	}}, nil
 }
 
-func (m WorkspaceManager) writeMinimalAuthenticationDiagnostic(runID string) string {
+func (m WorkspaceManager) writeMinimalAuthenticationDiagnostic(runID string) (string, error) {
 	dir := filepath.Join(m.CodexStateRoot, "diagnostics", runID)
-	path := filepath.Join(dir, "report.txt")
 	if filepath.Base(runID) != runID {
-		return path
-	}
-	if err := os.RemoveAll(dir); err != nil {
-		return path
+		return "", errors.New("diagnostic Run ID is invalid")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return path
+		return "", err
+	}
+	path := filepath.Join(dir, "report.txt")
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		return path, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 	body := "error: " + store.ErrSessionAuthenticationUnavailable.Error() + "\nevidence: detailed evidence omitted\n"
-	_ = os.WriteFile(path, []byte(body), 0o600)
-	return path
+	temporary, err := os.CreateTemp(dir, ".minimal-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if _, err := temporary.WriteString(body); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return "", err
+	}
+	removeTemporary = false
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("minimal diagnostic is not a regular file")
+	}
+	return path, nil
 }
 
 func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (bool, error) {

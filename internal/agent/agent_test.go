@@ -31,6 +31,7 @@ type fakeRuntime struct {
 	workspaceContent string
 	corruptCodexAuth bool
 	deleteCodexAuth  bool
+	blockDiagnostics bool
 	refreshedAuth    []byte
 }
 
@@ -82,6 +83,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	}
 	if r.deleteCodexAuth {
 		if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
+			return worker.Result{}, err
+		}
+	}
+	if r.blockDiagnostics {
+		if err := os.WriteFile(filepath.Join(filepath.Dir(spec.CodexStatePath), "diagnostics"), []byte("not a directory"), 0o600); err != nil {
 			return worker.Result{}, err
 		}
 	}
@@ -558,6 +564,34 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	}
 	if len(entries) != 1 || entries[0].Name() != "report.txt" {
 		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
+	}
+}
+
+func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		dirty: true, blockDiagnostics: true, err: errors.New("worker failed"),
+		results: []worker.Result{{Output: []byte("diagnostic storage unavailable"), ContainerID: "container-failed"}},
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail without diagnostics")); err == nil {
+		t.Fatal("failed worker run returned nil error")
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Run remained active after diagnostic failure: %v", err)
+	}
+	if _, err := db.RunDiagnostic(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("failed diagnostic path was persisted: %v", err)
 	}
 }
 

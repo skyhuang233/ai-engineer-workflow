@@ -67,6 +67,12 @@ ChatGPT authentication. It is atomically copied only when a Ticket Session has
 no `auth.json`, so a Session-local cache refreshed by Codex is never
 overwritten.
 
+Ticket Agents are trusted with this cache. Credential redaction in Worker
+artifacts is best effort rather than a security boundary; the workflow does
+not scan every commit, workspace artifact, output, or intermediate refresh
+generation for copied Codex credentials. Authentication-cache corruption must
+still durably fail the Run even when diagnostic evidence cannot be written.
+
 Doctor performs a real create-and-resume request inside the pinned Worker
 image using a temporary copy of this cache. A version-only Codex check is not
 sufficient: missing or rejected authentication fails the report before the

@@ -402,9 +402,7 @@ func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest,
 		return c.Workspace.restore(ctx, ws, restoreCommit)
 	})
 	var recordErr error
-	if diagnosticErr == nil {
-		recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: safeReason, Now: c.now()})
-	}
+	recordErr = c.Store.RecordRunFailure(ctx, store.RunFailure{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, DiagnosticsPath: diagnostic, Error: safeReason, Now: c.now()})
 	return Candidate{}, errors.Join(errors.New(safeReason), redactFailureError(diagnosticErr, redactor), redactFailureError(restoreErr, redactor), redactFailureError(recordErr, redactor))
 }
 

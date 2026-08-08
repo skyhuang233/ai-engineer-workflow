@@ -145,6 +145,45 @@ func TestCurrentClaimRejectsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestRecordRunFailureDoesNotRequireDiagnosticEvidence(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRunFailure(ctx, RunFailure{RunID: claim.RunID, LeaseToken: claim.LeaseToken, Error: "worker failed without evidence", Now: now.Add(time.Second)}); err != nil {
+		t.Fatalf("RecordRunFailure() = %v", err)
+	}
+	var runState string
+	if err := db.db.QueryRowContext(ctx, `SELECT state FROM worker_runs WHERE run_id = ?`, claim.RunID).Scan(&runState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" {
+		t.Fatalf("Run state = %q, want failed", runState)
+	}
+	if _, err := db.RunDiagnostic(ctx, claim.RunID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing evidence unexpectedly created a diagnostic: %v", err)
+	}
+}
+
 func TestCandidateAcceptanceRejectsAdditionalStructuredOutputProperties(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

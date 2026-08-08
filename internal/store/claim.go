@@ -336,7 +336,7 @@ func compensateSessionProvisioning(provisioning SessionProvisioningResult, cause
 
 func recordExpiredAuthenticationFailureTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, runID string, provisionErr error, now time.Time) (bool, error) {
 	var authenticationFailure *SessionAuthenticationFailure
-	if runID == "" || !errors.As(provisionErr, &authenticationFailure) || authenticationFailure.DiagnosticsPath == "" {
+	if runID == "" || !errors.As(provisionErr, &authenticationFailure) {
 		return false, nil
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), runID, RunRunning)
@@ -350,8 +350,10 @@ func recordExpiredAuthenticationFailureTx(ctx context.Context, tx *sql.Tx, versi
 	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND state = ?`, runID, LeaseActive); err != nil {
 		return true, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, authenticationFailure.DiagnosticsPath, ErrSessionAuthenticationUnavailable.Error(), formatTimestamp(now)); err != nil {
-		return true, err
+	if authenticationFailure.DiagnosticsPath != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_diagnostics(run_id, diagnostics_path, error, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, authenticationFailure.DiagnosticsPath, ErrSessionAuthenticationUnavailable.Error(), formatTimestamp(now)); err != nil {
+			return true, err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, runID); err != nil {
 		return true, err
@@ -363,6 +365,46 @@ func recordExpiredAuthenticationFailureTx(ctx context.Context, tx *sql.Tx, versi
 		return true, err
 	}
 	return true, nil
+}
+
+func (s *Store) RecordRecoveryAuthenticationFailure(ctx context.Context, run RecoveryRun, diagnosticsPath string, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if run.Claim.RunID == "" || run.Claim.LeaseToken == "" || run.Claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentRunID string
+	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AND l.state = ?`, run.Claim.RunID, run.Claim.LeaseToken, run.Claim.LeaseGeneration, RunRunning, LeaseActive).Scan(&currentRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidClaim
+	}
+	if err != nil {
+		return err
+	}
+	if currentRunID != run.Claim.RunID {
+		return ErrInvalidClaim
+	}
+	handled, err := recordExpiredAuthenticationFailureTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, run.Claim.RunID, &SessionAuthenticationFailure{DiagnosticsPath: diagnosticsPath}, now)
+	if err != nil {
+		return err
+	}
+	if !handled {
+		return ErrInvalidClaim
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int64) (TicketClaim, error) {
