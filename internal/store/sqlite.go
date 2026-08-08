@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 44
+	latestSchemaVersion = 45
 )
 
 var (
@@ -1171,6 +1171,39 @@ SET plan_version_ids_json = COALESCE((
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (44, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 45 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS plan_amendments (
+    amendment_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    issue_id INTEGER NOT NULL,
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    proposal_json TEXT NOT NULL,
+    impact_report TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'rejected', 'approved')),
+    applied_version_id TEXT NOT NULL DEFAULT '',
+    proposed_at TEXT NOT NULL,
+    decided_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS plan_amendments_pending_version_idx ON plan_amendments(version_id) WHERE state = 'pending'`,
+			`CREATE TABLE IF NOT EXISTS plan_amendment_pauses (
+    amendment_id TEXT NOT NULL REFERENCES plan_amendments(amendment_id),
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    PRIMARY KEY (amendment_id, issue_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 45: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (45, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

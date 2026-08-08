@@ -65,6 +65,8 @@ func TestValidateCandidateOutput(t *testing.T) {
 		{name: "complete", output: `{"summary":"implemented","commit":"abc","checks":[{"command":"go test ./...","outcome":"passed"}]}`, valid: true},
 		{name: "nullable commit", output: `{"summary":"implemented","commit":null,"checks":[{"command":"go test ./...","outcome":"passed"}]}`, valid: true},
 		{name: "legacy missing commit", output: `{"summary":"implemented","checks":[{"command":"go test ./...","outcome":"passed"}]}`, valid: true},
+		{name: "structured plan amendment", output: `{"summary":"dependency is obsolete","commit":null,"checks":[],"plan_amendment":{"summary":"dependency is obsolete","add_tickets":[],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[{"blocked_ticket_id":2,"blocker_ticket_id":1}]}}`, valid: true},
+		{name: "incomplete plan amendment", output: `{"summary":"dependency is obsolete","plan_amendment":{"summary":"dependency is obsolete","add_tickets":[]}}`},
 		{name: "additional property", output: `{"summary":"implemented","unexpected":"value"}`},
 		{name: "missing summary", output: `{"checks":[]}`},
 		{name: "missing verification evidence", output: `{"summary":"implemented"}`},

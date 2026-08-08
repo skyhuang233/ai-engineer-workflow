@@ -969,7 +969,8 @@ LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.
 LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
 LEFT JOIN worker_runs r ON r.run_id = s.current_run_id
 LEFT JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE t.version_id = ?`, versionID)
+WHERE t.version_id = ?
+  AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause JOIN plan_amendments amendment ON amendment.amendment_id = pause.amendment_id WHERE pause.version_id = t.version_id AND pause.issue_id = t.issue_id AND amendment.state = 'pending')`, versionID)
 	if err != nil {
 		return snapshot, err
 	}

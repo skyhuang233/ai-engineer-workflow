@@ -1335,7 +1335,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 		return err
 	}
 	if state != "open" {
-		if (kind == "closed_unmerged_impact" || kind == "inbox_delivery_recovery") && state == "answered" && priorAnswer == answer {
+		if (kind == "closed_unmerged_impact" || kind == "inbox_delivery_recovery" || kind == "plan_amendment") && state == "answered" && priorAnswer == answer {
 			return nil
 		}
 		return ErrNotFound
@@ -1396,6 +1396,15 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 			return ErrInvalidClaim
 		}
 		if err := resolveFrozenPlanPollFailureTx(ctx, tx, repository, versionID, now); err != nil {
+			return err
+		}
+	}
+	if kind == "plan_amendment" {
+		var decision amendmentDecision
+		if err := json.Unmarshal([]byte(answer), &decision); err != nil {
+			return ErrInvalidClaim
+		}
+		if err := s.resolvePlanAmendmentTx(ctx, tx, questionID, versionID, decision.Action, now); err != nil {
 			return err
 		}
 	}

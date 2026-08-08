@@ -168,14 +168,26 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
-	if commit == baseCommit {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output), &runRedactor)
-	}
 	var candidateOutput struct {
-		Commit string `json:"commit"`
+		Commit        string               `json:"commit"`
+		PlanAmendment *store.PlanAmendment `json:"plan_amendment"`
 	}
 	if err := json.Unmarshal(structured, &candidateOutput); err != nil {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result is invalid JSON", string(output), &runRedactor)
+	}
+	if candidateOutput.PlanAmendment != nil {
+		if commit != baseCommit || candidateOutput.Commit != "" {
+			return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Ticket Agent cannot combine a Plan Amendment with an implementation commit", string(output), &runRedactor)
+		}
+		candidateOutput.PlanAmendment.VersionID = request.Claim.VersionID
+		candidateOutput.PlanAmendment.TicketID = request.Claim.TicketID
+		if _, err := c.Store.ProposePlanAmendment(handoffCtx, *candidateOutput.PlanAmendment, c.now()); err != nil {
+			return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
+		}
+		return Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, StructuredOutput: structured}, nil
+	}
+	if commit == baseCommit {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output), &runRedactor)
 	}
 	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output), &runRedactor)
