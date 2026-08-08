@@ -406,6 +406,33 @@ func TestWorkspaceManagerRejectsOverlappingWorkspaceAndCodexState(t *testing.T) 
 	}
 }
 
+func TestWorkspaceManagerRollbackRemovesUncommittedSessionState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("host-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
+	result, err := manager.ProvisionCodexSession(ctx, store.SessionProvisioning{SessionID: "ts-uncommitted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(root, "codex", "ts-uncommitted")
+	if err := os.WriteFile(filepath.Join(state, "uncommitted-state"), []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result.Rollback == nil {
+		t.Fatal("new Session provisioning did not return rollback")
+	}
+	if err := result.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted Session state survived rollback: %v", err)
+	}
+}
+
 func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -445,7 +472,7 @@ func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
 	}
 }
 
-func TestControllerRejectsCredentialBearingCandidateBeforePersistence(t *testing.T) {
+func TestControllerAcceptsCredentialBearingCandidateInTrustedWorkflow(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -459,25 +486,18 @@ func TestControllerRejectsCredentialBearingCandidateBeforePersistence(t *testing
 	defer db.Close()
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-secret", "implemented with "+secret), ContainerID: "container-secret"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, GatewayURL: "http://gateway.test"}
-	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement safely")); err == nil || !strings.Contains(err.Error(), store.ErrSessionAuthenticationUnavailable.Error()) {
-		t.Fatalf("credential-bearing Candidate error = %v", err)
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement in trusted workflow")); err != nil {
+		t.Fatalf("credential-bearing Candidate was rejected: %v", err)
 	}
-	if _, err := db.CandidateRevision(ctx, claim.RunID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("credential-bearing Candidate persisted: %v", err)
-	}
-	diagnostic, err := db.RunDiagnostic(ctx, claim.RunID)
+	candidate, err := db.CandidateRevision(ctx, claim.RunID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("credential-bearing Candidate was not persisted: %v", err)
 	}
-	report, err := os.ReadFile(diagnostic)
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(string(candidate.StructuredOutput), secret) {
+		t.Fatalf("trusted Candidate output = %q, want preserved credential-bearing summary", candidate.StructuredOutput)
 	}
-	if strings.Contains(string(report), secret) || !strings.Contains(string(report), "detailed evidence omitted") {
-		t.Fatalf("credential-bearing Candidate diagnostic = %q", report)
-	}
-	if len(runtime.specs) != 1 {
-		t.Fatalf("credential-bearing Candidate launched %d workers", len(runtime.specs))
+	if len(runtime.specs) != 2 {
+		t.Fatalf("credential-bearing Candidate launched %d containers, want Worker and Delivery Controller", len(runtime.specs))
 	}
 }
 
@@ -524,7 +544,7 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
-	db, _, claim := createClaim(t, ctx, root)
+	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	authSource := filepath.Join(root, "host-auth.json")
 	if err := os.WriteFile(authSource, testChatGPTAuth("initial"), 0o600); err != nil {
@@ -564,6 +584,13 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	}
 	if len(entries) != 1 || entries[0].Name() != "report.txt" {
 		t.Fatalf("minimal diagnostic persisted unsafe evidence: %#v", entries)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("authentication-corrupt Run projection = %#v", projection.Tickets)
 	}
 }
 

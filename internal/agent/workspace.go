@@ -94,14 +94,14 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 		return store.SessionProvisioningResult{}, err
 	}
 	return store.SessionProvisioningResult{Rollback: func() error {
-		if err := os.Remove(authPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove uncommitted Ticket Session Codex authentication cache: %w", err)
+		if err := os.RemoveAll(state); err != nil {
+			return fmt.Errorf("remove uncommitted Ticket Session Codex state: %w", err)
 		}
-		if _, err := os.Stat(authPath); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
 			if err == nil {
-				return errors.New("uncommitted Ticket Session Codex authentication cache still exists")
+				return errors.New("uncommitted Ticket Session Codex state still exists")
 			}
-			return fmt.Errorf("verify uncommitted Ticket Session Codex authentication cache removal: %w", err)
+			return fmt.Errorf("verify uncommitted Ticket Session Codex state removal: %w", err)
 		}
 		return nil
 	}}, nil

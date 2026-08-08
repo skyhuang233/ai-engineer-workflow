@@ -451,7 +451,7 @@ func TestDeliveryCompletionRequiresUnexpiredLease(t *testing.T) {
 	}
 }
 
-func TestExpiredAgentFailureRecordsDiagnosticsWithoutMutatingWorkflow(t *testing.T) {
+func TestExpiredCurrentAgentFailureTerminatesRun(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -493,8 +493,8 @@ JOIN ticket_sessions s ON s.session_id = r.session_id
 WHERE r.run_id = ?`, claim.RunID).Scan(&runState, &leaseState, &failures); err != nil {
 		t.Fatal(err)
 	}
-	if runState != RunRunning || leaseState != LeaseActive || failures != 0 {
-		t.Fatalf("late agent failure mutated run=%q lease=%q failures=%d", runState, leaseState, failures)
+	if runState != "failed" || leaseState != "revoked" || failures != 1 {
+		t.Fatalf("late current agent failure left run=%q lease=%q failures=%d", runState, leaseState, failures)
 	}
 }
 

@@ -708,11 +708,12 @@ func (s *Store) RecordRunFailure(ctx context.Context, failure RunFailure) error 
 		return err
 	}
 	defer tx.Rollback()
-	var currentRunID, runState, leaseState, expiresText string
-	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id, r.state, l.state, l.expires_at
+	var currentRunID, runState, leaseState, versionID string
+	var issueID int64
+	err = tx.QueryRowContext(ctx, `SELECT s.current_run_id, r.state, l.state, s.version_id, s.issue_id
 FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, failure.LeaseToken, RunAgent).Scan(&currentRunID, &runState, &leaseState, &expiresText)
+WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, failure.LeaseToken, RunAgent).Scan(&currentRunID, &runState, &leaseState, &versionID, &issueID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -725,11 +726,7 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 			return err
 		}
 	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
-	if err != nil {
-		return err
-	}
-	if currentRunID != failure.RunID || runState != RunRunning || leaseState != LeaseActive || !expiresAt.After(failure.Now) {
+	if currentRunID != failure.RunID || runState != RunRunning || leaseState != LeaseActive {
 		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, now, failure.RunID, RunRunning); err != nil {
@@ -740,6 +737,12 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.run_kind = ?`, failure.RunID, fai
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, now, failure.RunID); err != nil {
 		return err
+	}
+	if failure.Error == ErrSessionAuthenticationUnavailable.Error() {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, failure.Error, failure.Now); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, failure.RunID)
 	if err != nil {
