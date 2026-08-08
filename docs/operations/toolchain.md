@@ -84,6 +84,10 @@ sufficient: missing or rejected authentication fails the report before the
 Worker image is activated. The temporary copy is removed after the probe, and
 credential contents are never included in the report.
 
+Doctor's production check runner has one fixed 10-minute shared deadline. The
+budget includes a cold pull of the exact Worker digest and the real Codex
+create-and-resume probe; reaching the deadline fails the run.
+
 `--workflow-repository` is the independently supplied repository that contains
 the publisher workflow. Doctor requires it to exactly match
 `worker.release_repository`, verifies that repository belongs to the configured

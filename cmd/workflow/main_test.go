@@ -33,6 +33,7 @@ func TestDoctorVerificationBudgetAllowsColdWorkerPullAndCodexResume(t *testing.T
 	if doctorVerificationTimeout != 10*time.Minute {
 		t.Fatalf("doctorVerificationTimeout = %s, want 10m", doctorVerificationTimeout)
 	}
+	t.Logf("workflow doctor verification budget = %s", doctorVerificationTimeout)
 }
 
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
