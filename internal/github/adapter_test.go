@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
 )
 
 func TestReadPlanUsesNativeSubIssuesAndBlockedByEndpoints(t *testing.T) {
@@ -128,8 +129,82 @@ func TestActionablePullRequestFeedbackIncludesOwnerEventsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 4 || events[0].Source != "review" || events[1].Source != "review" || events[1].Author != "owner" || events[1].Body != "Review submitted with state: APPROVED" || events[2].Source != "inline-comment" || events[3].Source != "conversation-comment" {
+	if len(events) != 3 || events[0].Source != "review" || events[1].Source != "inline-comment" || events[2].Source != "conversation-comment" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestPullRequestApprovalMustMatchCurrentCandidate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo/pulls/7/reviews" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"state": "APPROVED", "commit_id": "old-candidate", "user": map[string]string{"login": "owner", "type": "User"}}})
+	}))
+	defer server.Close()
+	approved, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").PullRequestApproved(context.Background(), "owner/repo", 7, "rebased-candidate")
+	if err != nil || approved {
+		t.Fatalf("stale approval approved=%t err=%v", approved, err)
+	}
+}
+
+func TestActionablePullRequestFeedbackBatchesSubmittedReviewAndDebouncesLooseInlineComments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/7/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 50, "body": "Please revise this.", "state": "CHANGES_REQUESTED", "user": map[string]string{"login": "owner", "type": "User"}}})
+		case "/repos/owner/repo/pulls/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 51, "body": "This line needs a test.", "pull_request_review_id": 50, "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 52, "body": "One more standalone concern.", "user": map[string]string{"login": "owner", "type": "User"}}})
+		case "/repos/owner/repo/issues/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	events, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ActionablePullRequestFeedback(context.Background(), "owner/repo", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %#v", events)
+	}
+	if events[0].BatchID != "review-submission:50" || !events[0].Debounce {
+		t.Fatalf("review event = %#v", events[0])
+	}
+	if events[1].BatchID != "review-submission:50" || !events[1].Debounce {
+		t.Fatalf("submitted inline event = %#v", events[1])
+	}
+	if events[2].BatchID != "" || !events[2].Debounce {
+		t.Fatalf("standalone inline event = %#v", events[2])
+	}
+}
+
+func TestActionablePullRequestFeedbackDebouncesInlineCommentOnPendingReview(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/7/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 50, "body": "Draft review.", "state": "PENDING", "user": map[string]string{"login": "owner", "type": "User"}}})
+		case "/repos/owner/repo/pulls/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 51, "body": "Draft inline concern.", "pull_request_review_id": 50, "user": map[string]string{"login": "owner", "type": "User"}}})
+		case "/repos/owner/repo/issues/7/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	events, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").ActionablePullRequestFeedback(context.Background(), "owner/repo", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].BatchID != "" || !events[0].Debounce {
+		t.Fatalf("pending review events = %#v", events)
 	}
 }
 
@@ -238,7 +313,7 @@ func TestHasPlanProjectionRejectsLegacyAndDuplicateStatusComments(t *testing.T) 
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(comments) }))
 		_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, projection)
 		server.Close()
-		if err == nil {
+		if !errors.Is(err, store.ErrDeliveryRejected) {
 			t.Fatalf("invalid status comments were accepted: %#v", comments)
 		}
 	}
@@ -254,7 +329,7 @@ func TestUpdatePlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T)
 	defer server.Close()
 
 	err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").UpdatePlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
-	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("UpdatePlanProjection error = %v", err)
 	}
 }
@@ -266,7 +341,7 @@ func TestHasPlanProjectionRejectsLegacyMarkerRegardlessOfDigest(t *testing.T) {
 	defer server.Close()
 
 	_, err := NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner").HasPlanProjection(context.Background(), "owner/repo", 10, plan.Projection{VersionID: "pv-1", State: "Active"})
-	if err == nil || !strings.Contains(err.Error(), "legacy workflow projection comment") {
+	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), "legacy workflow projection comment") {
 		t.Fatalf("HasPlanProjection error = %v", err)
 	}
 }
@@ -380,7 +455,11 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "workflow-answer:needs-attention-pv-1-1-g1: cancel-plan", "user": map[string]string{"login": "reviewer", "type": "User"}}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "body": "workflow-answer:needs-attention-pv-1-1-g1: retry after restoring access\nworkflow-answer:unknown: ignored", "user": map[string]string{"login": "owner", "type": "User"}}, {"id": 2, "body": "workflow-answer:needs-attention-pv-1-1-g1: proceed", "user": map[string]string{"login": "reviewer", "type": "User"}}, {"id": 3, "body": "workflow-answer:needs-attention-pv-1-1-g1: cancel-plan", "user": map[string]string{"login": "outsider", "type": "User"}}})
+		case "/repos/owner/repo/collaborators/reviewer":
+			w.WriteHeader(http.StatusNoContent)
+		case "/repos/owner/repo/collaborators/outsider":
+			w.WriteHeader(http.StatusNotFound)
 		default:
 			t.Fatalf("request = %s %s", r.Method, r.URL.String())
 		}
@@ -390,7 +469,7 @@ func TestWorkflowInboxAnswersExtractsKnownIdAddressedReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answers["needs-attention-pv-1-1-g1"] != "retry after restoring access" || len(answers) != 1 {
+	if answers["needs-attention-pv-1-1-g1"] != "proceed" || len(answers) != 1 {
 		t.Fatalf("answers = %#v", answers)
 	}
 }

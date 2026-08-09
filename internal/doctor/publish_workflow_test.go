@@ -20,7 +20,7 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	if !strings.Contains(string(workflow), "-- deploy/worker .github/workflows/publish-worker.yml") {
 		t.Fatal("publisher workflow changes do not require a Worker release")
 	}
-	if !strings.Contains(string(workflow), "schema_version:3") || !strings.Contains(string(workflow), "@base64") {
+	if !strings.Contains(string(workflow), "schema_version:4") || !strings.Contains(string(workflow), "@base64") {
 		t.Fatal("publisher workflow does not use the canonical base64 Worker input encoding")
 	}
 	if !strings.Contains(string(workflow), "worker-v${{ steps.pins.outputs.worker_version }}-$identity") {
@@ -46,6 +46,9 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	}
 	if !strings.Contains(string(workflow), "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}") {
 		t.Fatal("publisher workflow does not pass the pinned Go checksum to the Worker build")
+	}
+	if !strings.Contains(string(workflow), "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_sha256 }}") {
+		t.Fatal("publisher workflow does not pass the pinned GitHub CLI checksum to the Worker build")
 	}
 }
 
@@ -110,6 +113,31 @@ func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 	for _, required := range []string{`- "**/*.go"`, `- "go.mod"`, `- "go.sum"`, "go test ./..."} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("worker-contract does not preserve Control Plane test coverage: missing %q", required)
+		}
+	}
+}
+
+func TestWorkerWorkflowsBindSBOMAndFailClosedOnFixableHighVulnerabilities(t *testing.T) {
+	publish := readWorkflow(t, ".github", "workflows", "publish-worker.yml")
+	contract := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
+	for name, workflow := range map[string]string{"publish-worker": publish, "worker-contract": contract} {
+		for _, required := range []string{
+			"anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
+			"anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2",
+			"output-file: worker-sbom.spdx.json",
+			"sbom: worker-sbom.spdx.json",
+			"fail-build: true",
+			"severity-cutoff: high",
+			"only-fixed: true",
+		} {
+			if !strings.Contains(workflow, required) {
+				t.Fatalf("%s omits the Worker supply-chain gate %q", name, required)
+			}
+		}
+	}
+	for _, required := range []string{"sbom_sha256", "worker-sbom.spdx.json", "schema_version:5"} {
+		if !strings.Contains(publish, required) {
+			t.Fatalf("publish-worker does not bind SBOM evidence in the release: missing %q", required)
 		}
 	}
 }

@@ -1,7 +1,11 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "codex": {
-    "version": "0.146.0"
+    "version": "0.147.0"
+  },
+  "github_cli": {
+    "version": "2.97.0",
+    "linux_amd64_sha256": "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"
   },
   "go": {
     "version": "1.25.12",
@@ -12,8 +16,8 @@
     "upstream_repository": "kunchenguid/no-mistakes",
     "upstream_commit": "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
     "fork_repository": "skyhuang233/no-mistakes",
-    "fork_release": "workflow-v1.41.2.0",
-    "linux_amd64_sha256": "a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825"
+    "fork_release": "workflow-v1.41.2.1",
+    "linux_amd64_sha256": "1e6dc5c2b30271060da987f7bc3146301a11c6c4f1a37b670b5d735156d1abed"
   },
   "worker": {
     "version": "0.1.0",

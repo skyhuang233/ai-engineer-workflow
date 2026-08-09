@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,7 +23,8 @@ import (
 )
 
 type SQLiteCheck struct {
-	Path string
+	Path       string
+	BackupPath string
 }
 
 func (SQLiteCheck) Name() string { return "SQLite durability and locking" }
@@ -42,7 +44,25 @@ func (c SQLiteCheck) Run(ctx context.Context) Result {
 		return Result{Status: Fail, Summary: fmt.Sprintf("journal=%s synchronous=%d foreign_keys=%t integrity=%s write_locking=%t",
 			health.JournalMode, health.Synchronous, health.ForeignKeys, health.Integrity, health.WriteLocking)}
 	}
-	return Result{Status: Pass, Summary: "WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified"}
+	backupPath := c.BackupPath
+	if backupPath == "" {
+		backupPath = c.Path + ".backup"
+	}
+	metrics, metricsErr := database.OperationalMetrics(ctx, backupPath, time.Now().UTC())
+	if metricsErr != nil {
+		if !os.IsNotExist(rootCause(metricsErr)) {
+			return Result{Status: Fail, Summary: fmt.Sprintf("read SQLite backup operations metrics: %v", metricsErr), Err: metricsErr}
+		}
+		return Result{Status: Pass, Summary: "WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified; backup=unavailable"}
+	}
+	return Result{Status: Pass, Summary: fmt.Sprintf("WAL, synchronous=FULL, foreign keys, integrity, and serialized writer locking verified; backup_age=%s drill_succeeded=%t outbox_age=%s reconcile_lag=%s", metrics.BackupAge.Round(time.Second), metrics.DrillSucceeded, metrics.OutboxAge.Round(time.Second), metrics.ReconcileLag.Round(time.Second))}
+}
+
+func rootCause(err error) error {
+	for next := errors.Unwrap(err); next != nil; next = errors.Unwrap(err) {
+		err = next
+	}
+	return err
 }
 
 type DockerCheck struct {
@@ -181,6 +201,7 @@ printf worker > /workspace/container-marker
 curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_PROBE_TOKEN}" "http://host.docker.internal:${WORKFLOW_GATEWAY_PROBE_PORT}/health"
 printf "\nmount=ok\n"
 codex --version
+gh --version
 go version
 no-mistakes --version
 env | cut -d= -f1`
@@ -209,7 +230,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "gh version " + c.Manifest.GitHubCLIVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
@@ -362,6 +383,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
+		Immutable       bool   `json:"immutable"`
 		Assets          []struct {
 			ID   int64  `json:"id"`
 			Name string `json:"name"`
@@ -370,6 +392,9 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
 		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
 		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit", Err: err}
+	}
+	if !forkRelease.Immutable {
+		return Result{Status: Fail, Summary: "pinned no-mistakes fork release is not immutable"}
 	}
 	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
 	assetID := int64(0)

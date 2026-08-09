@@ -14,21 +14,31 @@ import (
 )
 
 type WorkerReleaseManifest struct {
-	SchemaVersion                int    `json:"schema_version"`
-	WorkerVersion                string `json:"worker_version"`
-	SourceCommit                 string `json:"source_commit"`
-	Image                        string `json:"image"`
-	CodexVersion                 string `json:"codex_version"`
-	GoVersion                    string `json:"go_version"`
-	GoLinuxAMD64SHA256           string `json:"go_linux_amd64_sha256"`
-	NoMistakesVersion            string `json:"no_mistakes_version"`
-	NoMistakesUpstreamRepository string `json:"no_mistakes_upstream_repository"`
-	NoMistakesCommit             string `json:"no_mistakes_commit"`
-	NoMistakesForkRepository     string `json:"no_mistakes_fork_repository"`
-	NoMistakesForkRelease        string `json:"no_mistakes_fork_release"`
-	NoMistakesLinuxAMD64SHA256   string `json:"no_mistakes_linux_amd64_sha256"`
-	BuildInputIdentity           string `json:"build_input_identity"`
-	GitHubActionsRunID           int64  `json:"github_actions_run_id"`
+	SchemaVersion                int                     `json:"schema_version"`
+	WorkerVersion                string                  `json:"worker_version"`
+	SourceCommit                 string                  `json:"source_commit"`
+	Image                        string                  `json:"image"`
+	CodexVersion                 string                  `json:"codex_version"`
+	GitHubCLIVersion             string                  `json:"github_cli_version"`
+	GitHubCLILinuxAMD64SHA256    string                  `json:"github_cli_linux_amd64_sha256"`
+	GoVersion                    string                  `json:"go_version"`
+	GoLinuxAMD64SHA256           string                  `json:"go_linux_amd64_sha256"`
+	NoMistakesVersion            string                  `json:"no_mistakes_version"`
+	NoMistakesUpstreamRepository string                  `json:"no_mistakes_upstream_repository"`
+	NoMistakesCommit             string                  `json:"no_mistakes_commit"`
+	NoMistakesForkRepository     string                  `json:"no_mistakes_fork_repository"`
+	NoMistakesForkRelease        string                  `json:"no_mistakes_fork_release"`
+	NoMistakesLinuxAMD64SHA256   string                  `json:"no_mistakes_linux_amd64_sha256"`
+	BuildInputIdentity           string                  `json:"build_input_identity"`
+	SBOMSHA256                   string                  `json:"sbom_sha256"`
+	VulnerabilityScan            VulnerabilityScanPolicy `json:"vulnerability_scan"`
+	GitHubActionsRunID           int64                   `json:"github_actions_run_id"`
+}
+
+type VulnerabilityScanPolicy struct {
+	Scanner        string `json:"scanner"`
+	SeverityCutoff string `json:"severity_cutoff"`
+	OnlyFixed      bool   `json:"only_fixed"`
 }
 
 type workerBuildInputs struct {
@@ -36,6 +46,7 @@ type workerBuildInputs struct {
 	DeployWorkerTree          string        `json:"deploy_worker_tree"`
 	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
 	Codex                     ToolPin       `json:"codex"`
+	GitHubCLI                 GitHubCLIPin  `json:"github_cli"`
 	Go                        GoPin         `json:"go"`
 	NoMistakes                NoMistakesPin `json:"no_mistakes"`
 	Worker                    WorkerPin     `json:"worker"`
@@ -46,6 +57,7 @@ type canonicalWorkerBuildInputs struct {
 	DeployWorkerTree          string        `json:"deploy_worker_tree"`
 	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
 	Codex                     ToolPin       `json:"codex"`
+	GitHubCLI                 GitHubCLIPin  `json:"github_cli"`
 	Go                        GoPin         `json:"go"`
 	NoMistakes                NoMistakesPin `json:"no_mistakes"`
 	Worker                    WorkerPin     `json:"worker"`
@@ -118,19 +130,23 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if err := client.RequestJSON(ctx, http.MethodGet, releasePath, nil, &release); err != nil {
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("read authoritative Worker Release: %w", err)
 	}
-	var assetID int64
-	manifestAssets := 0
+	var manifestAssetID, sbomAssetID int64
+	manifestAssets, sbomAssets := 0, 0
 	for _, asset := range release.Assets {
-		if asset.Name == "worker-release.json" {
+		switch asset.Name {
+		case "worker-release.json":
 			manifestAssets++
-			assetID = asset.ID
+			manifestAssetID = asset.ID
+		case "worker-sbom.spdx.json":
+			sbomAssets++
+			sbomAssetID = asset.ID
 		}
 	}
-	if len(release.Assets) != 1 || manifestAssets != 1 || assetID == 0 {
-		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must contain only one worker-release.json asset")
+	if len(release.Assets) != 2 || manifestAssets != 1 || sbomAssets != 1 || manifestAssetID == 0 || sbomAssetID == 0 {
+		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must contain exactly one worker-release.json and one worker-sbom.spdx.json asset")
 	}
 	raw, err := client.RequestBytes(ctx,
-		fmt.Sprintf("/repos/%s/releases/assets/%d", config.Worker.ReleaseRepository, assetID),
+		fmt.Sprintf("/repos/%s/releases/assets/%d", config.Worker.ReleaseRepository, manifestAssetID),
 		"application/octet-stream")
 	if err != nil {
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("download authoritative Worker Release Manifest: %w", err)
@@ -141,6 +157,19 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	}
 	if err := manifest.Validate(config); err != nil {
 		return WorkerReleaseManifest{}, nil, err
+	}
+	sbom, err := client.RequestBytes(ctx,
+		fmt.Sprintf("/repos/%s/releases/assets/%d", config.Worker.ReleaseRepository, sbomAssetID),
+		"application/octet-stream")
+	if err != nil {
+		return WorkerReleaseManifest{}, nil, fmt.Errorf("download authoritative Worker SBOM: %w", err)
+	}
+	if err := validateWorkerSBOM(sbom); err != nil {
+		return WorkerReleaseManifest{}, nil, err
+	}
+	sbomDigest := sha256.Sum256(sbom)
+	if fmt.Sprintf("%x", sbomDigest) != manifest.SBOMSHA256 {
+		return WorkerReleaseManifest{}, nil, errors.New("Worker SBOM checksum does not match the Release Manifest")
 	}
 	if release.TargetCommitish != manifest.SourceCommit {
 		return WorkerReleaseManifest{}, nil, errors.New("Worker Release target does not match manifest source commit")
@@ -208,7 +237,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 
 func (m WorkerReleaseManifest) Validate(config Config) error {
 	switch {
-	case m.SchemaVersion != 3:
+	case m.SchemaVersion != 5:
 		return errors.New("unsupported Worker Release Manifest schema")
 	case m.WorkerVersion != config.Worker.Version:
 		return errors.New("Worker Release version does not match toolchain")
@@ -218,6 +247,8 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 		return errors.New("Worker Release image does not match the immutable toolchain repository")
 	case m.CodexVersion != config.Codex.Version:
 		return errors.New("Worker Release Codex version does not match toolchain")
+	case m.GitHubCLIVersion != config.GitHubCLI.Version || m.GitHubCLILinuxAMD64SHA256 != config.GitHubCLI.LinuxAMD64SHA256:
+		return errors.New("Worker Release GitHub CLI pin does not match toolchain")
 	case m.GoVersion != config.Go.Version || m.GoLinuxAMD64SHA256 != config.Go.LinuxAMD64SHA256:
 		return errors.New("Worker Release Go pin does not match toolchain")
 	case m.NoMistakesVersion != config.NoMistakes.Version || m.NoMistakesUpstreamRepository != config.NoMistakes.UpstreamRepository ||
@@ -227,11 +258,29 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 		return errors.New("Worker Release no-mistakes pin does not match toolchain")
 	case !sha256Pattern.MatchString(m.BuildInputIdentity):
 		return errors.New("Worker Release build input identity must be SHA-256")
+	case !sha256Pattern.MatchString(m.SBOMSHA256):
+		return errors.New("Worker Release SBOM checksum must be SHA-256")
+	case m.VulnerabilityScan.Scanner != "grype" || m.VulnerabilityScan.SeverityCutoff != "high" || !m.VulnerabilityScan.OnlyFixed:
+		return errors.New("Worker Release vulnerability scan must fail on fixable high-or-greater Grype findings")
 	case m.GitHubActionsRunID <= 0:
 		return errors.New("Worker Release Actions run ID is required")
 	default:
 		return nil
 	}
+}
+
+func validateWorkerSBOM(raw []byte) error {
+	var document struct {
+		SPDXVersion string `json:"spdxVersion"`
+		Name        string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return fmt.Errorf("decode authoritative Worker SBOM: %w", err)
+	}
+	if document.SPDXVersion != "SPDX-2.3" || strings.TrimSpace(document.Name) == "" {
+		return errors.New("authoritative Worker SBOM must be a named SPDX 2.3 document")
+	}
+	return nil
 }
 
 func resolveWorkerBuildInputs(ctx context.Context, client *githubapi.Client, repository, ref string) (resolvedWorkerBuildInputs, error) {
@@ -306,10 +355,11 @@ func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tre
 
 func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
 	inputs := workerBuildInputs{
-		SchemaVersion:             3,
+		SchemaVersion:             4,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
+		GitHubCLI:                 config.GitHubCLI,
 		Go:                        config.Go,
 		NoMistakes:                config.NoMistakes,
 		Worker:                    config.Worker,
@@ -326,6 +376,10 @@ func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuil
 		PublishWorkerWorkflowBlob: base64.StdEncoding.EncodeToString([]byte(inputs.PublishWorkerWorkflowBlob)),
 		Codex: ToolPin{
 			Version: base64.StdEncoding.EncodeToString([]byte(inputs.Codex.Version)),
+		},
+		GitHubCLI: GitHubCLIPin{
+			Version:          base64.StdEncoding.EncodeToString([]byte(inputs.GitHubCLI.Version)),
+			LinuxAMD64SHA256: base64.StdEncoding.EncodeToString([]byte(inputs.GitHubCLI.LinuxAMD64SHA256)),
 		},
 		Go: GoPin{
 			Version:          base64.StdEncoding.EncodeToString([]byte(inputs.Go.Version)),

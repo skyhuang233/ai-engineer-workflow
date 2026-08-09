@@ -7,12 +7,39 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestSQLiteCheckReportsBackupAndRecoveryMetrics(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPath := databasePath + ".backup"
+	if _, err := database.CreateOnlineBackup(ctx, backupPath, time.Now().UTC()); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DrillBackup(ctx, backupPath, time.Now().UTC()); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := (SQLiteCheck{Path: databasePath, BackupPath: backupPath}).Run(ctx)
+	if result.Status != Pass || !strings.Contains(result.Summary, "backup_age=") || !strings.Contains(result.Summary, "drill_succeeded=true") || !strings.Contains(result.Summary, "outbox_age=") || !strings.Contains(result.Summary, "reconcile_lag=") {
+		t.Fatalf("SQLite doctor backup metrics = %#v", result)
+	}
+}
 
 type memoryCredential struct{ secret string }
 
@@ -26,6 +53,7 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	digest := sha256.Sum256(asset)
 	config.NoMistakes.LinuxAMD64SHA256 = hex.EncodeToString(digest[:])
 	var paths []string
+	immutableRelease := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -49,7 +77,7 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": immutableRelease, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -73,6 +101,11 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("GitHub check = %#v", result)
 	}
+	immutableRelease = false
+	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "immutable") {
+		t.Fatalf("GitHub check accepted a mutable no-mistakes release: %#v", result)
+	}
+	immutableRelease = true
 	asset = []byte("tampered no-mistakes asset")
 	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "checksum") {
 		t.Fatalf("GitHub check accepted tampered no-mistakes asset: %#v", result)
@@ -268,7 +301,7 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/8/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": true, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}

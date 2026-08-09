@@ -76,6 +76,123 @@ func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV39AddsQualityGateQuestions(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 40"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP INDEX quality_gate_questions_fingerprint_idx"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE quality_gate_questions"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var columns int
+	if err := migrated.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('quality_gate_questions') WHERE name IN ('fingerprint', 'allowed_answers_json', 'consumed_at')").Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns != 3 {
+		t.Fatalf("quality_gate_questions columns = %d, want 3", columns)
+	}
+}
+
+func TestMigrationFromV40AddsTicketDeliveryMergeCommit(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 41"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_deliveries DROP COLUMN merge_commit"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if !hasColumn(t, ctx, migrated.db, "ticket_deliveries", "merge_commit") {
+		t.Fatal("migration did not add ticket_deliveries.merge_commit")
+	}
+}
+
+func TestMigrationFromV42AddsMergeReadyObservationColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 43"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	for _, column := range []string{"validated_base_commit", "validated_head_commit"} {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE ticket_deliveries DROP COLUMN "+column); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for _, column := range []string{"validated_base_commit", "validated_head_commit"} {
+		if !hasColumn(t, ctx, migrated.db, "ticket_deliveries", column) {
+			t.Fatalf("migration did not add ticket_deliveries.%s", column)
+		}
+	}
+}
+
 func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

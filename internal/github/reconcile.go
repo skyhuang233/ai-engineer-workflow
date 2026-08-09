@@ -51,13 +51,13 @@ func (r DeliveredReconciler) ReconcileTicket(ctx context.Context, delivery store
 }
 
 func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store.TicketDelivery) (pullRequestState, error) {
-	state, err := r.Client.pullRequestDeliveryState(ctx, delivery.Repository, delivery.PullRequestNumber, delivery.CandidateCommit)
+	deliveryState, err := r.Client.pullRequestDelivery(ctx, delivery.Repository, delivery.PullRequestNumber, delivery.CandidateCommit)
 	if err != nil {
 		return pullRequestPending, err
 	}
-	switch state {
+	switch deliveryState.State {
 	case pullRequestDelivered:
-		if err := r.Store.MarkTicketDelivered(ctx, delivery.VersionID, delivery.IssueID); err != nil {
+		if _, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, deliveryState.MergeCommit); err != nil {
 			return pullRequestPending, wrapPollStoreError(err)
 		}
 	case pullRequestClosedUnmerged:
@@ -65,7 +65,7 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 			return pullRequestPending, wrapPollStoreError(err)
 		}
 	}
-	return state, nil
+	return deliveryState.State, nil
 }
 
 type pullRequestState int
@@ -77,11 +77,16 @@ const (
 )
 
 func (c *Client) pullRequestReachedMain(ctx context.Context, repository string, number int64, candidateCommit string) (bool, error) {
-	state, err := c.pullRequestDeliveryState(ctx, repository, number, candidateCommit)
-	return state == pullRequestDelivered, err
+	deliveryState, err := c.pullRequestDelivery(ctx, repository, number, candidateCommit)
+	return deliveryState.State == pullRequestDelivered, err
 }
 
-func (c *Client) pullRequestDeliveryState(ctx context.Context, repository string, number int64, candidateCommit string) (pullRequestState, error) {
+type pullRequestDeliveryResult struct {
+	State       pullRequestState
+	MergeCommit string
+}
+
+func (c *Client) pullRequestDelivery(ctx context.Context, repository string, number int64, candidateCommit string) (pullRequestDeliveryResult, error) {
 	var pull struct {
 		State          string       `json:"state"`
 		MergedAt       string       `json:"merged_at"`
@@ -92,29 +97,29 @@ func (c *Client) pullRequestDeliveryState(ctx context.Context, repository string
 		} `json:"base"`
 	}
 	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10), &pull); err != nil {
-		return pullRequestPending, err
+		return pullRequestDeliveryResult{}, err
 	}
 	if pull.State != "closed" {
-		return pullRequestPending, nil
+		return pullRequestDeliveryResult{State: pullRequestPending}, nil
 	}
 	if pull.MergedAt == "" {
-		return pullRequestClosedUnmerged, nil
+		return pullRequestDeliveryResult{State: pullRequestClosedUnmerged}, nil
 	}
 	if !actionableAuthor(c.RepositoryOwner, pull.MergedBy.Login, pull.MergedBy.Type) {
-		return pullRequestPending, nil
+		return pullRequestDeliveryResult{State: pullRequestPending}, nil
 	}
 	if pull.MergeCommitSHA == "" || pull.Base.Ref != "main" || candidateCommit == "" {
-		return pullRequestPending, nil
+		return pullRequestDeliveryResult{State: pullRequestPending}, nil
 	}
 	var comparison struct {
 		Status string `json:"status"`
 	}
 	path := "/repos/" + repository + "/compare/" + url.PathEscape(candidateCommit) + "...main"
 	if err := c.getJSON(ctx, path, &comparison); err != nil {
-		return pullRequestPending, err
+		return pullRequestDeliveryResult{}, err
 	}
 	if comparison.Status == "ahead" || comparison.Status == "identical" {
-		return pullRequestDelivered, nil
+		return pullRequestDeliveryResult{State: pullRequestDelivered, MergeCommit: pull.MergeCommitSHA}, nil
 	}
-	return pullRequestPending, nil
+	return pullRequestDeliveryResult{State: pullRequestPending}, nil
 }

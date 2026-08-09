@@ -12,13 +12,13 @@ import (
 // property is required, with null representing an unavailable commit.
 const Schema = `{
   "type": "object",
-  "required": ["summary", "commit", "checks"],
+  "required": ["summary", "commit", "checks", "plan_amendment"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
     "commit": {"type": ["string", "null"]},
     "checks": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "type": "object",
         "required": ["command", "outcome"],
@@ -28,6 +28,18 @@ const Schema = `{
         },
         "additionalProperties": false
       }
+    },
+    "plan_amendment": {
+      "type": ["object", "null"],
+      "required": ["summary", "add_tickets", "remove_ticket_ids", "add_dependencies", "remove_dependencies"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1},
+        "add_tickets": {"type": "array"},
+        "remove_ticket_ids": {"type": "array"},
+        "add_dependencies": {"type": "array"},
+        "remove_dependencies": {"type": "array"}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false
@@ -46,7 +58,7 @@ func Validate(output []byte) error {
 	}
 	for name := range fields {
 		switch name {
-		case "summary", "commit", "checks":
+		case "summary", "commit", "checks", "plan_amendment":
 		default:
 			return errors.New("structured result contains an unsupported property")
 		}
@@ -59,7 +71,25 @@ func Validate(output []byte) error {
 	if err := json.Unmarshal(summary, &summaryText); err != nil || jsonNull(summary) || strings.TrimSpace(summaryText) == "" {
 		return errors.New("structured result requires a nonempty summary")
 	}
-	if commit, ok := fields["commit"]; ok && !jsonNull(commit) {
+	if amendment, ok := fields["plan_amendment"]; ok && !jsonNull(amendment) {
+		var proposal map[string]json.RawMessage
+		if err := json.Unmarshal(amendment, &proposal); err != nil || proposal == nil || len(proposal) != 5 {
+			return errors.New("plan amendment requires a nonempty summary")
+		}
+		summary, ok := proposal["summary"]
+		if !ok || json.Unmarshal(summary, &summaryText) != nil || jsonNull(summary) || strings.TrimSpace(summaryText) == "" {
+			return errors.New("plan amendment requires a nonempty summary")
+		}
+		for _, name := range []string{"add_tickets", "remove_ticket_ids", "add_dependencies", "remove_dependencies"} {
+			var values []json.RawMessage
+			if raw, ok := proposal[name]; !ok || json.Unmarshal(raw, &values) != nil || jsonNull(raw) {
+				return errors.New("plan amendment requires complete structural changes")
+			}
+		}
+		return nil
+	}
+	commit, present := fields["commit"]
+	if present && !jsonNull(commit) {
 		var commitText string
 		if err := json.Unmarshal(commit, &commitText); err != nil {
 			return errors.New("structured result commit must be a string or null")

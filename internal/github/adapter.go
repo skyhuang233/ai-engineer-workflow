@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/store"
 )
 
 const apiVersion = "2022-11-28"
@@ -37,10 +38,112 @@ type RepositoryMetadata struct {
 }
 
 type PullRequestFeedback struct {
-	Source  string
-	EventID string
-	Author  string
-	Body    string
+	Source   string
+	EventID  string
+	Author   string
+	Body     string
+	BatchID  string
+	Debounce bool
+}
+
+type PullRequestRevision struct {
+	BaseBranch string
+	BaseCommit string
+	HeadCommit string
+}
+
+type DefaultBranchRevision struct{ Name, Head string }
+
+func (c *Client) CandidateIncludesDefaultBranch(ctx context.Context, repository, candidateCommit, defaultBranchHead string) (bool, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return false, err
+	}
+	if candidateCommit == "" || defaultBranchHead == "" {
+		return false, fmt.Errorf("candidate and default branch commits are required")
+	}
+	var comparison struct {
+		Status string `json:"status"`
+	}
+	path := "/repos/" + repository + "/compare/" + url.PathEscape(defaultBranchHead) + "..." + url.PathEscape(candidateCommit)
+	if err := c.getJSON(ctx, path, &comparison); err != nil {
+		return false, err
+	}
+	return comparison.Status == "ahead" || comparison.Status == "identical", nil
+}
+
+func (c *Client) PullRequestApproved(ctx context.Context, repository string, number int64, candidateCommit string) (bool, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return false, err
+	}
+	if number <= 0 || candidateCommit == "" {
+		return false, fmt.Errorf("pull request number and candidate commit are required")
+	}
+	var reviews []struct {
+		State    string       `json:"state"`
+		CommitID string       `json:"commit_id"`
+		User     userResponse `json:"user"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10)+"/reviews?per_page=100", &reviews); err != nil {
+		return false, err
+	}
+	for _, review := range reviews {
+		if actionableAuthor(c.RepositoryOwner, review.User.Login, review.User.Type) && review.State == "APPROVED" && review.CommitID == candidateCommit {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Client) DefaultBranchHead(ctx context.Context, repository string) (DefaultBranchRevision, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	var metadata struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository, &metadata); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	if metadata.DefaultBranch == "" {
+		return DefaultBranchRevision{}, fmt.Errorf("default branch is required")
+	}
+	var branch struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/git/ref/heads/"+url.PathEscape(metadata.DefaultBranch), &branch); err != nil {
+		return DefaultBranchRevision{}, err
+	}
+	if branch.Object.SHA == "" {
+		return DefaultBranchRevision{}, fmt.Errorf("default branch head is required")
+	}
+	return DefaultBranchRevision{Name: metadata.DefaultBranch, Head: branch.Object.SHA}, nil
+}
+
+func (c *Client) PullRequestRevision(ctx context.Context, repository string, number int64) (PullRequestRevision, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return PullRequestRevision{}, err
+	}
+	if number <= 0 {
+		return PullRequestRevision{}, fmt.Errorf("pull request number is required")
+	}
+	var pull struct {
+		Base struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"base"`
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := c.getJSON(ctx, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10), &pull); err != nil {
+		return PullRequestRevision{}, err
+	}
+	if pull.Base.Ref == "" || pull.Base.SHA == "" || pull.Head.SHA == "" {
+		return PullRequestRevision{}, fmt.Errorf("pull request revision is incomplete")
+	}
+	return PullRequestRevision{BaseBranch: pull.Base.Ref, BaseCommit: pull.Base.SHA, HeadCommit: pull.Head.SHA}, nil
 }
 
 func (c *Client) ActionablePullRequestFeedback(ctx context.Context, repository string, number int64) ([]PullRequestFeedback, error) {
@@ -66,12 +169,14 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 		SubmittedAt string `json:"submitted_at"`
 	}
 	type comment struct {
-		ID        int64  `json:"id"`
-		Body      string `json:"body"`
-		User      user   `json:"user"`
-		UpdatedAt string `json:"updated_at"`
+		ID                  int64  `json:"id"`
+		Body                string `json:"body"`
+		User                user   `json:"user"`
+		UpdatedAt           string `json:"updated_at"`
+		PullRequestReviewID int64  `json:"pull_request_review_id"`
 	}
 	var result []PullRequestFeedback
+	submittedReviewIDs := make(map[int64]struct{})
 	for page := 1; ; page++ {
 		var reviews []review
 		path := "/repos/" + repository + "/pulls/" + strconv.FormatInt(number, 10) + "/reviews?per_page=100&page=" + strconv.Itoa(page)
@@ -79,8 +184,12 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			return nil, err
 		}
 		for _, value := range reviews {
-			if value.State != "PENDING" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.SubmittedAt, since)) {
-				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body)})
+			submitted := value.State != "PENDING" && value.State != "APPROVED" && actionableReview(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body)
+			if submitted {
+				submittedReviewIDs[value.ID] = struct{}{}
+			}
+			if submitted && (full || changedSince(value.SubmittedAt, since)) {
+				result = append(result, PullRequestFeedback{Source: "review", EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: reviewFeedbackBody(value.State, value.Body), BatchID: reviewSubmissionBatchID(value.ID), Debounce: true})
 			}
 		}
 		if len(reviews) < 100 {
@@ -105,7 +214,14 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 			}
 			for _, value := range comments {
 				if actionableComment(c.RepositoryOwner, value.User.Login, value.User.Type, value.Body) && (full || changedSince(value.UpdatedAt, since)) {
-					result = append(result, PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body})
+					event := PullRequestFeedback{Source: endpoint.source, EventID: strconv.FormatInt(value.ID, 10), Author: value.User.Login, Body: value.Body}
+					if endpoint.source == "inline-comment" {
+						if _, submitted := submittedReviewIDs[value.PullRequestReviewID]; submitted {
+							event.BatchID = reviewSubmissionBatchID(value.PullRequestReviewID)
+						}
+						event.Debounce = true
+					}
+					result = append(result, event)
 				}
 			}
 			if len(comments) < 100 {
@@ -114,6 +230,10 @@ func (c *Client) ActionablePullRequestFeedbackSince(ctx context.Context, reposit
 		}
 	}
 	return result, nil
+}
+
+func reviewSubmissionBatchID(reviewID int64) string {
+	return "review-submission:" + strconv.FormatInt(reviewID, 10)
 }
 
 func changedSince(value string, since time.Time) bool {
@@ -253,8 +373,21 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 		return nil, err
 	}
 	answers := make(map[string]string)
+	collaboratorCache := make(map[string]bool)
 	for _, comment := range comments {
-		if !actionableAuthor(c.RepositoryOwner, comment.User.Login, comment.User.Type) {
+		if strings.EqualFold(comment.User.Type, "bot") || strings.HasSuffix(strings.ToLower(comment.User.Login), "[bot]") {
+			continue
+		}
+		login := strings.TrimSpace(comment.User.Login)
+		allowed, cached := collaboratorCache[login]
+		if !cached {
+			allowed, err = c.workflowInboxCollaborator(ctx, repository, login)
+			if err != nil {
+				return nil, err
+			}
+			collaboratorCache[login] = allowed
+		}
+		if !allowed {
 			continue
 		}
 		for questionID, answer := range parseWorkflowInboxAnswers(comment.Body) {
@@ -264,6 +397,21 @@ func (c *Client) WorkflowInboxAnswers(ctx context.Context, repository string, qu
 		}
 	}
 	return answers, nil
+}
+
+func (c *Client) workflowInboxCollaborator(ctx context.Context, repository, login string) (bool, error) {
+	if strings.EqualFold(strings.TrimSpace(login), strings.TrimSpace(c.RepositoryOwner)) {
+		return true, nil
+	}
+	if login == "" {
+		return false, nil
+	}
+	err := c.requestJSON(ctx, http.MethodGet, "/repos/"+repository+"/collaborators/"+url.PathEscape(login), nil, nil)
+	var apiErr *apiError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (c *Client) ProjectWorkflowInbox(ctx context.Context, repository string, questions []plan.WorkflowQuestion) error {
@@ -499,12 +647,12 @@ func (c *Client) HasPlanProjection(ctx context.Context, repository string, numbe
 				continue
 			}
 			if isLegacyPlanProjectionComment(comment) {
-				return false, fmt.Errorf("legacy workflow projection comment found")
+				return false, fmt.Errorf("%w: legacy workflow projection comment found", store.ErrDeliveryRejected)
 			}
 			if strings.Contains(comment.Body, planProjectionIdentity) {
 				statusComments++
 				if statusComments > 1 {
-					return false, fmt.Errorf("multiple workflow control-plane comments found")
+					return false, fmt.Errorf("%w: multiple workflow control-plane comments found", store.ErrDeliveryRejected)
 				}
 				if strings.Contains(comment.Body, marker) {
 					matched = true
@@ -540,11 +688,11 @@ func planProjectionStatusComment(comments []commentResponse, owner string) (*com
 			continue
 		}
 		if isLegacyPlanProjectionComment(comments[index]) {
-			return nil, fmt.Errorf("legacy workflow projection comment found")
+			return nil, fmt.Errorf("%w: legacy workflow projection comment found", store.ErrDeliveryRejected)
 		}
 		if strings.Contains(comments[index].Body, planProjectionIdentity) {
 			if status != nil {
-				return nil, fmt.Errorf("multiple workflow control-plane comments found")
+				return nil, fmt.Errorf("%w: multiple workflow control-plane comments found", store.ErrDeliveryRejected)
 			}
 			status = &comments[index]
 		}

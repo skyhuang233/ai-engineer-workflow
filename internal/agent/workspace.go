@@ -169,6 +169,17 @@ func (r RecoveryInspector) ContainerRunning(ctx context.Context, runID string) (
 	return r.Containers.ContainerRunning(ctx, runID)
 }
 
+func (r RecoveryInspector) IsolateContainer(ctx context.Context, runID string) error {
+	if r.Containers == nil {
+		return errors.New("container recovery inspector is incomplete")
+	}
+	isolator, ok := r.Containers.(worker.ContainerIsolator)
+	if !ok {
+		return errors.New("container recovery inspector cannot isolate expired Worker Runs")
+	}
+	return isolator.IsolateContainer(ctx, runID)
+}
+
 func (r RecoveryInspector) WorkspaceAvailable(_ context.Context, session store.TicketSession) (bool, error) {
 	for _, path := range []string{session.WorkspacePath, session.CodexStatePath} {
 		if strings.TrimSpace(path) == "" {

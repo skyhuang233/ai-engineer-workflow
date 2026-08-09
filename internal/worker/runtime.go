@@ -8,11 +8,24 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 )
 
 var ErrGitHubCredential = errors.New("worker spec contains a GitHub write credential")
+
+// InfrastructureError marks failures to start or communicate with the Worker
+// runtime. It lets the Control Plane back off without treating an unavailable
+// host as a Ticket Agent implementation failure.
+type InfrastructureError struct{ Err error }
+
+func (e InfrastructureError) Error() string               { return e.Err.Error() }
+func (e InfrastructureError) Unwrap() error               { return e.Err }
+func (e InfrastructureError) InfrastructureFailure() bool { return true }
+
+func IsInfrastructureFailure(err error) bool {
+	var failure interface{ InfrastructureFailure() bool }
+	return errors.As(err, &failure) && failure.InfrastructureFailure()
+}
 
 const GatewayHostMapping = "host.docker.internal:host-gateway"
 
@@ -57,6 +70,13 @@ type Runtime interface {
 
 type ContainerInspector interface {
 	ContainerRunning(context.Context, string) (bool, error)
+}
+
+// ContainerIsolator stops every container belonging to an expired Worker Run.
+// It is deliberately distinct from inspection: recovery must revoke a stale
+// Run's compute before dispatching a replacement generation.
+type ContainerIsolator interface {
+	IsolateContainer(context.Context, string) error
 }
 
 func (s Spec) Validate() error {
@@ -108,27 +128,57 @@ type ProcessRuntime struct {
 // and Codex state mounts are host-owned, so --rm only destroys compute after a
 // run and never the Ticket Session's durable state.
 type DockerRuntime struct {
-	Binary string
+	Binary                 string
+	DiskPath               string
+	MemoryThresholdPercent float64
+	DiskThresholdPercent   float64
 }
 
 func (r DockerRuntime) Unsafe(ctx context.Context) (bool, error) {
+	reason, err := r.Inspect(ctx)
+	return reason != "", err
+}
+
+// Inspect is a dispatch-only host safety gate. Any unavailable Docker health
+// probe is unsafe because the controller cannot verify that it can launch a
+// new Worker Run; it never changes existing containers.
+func (r DockerRuntime) Inspect(ctx context.Context) (string, error) {
 	binary := r.Binary
 	if binary == "" {
 		binary = "docker"
 	}
-	output, err := exec.CommandContext(ctx, binary, "stats", "--all", "--no-stream", "--format", "{{.MemPerc}}").Output()
+	if _, err := exec.CommandContext(ctx, binary, "info", "--format", "{{.ServerVersion}}").Output(); err != nil {
+		return "Docker health check failed", nil
+	}
+	memoryUsage, err := hostMemoryUsage(ctx)
 	if err != nil {
-		return false, err
+		return "host memory pressure could not be inspected", nil
 	}
-	var total float64
-	for _, field := range strings.Fields(string(output)) {
-		percent, err := strconv.ParseFloat(strings.TrimSuffix(field, "%"), 64)
-		if err != nil {
-			return false, err
-		}
-		total += percent
+	if memoryUsage >= r.memoryThreshold() {
+		return fmt.Sprintf("host memory usage %.1f%% reached the %.0f%% threshold", memoryUsage, r.memoryThreshold()), nil
 	}
-	return total >= 85, nil
+	diskUsage, err := hostDiskUsage(r.DiskPath)
+	if err != nil {
+		return "host disk pressure could not be inspected", nil
+	}
+	if diskUsage >= r.diskThreshold() {
+		return fmt.Sprintf("host disk usage %.1f%% reached the %.0f%% threshold", diskUsage, r.diskThreshold()), nil
+	}
+	return "", nil
+}
+
+func (r DockerRuntime) memoryThreshold() float64 {
+	if r.MemoryThresholdPercent > 0 {
+		return r.MemoryThresholdPercent
+	}
+	return 85
+}
+
+func (r DockerRuntime) diskThreshold() float64 {
+	if r.DiskThresholdPercent > 0 {
+		return r.DiskThresholdPercent
+	}
+	return 90
 }
 
 func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
@@ -141,15 +191,15 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	cidfile, err := os.CreateTemp("", "workflow-worker-cid-*")
 	if err != nil {
-		return Result{}, fmt.Errorf("create worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("create worker container id file: %w", err)}
 	}
 	cidfilePath := cidfile.Name()
 	if err := cidfile.Close(); err != nil {
 		_ = os.Remove(cidfilePath)
-		return Result{}, fmt.Errorf("close worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("close worker container id file: %w", err)}
 	}
 	if err := os.Remove(cidfilePath); err != nil {
-		return Result{}, fmt.Errorf("prepare worker container id file: %w", err)
+		return Result{}, InfrastructureError{Err: fmt.Errorf("prepare worker container id file: %w", err)}
 	}
 	defer os.Remove(cidfilePath)
 	args := dockerArgs(spec)
@@ -162,7 +212,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	output := append(append([]byte(nil), stdout.Bytes()...), stderr.Bytes()...)
 	containerID, readErr := os.ReadFile(cidfilePath)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return Result{Output: output}, fmt.Errorf("read worker container id: %w", readErr)
+		return Result{Output: output}, InfrastructureError{Err: fmt.Errorf("read worker container id: %w", readErr)}
 	}
 	result := Result{Output: output, Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ContainerID: strings.TrimSpace(string(containerID))}
 	if err != nil {
@@ -170,6 +220,11 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
+			if result.ExitCode == 125 {
+				return result, InfrastructureError{Err: err}
+			}
+		} else {
+			return result, InfrastructureError{Err: err}
 		}
 	}
 	return result, err
@@ -226,6 +281,26 @@ func (r DockerRuntime) ContainerRunning(ctx context.Context, runID string) (bool
 		return false, fmt.Errorf("inspect worker container: %w", err)
 	}
 	return strings.TrimSpace(string(output)) != "", nil
+}
+
+func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error {
+	if strings.TrimSpace(runID) == "" {
+		return errors.New("worker run ID is required")
+	}
+	name := r.Binary
+	if name == "" {
+		name = "docker"
+	}
+	output, err := exec.CommandContext(ctx, name, "container", "ls", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
+	if err != nil {
+		return fmt.Errorf("inspect expired worker container: %w", err)
+	}
+	for _, containerID := range strings.Fields(string(output)) {
+		if err := exec.CommandContext(ctx, name, "container", "kill", containerID).Run(); err != nil {
+			return fmt.Errorf("isolate expired worker container %s: %w", containerID, err)
+		}
+	}
+	return nil
 }
 
 func contains(values []string, target string) bool {

@@ -25,6 +25,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/githubcontract"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/scheduler"
+	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	"golang.org/x/term"
@@ -78,6 +79,14 @@ func main() {
 		runAnswerInbox(os.Args[2:])
 	case "recover-inbox-delivery":
 		runRecoverInboxDelivery(os.Args[2:])
+	case "backup":
+		runBackup(os.Args[2:])
+	case "restore":
+		runRestore(os.Args[2:])
+	case "drill-backup":
+		runBackupDrill(os.Args[2:])
+	case "metrics":
+		runMetrics(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -94,6 +103,106 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow reconcile-delivered [options]")
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
 	fmt.Fprintln(os.Stderr, "  workflow recover-inbox-delivery [options]")
+	fmt.Fprintln(os.Stderr, "  workflow backup [--database path] [--output path]")
+	fmt.Fprintln(os.Stderr, "  workflow restore --backup path [--database path]")
+	fmt.Fprintln(os.Stderr, "  workflow drill-backup --backup path")
+	fmt.Fprintln(os.Stderr, "  workflow metrics [--database path] [--backup path]")
+}
+
+func runBackup(args []string) {
+	flags := flag.NewFlagSet("backup", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	outputPath := flags.String("output", "", "online SQLite backup destination")
+	_ = flags.Parse(args)
+	if *outputPath == "" {
+		*outputPath = *databasePath + ".backup"
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	metadata, err := db.CreateOnlineBackup(context.Background(), *outputPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, metadata)
+	writeStructuredLog("sqlite_backup", metadata)
+}
+
+func runRestore(args []string) {
+	flags := flag.NewFlagSet("restore", flag.ExitOnError)
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "restored SQLite control-plane database")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		fmt.Fprintln(os.Stderr, "restore requires backup")
+		os.Exit(2)
+	}
+	lock, err := startup.AcquireLock(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer lock.Close()
+	if err := store.RestoreBackup(context.Background(), *backupPath, *databasePath); err != nil {
+		fail(err)
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	if err := db.ReconcileRestoredControlPlane(context.Background(), time.Now().UTC()); err != nil {
+		fail(err)
+	}
+	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+}
+
+func runBackupDrill(args []string) {
+	flags := flag.NewFlagSet("drill-backup", flag.ExitOnError)
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		fmt.Fprintln(os.Stderr, "drill-backup requires backup")
+		os.Exit(2)
+	}
+	drill, err := store.DrillBackup(context.Background(), *backupPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, drill)
+	writeStructuredLog("sqlite_backup_drill", drill)
+}
+
+func runMetrics(args []string) {
+	flags := flag.NewFlagSet("metrics", flag.ExitOnError)
+	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	backupPath := flags.String("backup", "", "verified SQLite online backup")
+	_ = flags.Parse(args)
+	if *backupPath == "" {
+		*backupPath = *databasePath + ".backup"
+	}
+	db, err := store.Open(context.Background(), *databasePath)
+	if err != nil {
+		fail(err)
+	}
+	defer db.Close()
+	metrics, err := db.OperationalMetrics(context.Background(), *backupPath, time.Now().UTC())
+	if err != nil {
+		fail(err)
+	}
+	writeJSON(os.Stdout, metrics)
+	writeStructuredLog("sqlite_operational_metrics", metrics)
+}
+
+func writeJSON(destination *os.File, value any) {
+	if err := json.NewEncoder(destination).Encode(value); err != nil {
+		fail(err)
+	}
+}
+
+func writeStructuredLog(event string, value any) {
+	writeJSON(os.Stderr, map[string]any{"event": event, "data": value})
 }
 
 func runDoctor(args []string) {
@@ -414,7 +523,7 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 			return err
 		}
 		for _, event := range events {
-			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+			feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body, BatchID: event.BatchID, Debounce: event.Debounce})
 		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -532,16 +641,36 @@ func runPollGitHub(args []string) {
 		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and ChatGPT authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
-	config, err := doctor.LoadConfig(*configPath)
+	lock, err := startup.AcquireLock(*databasePath)
 	if err != nil {
 		fail(err)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	defer lock.Close()
+	db, err := store.OpenForStartup(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
+	if err := db.IntegrityCheck(context.Background()); err != nil {
+		fail(err)
+	}
+	if err := db.Migrate(context.Background()); err != nil {
+		fail(err)
+	}
+	config, err := doctor.LoadConfig(*configPath)
+	if err != nil {
+		fail(err)
+	}
 	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
+	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
+	if reason, err := runtime.Inspect(context.Background()); err != nil {
+		fail(err)
+	} else if reason != "" {
+		fail(errors.New(reason))
+	}
+	if _, err := workspaceManager.ReclaimClosed(context.Background(), db, *workspaceRetention, time.Now().UTC()); err != nil {
+		fail(err)
+	}
 	var workers sync.WaitGroup
 	var workerError error
 	var workerErrorMu sync.Mutex
@@ -638,7 +767,7 @@ func runPollGitHub(args []string) {
 			}
 			return nil
 		}
-		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
+		control := func(ctx context.Context, bootstrapped bool) (github.BootstrapControlResult, error) {
 			controlResult := github.BootstrapControlResult{}
 			attemptedPlanVersionID = ""
 			attemptedPlanAlreadyComplete = false
@@ -651,13 +780,22 @@ func runPollGitHub(args []string) {
 			if bootstrapErr != nil {
 				return controlResult, bootstrapErr
 			}
-			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime, ProvisionSession: workspaceManager.ProvisionCodexSession}
+			paused, err := dispatcher.DispatchPaused(ctx, *repository)
 			if err != nil {
 				return controlResult, err
 			}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: worker.DockerRuntime{}, Workspace: workspaceManager}, HostPressure: worker.DockerRuntime{}, ProvisionSession: workspaceManager.ProvisionCodexSession}
-			if err := dispatcher.Recover(ctx, *repository, activeRoot); err != nil {
+			if paused {
+				return controlResult, nil
+			}
+			roots, err := db.ActivePlanRoots(ctx, *repository)
+			if err != nil {
 				return controlResult, err
+			}
+			for _, root := range roots {
+				if err := dispatcher.Recover(ctx, *repository, root.RootIssueNumber); err != nil {
+					return controlResult, err
+				}
 			}
 			if _, err := workspaceManager.ReclaimClosed(ctx, db, *workspaceRetention, time.Now().UTC()); err != nil {
 				return controlResult, err
@@ -674,7 +812,7 @@ func runPollGitHub(args []string) {
 				return controlResult, err
 			}
 			for {
-				claim, claimErr := dispatcher.Claim(ctx, *repository, activeRoot, 0, "workflow-control-plane")
+				claim, claimErr := dispatcher.ClaimNext(ctx, *repository, "workflow-control-plane")
 				if claimErr == nil {
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
@@ -687,7 +825,12 @@ func runPollGitHub(args []string) {
 				}
 				return controlResult, claimErr
 			}
-		})
+		}
+		poller.AfterDelivered = func(ctx context.Context) error {
+			_, err := control(ctx, true)
+			return err
+		}
+		result, err := poller.PollWithBootstrap(ctx, *repository, bootstrap, control)
 		if shouldLogNeedsAttentionError(err) {
 			fmt.Fprintln(os.Stderr, err)
 		}

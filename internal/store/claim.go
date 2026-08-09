@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -21,6 +22,12 @@ type ClaimRequest struct {
 	LeaseTTL         time.Duration
 	Now              time.Time
 	ProvisionSession SessionProvisioner
+
+	// fairness fields are populated only by ClaimNextReady. Keeping them
+	// private prevents explicit ticket claims from perturbing global turns.
+	fairnessRepository  string
+	fairnessRootIssueID int64
+	fairnessRootNumber  int64
 }
 
 type SessionProvisioning struct {
@@ -79,6 +86,7 @@ func maxWorkerAttempts(value int) int {
 
 type TicketClaim struct {
 	VersionID       string
+	PlanRootNumber  int64
 	TicketID        int64
 	TicketNumber    int64
 	TicketTitle     string
@@ -115,6 +123,10 @@ func (s *Store) ReadyFrontier(ctx context.Context, versionID string, maxParallel
 func (s *Store) ClaimReady(ctx context.Context, request ClaimRequest) (TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	return s.claimReady(ctx, request)
+}
+
+func (s *Store) claimReady(ctx context.Context, request ClaimRequest) (TicketClaim, error) {
 	if request.VersionID == "" || request.Owner == "" || request.MaxParallelRuns <= 0 {
 		return TicketClaim{}, ErrInvalidClaim
 	}
@@ -264,6 +276,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 			if err != nil {
 				return TicketClaim{}, err
 			}
+			claimedRevalidations, err := releaseMergeReadyRevalidationsTx(ctx, tx, currentRunID)
+			if err != nil {
+				return TicketClaim{}, err
+			}
+			claimedFeedback += claimedRevalidations
 			if claimedFeedback > 0 {
 				if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(request.Now), request.VersionID, selected.IssueID); err != nil {
 					return TicketClaim{}, err
@@ -280,6 +297,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 		}
 	}
 
+	if ready, err := infrastructureRetryReadyTx(ctx, tx, sessionID, request.Now); err != nil {
+		return TicketClaim{}, err
+	} else if !ready {
+		return TicketClaim{}, ErrNotReady
+	}
 	if currentGeneration == 0 {
 		currentGeneration = 1
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET current_lease_generation = ?, updated_at = ? WHERE session_id = ?`, currentGeneration, formatTimestamp(request.Now), sessionID); err != nil {
@@ -298,7 +320,11 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= maxWorkerAttempts(request.MaxAttempts) {
-		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, "worker retry budget exhausted", request.Now); err != nil {
+		reason, err := noProgressReasonTx(ctx, tx, sessionID, attemptsInEpoch)
+		if err != nil {
+			return TicketClaim{}, err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, reason, request.Now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -339,10 +365,17 @@ VALUES (?, ?, ?, 0, ?)
 ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`, request.VersionID, selected.IssueID, plan.StateRunning, formatTimestamp(request.Now)); err != nil {
 		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
+	if err := recordDispatchFairnessTx(ctx, tx, request.fairnessRepository, request.fairnessRootIssueID, request.Now); err != nil {
+		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return TicketClaim{}, compensateSessionProvisioning(provisioned, err)
 	}
-	return TicketClaim{VersionID: request.VersionID, TicketID: selected.IssueID, TicketNumber: selected.Number, TicketTitle: selected.Title, Owner: request.Owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: currentGeneration, LeaseExpiresAt: expiresAt}, nil
+	claim := TicketClaim{VersionID: request.VersionID, TicketID: selected.IssueID, TicketNumber: selected.Number, TicketTitle: selected.Title, Owner: request.Owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: currentGeneration, LeaseExpiresAt: expiresAt}
+	if request.fairnessRepository != "" {
+		claim.PlanRootNumber = request.fairnessRootNumber
+	}
+	return claim, nil
 }
 
 func compensateSessionProvisioning(provisioning SessionProvisioningResult, cause error) error {
@@ -375,6 +408,9 @@ func recordEstablishedSessionAuthenticationFailureTx(ctx context.Context, tx *sq
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET claimed_run_id = '' WHERE claimed_run_id = ?`, runID); err != nil {
+			return true, err
+		}
+		if _, err := releaseMergeReadyRevalidationsTx(ctx, tx, runID); err != nil {
 			return true, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET consecutive_failures = consecutive_failures + 1, updated_at = ? WHERE session_id = (SELECT session_id FROM worker_runs WHERE run_id = ?)`, formatTimestamp(now), runID); err != nil {
@@ -504,7 +540,8 @@ JOIN plans p ON p.id = v.plan_id
 WHERE p.repository = ? AND p.current_version_id = s.version_id
 AND s.state = ? AND s.accepted_commit != '' AND s.delivery_retry_pending = 1
 AND rt.state = ? AND rt.delivered = 0
-ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.StateWaitingReview, available)
+AND NOT EXISTS (SELECT 1 FROM infrastructure_retry_backoffs backoff WHERE backoff.session_id = s.session_id AND backoff.retry_at > ?)
+ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.StateWaitingReview, formatTimestamp(now), available)
 	if err != nil {
 		return nil, err
 	}
@@ -707,21 +744,27 @@ func (s *Store) ClaimReviewRevision(ctx context.Context, versionID string, issue
 		return TicketClaim{}, ErrNotReady
 	}
 	var sessionID, owner, sessionState, runtimeState string
+	var deliveryRetryPending int
 	var ticketNumber int64
 	var ticketTitle string
 	var generation, recoveryEpoch int64
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, rt.state, t.issue_number, t.title
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.owner, s.state, s.current_lease_generation, s.delivery_retry_pending, rt.state, t.issue_number, t.title
 FROM ticket_sessions s
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &runtimeState, &ticketNumber, &ticketTitle)
+WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID, &owner, &sessionState, &generation, &deliveryRetryPending, &runtimeState, &ticketNumber, &ticketTitle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound
 	}
 	if err != nil {
 		return TicketClaim{}, err
 	}
-	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" {
+	if sessionState != SessionRunning || runtimeState != plan.StateWaitingReview || owner == "" || deliveryRetryPending != 0 {
+		return TicketClaim{}, ErrNotReady
+	}
+	if ready, err := infrastructureRetryReadyTx(ctx, tx, sessionID, now); err != nil {
+		return TicketClaim{}, err
+	} else if !ready {
 		return TicketClaim{}, ErrNotReady
 	}
 	activeRuns, err := activeRunCountTx(ctx, tx, now)
@@ -748,7 +791,11 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).Scan(&sessionID,
 		return TicketClaim{}, err
 	}
 	if attemptsInEpoch >= limit {
-		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "worker retry budget exhausted", now); err != nil {
+		reason, err := noProgressReasonTx(ctx, tx, sessionID, attemptsInEpoch)
+		if err != nil {
+			return TicketClaim{}, err
+		}
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
 			return TicketClaim{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -792,52 +839,126 @@ func planFrozenTx(ctx context.Context, tx frontierRows, versionID string) (bool,
 	return err == nil, err
 }
 
+func infrastructureRetryReadyTx(ctx context.Context, tx *sql.Tx, sessionID string, now time.Time) (bool, error) {
+	var retryText string
+	err := tx.QueryRowContext(ctx, `SELECT retry_at FROM infrastructure_retry_backoffs WHERE session_id = ?`, sessionID).Scan(&retryText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, retryText)
+	if err != nil {
+		return false, err
+	}
+	return !retryAt.After(now), nil
+}
+
+func noProgressReasonTx(ctx context.Context, tx *sql.Tx, sessionID string, attempts int) (string, error) {
+	reason := fmt.Sprintf("worker retry budget exhausted after %d attempts without a new accepted Candidate Revision", attempts)
+	var latest string
+	err := tx.QueryRowContext(ctx, `SELECT failure.reason
+FROM run_failures failure
+JOIN worker_runs run ON run.run_id = failure.run_id
+WHERE run.session_id = ?
+ORDER BY failure.recorded_at DESC, failure.run_id DESC
+LIMIT 1`, sessionID).Scan(&latest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reason, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(latest) != "" {
+		reason += ": " + latest
+	}
+	return reason, nil
+}
+
 // MarkTicketDelivered records the durable delivery fact that unlocks dependent
 // tickets. The caller is expected to have already verified the merged revision
 // and reachability at the GitHub boundary.
 func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issueID int64) error {
+	_, err := s.markTicketDelivered(ctx, versionID, issueID, "")
+	return err
+}
+
+// MarkTicketDeliveredAtMerge records the merge revision with the Delivered
+// fact. A repeated reconciliation leaves the original delivery fact unchanged.
+func (s *Store) MarkTicketDeliveredAtMerge(ctx context.Context, versionID string, issueID int64, mergeCommit string) (bool, error) {
+	if mergeCommit == "" {
+		return false, ErrInvalidClaim
+	}
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit)
+}
+
+func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	nowText := formatTimestamp(now)
-	result, err := tx.ExecContext(ctx, `INSERT INTO ticket_runtime(version_id, issue_id, state, delivered, updated_at)
-SELECT version_id, issue_id, ?, 1, ? FROM plan_tickets WHERE version_id = ? AND issue_id = ?
-ON CONFLICT(version_id, issue_id) DO UPDATE SET state = excluded.state, delivered = 1, updated_at = excluded.updated_at`, plan.StateDelivered, nowText, versionID, issueID)
+	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, delivered = 1, updated_at = ?
+WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, nowText, versionID, issueID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
-		return ErrNotFound
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM plan_tickets WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		} else if err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if mergeCommit != "" {
+		result, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries SET merge_commit = ?, updated_at = ? WHERE version_id = ? AND issue_id = ?`, mergeCommit, nowText, versionID, issueID)
+		if err != nil {
+			return false, err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return false, ErrNotFound
+		}
 	}
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
 		if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
-			return err
+			return false, err
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
 	} else if err != nil {
-		return err
+		return false, err
 	}
 	if runID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "succeeded", nowText, runID, RunRunning); err != nil {
-			return err
+			return false, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND state = ?`, "revoked", runID, LeaseActive); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
@@ -906,7 +1027,8 @@ LEFT JOIN ticket_runtime rt ON rt.version_id = t.version_id AND rt.issue_id = t.
 LEFT JOIN ticket_sessions s ON s.version_id = t.version_id AND s.issue_id = t.issue_id
 LEFT JOIN worker_runs r ON r.run_id = s.current_run_id
 LEFT JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE t.version_id = ?`, versionID)
+WHERE t.version_id = ?
+  AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause JOIN plan_amendments amendment ON amendment.amendment_id = pause.amendment_id WHERE pause.version_id = t.version_id AND pause.issue_id = t.issue_id AND amendment.state = 'pending')`, versionID)
 	if err != nil {
 		return snapshot, err
 	}

@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +14,9 @@ import (
 func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	config := validConfig()
 	private := false
-	assets := `[{"id":9,"name":"worker-release.json"}]`
+	sbom := []byte(`{"spdxVersion":"SPDX-2.3","name":"workflow-worker"}`)
+	sbomDigest := fmt.Sprintf("%x", sha256.Sum256(sbom))
+	assets := `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-sbom.spdx.json"}]`
 	sourceSHA := strings.Repeat("a", 40)
 	mainSHA := strings.Repeat("c", 40)
 	sourceRootTree := strings.Repeat("1", 40)
@@ -29,11 +32,13 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	publisherWorkflowBlob := strings.Repeat("b", 40)
 	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob)
 	manifestData, err := json.Marshal(WorkerReleaseManifest{
-		SchemaVersion:                3,
+		SchemaVersion:                5,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 sourceSHA,
 		Image:                        config.Worker.ImageRepository + "@sha256:" + strings.Repeat("b", 64),
 		CodexVersion:                 config.Codex.Version,
+		GitHubCLIVersion:             config.GitHubCLI.Version,
+		GitHubCLILinuxAMD64SHA256:    config.GitHubCLI.LinuxAMD64SHA256,
 		GoVersion:                    config.Go.Version,
 		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
 		NoMistakesVersion:            config.NoMistakes.Version,
@@ -43,7 +48,11 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
 		BuildInputIdentity:           buildInputIdentity,
-		GitHubActionsRunID:           123,
+		SBOMSHA256:                   sbomDigest,
+		VulnerabilityScan: VulnerabilityScanPolicy{
+			Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true,
+		},
+		GitHubActionsRunID: 123,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +76,8 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 			_, _ = w.Write([]byte(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":` + assets + `}`))
 		case "/repos/skyhuang233/workflow/releases/assets/9":
 			_, _ = w.Write([]byte(manifest))
+		case "/repos/skyhuang233/workflow/releases/assets/10":
+			_, _ = w.Write(sbom)
 		case "/repos/skyhuang233/workflow/commits/main":
 			_, _ = w.Write([]byte(`{"sha":"` + mainSHA + `","commit":{"tree":{"sha":"` + mainRootTree + `"}}}`))
 		case "/repos/skyhuang233/workflow/commits/" + sourceSHA:
@@ -112,15 +123,20 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	if !fullPullRequested {
 		t.Fatal("fetch did not load the full merged pull request")
 	}
-	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-release.json"}]`
+	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-release.json"},{"id":11,"name":"worker-sbom.spdx.json"}]`
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a release with duplicate worker-release.json assets")
 	}
 	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"unexpected-asset.txt"}]`
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
-		t.Fatal("accepted a release with an asset other than worker-release.json")
+		t.Fatal("accepted a release without the bound Worker SBOM")
 	}
-	assets = `[{"id":9,"name":"worker-release.json"}]`
+	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-sbom.spdx.json"}]`
+	sbom = []byte(`{"spdxVersion":"SPDX-2.3","name":"tampered"}`)
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
+		t.Fatal("accepted a Worker SBOM whose checksum differs from the manifest")
+	}
+	sbom = []byte(`{"spdxVersion":"SPDX-2.3","name":"workflow-worker"}`)
 	workflowID = 88
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest attributed to an unrelated successful workflow")

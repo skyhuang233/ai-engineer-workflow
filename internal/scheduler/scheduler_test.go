@@ -21,13 +21,34 @@ func (r *reader) ReadPlan(context.Context, string, int64) (plan.Snapshot, error)
 
 type projector struct{ body string }
 
+type rootProjector struct{ projected map[int64]plan.Projection }
+
+func (p *rootProjector) ProjectPlan(_ context.Context, _ string, root int64, projection plan.Projection, _ string) error {
+	p.projected[root] = projection
+	return nil
+}
+
 type recoveryInspector struct {
 	containerRunning bool
 	workspaceReady   bool
+	isolate          func(string)
+}
+
+type pressureInspector struct{ reason string }
+
+func (p pressureInspector) Inspect(context.Context) (string, error) {
+	return p.reason, nil
 }
 
 func (r recoveryInspector) ContainerRunning(context.Context, string) (bool, error) {
 	return r.containerRunning, nil
+}
+
+func (r recoveryInspector) IsolateContainer(_ context.Context, runID string) error {
+	if r.isolate != nil {
+		r.isolate(runID)
+	}
+	return nil
 }
 
 func (r recoveryInspector) WorkspaceAvailable(context.Context, store.TicketSession) (bool, error) {
@@ -173,6 +194,82 @@ func TestDispatcherAdmissionFailureDoesNotConsumeWorkerAttempt(t *testing.T) {
 	t.Logf("failed ChatGPT admission consumed no Worker attempt; the first durable claim remained attempt %d", claim.Attempt)
 }
 
+func TestClaimNextRoundRobinsPlansAndProjectsOnlyTheirOwningRoots(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, snapshot := range []plan.Snapshot{
+		{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "plan A", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "A", Labels: []string{plan.TicketLabel}, State: "open"}}},
+		{Repository: "owner/repo", Root: plan.Issue{ID: 200, Number: 20, Body: "plan B", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 2, Number: 21, Title: "B", Labels: []string{plan.TicketLabel}, State: "open"}}},
+	} {
+		fingerprint, err := snapshot.Fingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.MarkActive(ctx, version.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projector := &rootProjector{projected: make(map[int64]plan.Projection)}
+	dispatcher := scheduler.Dispatcher{Store: db, Projector: projector, MaxParallelRuns: 2, LeaseTTL: time.Hour}
+	first, err := dispatcher.ClaimNext(ctx, "owner/repo", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := dispatcher.ClaimNext(ctx, "owner/repo", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PlanRootNumber != 10 || second.PlanRootNumber != 20 || len(projector.projected) != 2 {
+		t.Fatalf("global claims=%d,%d projected=%#v", first.PlanRootNumber, second.PlanRootNumber, projector.projected)
+	}
+}
+
+func TestHostPressurePausesNewDispatchWithoutChangingActiveRuns(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "running", Labels: []string{plan.TicketLabel}, State: "open"}, {ID: 2, Number: 12, Title: "queued", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	running, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &projector{body: snapshot.Root.Body}
+	dispatcher := scheduler.Dispatcher{Store: db, Projector: root, MaxParallelRuns: 2, LeaseTTL: time.Hour, HostPressure: pressureInspector{reason: "Docker health check failed"}, Now: func() time.Time { return now }}
+	if _, err := dispatcher.ClaimNext(ctx, snapshot.Repository, "another-agent"); !errors.Is(err, store.ErrCapacity) {
+		t.Fatalf("pressure claim error = %v, want ErrCapacity", err)
+	}
+	current, err := db.CurrentClaim(ctx, version.ID, running.TicketID)
+	if err != nil || current.RunID != running.RunID {
+		t.Fatalf("pressure changed active claim = %#v, %v", current, err)
+	}
+	if !strings.Contains(root.body, "new dispatches: paused") || !strings.Contains(root.body, "Docker health check failed") {
+		t.Fatalf("pressure projection = %q", root.body)
+	}
+}
+
 func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
@@ -207,6 +304,58 @@ func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 	}
 	if replacement.RunID == claim.RunID {
 		t.Fatalf("recovery retained dead run %q", claim.RunID)
+	}
+}
+
+func TestRecoverIsolatesExpiredContainerBeforeReplacementRun(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := time.Date(2099, 8, 9, 12, 0, 0, 0, time.UTC)
+	now := claimedAt.Add(2 * time.Minute)
+	expired, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claimedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordWorkerAudit(ctx, store.WorkerAudit{RunID: expired.RunID, LeaseToken: expired.LeaseToken, ImageDigest: "sha256:old", ToolVersions: map[string]string{"codex": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	dispatcher := scheduler.Dispatcher{Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{}, Recovery: recoveryInspector{containerRunning: true, workspaceReady: true, isolate: func(runID string) { isolated = append(isolated, runID) }}, Now: func() time.Time { return now }}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 1 || isolated[0] != expired.RunID {
+		t.Fatalf("isolated runs = %#v, want [%q]", isolated, expired.RunID)
+	}
+	if err := db.AcceptCandidate(ctx, store.CandidateRevision{RunID: expired.RunID, LeaseToken: expired.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "stale", StructuredOutput: []byte(`{"summary":"stale","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("late Candidate acceptance = %v, want ErrInvalidClaim", err)
+	}
+	replacement, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.SessionID != expired.SessionID || replacement.LeaseGeneration != expired.LeaseGeneration+1 {
+		t.Fatalf("replacement = %#v, want retained Session and next Lease generation", replacement)
+	}
+	audit, err := db.WorkerAudit(ctx, expired.RunID)
+	if err != nil || audit.ImageDigest != "sha256:old" {
+		t.Fatalf("old Run audit = %#v, %v", audit, err)
 	}
 }
 

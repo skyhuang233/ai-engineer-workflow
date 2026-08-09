@@ -789,6 +789,123 @@ func TestReplacementRequiresAnAuthoritativeReference(t *testing.T) {
 	}
 }
 
+func TestReplacementCannotReuseCancelledTicketIdentity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := testSnapshot()
+	replacement.Root.ID = 200
+	replacement.Root.Number = 20
+	replacementFingerprint, err := replacement.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BeginActivation(ctx, replacement, replacementFingerprint, "replacement-revision"); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var question WorkflowQuestion
+	for _, candidate := range questions {
+		if candidate.Kind == "closed_unmerged_impact" {
+			question = candidate
+			break
+		}
+	}
+	if question.ID == "" {
+		t.Fatalf("closed-unmerged question missing from %#v", questions)
+	}
+	answer := `{"action":"replace","replacement":{"plan_root_issue_id":200}}`
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, question.ID, answer, now.Add(time.Second)); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("reused ticket replacement = %v, want invalid claim", err)
+	}
+	stored, err := db.WorkflowQuestion(ctx, snapshot.Repository, question.ID)
+	if err != nil || stored.State != "open" || stored.Answer != "" {
+		t.Fatalf("reused ticket replacement changed question = %#v, %v", stored, err)
+	}
+}
+
+func TestReplacementCannotReuseAnotherUndeliveredSourceTicketIdentity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := testSnapshot()
+	replacement.Root.ID = 200
+	replacement.Root.Number = 20
+	replacement.Children[0].ID = 101
+	replacement.Children[0].Number = 21
+	replacement.BlockedBy = map[int64][]plan.Issue{2: {{ID: 101, Number: 21, Labels: []string{plan.TicketLabel}, State: "open"}}}
+	replacementFingerprint, err := replacement.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BeginActivation(ctx, replacement, replacementFingerprint, "replacement-revision"); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var question WorkflowQuestion
+	for _, candidate := range questions {
+		if candidate.Kind == "closed_unmerged_impact" {
+			question = candidate
+			break
+		}
+	}
+	if question.ID == "" {
+		t.Fatalf("closed-unmerged question missing from %#v", questions)
+	}
+	answer := `{"action":"replace","replacement":{"plan_root_issue_id":200}}`
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, question.ID, answer, now.Add(time.Second)); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatalf("reused undelivered source ticket replacement = %v, want invalid claim", err)
+	}
+}
+
 func TestPollFailureSkipsTerminalAndFrozenPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

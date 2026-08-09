@@ -1,20 +1,24 @@
 FROM node:22-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46
 
-ARG CODEX_VERSION=0.146.0
+ARG CODEX_VERSION=0.147.0
+ARG GITHUB_CLI_VERSION=2.97.0
+ARG GITHUB_CLI_LINUX_AMD64_SHA256=a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112
 ARG GO_VERSION=1.25.12
 ARG GO_LINUX_AMD64_SHA256=234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1
 ARG NO_MISTAKES_VERSION=v1.41.2
 ARG NO_MISTAKES_UPSTREAM_COMMIT=867d64d9c2df89f3f204ad1f5528e5bf7b460caa
 ARG NO_MISTAKES_FORK_REPOSITORY=skyhuang233/no-mistakes
-ARG NO_MISTAKES_FORK_RELEASE=workflow-v1.41.2.0
-ARG NO_MISTAKES_SHA256=a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825
+ARG NO_MISTAKES_FORK_RELEASE=workflow-v1.41.2.1
+ARG NO_MISTAKES_SHA256=1e6dc5c2b30271060da987f7bc3146301a11c6c4f1a37b670b5d735156d1abed
 
 ENV DEBIAN_SNAPSHOT=20260713T000000Z \
-    APT_PACKAGES="ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 gh=2.23.0+dfsg1-1 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2" \
+    APT_PACKAGES="ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2" \
     PATH="/usr/local/go/bin:${PATH}"
 
 LABEL org.opencontainers.image.source="https://github.com/skyhuang233/workflow"
 LABEL io.workflow.codex.version="${CODEX_VERSION}"
+LABEL io.workflow.github-cli.version="${GITHUB_CLI_VERSION}"
+LABEL io.workflow.github-cli.linux-amd64-sha256="${GITHUB_CLI_LINUX_AMD64_SHA256}"
 LABEL io.workflow.go.version="${GO_VERSION}"
 LABEL io.workflow.go.linux-amd64-sha256="${GO_LINUX_AMD64_SHA256}"
 LABEL io.workflow.no-mistakes.version="${NO_MISTAKES_VERSION}"
@@ -31,7 +35,18 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && rm --recursive --force /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+    && test ! -e /usr/local/lib/node_modules/npm \
     && codex --version
+
+RUN curl --fail --show-error --location \
+      "https://github.com/cli/cli/releases/download/v${GITHUB_CLI_VERSION}/gh_${GITHUB_CLI_VERSION}_linux_amd64.tar.gz" \
+      --output /tmp/gh.tar.gz \
+    && echo "${GITHUB_CLI_LINUX_AMD64_SHA256}  /tmp/gh.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/gh.tar.gz --directory /tmp \
+    && install --mode 0755 "/tmp/gh_${GITHUB_CLI_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && rm --recursive --force /tmp/gh.tar.gz "/tmp/gh_${GITHUB_CLI_VERSION}_linux_amd64" \
+    && gh version
 
 RUN curl --fail --show-error --location \
       "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \

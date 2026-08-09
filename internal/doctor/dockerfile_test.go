@@ -23,13 +23,20 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 		"https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}",
 		"apt-get update -o Acquire::Check-Valid-Until=false -o Acquire::https::Verify-Peer=false",
 		"apt-get install --yes --no-install-recommends -o Acquire::https::Verify-Peer=false ca-certificates=20230311+deb12u1",
-		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 gh=2.23.0+dfsg1-1 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2\"",
+		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2\"",
 		"io.workflow.debian.snapshot",
 		"io.workflow.apt.packages",
 		"GO_VERSION=1.25.12",
 		"GO_LINUX_AMD64_SHA256=234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1",
 		"io.workflow.go.version",
 		"go version",
+		"GITHUB_CLI_VERSION=2.97.0",
+		"GITHUB_CLI_LINUX_AMD64_SHA256=a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112",
+		"https://github.com/cli/cli/releases/download/v${GITHUB_CLI_VERSION}/gh_${GITHUB_CLI_VERSION}_linux_amd64.tar.gz",
+		"io.workflow.github-cli.version",
+		"gh version",
+		"rm --recursive --force /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx",
+		"test ! -e /usr/local/lib/node_modules/npm",
 		"NO_MISTAKES_UPSTREAM_COMMIT",
 		"io.workflow.no-mistakes.upstream-commit",
 	} {
@@ -39,6 +46,9 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 	}
 	if strings.Contains(contents, "http://snapshot.debian.org") {
 		t.Fatal("Worker Dockerfile uses an insecure Debian snapshot transport")
+	}
+	if strings.Contains(contents, "gh=2.23.0") {
+		t.Fatal("Worker Dockerfile still installs the vulnerable Debian GitHub CLI")
 	}
 }
 

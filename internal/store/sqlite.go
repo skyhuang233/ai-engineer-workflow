@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 38
+	latestSchemaVersion = 47
 )
 
 var (
@@ -65,9 +65,26 @@ func formatTimestamp(value time.Time) string {
 	return value.UTC().Format(timestampLayout)
 }
 
-// Open configures SQLite as the durable runtime store and runs all pending
-// migrations before returning a usable Store.
+// Open configures SQLite, checks its integrity, and runs all pending migrations.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	store, err := OpenForStartup(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.IntegrityCheck(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	if err := store.Migrate(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenForStartup configures SQLite without migrations so startup can make the
+// integrity-check then migration boundary explicit.
+func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
 	databasePath := ""
 	if dsn != ":memory:" && !strings.HasPrefix(dsn, "file:") {
 		databasePath = dsn
@@ -85,11 +102,18 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := store.Migrate(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
 	return store, nil
+}
+
+func (s *Store) IntegrityCheck(ctx context.Context) error {
+	var result string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		return fmt.Errorf("check sqlite integrity: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("check sqlite integrity: %s", result)
+	}
+	return nil
 }
 
 func (s *Store) configure(ctx context.Context) error {
@@ -1046,6 +1070,219 @@ SET plan_version_ids_json = COALESCE((
 			return fmt.Errorf("migration 38: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (38, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 39 {
+		for _, column := range []struct {
+			name       string
+			definition string
+		}{
+			{name: "batch_id", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "ready_at", definition: "TEXT NOT NULL DEFAULT ''"},
+		} {
+			exists, err := tableHasColumnTx(ctx, tx, "review_feedback_events", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 39: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE review_feedback_events ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 39: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS review_feedback_ready_idx ON review_feedback_events(version_id, issue_id, claimed_run_id, ready_at, received_at)`); err != nil {
+			return fmt.Errorf("migration 39: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE review_feedback_events SET batch_id = 'feedback:' || source || ':' || event_id WHERE batch_id = ''`); err != nil {
+			return fmt.Errorf("migration 39: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (39, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 40 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS quality_gate_questions (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    issue_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL REFERENCES ticket_sessions(session_id),
+    delivery_run_id TEXT NOT NULL REFERENCES worker_runs(run_id),
+    source TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    finding_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL CHECK (action IN ('ask-user', 'skip')),
+    reason TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    allowed_answers_json TEXT NOT NULL,
+	consumed_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 40: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS quality_gate_questions_fingerprint_idx ON quality_gate_questions(version_id, issue_id, fingerprint)`); err != nil {
+			return fmt.Errorf("migration 40: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (40, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 41 {
+		exists, err := tableHasColumnTx(ctx, tx, "ticket_deliveries", "merge_commit")
+		if err != nil {
+			return fmt.Errorf("migration 41: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE ticket_deliveries ADD COLUMN merge_commit TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migration 41: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (41, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 42 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS dispatch_fairness (
+    repository TEXT PRIMARY KEY,
+    last_root_issue_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 42: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (42, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 43 {
+		for _, column := range []struct {
+			name       string
+			definition string
+		}{
+			{name: "validated_base_commit", definition: "TEXT NOT NULL DEFAULT ''"},
+			{name: "validated_head_commit", definition: "TEXT NOT NULL DEFAULT ''"},
+		} {
+			exists, err := tableHasColumnTx(ctx, tx, "ticket_deliveries", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 43: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE ticket_deliveries ADD COLUMN "+column.name+" "+column.definition); err != nil {
+					return fmt.Errorf("migration 43: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (43, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 44 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS merge_ready_revalidations (
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    claimed_run_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (version_id, issue_id, event_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE INDEX IF NOT EXISTS merge_ready_revalidations_unclaimed_idx ON merge_ready_revalidations(version_id, issue_id, claimed_run_id, received_at)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 44: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (44, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 45 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS plan_amendments (
+    amendment_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL REFERENCES plan_versions(version_id),
+    issue_id INTEGER NOT NULL,
+    question_id TEXT NOT NULL UNIQUE REFERENCES workflow_questions(question_id),
+    proposal_json TEXT NOT NULL,
+    impact_report TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'rejected', 'approved')),
+    applied_version_id TEXT NOT NULL DEFAULT '',
+    proposed_at TEXT NOT NULL,
+    decided_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS plan_amendments_pending_version_idx ON plan_amendments(version_id) WHERE state = 'pending'`,
+			`CREATE TABLE IF NOT EXISTS plan_amendment_pauses (
+    amendment_id TEXT NOT NULL REFERENCES plan_amendments(amendment_id),
+    version_id TEXT NOT NULL,
+    issue_id INTEGER NOT NULL,
+    PRIMARY KEY (amendment_id, issue_id),
+    FOREIGN KEY (version_id, issue_id) REFERENCES plan_tickets(version_id, issue_id)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 45: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (45, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 46 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS run_failures (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    class TEXT NOT NULL CHECK (class IN ('code_quality', 'infrastructure')),
+    reason TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS infrastructure_retry_backoffs (
+    session_id TEXT PRIMARY KEY REFERENCES ticket_sessions(session_id),
+    consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures > 0),
+    retry_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS needs_attention_fingerprints (
+    question_id TEXT PRIMARY KEY REFERENCES workflow_questions(question_id),
+    fingerprint TEXT NOT NULL
+)`,
+			`CREATE INDEX IF NOT EXISTS needs_attention_fingerprints_lookup_idx ON needs_attention_fingerprints(fingerprint)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 46: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (46, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 47 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS control_plane_backups (
+    backup_path TEXT PRIMARY KEY,
+    checksum_sha256 TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS control_plane_backup_references (
+	backup_path TEXT NOT NULL REFERENCES control_plane_backups(backup_path),
+    kind TEXT NOT NULL CHECK (kind IN ('workspace', 'artifact')),
+    reference_path TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL DEFAULT '',
+    available INTEGER NOT NULL CHECK (available IN (0, 1)),
+    PRIMARY KEY (backup_path, kind, reference_path)
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 47: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (47, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

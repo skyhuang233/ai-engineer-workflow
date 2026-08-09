@@ -61,6 +61,8 @@ jobs:
           echo "image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "worker_release_repository=$(jq -r .worker.release_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_version=$(jq -r .github_cli.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_sha256=$(jq -r .github_cli.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
@@ -103,7 +105,7 @@ jobs:
           identity_json="$(jq --compact-output \
             --arg deploy_worker_tree "$deploy_worker_tree" \
             --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
-            '{schema_version:3,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
+            '{schema_version:4,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
             config/toolchain.json)"
           identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
           [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || {
@@ -123,8 +125,8 @@ jobs:
             required=true
           else
             git show "${BEFORE_SHA}:config/toolchain.json" |
-              jq --sort-keys '{codex,go,no_mistakes,worker}' > /tmp/worker-inputs-before.json
-            jq --sort-keys '{codex,go,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
+              jq --sort-keys '{codex,github_cli,go,no_mistakes,worker}' > /tmp/worker-inputs-before.json
+            jq --sort-keys '{codex,github_cli,go,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
             if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
                ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker .github/workflows/publish-worker.yml; then
               required=true
@@ -155,17 +157,21 @@ jobs:
               echo "Worker version already belongs to a different accepted commit" >&2
               exit 1
             }
-            asset_id="$(jq -r 'if (.assets | length) == 1 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
-            test -n "$asset_id" || {
-              echo "Existing Worker Release has no unambiguous release manifest" >&2
+            manifest_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
+            sbom_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-sbom.spdx.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
+            test -n "$manifest_asset_id" && test -n "$sbom_asset_id" || {
+              echo "Existing Worker Release lacks an unambiguous manifest or SPDX SBOM" >&2
               exit 1
             }
-            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > worker-release.json
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${manifest_asset_id}" > worker-release.json
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${sbom_asset_id}" > worker-sbom.spdx.json
             jq --exit-status \
               --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
               --arg source_commit "$GITHUB_SHA" \
               --arg image_repository "${{ steps.pins.outputs.image_repository }}" \
               --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+              --arg github_cli_version "${{ steps.pins.outputs.github_cli_version }}" \
+              --arg github_cli_linux_amd64_sha256 "${{ steps.pins.outputs.github_cli_sha256 }}" \
               --arg go_version "${{ steps.pins.outputs.go_version }}" \
               --arg go_linux_amd64_sha256 "${{ steps.pins.outputs.go_sha256 }}" \
               --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
@@ -175,13 +181,15 @@ jobs:
               --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
               --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
               --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
-              '(.schema_version == 3) and
+              '(.schema_version == 5) and
                (.worker_version == $worker_version) and
                (.source_commit == $source_commit) and
                (.image | type == "string") and
                (.image | startswith($image_repository + "@sha256:")) and
                (.image | test("^.+@sha256:[0-9a-f]{64}$")) and
                (.codex_version == $codex_version) and
+               (.github_cli_version == $github_cli_version) and
+               (.github_cli_linux_amd64_sha256 == $github_cli_linux_amd64_sha256) and
                (.go_version == $go_version) and
                (.go_linux_amd64_sha256 == $go_linux_amd64_sha256) and
                (.no_mistakes_version == $no_mistakes_version) and
@@ -191,11 +199,18 @@ jobs:
                (.no_mistakes_fork_release == $no_mistakes_fork_release) and
                (.no_mistakes_linux_amd64_sha256 == $no_mistakes_linux_amd64_sha256) and
                (.build_input_identity == $build_input_identity) and
+               (.sbom_sha256 | test("^[0-9a-f]{64}$")) and
+               (.vulnerability_scan == {scanner:"grype",severity_cutoff:"high",only_fixed:true}) and
                (.github_actions_run_id | type == "number" and . > 0)' \
               worker-release.json > /dev/null || {
                 echo "Existing Worker Release has an incomplete or invalid release manifest" >&2
                 exit 1
               }
+            sbom_sha256="$(jq -r .sbom_sha256 worker-release.json)"
+            echo "${sbom_sha256}  worker-sbom.spdx.json" | sha256sum --check --strict || {
+              echo "Existing Worker SBOM does not match the Release Manifest" >&2
+              exit 1
+            }
             image="$(jq -r .image worker-release.json)"
             docker buildx imagetools inspect "$image" > /dev/null || {
               echo "Existing Worker Release image digest does not resolve" >&2
@@ -252,6 +267,8 @@ jobs:
           tags: ${{ steps.pins.outputs.image_repository }}:${{ steps.build-inputs.outputs.release_identity }}
           build-args: |
             CODEX_VERSION=${{ steps.pins.outputs.codex_version }}
+            GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}
+            GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_sha256 }}
             GO_VERSION=${{ steps.pins.outputs.go_version }}
             GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}
             NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}
@@ -259,17 +276,37 @@ jobs:
             NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}
             NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}
             NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}
+      - name: Generate published Worker SBOM
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ steps.pins.outputs.image_repository }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: worker-sbom.spdx.json
+          upload-artifact: false
+      - name: Scan published Worker dependencies
+        if: steps.changes.outputs.required == 'true'
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
       - name: Create authoritative Worker Release Manifest
         if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          sbom_sha256="$(sha256sum worker-sbom.spdx.json | awk '{print $1}')"
           jq --null-input \
             --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
             --arg source_commit "${GITHUB_SHA}" \
             --arg image "${{ steps.pins.outputs.image_repository }}@${IMAGE_DIGEST}" \
             --arg codex_version "${{ steps.pins.outputs.codex_version }}" \
+            --arg github_cli_version "${{ steps.pins.outputs.github_cli_version }}" \
+            --arg github_cli_linux_amd64_sha256 "${{ steps.pins.outputs.github_cli_sha256 }}" \
             --arg go_version "${{ steps.pins.outputs.go_version }}" \
             --arg go_linux_amd64_sha256 "${{ steps.pins.outputs.go_sha256 }}" \
             --arg no_mistakes_version "${{ steps.pins.outputs.no_mistakes_version }}" \
@@ -279,15 +316,19 @@ jobs:
             --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
             --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
             --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
+            --arg sbom_sha256 "$sbom_sha256" \
             --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
-            '{schema_version:3, worker_version:$worker_version, source_commit:$source_commit,
-              image:$image, codex_version:$codex_version, go_version:$go_version,
+            '{schema_version:5, worker_version:$worker_version, source_commit:$source_commit,
+              image:$image, codex_version:$codex_version, github_cli_version:$github_cli_version,
+              github_cli_linux_amd64_sha256:$github_cli_linux_amd64_sha256, go_version:$go_version,
               go_linux_amd64_sha256:$go_linux_amd64_sha256, no_mistakes_version:$no_mistakes_version,
               no_mistakes_upstream_repository:$no_mistakes_upstream_repository, no_mistakes_commit:$no_mistakes_commit,
               no_mistakes_fork_repository:$no_mistakes_fork_repository,
               no_mistakes_fork_release:$no_mistakes_fork_release,
               no_mistakes_linux_amd64_sha256:$no_mistakes_linux_amd64_sha256,
-              build_input_identity:$build_input_identity, github_actions_run_id:$github_actions_run_id}' \
+              build_input_identity:$build_input_identity, sbom_sha256:$sbom_sha256,
+              vulnerability_scan:{scanner:"grype",severity_cutoff:"high",only_fixed:true},
+              github_actions_run_id:$github_actions_run_id}' \
             > worker-release.json
           jq --exit-status . worker-release.json
       - name: Publish Worker Release Manifest
@@ -298,4 +339,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Worker ${{ steps.build-inputs.outputs.release_identity }}
           body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
-          files: worker-release.json
+          files: |
+            worker-release.json
+            worker-sbom.spdx.json

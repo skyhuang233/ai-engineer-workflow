@@ -16,6 +16,7 @@ import (
 
 type PollResult struct {
 	Deliveries int
+	Delivered  int
 	Feedback   int
 	Checks     int
 }
@@ -27,6 +28,7 @@ type BootstrapControlResult struct {
 	AttemptedPlanAlreadyComplete bool
 }
 type BootstrapControlPass func(context.Context, bool) (BootstrapControlResult, error)
+type DeliveredControlPass func(context.Context) error
 
 type WorkflowInboxProjector interface {
 	ProjectWorkflowInbox(context.Context, string, []plan.WorkflowQuestion) error
@@ -111,6 +113,7 @@ type Poller struct {
 	Client                *Client
 	Now                   func() time.Time
 	LaunchReview          ReviewLauncher
+	AfterDelivered        DeliveredControlPass
 	InboxProjector        WorkflowInboxProjector
 	MaxFailures           int
 	MaxWorkerAttempts     int
@@ -498,6 +501,14 @@ func (p Poller) pollWithBootstrapLeased(ctx context.Context, repository string, 
 		}
 		return p.recordFailureForPlans(ctx, repository, now, attemptedActiveVersionIDs, err)
 	}
+	if result.Delivered > 0 && p.AfterDelivered != nil {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		if err := p.AfterDelivered(ctx); err != nil {
+			return p.recordFailureForPlans(ctx, repository, now, attemptedActiveVersionIDs, err)
+		}
+	}
 	if err := p.Store.RecordGitHubPollSuccessLeased(ctx, repository, now, full, leaseToken, p.now()); err != nil {
 		return PollResult{}, err
 	}
@@ -786,16 +797,82 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 		return PollResult{}, wrapPollStoreError(err)
 	}
 	result := PollResult{Deliveries: len(deliveries)}
+	defaultBranch := DefaultBranchRevision{}
+	if len(deliveries) > 0 {
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		defaultBranch, err = p.Client.DefaultBranchHead(ctx, repository)
+		if err != nil {
+			return PollResult{}, err
+		}
+	}
 	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
 	for _, delivery := range deliveries {
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err
 		}
-		terminal, err := reconciler.ReconcileTicket(ctx, delivery)
+		state, err := reconciler.reconcileTicket(ctx, delivery)
 		if err != nil {
 			return PollResult{}, err
 		}
+		terminal := state != pullRequestPending
+		if state == pullRequestDelivered {
+			result.Delivered++
+		}
+		if err := p.renewPollLease(ctx, repository); err != nil {
+			return PollResult{}, err
+		}
+		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
+		if err != nil {
+			return PollResult{}, err
+		}
+		if changed {
+			updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
+			if err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			if err := p.Store.RecordPullRequestChecksETag(ctx, delivery.VersionID, delivery.IssueID, etag); err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			result.Checks += updated
+		}
 		if !terminal {
+			if err := p.renewPollLease(ctx, repository); err != nil {
+				return PollResult{}, err
+			}
+			revision, err := p.Client.PullRequestRevision(ctx, repository, delivery.PullRequestNumber)
+			if err != nil {
+				return PollResult{}, err
+			}
+			candidateIncludesDefault, err := p.Client.CandidateIncludesDefaultBranch(ctx, repository, delivery.CandidateCommit, defaultBranch.Head)
+			if err != nil {
+				return PollResult{}, err
+			}
+			humanReviewed, err := p.Client.PullRequestApproved(ctx, repository, delivery.PullRequestNumber, delivery.CandidateCommit)
+			if err != nil {
+				return PollResult{}, err
+			}
+			checksPassed, err := p.Store.PullRequestChecksPassed(ctx, delivery.VersionID, delivery.IssueID, delivery.CandidateCommit)
+			if err != nil {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			invalidated, err := p.Store.ObserveMergeReady(ctx, delivery, store.MergeReadyObservation{
+				DefaultBranch:            defaultBranch.Name,
+				DefaultBranchHead:        defaultBranch.Head,
+				BaseBranch:               revision.BaseBranch,
+				BaseCommit:               revision.BaseCommit,
+				CandidateHead:            revision.HeadCommit,
+				CandidateIncludesDefault: candidateIncludesDefault,
+				ChecksPassed:             checksPassed,
+				HumanReviewed:            humanReviewed,
+			}, now)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return PollResult{}, wrapPollStoreError(err)
+			}
+			if invalidated {
+				result.Feedback++
+			}
 			if err := p.renewPollLease(ctx, repository); err != nil {
 				return PollResult{}, err
 			}
@@ -805,7 +882,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 			}
 			feedback := make([]store.ReviewFeedback, 0, len(events))
 			for _, event := range events {
-				feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body})
+				feedback = append(feedback, store.ReviewFeedback{Source: event.Source, EventID: event.EventID, Author: event.Author, Body: event.Body, BatchID: event.BatchID, Debounce: event.Debounce})
 			}
 			inserted, err := p.Store.RecordReviewFeedback(ctx, delivery.VersionID, delivery.IssueID, feedback, now)
 			if err != nil {
@@ -825,23 +902,6 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 					return PollResult{}, wrapPollStoreError(claimErr)
 				}
 			}
-		}
-		if err := p.renewPollLease(ctx, repository); err != nil {
-			return PollResult{}, err
-		}
-		checks, etag, changed, err := p.Client.PullRequestChecksIfChanged(ctx, repository, delivery.CandidateCommit, delivery.ChecksETag, full)
-		if err != nil {
-			return PollResult{}, err
-		}
-		if changed {
-			updated, err := p.Store.RecordPullRequestChecks(ctx, delivery.VersionID, delivery.IssueID, checks, now)
-			if err != nil {
-				return PollResult{}, wrapPollStoreError(err)
-			}
-			if err := p.Store.RecordPullRequestChecksETag(ctx, delivery.VersionID, delivery.IssueID, etag); err != nil {
-				return PollResult{}, wrapPollStoreError(err)
-			}
-			result.Checks += updated
 		}
 	}
 	return result, nil

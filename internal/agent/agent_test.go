@@ -1066,7 +1066,7 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	}
 }
 
-func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
+func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1081,14 +1081,11 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 		t.Fatalf("Candidate acceptance was not durable: %v", err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
-	if err != nil || len(questions) != 1 || !strings.Contains(questions[0].Prompt, "Delivery Controller failed") {
-		t.Fatalf("Delivery Controller recovery question = %#v, err = %v", questions, err)
+	if err != nil || len(questions) != 0 {
+		t.Fatalf("Delivery Controller should retry before Needs Attention: %#v, err = %v", questions, err)
 	}
 	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
 		t.Fatalf("review claim after failed delivery = %v, want not ready", err)
-	}
-	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "retry", time.Now().UTC()); err != nil {
-		t.Fatal(err)
 	}
 	if _, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC()); err != nil {
 		t.Fatal(err)
@@ -1121,6 +1118,82 @@ func TestControllerMarksFailedDeliveryNeedsAttention(t *testing.T) {
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
+	}
+}
+
+func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  source: no-mistakes\n  finding_id: finding-42\n  action: ask-user\n  reason: choose the migration strategy\n  allowed_answers[2]: proceed, decline\n")
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("run with human gate: %v", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("quality gate questions = %#v, err=%v", questions, err)
+	}
+	question := questions[0]
+	if question.Kind != "quality_gate" || !strings.Contains(question.Prompt, "finding-42") || !strings.Contains(question.Prompt, "proceed, decline") || !strings.Contains(question.Prompt, "workflow-answer:"+question.ID) {
+		t.Fatalf("quality gate question = %#v", question)
+	}
+	if _, err := db.ClaimReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("manual Agent continuation bypassed active gate: %v", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "not-allowed", time.Now().UTC()); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("invalid quality gate answer = %v, want ErrInvalidClaim", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "proceed", time.Now().UTC()); err != nil {
+		t.Fatalf("answer quality gate: %v", err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "proceed", time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("duplicate quality gate answer = %v, want ErrNotFound", err)
+	}
+	if _, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending gate retry = %#v, err=%v", pending, err)
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("retry answered gate: %v", err)
+	}
+	if len(retryRuntime.specs) != 1 || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ID"] != "gate-17" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_FINDING_ID"] != "finding-42" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ANSWER"] != "proceed" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ENFORCED"] != "true" {
+		t.Fatalf("quality gate retry environment = %#v", retryRuntime.specs)
+	}
+	if strings.Contains(strings.Join(retryRuntime.specs[0].Command, " "), "--yes") {
+		t.Fatalf("Delivery Controller used forbidden global approval: %#v", retryRuntime.specs[0].Command)
+	}
+}
+
+func TestControllerRejectsAnswerForStaleQualityGate(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	gateOutput := []byte("run:\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-stale\n  action: ask-user\n  reason: choose a migration strategy\n  allowed_answers[1]: proceed\n")
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("quality gate questions = %#v, err=%v", questions, err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "proceed", time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale quality gate answer = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1316,6 +1389,41 @@ func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
 	}
 	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(3*time.Hour)); err != nil || reclaimed != 0 {
 		t.Fatalf("idempotent reclaim = %d, %v", reclaimed, err)
+	}
+}
+
+func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
+	outsideStatePath := filepath.Join(root, "outside", claim.SessionID)
+	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideStatePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-1", WorkspacePath: workspacePath, CodexStatePath: outsideStatePath, Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(2*time.Hour)); err == nil || reclaimed != 0 {
+		t.Fatalf("cleanup failure reclaim = %d, %v; want zero and an error", reclaimed, err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Delivered" {
+		t.Fatalf("ticket state after cleanup failure = %q, want Delivered", projection.Tickets[0].State)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("delivered current claim after cleanup failure = %v, want ErrNotFound", err)
 	}
 }
 
