@@ -541,6 +541,13 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, maxAttempts int, now time.Time, provisionSession ...store.SessionProvisioner) (store.TicketClaim, string, error) {
 	claim, err := db.CurrentClaim(ctx, versionID, ticketID)
 	if err == nil {
+		revisionPrompt, promptErr := db.ClaimedReviewRevisionPrompt(ctx, claim.RunID)
+		if promptErr == nil {
+			return claim, revisionPrompt, nil
+		}
+		if !errors.Is(promptErr, store.ErrNotFound) {
+			return store.TicketClaim{}, "", promptErr
+		}
 		return claim, "", nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {

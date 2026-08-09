@@ -568,6 +568,65 @@ func TestAcquireTicketClaimReplacesExpiredWorker(t *testing.T) {
 	t.Logf("run-ticket claim acquisition reused Ticket Session %s and advanced from attempt %d to %d", replacement.SessionID, expired.Attempt, replacement.Attempt)
 }
 
+func TestAcquireTicketClaimRestoresClaimedReviewPromptBeforeControllerRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Body: "initial specification must not replace review feedback", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	feedbackBody := "  preserve this review feedback exactly  \nincluding its whitespace"
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []store.ReviewFeedback{{Source: "review", EventID: "50", Author: "human", Body: feedbackBody}}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	revision, expectedPrompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(3*time.Second), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, recoveredPrompt, err := acquireTicketClaim(ctx, db, version.ID, claim.TicketID, store.DefaultMaxWorkerAttempts, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.RunID != revision.RunID || recoveredPrompt != expectedPrompt {
+		t.Fatalf("recovered claim = %#v, prompt = %q; want run %q, prompt %q", recovered, recoveredPrompt, revision.RunID, expectedPrompt)
+	}
+	resolved, err := resolveWorkerPrompt(ctx, db, recovered, recoveredPrompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != expectedPrompt || strings.Contains(resolved, snapshot.Children[0].Body) {
+		t.Fatalf("resolved recovery prompt = %q, want exact claimed review prompt %q", resolved, expectedPrompt)
+	}
+}
+
 func TestDispatchPendingDeliveryClaimsOnlyLaunchesRecoveredDelivery(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
