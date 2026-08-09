@@ -17,7 +17,8 @@ const (
 var fullLowercaseCommitSHA = regexp.MustCompile(fullLowercaseCommitSHAPattern)
 
 // Schema is the strict contract supplied to OpenAI structured output. Every
-// property is required, with null representing an unavailable commit.
+// property is required. Implementation Candidates name their exact workspace
+// HEAD; null is reserved for a Plan Amendment with no implementation commit.
 const Schema = `{
   "type": "object",
   "required": ["summary", "commit", "checks", "plan_amendment"],

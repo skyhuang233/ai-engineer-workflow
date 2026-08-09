@@ -51,7 +51,14 @@ Start the credential-isolated Gateway and one persistent `poll-github` process
 with `--max-parallel-runs 2`. Activation must occur only after the complete DAG
 has been reread and accepted. Before activation, capture evidence that the ready
 frontier and Worker Run count are zero. After activation, capture two distinct
-concurrent Ticket Sessions and Worker Runs.
+concurrent Ticket Sessions and Worker Runs. Each initial Ticket Agent must
+implement the complete specification captured in its activated plan version
+without retrieving the ticket from GitHub. Inspect each new Ticket Workspace's
+repository-local Git configuration and require `workflow-ticket-agent` /
+`workflow-ticket-agent@users.noreply.github.com`; require every implementation
+Candidate to report the lowercase 40-character SHA that exactly equals its
+Workspace `HEAD`; `null` is reserved for a Plan Amendment with no implementation
+commit.
 
 The owner then performs these interventions in order:
 
@@ -114,6 +121,9 @@ baseline mapping and add the successful run URL beside every row in the issue:
 | Lease generation and expected remote head fence writes | `TestGatewayRejectsZombieCommandAfterLeaseReplacement`, `TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite`, `TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite` |
 | Outbox before call, unknown result reconciliation, no duplicate object | `TestGatewayUsesDurableOutboxAndReconcilesAnUncertainWrite`, `TestGatewayTreatsPostDeadlineSuccessAsUncertain`, `TestOutboxProcessingLeaseCanBeReclaimedAfterRestart` |
 | Worker cannot choose target or receive GitHub write credentials | `TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs`, `TestGatewayDerivesRepositoryFromLeasedTicket`, `TestWorkspacePusherRejectsPushURLWithEmbeddedCredential` |
+| Initial Worker receives the immutable activated ticket specification without GitHub access | `TestTicketBodyReturnsImmutableActivatedSpecification`, `TestResolveWorkerPromptUsesImmutableBodyForInitialRun`, `TestImplementationPromptCarriesPersistedTicketContract` |
+| New and recovered workspaces use the non-owner ticket-agent Git identity | `TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF`, `TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery` |
+| Implementation Candidate names its exact lowercase full workspace HEAD | `TestSchemaMeetsOpenAIStrictObjectRequirements`, `TestValidateStrictCandidateOutput`, `TestControllerRejectsImplementationCandidateWithNullCommit` |
 | Workspace/Codex state outlive containers; dirty exits restore accepted commit | `TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun`, `TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement` |
 | Feedback is owner-classified, deduplicated and batched once | `TestActionablePullRequestFeedbackIncludesOwnerEventsOnly`, `TestReviewFeedbackDeduplicatesAndBatchesOneRevision` |
 | Agent cannot merge, resolve threads or write `main` | `TestGatewayRejectsAgentPhasePublicationBeforeDeliveryController`, `TestGatewayAllowsDeliveryControllerCommandFromAcceptedCandidate` plus the real Gateway capability drill |
