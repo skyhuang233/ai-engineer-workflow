@@ -272,8 +272,13 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
+	defaultBranch, err := trustedWorkspaceDefaultBranch(ctx, ws.Path)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
+	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
+		"NM_HOME":                          "/codex-state/no-mistakes",
 		"NO_MISTAKES_WORKFLOW_MODE":        "true",
 		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
 		"NO_MISTAKES_REVISION_ROUND":       session.AcceptedCandidateRunID,
@@ -282,6 +287,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		"NO_MISTAKES_LEASE_TOKEN":          deliveryClaim.LeaseToken,
 		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(deliveryClaim.LeaseGeneration),
 		"NO_MISTAKES_REPOSITORY":           publication.Repository,
+		"NO_MISTAKES_DEFAULT_BRANCH":       defaultBranch,
 		"NO_MISTAKES_BRANCH":               publication.Branch,
 		"NO_MISTAKES_COMMIT_SHA":           session.AcceptedCommit,
 		"NO_MISTAKES_EXPECTED_REMOTE_HEAD": publication.ExpectedRemoteHead,
@@ -348,6 +354,30 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return err
 	}
 	return nil
+}
+
+func trustedWorkspaceDefaultBranch(ctx context.Context, workspacePath string) (string, error) {
+	if strings.TrimSpace(workspacePath) == "" {
+		return "", errors.New("Ticket Workspace path is required")
+	}
+	output, err := gitOutput(ctx, workspacePath, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "ref:" && strings.HasPrefix(fields[1], "refs/heads/") {
+			branch := strings.TrimPrefix(fields[1], "refs/heads/")
+			if branch == "" {
+				break
+			}
+			if _, err := gitOutput(ctx, workspacePath, "check-ref-format", "--branch", branch); err != nil {
+				return "", fmt.Errorf("invalid source default branch %q: %w", branch, err)
+			}
+			return branch, nil
+		}
+	}
+	return "", errors.New("source repository did not advertise a default branch")
 }
 
 func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {

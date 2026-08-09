@@ -14,10 +14,12 @@ prerequisite, not the approval itself.
   image with its dependency tree before the Worker contract is checked.
 - Go is pinned to an exact Linux amd64 archive version and official SHA-256
   checksum. Doctor verifies `go version` inside the exact Worker image.
-- `no-mistakes` is pinned to an upstream release, verified commit, fork
-  repository, fork release, and Linux release-asset checksum. Doctor reads the
-  installed executable's full immutable Go `vcs.revision` build metadata, so
-  its abbreviated human-readable version output is not used as provenance.
+- `no-mistakes` is pinned to a verified upstream commit plus a distinct fork
+  commit, immutable fork release, and Linux release-asset checksum. Doctor
+  proves the upstream commit is the fork commit's merge base, the release
+  targets the fork commit, and the installed executable's full immutable Go
+  `vcs.revision` equals that fork commit. Its abbreviated human-readable
+  version output is not used as provenance.
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
@@ -190,7 +192,8 @@ and record its result in Issue #7.
 Never edit only one version string. A toolchain upgrade is accepted only after:
 
 1. recording the selected tool's exact upstream version and, for
-   `no-mistakes`, its full verified commit and immutable fork release;
+   `no-mistakes`, its full verified upstream and fork commits and immutable
+   fork release;
 2. recording and verifying the official or release-asset SHA-256 for every
    downloaded archive;
 3. updating the machine pins and immutable Worker build inputs together;

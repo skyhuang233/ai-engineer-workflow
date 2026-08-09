@@ -46,6 +46,7 @@ type NoMistakesPin struct {
 	UpstreamRepository string `json:"upstream_repository"`
 	UpstreamCommit     string `json:"upstream_commit"`
 	ForkRepository     string `json:"fork_repository"`
+	ForkCommit         string `json:"fork_commit"`
 	ForkRelease        string `json:"fork_release"`
 	LinuxAMD64SHA256   string `json:"linux_amd64_sha256"`
 }
@@ -119,7 +120,7 @@ func LoadConfig(path string) (Config, error) {
 
 func (c Config) Validate() error {
 	switch {
-	case c.SchemaVersion != 4:
+	case c.SchemaVersion != 5:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
@@ -139,6 +140,8 @@ func (c Config) Validate() error {
 		return errors.New("no-mistakes upstream commit must be a full SHA")
 	case !repoPattern.MatchString(c.NoMistakes.ForkRepository):
 		return errors.New("no-mistakes fork repository must be owner/name")
+	case !shaPattern.MatchString(c.NoMistakes.ForkCommit):
+		return errors.New("no-mistakes fork commit must be a full SHA")
 	case strings.TrimSpace(c.NoMistakes.ForkRelease) == "":
 		return errors.New("no-mistakes fork release is required")
 	case !sha256Pattern.MatchString(c.NoMistakes.LinuxAMD64SHA256):

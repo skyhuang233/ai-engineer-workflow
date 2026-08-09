@@ -1249,6 +1249,12 @@ func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryC
 	if spec.Environment["NO_MISTAKES_WORKFLOW_MODE"] != "true" || spec.Environment["NO_MISTAKES_DELIVERY_CYCLE"] != deliveryCycle || spec.Environment["NO_MISTAKES_REVISION_ROUND"] != revisionRound || spec.Environment["NO_MISTAKES_CORRELATION_ID"] != correlationID {
 		t.Fatalf("Delivery Controller workflow correlation environment = %#v", spec.Environment)
 	}
+	if spec.Environment["NM_HOME"] != "/codex-state/no-mistakes" {
+		t.Fatalf("Delivery Controller no-mistakes state = %q, want persistent Ticket state", spec.Environment["NM_HOME"])
+	}
+	if spec.Environment["NO_MISTAKES_DEFAULT_BRANCH"] != "main" {
+		t.Fatalf("Delivery Controller default branch = %q, want trusted source default", spec.Environment["NO_MISTAKES_DEFAULT_BRANCH"])
+	}
 }
 
 func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T) {

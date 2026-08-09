@@ -251,7 +251,10 @@ func TestHostPressurePausesNewDispatchWithoutChangingActiveRuns(t *testing.T) {
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	// CurrentClaim evaluates lease liveness against the real clock, so anchor
+	// this active-run invariant to the test's current time rather than a date
+	// that eventually becomes an expired lease.
+	now := time.Now().UTC().Truncate(time.Second)
 	running, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now})
 	if err != nil {
 		t.Fatal(err)
