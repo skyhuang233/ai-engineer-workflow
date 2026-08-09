@@ -36,6 +36,23 @@ func TestDoctorVerificationBudgetAllowsColdWorkerPullAndCodexResume(t *testing.T
 	t.Logf("workflow doctor verification budget = %s", doctorVerificationTimeout)
 }
 
+func TestImplementationPromptCarriesPersistedTicketContract(t *testing.T) {
+	claim := store.TicketClaim{TicketNumber: 8, TicketTitle: "Add the alpha record"}
+	body := "Create qualification/issue20-e2e.md with exactly:\nalpha: issue-20-production-e2e"
+	prompt := implementationPrompt(claim, body)
+	for _, want := range []string{
+		"Implement Executable Ticket #8: Add the alpha record",
+		body,
+		"Do not call GitHub",
+		"Commit all changes and leave the Ticket Workspace clean.",
+		"exact full lowercase 40-character Git commit SHA",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("implementationPrompt() omitted %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "workflow.db")

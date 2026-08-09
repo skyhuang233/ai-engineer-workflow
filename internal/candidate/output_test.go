@@ -25,6 +25,14 @@ func TestSchemaMeetsOpenAIStrictObjectRequirements(t *testing.T) {
 	if len(types) != 2 || types[0] != "string" || types[1] != "null" {
 		t.Fatalf("commit schema type = %#v, want string-or-null", types)
 	}
+	if got, want := commit["pattern"], "^[0-9a-f]{40}$"; got != want {
+		t.Fatalf("commit schema pattern = %#v, want %q", got, want)
+	}
+	for _, field := range []string{"minLength", "maxLength"} {
+		if got, want := commit[field], float64(40); got != want {
+			t.Fatalf("commit schema %s = %#v, want %.0f", field, got, want)
+		}
+	}
 }
 
 func validateStrictSchema(node any, path string) error {
@@ -207,6 +215,7 @@ func TestValidateCandidateOutput(t *testing.T) {
 
 func TestValidateStrictCandidateOutput(t *testing.T) {
 	valid := `{"summary":"implemented","commit":null,"checks":[],"plan_amendment":null}`
+	validCommit := `{"summary":"implemented","commit":"0123456789abcdef0123456789abcdef01234567","checks":[],"plan_amendment":null}`
 	validAmendment := `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1,"NodeID":"node","Number":2,"Title":"ticket","Body":"body","State":"open","Labels":["workflow:ticket"],"UpdatedAt":"now","Delivered":false,"Author":"agent","AuthorType":"Bot"}],"remove_ticket_ids":[3],"add_dependencies":[{"blocked_ticket_id":2,"blocker_ticket_id":1}],"remove_dependencies":[]}}`
 	for _, tt := range []struct {
 		name   string
@@ -214,7 +223,11 @@ func TestValidateStrictCandidateOutput(t *testing.T) {
 		valid  bool
 	}{
 		{name: "complete", output: valid, valid: true},
+		{name: "complete with commit", output: validCommit, valid: true},
 		{name: "complete amendment", output: validAmendment, valid: true},
+		{name: "abbreviated commit", output: `{"summary":"implemented","commit":"0123456","checks":[],"plan_amendment":null}`},
+		{name: "commit with subject", output: `{"summary":"implemented","commit":"0123456789abcdef0123456789abcdef01234567 candidate","checks":[],"plan_amendment":null}`},
+		{name: "uppercase commit", output: `{"summary":"implemented","commit":"0123456789ABCDEF0123456789ABCDEF01234567","checks":[],"plan_amendment":null}`},
 		{name: "missing commit", output: `{"summary":"implemented","checks":[],"plan_amendment":null}`},
 		{name: "missing plan amendment", output: `{"summary":"implemented","commit":null,"checks":[]}`},
 		{name: "missing ticket field", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},

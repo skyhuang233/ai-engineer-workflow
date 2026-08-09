@@ -202,7 +202,12 @@ func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T)
 	if strings.Contains(string(readme), "\r\n") {
 		t.Fatalf("Ticket Workspace README uses CRLF: %q", readme)
 	}
-	for key, want := range map[string]string{"core.autocrlf": "false", "core.eol": "lf"} {
+	for key, want := range map[string]string{
+		"core.autocrlf": "false",
+		"core.eol":      "lf",
+		"user.name":     "workflow-ticket-agent",
+		"user.email":    "workflow-ticket-agent@users.noreply.github.com",
+	} {
 		command := exec.Command("git", "config", "--local", "--get", key)
 		command.Dir = session.WorkspacePath
 		output, err := command.CombinedOutput()
@@ -233,6 +238,11 @@ func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testin
 			t.Fatalf("git %v: %v\n%s", args, err, output)
 		}
 	}
+	for key, value := range map[string]string{"user.name": "repository-owner", "user.email": "owner@example.com"} {
+		if output, err := exec.Command("git", "-C", workspacePath, "config", "--local", key, value).CombinedOutput(); err != nil {
+			t.Fatalf("configure existing workspace %s: %v\n%s", key, err, output)
+		}
+	}
 	readmePath := filepath.Join(workspacePath, "README.md")
 	before, err := os.ReadFile(readmePath)
 	if err != nil {
@@ -259,6 +269,14 @@ func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testin
 	}
 	if strings.Contains(string(after), "\r\n") {
 		t.Fatalf("recovered Ticket Workspace still uses CRLF: %q", after)
+	}
+	for key, want := range map[string]string{"user.name": "workflow-ticket-agent", "user.email": "workflow-ticket-agent@users.noreply.github.com"} {
+		command := exec.Command("git", "config", "--local", "--get", key)
+		command.Dir = workspacePath
+		output, err := command.CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != want {
+			t.Fatalf("recovered Ticket Workspace %s = %q, err=%v; want %q", key, output, err, want)
+		}
 	}
 	status := exec.Command("git", "status", "--porcelain")
 	status.Dir = workspacePath

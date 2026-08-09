@@ -814,8 +814,12 @@ func runPollGitHub(args []string) {
 			for {
 				claim, claimErr := dispatcher.ClaimNext(ctx, *repository, "workflow-control-plane")
 				if claimErr == nil {
+					body, err := db.TicketBody(ctx, claim.VersionID, claim.TicketID)
+					if err != nil {
+						return controlResult, err
+					}
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
-					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
+					if err := launch(ctx, claim, implementationPrompt(claim, body), branch, "", true); err != nil {
 						return controlResult, err
 					}
 					continue
@@ -863,6 +867,15 @@ func runPollGitHub(args []string) {
 		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func implementationPrompt(claim store.TicketClaim, body string) string {
+	return fmt.Sprintf(`Implement Executable Ticket #%d: %s
+
+Authoritative ticket specification:
+%s
+
+Implement the exact specification and acceptance criteria above. The Worker intentionally has no GitHub credential. Do not call GitHub or attempt to retrieve the Issue. Commit all changes and leave the Ticket Workspace clean. In the structured Candidate response, commit must be the exact full lowercase 40-character Git commit SHA only, with no subject or other text.`, claim.TicketNumber, claim.TicketTitle, body)
 }
 
 func shouldLogNeedsAttentionError(err error) bool {
