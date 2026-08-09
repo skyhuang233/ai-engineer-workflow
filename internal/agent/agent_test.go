@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -127,6 +128,18 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	if r.failAfterCommit {
 		return result, r.err
 	}
+	for _, output := range []*[]byte{&result.Output, &result.Stdout} {
+		if !bytes.Contains(*output, []byte(candidateCommitPlaceholder)) {
+			continue
+		}
+		head := exec.Command("git", "rev-parse", "HEAD")
+		head.Dir = spec.WorkspacePath
+		commit, err := head.Output()
+		if err != nil {
+			return worker.Result{}, err
+		}
+		*output = bytes.ReplaceAll(*output, []byte(candidateCommitPlaceholder), []byte(strings.TrimSpace(string(commit))))
+	}
 	return result, nil
 }
 
@@ -202,7 +215,12 @@ func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T)
 	if strings.Contains(string(readme), "\r\n") {
 		t.Fatalf("Ticket Workspace README uses CRLF: %q", readme)
 	}
-	for key, want := range map[string]string{"core.autocrlf": "false", "core.eol": "lf"} {
+	for key, want := range map[string]string{
+		"core.autocrlf": "false",
+		"core.eol":      "lf",
+		"user.name":     "workflow-ticket-agent",
+		"user.email":    "workflow-ticket-agent@users.noreply.github.com",
+	} {
 		command := exec.Command("git", "config", "--local", "--get", key)
 		command.Dir = session.WorkspacePath
 		output, err := command.CombinedOutput()
@@ -233,6 +251,11 @@ func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testin
 			t.Fatalf("git %v: %v\n%s", args, err, output)
 		}
 	}
+	for key, value := range map[string]string{"user.name": "repository-owner", "user.email": "owner@example.com"} {
+		if output, err := exec.Command("git", "-C", workspacePath, "config", "--local", key, value).CombinedOutput(); err != nil {
+			t.Fatalf("configure existing workspace %s: %v\n%s", key, err, output)
+		}
+	}
 	readmePath := filepath.Join(workspacePath, "README.md")
 	before, err := os.ReadFile(readmePath)
 	if err != nil {
@@ -259,6 +282,14 @@ func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testin
 	}
 	if strings.Contains(string(after), "\r\n") {
 		t.Fatalf("recovered Ticket Workspace still uses CRLF: %q", after)
+	}
+	for key, want := range map[string]string{"user.name": "workflow-ticket-agent", "user.email": "workflow-ticket-agent@users.noreply.github.com"} {
+		command := exec.Command("git", "config", "--local", "--get", key)
+		command.Dir = workspacePath
+		output, err := command.CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != want {
+			t.Fatalf("recovered Ticket Workspace %s = %q, err=%v; want %q", key, output, err, want)
+		}
 	}
 	status := exec.Command("git", "status", "--porcelain")
 	status.Dir = workspacePath
@@ -916,6 +947,22 @@ func createClaimWithProvisioner(t *testing.T, ctx context.Context, root string, 
 	return db, version, claim
 }
 
+func TestControllerRejectsImplementationCandidateWithNullCommit(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutputWithCommit("codex-session", "implemented", nil), ContainerID: "container-1"}}}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "structured result must name the workspace HEAD commit") {
+		t.Fatalf("null implementation commit error = %v", err)
+	}
+}
+
 func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -1427,8 +1474,14 @@ func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
 	}
 }
 
+const candidateCommitPlaceholder = "WORKSPACE_HEAD_COMMIT"
+
 func codexOutput(sessionID, summary string) []byte {
-	message, _ := json.Marshal(map[string]any{"summary": summary, "commit": nil, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}, "plan_amendment": nil})
+	return codexOutputWithCommit(sessionID, summary, candidateCommitPlaceholder)
+}
+
+func codexOutputWithCommit(sessionID, summary string, commit any) []byte {
+	message, _ := json.Marshal(map[string]any{"summary": summary, "commit": commit, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}, "plan_amendment": nil})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
 }

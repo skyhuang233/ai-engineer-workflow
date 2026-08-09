@@ -23,6 +23,7 @@ type ReviewFeedback struct {
 const (
 	inlineFeedbackDebounceWindow = 2 * time.Minute
 	inlineFeedbackDebounceBatch  = "inline-debounce"
+	reviewRevisionPromptSuffix   = "\n\nWhen replying on the existing pull request, include the IDs above, the resulting commit SHA, and complete verification evidence; request re-review. Do not resolve any review thread."
 )
 
 func releaseMergeReadyRevalidationsTx(ctx context.Context, tx *sql.Tx, runID string) (int64, error) {
@@ -114,6 +115,61 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = ''`,
 		return 0, err
 	}
 	return inserted, nil
+}
+
+func (s *Store) ClaimedReviewRevisionPrompt(ctx context.Context, runID string) (string, error) {
+	if strings.TrimSpace(runID) == "" {
+		return "", ErrNotFound
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT source, event_id, author, body FROM review_feedback_events
+WHERE claimed_run_id = ? ORDER BY received_at, source, event_id`, runID)
+	if err != nil {
+		return "", err
+	}
+	var prompt strings.Builder
+	for rows.Next() {
+		var source, eventID, author, body string
+		if err := rows.Scan(&source, &eventID, &author, &body); err != nil {
+			rows.Close()
+			return "", err
+		}
+		appendReviewFeedbackPrompt(&prompt, source, eventID, author, body)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", err
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+	if prompt.Len() > 0 {
+		prompt.WriteString(reviewRevisionPromptSuffix)
+		return prompt.String(), nil
+	}
+	var eventID, body string
+	err = s.db.QueryRowContext(ctx, `SELECT event_id, body FROM merge_ready_revalidations
+WHERE claimed_run_id = ? ORDER BY received_at, event_id LIMIT 1`, runID).Scan(&eventID, &body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(&prompt, "Merge-Ready revalidation ID integration-base/%s:\n%s", eventID, body)
+	prompt.WriteString(reviewRevisionPromptSuffix)
+	return prompt.String(), nil
+}
+
+func appendReviewFeedbackPrompt(prompt *strings.Builder, source, eventID, author, body string) {
+	if prompt.Len() > 0 {
+		prompt.WriteString("\n\n")
+	}
+	feedbackID := source + "/" + eventID
+	if author == "" {
+		fmt.Fprintf(prompt, "Review feedback ID %s (%s):\n%s", feedbackID, source, body)
+	} else {
+		fmt.Fprintf(prompt, "Review feedback ID %s from %s (%s):\n%s", feedbackID, author, source, body)
+	}
 }
 
 func (s *Store) ClaimQueuedReviewRevision(ctx context.Context, versionID string, issueID int64, leaseTTL time.Duration, now time.Time, maxParallelRuns, maxAttempts int, provisionSession ...SessionProvisioner) (TicketClaim, string, error) {
@@ -271,15 +327,7 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' A
 				return TicketClaim{}, "", err
 			}
 			eventKeys = append(eventKeys, source+"\x00"+eventID)
-			if prompt.Len() > 0 {
-				prompt.WriteString("\n\n")
-			}
-			feedbackID := source + "/" + eventID
-			if author == "" {
-				fmt.Fprintf(&prompt, "Review feedback ID %s (%s):\n%s", feedbackID, source, body)
-			} else {
-				fmt.Fprintf(&prompt, "Review feedback ID %s from %s (%s):\n%s", feedbackID, author, source, body)
-			}
+			appendReviewFeedbackPrompt(&prompt, source, eventID, author, body)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -302,7 +350,7 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' A
 	if len(eventKeys) == 0 {
 		return TicketClaim{}, "", ErrNotFound
 	}
-	prompt.WriteString("\n\nWhen replying on the existing pull request, include the IDs above, the resulting commit SHA, and complete verification evidence; request re-review. Do not resolve any review thread.")
+	prompt.WriteString(reviewRevisionPromptSuffix)
 	generation++
 	var attempt int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt), 0) + 1 FROM worker_runs WHERE session_id = ?`, sessionID).Scan(&attempt); err != nil {

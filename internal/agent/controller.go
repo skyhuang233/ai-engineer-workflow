@@ -189,8 +189,8 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if commit == baseCommit {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "worker produced no new commit", string(output), &runRedactor)
 	}
-	if candidateOutput.Commit != "" && candidateOutput.Commit != commit {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result names a different commit", string(output), &runRedactor)
+	if candidateOutput.Commit != commit {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, "Codex structured result must name the workspace HEAD commit", string(output), &runRedactor)
 	}
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {

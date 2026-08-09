@@ -63,6 +63,35 @@ func TestClaimReadyCreatesSessionRunAndLeaseAtomically(t *testing.T) {
 	}
 }
 
+func TestTicketBodyReturnsImmutableActivatedSpecification(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	snapshot.Children[0].Body = "create qualification/issue20-e2e.md with the exact alpha record"
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := db.TicketBody(ctx, version.ID, snapshot.Children[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != snapshot.Children[0].Body {
+		t.Fatalf("TicketBody() = %q, want %q", body, snapshot.Children[0].Body)
+	}
+	if _, err := db.TicketBody(ctx, version.ID, 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing TicketBody() error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestClaimReadyCompensatesNewSessionProvisioningOnTransactionFailure(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

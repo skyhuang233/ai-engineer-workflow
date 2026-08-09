@@ -346,6 +346,9 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, sourceRepositor
 	if err := configureTicketWorkspaceLineEndings(ctx, path); err != nil {
 		return workspace{}, err
 	}
+	if err := configureTicketWorkspaceGitIdentity(ctx, path); err != nil {
+		return workspace{}, err
+	}
 	if err := validateLocalRemotes(ctx, path); err != nil {
 		return workspace{}, err
 	}
@@ -541,6 +544,18 @@ func configureTicketWorkspaceLineEndings(ctx context.Context, path string) error
 	}
 	if err := runGit(ctx, path, "config", "--local", "core.eol", "lf"); err != nil {
 		return fmt.Errorf("configure Ticket Workspace line ending: %w", err)
+	}
+	return nil
+}
+
+func configureTicketWorkspaceGitIdentity(ctx context.Context, path string) error {
+	for key, value := range map[string]string{
+		"user.name":  "workflow-ticket-agent",
+		"user.email": "workflow-ticket-agent@users.noreply.github.com",
+	} {
+		if err := runGit(ctx, path, "config", "--local", key, value); err != nil {
+			return fmt.Errorf("configure Ticket Workspace %s: %w", key, err)
+		}
 	}
 	return nil
 }

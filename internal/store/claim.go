@@ -99,6 +99,22 @@ type TicketClaim struct {
 	LeaseExpiresAt  time.Time
 }
 
+// TicketBody returns the immutable specification persisted when the Delivery
+// Plan version was activated. Workers do not need GitHub credentials to read it.
+func (s *Store) TicketBody(ctx context.Context, versionID string, issueID int64) (string, error) {
+	if strings.TrimSpace(versionID) == "" || issueID == 0 {
+		return "", ErrNotFound
+	}
+	var body string
+	if err := s.db.QueryRowContext(ctx, `SELECT body FROM plan_tickets WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&body); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return body, nil
+}
+
 // ReadyFrontier is a read-only preview. ClaimReady repeats the same query and
 // checks in its transaction, so a stale preview can never grant ownership.
 func (s *Store) ReadyFrontier(ctx context.Context, versionID string, maxParallelRuns int, now time.Time) ([]plan.FrontierTicket, error) {

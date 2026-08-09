@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
+	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
@@ -489,11 +490,9 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	if revisionPrompt != "" {
-		*prompt = revisionPrompt
-	}
-	if *prompt == "" {
-		fail(fmt.Errorf("run-ticket requires prompt for an active worker run"))
+	*prompt, err = resolveWorkerPrompt(ctx, db, claim, revisionPrompt)
+	if err != nil {
+		fail(err)
 	}
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
@@ -542,6 +541,13 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 func acquireTicketClaim(ctx context.Context, db *store.Store, versionID string, ticketID int64, maxAttempts int, now time.Time, provisionSession ...store.SessionProvisioner) (store.TicketClaim, string, error) {
 	claim, err := db.CurrentClaim(ctx, versionID, ticketID)
 	if err == nil {
+		revisionPrompt, promptErr := db.ClaimedReviewRevisionPrompt(ctx, claim.RunID)
+		if promptErr == nil {
+			return claim, revisionPrompt, nil
+		}
+		if !errors.Is(promptErr, store.ErrNotFound) {
+			return store.TicketClaim{}, "", promptErr
+		}
 		return claim, "", nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
@@ -675,6 +681,10 @@ func runPollGitHub(args []string) {
 	var workerError error
 	var workerErrorMu sync.Mutex
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+		prompt, err := resolveWorkerPrompt(ctx, db, claim, prompt)
+		if err != nil {
+			return err
+		}
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
 			err := runClaimWorker(workerCtx, db, *repository, *source, workspaceManager, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
@@ -815,7 +825,7 @@ func runPollGitHub(args []string) {
 				claim, claimErr := dispatcher.ClaimNext(ctx, *repository, "workflow-control-plane")
 				if claimErr == nil {
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
-					if err := launch(ctx, claim, "Implement ticket #"+fmt.Sprint(claim.TicketNumber)+": "+claim.TicketTitle, branch, "", true); err != nil {
+					if err := launch(ctx, claim, "", branch, "", true); err != nil {
 						return controlResult, err
 					}
 					continue
@@ -863,6 +873,26 @@ func runPollGitHub(args []string) {
 		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func resolveWorkerPrompt(ctx context.Context, db *store.Store, claim store.TicketClaim, persistedRevisionPrompt string) (string, error) {
+	if persistedRevisionPrompt != "" {
+		return persistedRevisionPrompt, nil
+	}
+	body, err := db.TicketBody(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return "", err
+	}
+	return implementationPrompt(claim, body), nil
+}
+
+func implementationPrompt(claim store.TicketClaim, body string) string {
+	return fmt.Sprintf(`Implement Executable Ticket #%d: %s
+
+Authoritative ticket specification:
+%s
+
+Implement the exact specification and acceptance criteria above. The Worker intentionally has no GitHub credential. Do not call GitHub or attempt to retrieve the Executable Ticket from GitHub. Commit all changes and leave the Ticket Workspace clean. In the structured Candidate response, commit must be the %s only, with no subject or other text.`, claim.TicketNumber, claim.TicketTitle, body, candidateoutput.CommitSHARequirement)
 }
 
 func shouldLogNeedsAttentionError(err error) bool {
