@@ -34,10 +34,44 @@ const Schema = `{
       "required": ["summary", "add_tickets", "remove_ticket_ids", "add_dependencies", "remove_dependencies"],
       "properties": {
         "summary": {"type": "string", "minLength": 1},
-        "add_tickets": {"type": "array"},
-        "remove_ticket_ids": {"type": "array"},
-        "add_dependencies": {"type": "array"},
-        "remove_dependencies": {"type": "array"}
+        "add_tickets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ID", "Number", "Title"],
+            "properties": {
+              "ID": {"type": "integer"},
+              "Number": {"type": "integer"},
+              "Title": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        },
+        "remove_ticket_ids": {"type": "array", "items": {"type": "integer"}},
+        "add_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["blocked_ticket_id", "blocker_ticket_id"],
+            "properties": {
+              "blocked_ticket_id": {"type": "integer"},
+              "blocker_ticket_id": {"type": "integer"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "remove_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["blocked_ticket_id", "blocker_ticket_id"],
+            "properties": {
+              "blocked_ticket_id": {"type": "integer"},
+              "blocker_ticket_id": {"type": "integer"}
+            },
+            "additionalProperties": false
+          }
+        }
       },
       "additionalProperties": false
     }

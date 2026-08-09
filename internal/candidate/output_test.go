@@ -28,6 +28,11 @@ func assertStrictObjectSchema(t *testing.T, node any, path string) {
 			assertStrictObjectSchema(t, child, fmt.Sprintf("%s[%d]", path, index))
 		}
 	case map[string]any:
+		if value["type"] == "array" {
+			if _, ok := value["items"]; !ok {
+				t.Errorf("array schema %s has no items schema", path)
+			}
+		}
 		if value["type"] == "object" {
 			properties, ok := value["properties"].(map[string]any)
 			if !ok {
