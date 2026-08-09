@@ -280,9 +280,15 @@ func validatePlanAmendment(raw json.RawMessage) error {
 			return err
 		}
 	}
-	var ticketIDs []int64
+	var ticketIDs []json.RawMessage
 	if jsonNull(proposal["remove_ticket_ids"]) || json.Unmarshal(proposal["remove_ticket_ids"], &ticketIDs) != nil {
 		return errors.New("plan amendment remove_ticket_ids must contain integers")
+	}
+	for _, ticketID := range ticketIDs {
+		var value int64
+		if jsonNull(ticketID) || json.Unmarshal(ticketID, &value) != nil {
+			return errors.New("plan amendment remove_ticket_ids must contain integers")
+		}
 	}
 	for _, name := range []string{"add_dependencies", "remove_dependencies"} {
 		var dependencies []json.RawMessage
@@ -326,9 +332,15 @@ func validatePlanIssue(raw json.RawMessage) error {
 	if err := nonemptyString(fields["Title"], "plan amendment ticket requires a nonempty title"); err != nil {
 		return err
 	}
-	var labels []string
+	var labels []json.RawMessage
 	if jsonNull(fields["Labels"]) || json.Unmarshal(fields["Labels"], &labels) != nil {
 		return errors.New("plan amendment ticket labels must be strings")
+	}
+	for _, label := range labels {
+		var value string
+		if jsonNull(label) || json.Unmarshal(label, &value) != nil {
+			return errors.New("plan amendment ticket labels must be strings")
+		}
 	}
 	var delivered bool
 	if jsonNull(fields["Delivered"]) || json.Unmarshal(fields["Delivered"], &delivered) != nil {

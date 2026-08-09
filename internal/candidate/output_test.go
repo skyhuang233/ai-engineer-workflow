@@ -219,6 +219,8 @@ func TestValidateStrictCandidateOutput(t *testing.T) {
 		{name: "missing plan amendment", output: `{"summary":"implemented","commit":null,"checks":[]}`},
 		{name: "missing ticket field", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},
 		{name: "untyped ticket labels", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1,"NodeID":"node","Number":2,"Title":"ticket","Body":"body","State":"open","Labels":[1],"UpdatedAt":"now","Delivered":false,"Author":"agent","AuthorType":"Bot"}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},
+		{name: "null ticket label", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1,"NodeID":"node","Number":2,"Title":"ticket","Body":"body","State":"open","Labels":[null],"UpdatedAt":"now","Delivered":false,"Author":"agent","AuthorType":"Bot"}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},
+		{name: "null removed ticket ID", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[],"remove_ticket_ids":[null],"add_dependencies":[],"remove_dependencies":[]}}`},
 		{name: "untyped dependency", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[],"remove_ticket_ids":[],"add_dependencies":[{"blocked_ticket_id":"2","blocker_ticket_id":1}],"remove_dependencies":[]}}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
