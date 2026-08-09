@@ -53,6 +53,47 @@ func TestImplementationPromptCarriesPersistedTicketContract(t *testing.T) {
 	}
 }
 
+func TestResolveWorkerPromptUsesImmutableBodyForInitialRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 11, Title: "first", Body: "authoritative acceptance criteria", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.TicketClaim{VersionID: version.ID, TicketID: 1, TicketNumber: 11, TicketTitle: "first"}
+	prompt, err := resolveWorkerPrompt(ctx, db, claim, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, snapshot.Children[0].Body) {
+		t.Fatalf("initial Worker prompt = %q", prompt)
+	}
+}
+
+func TestResolveWorkerPromptPreservesReviewRevisionExactly(t *testing.T) {
+	persisted := "  Review feedback ID review/50:\nkeep surrounding whitespace exactly  "
+	prompt, err := resolveWorkerPrompt(context.Background(), nil, store.TicketClaim{}, persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt != persisted {
+		t.Fatalf("review revision prompt = %q, want %q", prompt, persisted)
+	}
+}
+
 func TestRecoverInboxDeliveryCLIListsAndAuthorizesOldestGeneration(t *testing.T) {
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "workflow.db")

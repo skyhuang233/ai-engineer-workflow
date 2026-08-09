@@ -490,11 +490,9 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	if revisionPrompt != "" {
-		*prompt = revisionPrompt
-	}
-	if *prompt == "" {
-		fail(fmt.Errorf("run-ticket requires prompt for an active worker run"))
+	*prompt, err = resolveWorkerPrompt(ctx, db, claim, revisionPrompt)
+	if err != nil {
+		fail(err)
 	}
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
@@ -676,6 +674,10 @@ func runPollGitHub(args []string) {
 	var workerError error
 	var workerErrorMu sync.Mutex
 	launch := func(ctx context.Context, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+		prompt, err := resolveWorkerPrompt(ctx, db, claim, prompt)
+		if err != nil {
+			return err
+		}
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
 			err := runClaimWorker(workerCtx, db, *repository, *source, workspaceManager, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
@@ -815,12 +817,8 @@ func runPollGitHub(args []string) {
 			for {
 				claim, claimErr := dispatcher.ClaimNext(ctx, *repository, "workflow-control-plane")
 				if claimErr == nil {
-					body, err := db.TicketBody(ctx, claim.VersionID, claim.TicketID)
-					if err != nil {
-						return controlResult, err
-					}
 					branch := "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
-					if err := launch(ctx, claim, implementationPrompt(claim, body), branch, "", true); err != nil {
+					if err := launch(ctx, claim, "", branch, "", true); err != nil {
 						return controlResult, err
 					}
 					continue
@@ -868,6 +866,17 @@ func runPollGitHub(args []string) {
 		}
 		time.Sleep(nextPollDelay(db, *repository, *interval, lastPollResult, time.Now().UTC()))
 	}
+}
+
+func resolveWorkerPrompt(ctx context.Context, db *store.Store, claim store.TicketClaim, persistedRevisionPrompt string) (string, error) {
+	if persistedRevisionPrompt != "" {
+		return persistedRevisionPrompt, nil
+	}
+	body, err := db.TicketBody(ctx, claim.VersionID, claim.TicketID)
+	if err != nil {
+		return "", err
+	}
+	return implementationPrompt(claim, body), nil
 }
 
 func implementationPrompt(claim store.TicketClaim, body string) string {
