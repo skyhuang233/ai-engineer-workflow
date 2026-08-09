@@ -35,9 +35,9 @@ prerequisite, not the approval itself.
   prerequisite: that owner retains sole merge authority. Its deployable
   workflow verifies only the live GitHub repository contract and does not
   require a copy of the Control Plane source tree. It can be manually rerun
-  with `workflow_dispatch` after a visibility change. Control Plane tests
-  remain in this repository's `worker-contract` CI, which runs for all Go
-  source and module changes.
+  with `workflow_dispatch` after a visibility change. Control Plane tests and
+  vetting remain in this repository's `worker-contract` CI, which runs for all
+  Go source and module changes.
 - Set the integration repository's `WORKFLOW_INTEGRATION_REPOSITORY` and
   `WORKFLOW_GATEWAY_CREDENTIAL_OWNER` Actions variables to those configured
   values. Its contract workflow fails closed unless the variables, runner
@@ -95,10 +95,13 @@ container's Codex sandbox, Docker privilege, and GitHub credential boundary.
 Workspace persistence and its repository-local LF policy.
 
 Doctor performs a real create-and-resume request inside the pinned Worker
-image using a temporary copy of this cache. A version-only Codex check is not
-sufficient: missing or rejected authentication fails the report before the
-Worker image is activated. The temporary copy is removed after the probe, and
-credential contents are never included in the report.
+image using a temporary copy of this cache and supplies the exact Candidate
+structured-output schema to both turns. The check fails unless Codex accepts
+that schema, returns a valid Candidate response, and recalls the first turn's
+nonce after resume. A version-only Codex check is not sufficient: missing or
+rejected authentication fails the report before the Worker image is activated.
+The temporary copy is removed after the probe, and credential contents are
+never included in the report.
 
 Doctor's production check runner has one fixed 10-minute shared deadline. The
 budget includes a cold pull of the exact Worker digest and the real Codex
@@ -194,8 +197,9 @@ Never edit only one version string. A toolchain upgrade is accepted only after:
 4. building and testing on the PR without publishing;
 5. having the owner accept and merge the PR to main;
 6. letting GitHub Actions publish the image and authoritative Release Manifest;
-7. running unit, Docker, Codex resume, SQLite, Gateway, and dedicated GitHub
-   contract checks, which activates the verified digest for new Worker Runs.
+7. running unit, Docker, Codex Candidate-schema create/resume, SQLite, Gateway,
+   and dedicated GitHub contract checks, which activates the verified digest
+   for new Worker Runs.
 
 Floating tags such as `latest`, floating branches such as `main`, and
 unversioned local executables are not production inputs.

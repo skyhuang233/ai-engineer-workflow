@@ -269,8 +269,8 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 		t.Fatal(err)
 	}
 	executor := &recordingExecutor{outputs: [][]byte{
-		[]byte("{\"type\":\"thread.started\",\"thread_id\":\"worker-session-7\"}\n"),
-		[]byte("{\"type\":\"item.completed\",\"item\":{\"text\":\"worker-nonce-7\"}}\n"),
+		[]byte("{\"type\":\"thread.started\",\"thread_id\":\"worker-session-7\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"summary\\\":\\\"phase-one\\\",\\\"commit\\\":null,\\\"checks\\\":[{\\\"command\\\":\\\"doctor schema probe\\\",\\\"outcome\\\":\\\"passed\\\"}],\\\"plan_amendment\\\":null}\"}}\n"),
+		[]byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"summary\\\":\\\"worker-nonce-7\\\",\\\"commit\\\":null,\\\"checks\\\":[{\\\"command\\\":\\\"doctor schema probe\\\",\\\"outcome\\\":\\\"passed\\\"}],\\\"plan_amendment\\\":null}\"}}\n"),
 	}}
 	result := (WorkerCodexSessionCheck{
 		Executor: executor, Image: "ghcr.io/owner/worker@sha256:bbbb", AuthFile: authFile, Nonce: "worker-nonce-7",
@@ -283,18 +283,87 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	}
 	initial := strings.Join(executor.commands[0], " ")
 	resumed := strings.Join(executor.commands[1], " ")
-	if !strings.HasPrefix(initial, "docker run --rm") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec") {
+	if !strings.HasPrefix(initial, "docker run --rm") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec --sandbox read-only") {
 		t.Fatalf("initial Worker Codex command = %q", initial)
 	}
 	for _, command := range []string{initial, resumed} {
 		if !strings.Contains(command, "--cap-add SYS_ADMIN") || !strings.Contains(command, "--security-opt seccomp=unconfined") {
 			t.Fatalf("Worker Codex command omits bubblewrap sandbox permissions: %q", command)
 		}
+		if !strings.Contains(command, "--output-schema /codex-state/output-schema.json") {
+			t.Fatalf("Worker Codex command omits the Candidate output schema: %q", command)
+		}
 	}
-	if !strings.Contains(resumed, "codex exec resume") || !strings.Contains(resumed, "worker-session-7") {
+	if !strings.Contains(resumed, "codex exec --sandbox read-only resume") || !strings.Contains(resumed, "worker-session-7") {
 		t.Fatalf("resumed Worker Codex command = %q", resumed)
 	}
 	t.Logf("Doctor result: %s\ncreate: %s\nresume: %s", result.Summary, initial, resumed)
+}
+
+func TestWorkerCodexSessionCheckRejectsInvalidStructuredResponse(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingExecutor{outputs: [][]byte{
+		[]byte("{\"type\":\"thread.started\",\"thread_id\":\"worker-session-7\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{}\"}}\n"),
+	}}
+	result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "invalid structured response") {
+		t.Fatalf("Run() = %#v, want invalid structured response failure", result)
+	}
+}
+
+func TestWorkerCodexSessionCheckRequiresStrictRootFields(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		candidate string
+	}{
+		{name: "missing commit", candidate: `{"summary":"phase-one","checks":[],"plan_amendment":null}`},
+		{name: "missing plan amendment", candidate: `{"summary":"phase-one","commit":null,"checks":[]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authFile := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			executor := &recordingExecutor{outputs: [][]byte{workerCodexTestOutput("worker-session-7", tt.candidate)}}
+			result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile}).Run(context.Background())
+			if result.Status != Fail || !strings.Contains(result.Summary, "create schema probe") {
+				t.Fatalf("Run() = %#v, want strict create schema failure", result)
+			}
+		})
+	}
+}
+
+func TestWorkerCodexSessionCheckUsesFinalValidAgentMessageForNonce(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		responses []string
+		want      Status
+	}{
+		{name: "final response recalls nonce", responses: []string{"wrong", "worker-nonce-7"}, want: Pass},
+		{name: "final response violates nonce", responses: []string{"worker-nonce-7", "wrong"}, want: Fail},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authFile := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resumed := make([]string, 0, len(tt.responses))
+			for _, summary := range tt.responses {
+				resumed = append(resumed, strictCandidate(summary))
+			}
+			executor := &recordingExecutor{outputs: [][]byte{
+				workerCodexTestOutput("worker-session-7", strictCandidate("phase-one")),
+				workerCodexTestOutput("", resumed...),
+			}}
+			result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile, Nonce: "worker-nonce-7"}).Run(context.Background())
+			if result.Status != tt.want {
+				t.Fatalf("Run() = %#v, want %s", result, tt.want)
+			}
+		})
+	}
 }
 
 func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutput(t *testing.T) {
@@ -317,6 +386,31 @@ func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutpu
 
 func doctorTestChatGPTAuth(accessToken string) []byte {
 	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
+}
+
+func strictCandidate(summary string) string {
+	encoded, _ := json.Marshal(map[string]any{
+		"summary": summary, "commit": nil, "checks": []map[string]string{{"command": "doctor schema probe", "outcome": "passed"}}, "plan_amendment": nil,
+	})
+	return string(encoded)
+}
+
+func workerCodexTestOutput(sessionID string, candidates ...string) []byte {
+	var output strings.Builder
+	if sessionID != "" {
+		event, _ := json.Marshal(map[string]string{"type": "thread.started", "thread_id": sessionID})
+		output.Write(event)
+		output.WriteByte('\n')
+	}
+	for _, candidate := range candidates {
+		event, _ := json.Marshal(map[string]any{
+			"type": "item.completed",
+			"item": map[string]string{"type": "agent_message", "text": candidate},
+		})
+		output.Write(event)
+		output.WriteByte('\n')
+	}
+	return []byte(output.String())
 }
 
 type checkFunc struct {
