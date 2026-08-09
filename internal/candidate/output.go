@@ -9,7 +9,12 @@ import (
 	"strings"
 )
 
-var fullLowercaseCommitSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+const (
+	fullLowercaseCommitSHAPattern = `^[0-9a-f]{40}$`
+	CommitSHARequirement          = "exact full lowercase 40-character Git commit SHA"
+)
+
+var fullLowercaseCommitSHA = regexp.MustCompile(fullLowercaseCommitSHAPattern)
 
 // Schema is the strict contract supplied to OpenAI structured output. Every
 // property is required, with null representing an unavailable commit.
@@ -18,7 +23,7 @@ const Schema = `{
   "required": ["summary", "commit", "checks", "plan_amendment"],
   "properties": {
     "summary": {"type": "string", "minLength": 1},
-    "commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "minLength": 40, "maxLength": 40},
+    "commit": {"type": ["string", "null"], "pattern": "` + fullLowercaseCommitSHAPattern + `", "minLength": 40, "maxLength": 40},
     "checks": {
       "type": "array",
       "minItems": 0,
@@ -176,7 +181,7 @@ func ValidateStrict(output []byte) error {
 	if !jsonNull(fields["commit"]) {
 		var commit string
 		if err := json.Unmarshal(fields["commit"], &commit); err != nil || !fullLowercaseCommitSHA.MatchString(commit) {
-			return errors.New("structured result commit must be a full lowercase 40-character Git SHA or null")
+			return errors.New("structured result commit must be an " + CommitSHARequirement + " or null")
 		}
 	}
 	if err := validateChecks(fields["checks"]); err != nil {

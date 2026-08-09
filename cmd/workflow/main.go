@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
+	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
@@ -875,7 +876,7 @@ func implementationPrompt(claim store.TicketClaim, body string) string {
 Authoritative ticket specification:
 %s
 
-Implement the exact specification and acceptance criteria above. The Worker intentionally has no GitHub credential. Do not call GitHub or attempt to retrieve the Issue. Commit all changes and leave the Ticket Workspace clean. In the structured Candidate response, commit must be the exact full lowercase 40-character Git commit SHA only, with no subject or other text.`, claim.TicketNumber, claim.TicketTitle, body)
+Implement the exact specification and acceptance criteria above. The Worker intentionally has no GitHub credential. Do not call GitHub or attempt to retrieve the Executable Ticket from GitHub. Commit all changes and leave the Ticket Workspace clean. In the structured Candidate response, commit must be the %s only, with no subject or other text.`, claim.TicketNumber, claim.TicketTitle, body, candidateoutput.CommitSHARequirement)
 }
 
 func shouldLogNeedsAttentionError(err error) bool {

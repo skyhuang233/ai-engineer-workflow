@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -126,6 +127,18 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	r.results = r.results[1:]
 	if r.failAfterCommit {
 		return result, r.err
+	}
+	for _, output := range []*[]byte{&result.Output, &result.Stdout} {
+		if !bytes.Contains(*output, []byte(candidateCommitPlaceholder)) {
+			continue
+		}
+		head := exec.Command("git", "rev-parse", "HEAD")
+		head.Dir = spec.WorkspacePath
+		commit, err := head.Output()
+		if err != nil {
+			return worker.Result{}, err
+		}
+		*output = bytes.ReplaceAll(*output, []byte(candidateCommitPlaceholder), []byte(strings.TrimSpace(string(commit))))
 	}
 	return result, nil
 }
@@ -934,6 +947,22 @@ func createClaimWithProvisioner(t *testing.T, ctx context.Context, root string, 
 	return db, version, claim
 }
 
+func TestControllerRejectsImplementationCandidateWithNullCommit(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutputWithCommit("codex-session", "implemented", nil), ContainerID: "container-1"}}}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "structured result must name the workspace HEAD commit") {
+		t.Fatalf("null implementation commit error = %v", err)
+	}
+}
+
 func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -1445,8 +1474,14 @@ func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
 	}
 }
 
+const candidateCommitPlaceholder = "WORKSPACE_HEAD_COMMIT"
+
 func codexOutput(sessionID, summary string) []byte {
-	message, _ := json.Marshal(map[string]any{"summary": summary, "commit": nil, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}, "plan_amendment": nil})
+	return codexOutputWithCommit(sessionID, summary, candidateCommitPlaceholder)
+}
+
+func codexOutputWithCommit(sessionID, summary string, commit any) []byte {
+	message, _ := json.Marshal(map[string]any{"summary": summary, "commit": commit, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}, "plan_amendment": nil})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
 }
