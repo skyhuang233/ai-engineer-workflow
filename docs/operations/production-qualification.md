@@ -32,7 +32,8 @@ or complete diffs into it.
 5. Download the two assets from the accepted source-keyed Worker Release. The
    `worker-sbom.spdx.json` SHA-256 must equal `sbom_sha256` in
    `worker-release.json`; the manifest must record the exact Worker digest,
-   no-mistakes fork release/checksum, successful publisher run, and the
+   GitHub CLI version/checksum, no-mistakes immutable fork release/checksum,
+   successful publisher run, and the
    fail-closed Grype `high`/`only_fixed` policy.
 6. Link the successful `worker-contract`, `publish-worker`, and dedicated
    `workflow-contract` runs. A warning, skipped gate, mutable tag, extra release

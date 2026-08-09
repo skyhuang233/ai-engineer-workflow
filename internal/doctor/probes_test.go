@@ -53,6 +53,7 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	digest := sha256.Sum256(asset)
 	config.NoMistakes.LinuxAMD64SHA256 = hex.EncodeToString(digest[:])
 	var paths []string
+	immutableRelease := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -76,7 +77,7 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": immutableRelease, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -100,6 +101,11 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("GitHub check = %#v", result)
 	}
+	immutableRelease = false
+	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "immutable") {
+		t.Fatalf("GitHub check accepted a mutable no-mistakes release: %#v", result)
+	}
+	immutableRelease = true
 	asset = []byte("tampered no-mistakes asset")
 	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "checksum") {
 		t.Fatalf("GitHub check accepted tampered no-mistakes asset: %#v", result)
@@ -295,7 +301,7 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/8/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": true, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}

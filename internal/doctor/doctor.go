@@ -36,6 +36,11 @@ type GoPin struct {
 	LinuxAMD64SHA256 string `json:"linux_amd64_sha256"`
 }
 
+type GitHubCLIPin struct {
+	Version          string `json:"version"`
+	LinuxAMD64SHA256 string `json:"linux_amd64_sha256"`
+}
+
 type NoMistakesPin struct {
 	Version            string `json:"version"`
 	UpstreamRepository string `json:"upstream_repository"`
@@ -77,6 +82,7 @@ type UpgradePolicy struct {
 type Config struct {
 	SchemaVersion int           `json:"schema_version"`
 	Codex         ToolPin       `json:"codex"`
+	GitHubCLI     GitHubCLIPin  `json:"github_cli"`
 	Go            GoPin         `json:"go"`
 	NoMistakes    NoMistakesPin `json:"no_mistakes"`
 	Worker        WorkerPin     `json:"worker"`
@@ -113,10 +119,14 @@ func LoadConfig(path string) (Config, error) {
 
 func (c Config) Validate() error {
 	switch {
-	case c.SchemaVersion != 3:
+	case c.SchemaVersion != 4:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
+	case !versionPattern.MatchString(c.GitHubCLI.Version):
+		return errors.New("GitHub CLI version is required and must be path-safe")
+	case !sha256Pattern.MatchString(c.GitHubCLI.LinuxAMD64SHA256):
+		return errors.New("GitHub CLI Linux asset checksum must be SHA-256")
 	case !versionPattern.MatchString(c.Go.Version):
 		return errors.New("Go version is required and must be path-safe")
 	case !sha256Pattern.MatchString(c.Go.LinuxAMD64SHA256):

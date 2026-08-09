@@ -27,6 +27,8 @@ jobs:
         run: |
           echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_version=$(jq -r .github_cli.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_sha256=$(jq -r .github_cli.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
@@ -38,6 +40,8 @@ jobs:
         run: |
           docker build \
             --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
+            --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
+            --build-arg "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_sha256 }}" \
             --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
             --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}" \
             --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
@@ -55,6 +59,13 @@ jobs:
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.codex_version }}"
           else
             echo "Codex emitted an unrecognized version string: $codex_output" >&2
+            exit 1
+          fi
+          github_cli_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" gh --version | head -n 1)"
+          if [[ "$github_cli_output" =~ ^gh[[:space:]]version[[:space:]]([^[:space:]]+)([[:space:]].*)?$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.github_cli_version }}"
+          else
+            echo "GitHub CLI emitted an unrecognized version string: $github_cli_output" >&2
             exit 1
           fi
           no_mistakes_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" no-mistakes --version)"

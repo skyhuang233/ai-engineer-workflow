@@ -8,6 +8,10 @@ prerequisite, not the approval itself.
 `workflow doctor`. Every executable version and artifact is immutable:
 
 - Codex CLI is pinned to an exact package version.
+- GitHub CLI is installed from its official Linux amd64 release archive rather
+  than Debian's older package, and is pinned by exact version and SHA-256.
+  The npm client is used only to install Codex and is removed from the runtime
+  image with its dependency tree before the Worker contract is checked.
 - Go is pinned to an exact Linux amd64 archive version and official SHA-256
   checksum. Doctor verifies `go version` inside the exact Worker image.
 - `no-mistakes` is pinned to an upstream release, verified commit, fork
@@ -22,6 +26,9 @@ prerequisite, not the approval itself.
   immutable release contains exactly `worker-release.json` and
   `worker-sbom.spdx.json`; Doctor verifies the manifest-bound SBOM checksum and
   the successful publisher run before activating the image.
+  A VEX statement cannot waive a fixable finding; any future VEX must name one
+  vulnerability and package and include evidence that the affected code is not
+  executable in the Worker contract.
 - The dedicated GitHub integration repository and its required workflow path
   are explicit. The repository may be public or private, but its owner must
   match the configured Gateway Credential owner. Branch protection is not a

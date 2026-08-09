@@ -201,6 +201,7 @@ printf worker > /workspace/container-marker
 curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_PROBE_TOKEN}" "http://host.docker.internal:${WORKFLOW_GATEWAY_PROBE_PORT}/health"
 printf "\nmount=ok\n"
 codex --version
+gh --version
 go version
 no-mistakes --version
 env | cut -d= -f1`
@@ -229,7 +230,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "gh version " + c.Manifest.GitHubCLIVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
@@ -382,6 +383,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
+		Immutable       bool   `json:"immutable"`
 		Assets          []struct {
 			ID   int64  `json:"id"`
 			Name string `json:"name"`
@@ -390,6 +392,9 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
 		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
 		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit", Err: err}
+	}
+	if !forkRelease.Immutable {
+		return Result{Status: Fail, Summary: "pinned no-mistakes fork release is not immutable"}
 	}
 	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
 	assetID := int64(0)

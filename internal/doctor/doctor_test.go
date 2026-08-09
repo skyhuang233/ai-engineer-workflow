@@ -30,6 +30,8 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{"codex version", func(c *Config) { c.Codex.Version = "" }},
+		{"GitHub CLI version", func(c *Config) { c.GitHubCLI.Version = "" }},
+		{"GitHub CLI checksum", func(c *Config) { c.GitHubCLI.LinuxAMD64SHA256 = "latest" }},
 		{"upstream commit", func(c *Config) { c.NoMistakes.UpstreamCommit = "main" }},
 		{"fork release", func(c *Config) { c.NoMistakes.ForkRelease = "" }},
 		{"asset checksum", func(c *Config) { c.NoMistakes.LinuxAMD64SHA256 = "latest" }},
@@ -210,16 +212,17 @@ func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 3,
-		Codex:         ToolPin{Version: "0.146.0"},
+		SchemaVersion: 4,
+		Codex:         ToolPin{Version: "0.147.0"},
+		GitHubCLI:     GitHubCLIPin{Version: "2.97.0", LinuxAMD64SHA256: "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"},
 		Go:            GoPin{Version: "1.25.12", LinuxAMD64SHA256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"},
 		NoMistakes: NoMistakesPin{
 			Version:            "v1.41.2",
 			UpstreamRepository: "kunchenguid/no-mistakes",
 			UpstreamCommit:     "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
 			ForkRepository:     "skyhuang233/no-mistakes",
-			ForkRelease:        "workflow-v1.41.2.0",
-			LinuxAMD64SHA256:   "a100c58bdfe7df9f598ecec32553d5fbd8eb0079912fc830f362011fd9dc8825",
+			ForkRelease:        "workflow-v1.41.2.1",
+			LinuxAMD64SHA256:   "1e6dc5c2b30271060da987f7bc3146301a11c6c4f1a37b670b5d735156d1abed",
 		},
 		Worker: WorkerPin{
 			Version:           "0.1.0",
