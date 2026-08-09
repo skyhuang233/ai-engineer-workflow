@@ -1428,7 +1428,7 @@ func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
 }
 
 func codexOutput(sessionID, summary string) []byte {
-	message, _ := json.Marshal(map[string]any{"summary": summary, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}})
+	message, _ := json.Marshal(map[string]any{"summary": summary, "commit": nil, "checks": []map[string]string{{"command": "go test ./...", "outcome": "passed"}}, "plan_amendment": nil})
 	item, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": string(message)}})
 	return []byte(`{"type":"thread.started","thread_id":"` + sessionID + `"}` + "\n" + string(item))
 }

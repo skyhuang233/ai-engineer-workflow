@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -202,4 +203,55 @@ func TestValidateCandidateOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateStrictCandidateOutput(t *testing.T) {
+	valid := `{"summary":"implemented","commit":null,"checks":[],"plan_amendment":null}`
+	validAmendment := `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1,"NodeID":"node","Number":2,"Title":"ticket","Body":"body","State":"open","Labels":["workflow:ticket"],"UpdatedAt":"now","Delivered":false,"Author":"agent","AuthorType":"Bot"}],"remove_ticket_ids":[3],"add_dependencies":[{"blocked_ticket_id":2,"blocker_ticket_id":1}],"remove_dependencies":[]}}`
+	for _, tt := range []struct {
+		name   string
+		output string
+		valid  bool
+	}{
+		{name: "complete", output: valid, valid: true},
+		{name: "complete amendment", output: validAmendment, valid: true},
+		{name: "missing commit", output: `{"summary":"implemented","checks":[],"plan_amendment":null}`},
+		{name: "missing plan amendment", output: `{"summary":"implemented","commit":null,"checks":[]}`},
+		{name: "missing ticket field", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},
+		{name: "untyped ticket labels", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[{"ID":1,"NodeID":"node","Number":2,"Title":"ticket","Body":"body","State":"open","Labels":[1],"UpdatedAt":"now","Delivered":false,"Author":"agent","AuthorType":"Bot"}],"remove_ticket_ids":[],"add_dependencies":[],"remove_dependencies":[]}}`},
+		{name: "untyped dependency", output: `{"summary":"replan","commit":null,"checks":[],"plan_amendment":{"summary":"replan","add_tickets":[],"remove_ticket_ids":[],"add_dependencies":[{"blocked_ticket_id":"2","blocker_ticket_id":1}],"remove_dependencies":[]}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateStrict([]byte(tt.output))
+			if (err == nil) != tt.valid {
+				t.Fatalf("ValidateStrict(%s) error = %v, valid = %t", tt.output, err, tt.valid)
+			}
+		})
+	}
+}
+
+func TestExtractCodexCandidateSelectsFinalValidAgentMessage(t *testing.T) {
+	first := `{"summary":"first","commit":null,"checks":[],"plan_amendment":null}`
+	final := `{"summary":"final","commit":null,"checks":[],"plan_amendment":null}`
+	output := appendCodexAgentMessages(first, final, `{}`)
+	structured, err := ExtractCodexCandidate(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(structured) != final {
+		t.Fatalf("ExtractCodexCandidate() = %s, want final valid message %s", structured, final)
+	}
+}
+
+func appendCodexAgentMessages(messages ...string) []byte {
+	var output strings.Builder
+	for _, message := range messages {
+		event, _ := json.Marshal(map[string]any{
+			"type": "item.completed",
+			"item": map[string]string{"type": "agent_message", "text": message},
+		})
+		output.Write(event)
+		output.WriteByte('\n')
+	}
+	return []byte(output.String())
 }

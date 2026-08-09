@@ -314,6 +314,58 @@ func TestWorkerCodexSessionCheckRejectsInvalidStructuredResponse(t *testing.T) {
 	}
 }
 
+func TestWorkerCodexSessionCheckRequiresStrictRootFields(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		candidate string
+	}{
+		{name: "missing commit", candidate: `{"summary":"phase-one","checks":[],"plan_amendment":null}`},
+		{name: "missing plan amendment", candidate: `{"summary":"phase-one","commit":null,"checks":[]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authFile := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			executor := &recordingExecutor{outputs: [][]byte{workerCodexTestOutput("worker-session-7", tt.candidate)}}
+			result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile}).Run(context.Background())
+			if result.Status != Fail || !strings.Contains(result.Summary, "create schema probe") {
+				t.Fatalf("Run() = %#v, want strict create schema failure", result)
+			}
+		})
+	}
+}
+
+func TestWorkerCodexSessionCheckUsesFinalValidAgentMessageForNonce(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		responses []string
+		want      Status
+	}{
+		{name: "final response recalls nonce", responses: []string{"wrong", "worker-nonce-7"}, want: Pass},
+		{name: "final response violates nonce", responses: []string{"worker-nonce-7", "wrong"}, want: Fail},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authFile := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resumed := make([]string, 0, len(tt.responses))
+			for _, summary := range tt.responses {
+				resumed = append(resumed, strictCandidate(summary))
+			}
+			executor := &recordingExecutor{outputs: [][]byte{
+				workerCodexTestOutput("worker-session-7", strictCandidate("phase-one")),
+				workerCodexTestOutput("", resumed...),
+			}}
+			result := (WorkerCodexSessionCheck{Executor: executor, Image: "sha256:image", AuthFile: authFile, Nonce: "worker-nonce-7"}).Run(context.Background())
+			if result.Status != tt.want {
+				t.Fatalf("Run() = %#v, want %s", result, tt.want)
+			}
+		})
+	}
+}
+
 func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutput(t *testing.T) {
 	authFile := filepath.Join(t.TempDir(), "auth.json")
 	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
@@ -334,6 +386,31 @@ func TestWorkerCodexSessionCheckReportsRejectedAuthenticationWithoutLeakingOutpu
 
 func doctorTestChatGPTAuth(accessToken string) []byte {
 	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
+}
+
+func strictCandidate(summary string) string {
+	encoded, _ := json.Marshal(map[string]any{
+		"summary": summary, "commit": nil, "checks": []map[string]string{{"command": "doctor schema probe", "outcome": "passed"}}, "plan_amendment": nil,
+	})
+	return string(encoded)
+}
+
+func workerCodexTestOutput(sessionID string, candidates ...string) []byte {
+	var output strings.Builder
+	if sessionID != "" {
+		event, _ := json.Marshal(map[string]string{"type": "thread.started", "thread_id": sessionID})
+		output.Write(event)
+		output.WriteByte('\n')
+	}
+	for _, candidate := range candidates {
+		event, _ := json.Marshal(map[string]any{
+			"type": "item.completed",
+			"item": map[string]string{"type": "agent_message", "text": candidate},
+		})
+		output.Write(event)
+		output.WriteByte('\n')
+	}
+	return []byte(output.String())
 }
 
 type checkFunc struct {

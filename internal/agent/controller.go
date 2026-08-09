@@ -514,33 +514,11 @@ func errorText(err error, exitCode int) string {
 
 func parseOutput(output []byte, existing string) (string, []byte, error) {
 	sessionID, _ := parseSessionID(output, existing)
-	var structured []byte
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var value struct {
-			Type string `json:"type"`
-			Item struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"item"`
-		}
-		if err := json.Unmarshal([]byte(line), &value); err != nil {
-			continue
-		}
-		if value.Type == "item.completed" && value.Item.Type == "agent_message" {
-			candidate := []byte(strings.TrimSpace(value.Item.Text))
-			if candidateoutput.Validate(candidate) == nil {
-				structured = append([]byte(nil), candidate...)
-			}
-		}
-	}
+	structured, structuredErr := candidateoutput.ExtractCodexCandidate(output)
 	if sessionID == "" {
 		sessionID = existing
 	}
-	if sessionID == "" || len(structured) == 0 {
+	if sessionID == "" || structuredErr != nil {
 		return "", nil, errors.New("Codex output did not contain a session and structured result")
 	}
 	return sessionID, structured, nil

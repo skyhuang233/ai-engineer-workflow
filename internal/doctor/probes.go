@@ -117,7 +117,7 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return workerCodexFailure("create authenticated Worker Codex session", initial, err)
 	}
-	if _, err := workerCodexStructuredCandidate(initial); err != nil {
+	if _, err := candidateoutput.ExtractCodexCandidate(initial); err != nil {
 		return Result{Status: Fail, Summary: "Worker Codex create schema probe returned an invalid structured response"}
 	}
 	sessionID := jsonEventString(initial, "thread.started", "thread_id")
@@ -130,7 +130,7 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return workerCodexFailure("resume authenticated Worker Codex session", resumed, err)
 	}
-	structured, err := workerCodexStructuredCandidate(resumed)
+	structured, err := candidateoutput.ExtractCodexCandidate(resumed)
 	if err != nil {
 		return Result{Status: Fail, Summary: "Worker Codex resume schema probe returned an invalid structured response"}
 	}
@@ -141,25 +141,6 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 		return Result{Status: Fail, Summary: "resumed Worker Codex session did not recall prior-turn context"}
 	}
 	return Result{Status: Pass, Summary: "pinned Worker accepted the Candidate schema, authenticated, and resumed persisted context"}
-}
-
-func workerCodexStructuredCandidate(output []byte) ([]byte, error) {
-	for _, line := range strings.Split(string(output), "\n") {
-		var event struct {
-			Type string `json:"type"`
-			Item struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"item"`
-		}
-		if json.Unmarshal([]byte(line), &event) == nil && event.Type == "item.completed" && event.Item.Type == "agent_message" {
-			structured := []byte(strings.TrimSpace(event.Item.Text))
-			if candidateoutput.Validate(structured) == nil {
-				return structured, nil
-			}
-		}
-	}
-	return nil, errors.New("Codex output did not contain a valid Candidate structured response")
 }
 
 func workerCodexCommand(image, workspace, codexState string, command ...string) []string {
