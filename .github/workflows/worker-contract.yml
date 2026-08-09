@@ -79,3 +79,18 @@ jobs:
           test "${#embedded_no_mistakes_modified[@]}" -eq 1
           test "${embedded_no_mistakes_modified[0]}" = false
           test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"
+      - name: Generate candidate Worker SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: workflow-worker:${{ steps.pins.outputs.worker_version }}
+          format: spdx-json
+          output-file: worker-sbom.spdx.json
+          upload-artifact: false
+      - name: Scan candidate Worker dependencies
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table

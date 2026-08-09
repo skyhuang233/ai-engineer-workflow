@@ -155,12 +155,14 @@ jobs:
               echo "Worker version already belongs to a different accepted commit" >&2
               exit 1
             }
-            asset_id="$(jq -r 'if (.assets | length) == 1 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
-            test -n "$asset_id" || {
-              echo "Existing Worker Release has no unambiguous release manifest" >&2
+            manifest_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
+            sbom_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-sbom.spdx.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
+            test -n "$manifest_asset_id" && test -n "$sbom_asset_id" || {
+              echo "Existing Worker Release lacks an unambiguous manifest or SPDX SBOM" >&2
               exit 1
             }
-            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > worker-release.json
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${manifest_asset_id}" > worker-release.json
+            gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${sbom_asset_id}" > worker-sbom.spdx.json
             jq --exit-status \
               --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
               --arg source_commit "$GITHUB_SHA" \
@@ -175,7 +177,7 @@ jobs:
               --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
               --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
               --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
-              '(.schema_version == 3) and
+              '(.schema_version == 4) and
                (.worker_version == $worker_version) and
                (.source_commit == $source_commit) and
                (.image | type == "string") and
@@ -191,11 +193,18 @@ jobs:
                (.no_mistakes_fork_release == $no_mistakes_fork_release) and
                (.no_mistakes_linux_amd64_sha256 == $no_mistakes_linux_amd64_sha256) and
                (.build_input_identity == $build_input_identity) and
+               (.sbom_sha256 | test("^[0-9a-f]{64}$")) and
+               (.vulnerability_scan == {scanner:"grype",severity_cutoff:"high",only_fixed:true}) and
                (.github_actions_run_id | type == "number" and . > 0)' \
               worker-release.json > /dev/null || {
                 echo "Existing Worker Release has an incomplete or invalid release manifest" >&2
                 exit 1
               }
+            sbom_sha256="$(jq -r .sbom_sha256 worker-release.json)"
+            echo "${sbom_sha256}  worker-sbom.spdx.json" | sha256sum --check --strict || {
+              echo "Existing Worker SBOM does not match the Release Manifest" >&2
+              exit 1
+            }
             image="$(jq -r .image worker-release.json)"
             docker buildx imagetools inspect "$image" > /dev/null || {
               echo "Existing Worker Release image digest does not resolve" >&2
@@ -259,12 +268,30 @@ jobs:
             NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}
             NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}
             NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}
+      - name: Generate published Worker SBOM
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ steps.pins.outputs.image_repository }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: worker-sbom.spdx.json
+          upload-artifact: false
+      - name: Scan published Worker dependencies
+        if: steps.changes.outputs.required == 'true'
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
       - name: Create authoritative Worker Release Manifest
         if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          sbom_sha256="$(sha256sum worker-sbom.spdx.json | awk '{print $1}')"
           jq --null-input \
             --arg worker_version "${{ steps.pins.outputs.worker_version }}" \
             --arg source_commit "${GITHUB_SHA}" \
@@ -279,15 +306,18 @@ jobs:
             --arg no_mistakes_fork_release "${{ steps.pins.outputs.no_mistakes_fork_release }}" \
             --arg no_mistakes_linux_amd64_sha256 "${{ steps.pins.outputs.no_mistakes_sha256 }}" \
             --arg build_input_identity "${{ steps.build-inputs.outputs.identity }}" \
+            --arg sbom_sha256 "$sbom_sha256" \
             --argjson github_actions_run_id "${GITHUB_RUN_ID}" \
-            '{schema_version:3, worker_version:$worker_version, source_commit:$source_commit,
+            '{schema_version:4, worker_version:$worker_version, source_commit:$source_commit,
               image:$image, codex_version:$codex_version, go_version:$go_version,
               go_linux_amd64_sha256:$go_linux_amd64_sha256, no_mistakes_version:$no_mistakes_version,
               no_mistakes_upstream_repository:$no_mistakes_upstream_repository, no_mistakes_commit:$no_mistakes_commit,
               no_mistakes_fork_repository:$no_mistakes_fork_repository,
               no_mistakes_fork_release:$no_mistakes_fork_release,
               no_mistakes_linux_amd64_sha256:$no_mistakes_linux_amd64_sha256,
-              build_input_identity:$build_input_identity, github_actions_run_id:$github_actions_run_id}' \
+              build_input_identity:$build_input_identity, sbom_sha256:$sbom_sha256,
+              vulnerability_scan:{scanner:"grype",severity_cutoff:"high",only_fixed:true},
+              github_actions_run_id:$github_actions_run_id}' \
             > worker-release.json
           jq --exit-status . worker-release.json
       - name: Publish Worker Release Manifest
@@ -298,4 +328,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Worker ${{ steps.build-inputs.outputs.release_identity }}
           body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
-          files: worker-release.json
+          files: |
+            worker-release.json
+            worker-sbom.spdx.json

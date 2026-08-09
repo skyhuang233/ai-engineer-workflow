@@ -86,7 +86,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
 	manifest := WorkerReleaseManifest{
-		SchemaVersion:                3,
+		SchemaVersion:                4,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -100,7 +100,11 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
 		BuildInputIdentity:           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		GitHubActionsRunID:           123,
+		SBOMSHA256:                   "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		VulnerabilityScan: VulnerabilityScanPolicy{
+			Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true,
+		},
+		GitHubActionsRunID: 123,
 	}
 	if err := manifest.Validate(config); err != nil {
 		t.Fatalf("valid manifest: %v", err)
@@ -123,5 +127,15 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 	manifest.NoMistakesUpstreamRepository = "wrong/repository"
 	if err := manifest.Validate(config); err == nil {
 		t.Fatal("manifest accepted a different no-mistakes upstream repository")
+	}
+	manifest.NoMistakesUpstreamRepository = config.NoMistakes.UpstreamRepository
+	manifest.SBOMSHA256 = "missing"
+	if err := manifest.Validate(config); err == nil {
+		t.Fatal("manifest accepted an unbound Worker SBOM")
+	}
+	manifest.SBOMSHA256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	manifest.VulnerabilityScan.OnlyFixed = false
+	if err := manifest.Validate(config); err == nil {
+		t.Fatal("manifest accepted a weaker vulnerability policy")
 	}
 }

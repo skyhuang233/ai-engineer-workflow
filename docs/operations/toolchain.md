@@ -1,5 +1,9 @@
 # Production toolchain baseline
 
+The final production decision follows
+[production-qualification.md](production-qualification.md); Doctor is a hard
+prerequisite, not the approval itself.
+
 `config/toolchain.json` is the machine-readable production baseline checked by
 `workflow doctor`. Every executable version and artifact is immutable:
 
@@ -13,6 +17,11 @@
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
+- Every candidate and published Worker image produces an SPDX 2.3 SBOM and is
+  scanned with Grype. A fixable High-or-greater finding fails the build. The
+  immutable release contains exactly `worker-release.json` and
+  `worker-sbom.spdx.json`; Doctor verifies the manifest-bound SBOM checksum and
+  the successful publisher run before activating the image.
 - The dedicated GitHub integration repository and its required workflow path
   are explicit. The repository may be public or private, but its owner must
   match the configured Gateway Credential owner. Branch protection is not a
@@ -158,7 +167,8 @@ immutable Debian snapshot and exact direct APT package versions, which are also
 recorded as image labels for build provenance. Release and image tags contain
 the declared Worker version and this identity, allowing an input change to
 produce a new immutable release without a manual version bump. The manifest
-must be the sole asset for that exact source-keyed Worker release and must be published by the fixed
+and its checksum-bound SPDX SBOM must be the only two assets for that exact
+source-keyed Worker release and must be published by the fixed
 `publish-worker` push workflow after an unambiguous non-bot merge by the
 configured owner. A successful complete run atomically makes that digest the
 Active Worker Image for new Worker Runs; existing runs remain pinned to their

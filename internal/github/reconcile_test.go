@@ -108,7 +108,7 @@ func TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier(t *test
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2099, 8, 9, 0, 0, 0, 0, time.UTC)
 	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
 	if err != nil {
 		t.Fatal(err)
