@@ -37,12 +37,20 @@ const Schema = `{
         "add_tickets": {
           "type": "array",
           "items": {
-            "type": "object",
-            "required": ["ID", "Number", "Title"],
+          "type": "object",
+            "required": ["ID", "NodeID", "Number", "Title", "Body", "State", "Labels", "UpdatedAt", "Delivered", "Author", "AuthorType"],
             "properties": {
               "ID": {"type": "integer"},
+              "NodeID": {"type": "string"},
               "Number": {"type": "integer"},
-              "Title": {"type": "string", "minLength": 1}
+              "Title": {"type": "string", "minLength": 1},
+              "Body": {"type": "string"},
+              "State": {"type": "string"},
+              "Labels": {"type": "array", "items": {"type": "string"}},
+              "UpdatedAt": {"type": "string"},
+              "Delivered": {"type": "boolean"},
+              "Author": {"type": "string"},
+              "AuthorType": {"type": "string"}
             },
             "additionalProperties": false
           }

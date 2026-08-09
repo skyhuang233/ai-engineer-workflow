@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	githubapi "github.com/skyhuang233/workflow/internal/github"
@@ -98,6 +100,10 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 	if err := codexauth.Seed(c.AuthFile, codexState); err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
+	schemaPath := filepath.Join(codexState, "output-schema.json")
+	if err := os.WriteFile(schemaPath, []byte(candidateoutput.Schema), 0o600); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
 	nonce := c.Nonce
 	if nonce == "" {
 		nonce, err = randomToken()
@@ -106,25 +112,54 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 		}
 	}
 	initial, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
-		"exec", "--skip-git-repo-check", "--json", "--sandbox", "read-only",
-		"Remember this nonce for the next turn: "+nonce+". Reply with exactly: phase-one"))
+		"exec", "--sandbox", "read-only", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check",
+		"Remember this nonce for the next turn: "+nonce+`. Return the required JSON with summary "phase-one", commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
 		return workerCodexFailure("create authenticated Worker Codex session", initial, err)
+	}
+	if _, err := workerCodexStructuredCandidate(initial); err != nil {
+		return Result{Status: Fail, Summary: "Worker Codex create schema probe returned an invalid structured response"}
 	}
 	sessionID := jsonEventString(initial, "thread.started", "thread_id")
 	if sessionID == "" {
 		return Result{Status: Fail, Summary: "Worker Codex did not emit a persistent session ID"}
 	}
 	resumed, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
-		"exec", "resume", "--json", "--skip-git-repo-check", sessionID,
-		"Reply with only the nonce I gave you in the previous turn."))
+		"exec", "--sandbox", "read-only", "resume", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check", sessionID,
+		`Return the required JSON with the nonce from the previous turn as summary, commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
 		return workerCodexFailure("resume authenticated Worker Codex session", resumed, err)
 	}
-	if !strings.Contains(string(resumed), nonce) {
+	structured, err := workerCodexStructuredCandidate(resumed)
+	if err != nil {
+		return Result{Status: Fail, Summary: "Worker Codex resume schema probe returned an invalid structured response"}
+	}
+	var result struct {
+		Summary string `json:"summary"`
+	}
+	if json.Unmarshal(structured, &result) != nil || result.Summary != nonce {
 		return Result{Status: Fail, Summary: "resumed Worker Codex session did not recall prior-turn context"}
 	}
-	return Result{Status: Pass, Summary: "pinned Worker authenticated with the host ChatGPT cache and resumed persisted context"}
+	return Result{Status: Pass, Summary: "pinned Worker accepted the Candidate schema, authenticated, and resumed persisted context"}
+}
+
+func workerCodexStructuredCandidate(output []byte) ([]byte, error) {
+	for _, line := range strings.Split(string(output), "\n") {
+		var event struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.Type == "item.completed" && event.Item.Type == "agent_message" {
+			structured := []byte(strings.TrimSpace(event.Item.Text))
+			if candidateoutput.Validate(structured) == nil {
+				return structured, nil
+			}
+		}
+	}
+	return nil, errors.New("Codex output did not contain a valid Candidate structured response")
 }
 
 func workerCodexCommand(image, workspace, codexState string, command ...string) []string {
