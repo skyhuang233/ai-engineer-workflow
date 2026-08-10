@@ -275,7 +275,7 @@ func runDoctor(args []string) {
 				Command:      []string{"no-mistakes", "--version"},
 				Tool:         "no-mistakes",
 				ExactVersion: config.NoMistakes.Version,
-				ExactCommit:  config.NoMistakes.UpstreamCommit,
+				ExactCommit:  config.NoMistakes.ForkCommit,
 			},
 		},
 		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Image, AuthFile: *codexAuthFile},

@@ -25,8 +25,9 @@ type WorkerReleaseManifest struct {
 	GoLinuxAMD64SHA256           string                  `json:"go_linux_amd64_sha256"`
 	NoMistakesVersion            string                  `json:"no_mistakes_version"`
 	NoMistakesUpstreamRepository string                  `json:"no_mistakes_upstream_repository"`
-	NoMistakesCommit             string                  `json:"no_mistakes_commit"`
+	NoMistakesUpstreamCommit     string                  `json:"no_mistakes_upstream_commit"`
 	NoMistakesForkRepository     string                  `json:"no_mistakes_fork_repository"`
+	NoMistakesForkCommit         string                  `json:"no_mistakes_fork_commit"`
 	NoMistakesForkRelease        string                  `json:"no_mistakes_fork_release"`
 	NoMistakesLinuxAMD64SHA256   string                  `json:"no_mistakes_linux_amd64_sha256"`
 	BuildInputIdentity           string                  `json:"build_input_identity"`
@@ -237,7 +238,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 
 func (m WorkerReleaseManifest) Validate(config Config) error {
 	switch {
-	case m.SchemaVersion != 5:
+	case m.SchemaVersion != 6:
 		return errors.New("unsupported Worker Release Manifest schema")
 	case m.WorkerVersion != config.Worker.Version:
 		return errors.New("Worker Release version does not match toolchain")
@@ -252,8 +253,9 @@ func (m WorkerReleaseManifest) Validate(config Config) error {
 	case m.GoVersion != config.Go.Version || m.GoLinuxAMD64SHA256 != config.Go.LinuxAMD64SHA256:
 		return errors.New("Worker Release Go pin does not match toolchain")
 	case m.NoMistakesVersion != config.NoMistakes.Version || m.NoMistakesUpstreamRepository != config.NoMistakes.UpstreamRepository ||
-		m.NoMistakesCommit != config.NoMistakes.UpstreamCommit ||
+		m.NoMistakesUpstreamCommit != config.NoMistakes.UpstreamCommit ||
 		m.NoMistakesForkRepository != config.NoMistakes.ForkRepository || m.NoMistakesForkRelease != config.NoMistakes.ForkRelease ||
+		m.NoMistakesForkCommit != config.NoMistakes.ForkCommit ||
 		m.NoMistakesLinuxAMD64SHA256 != config.NoMistakes.LinuxAMD64SHA256:
 		return errors.New("Worker Release no-mistakes pin does not match toolchain")
 	case !sha256Pattern.MatchString(m.BuildInputIdentity):
@@ -355,7 +357,7 @@ func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tre
 
 func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
 	inputs := workerBuildInputs{
-		SchemaVersion:             4,
+		SchemaVersion:             5,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
@@ -390,6 +392,7 @@ func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuil
 			UpstreamRepository: base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.UpstreamRepository)),
 			UpstreamCommit:     base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.UpstreamCommit)),
 			ForkRepository:     base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.ForkRepository)),
+			ForkCommit:         base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.ForkCommit)),
 			ForkRelease:        base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.ForkRelease)),
 			LinuxAMD64SHA256:   base64.StdEncoding.EncodeToString([]byte(inputs.NoMistakes.LinuxAMD64SHA256)),
 		},

@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "codex": {
     "version": "0.147.0"
   },
@@ -16,8 +16,9 @@
     "upstream_repository": "kunchenguid/no-mistakes",
     "upstream_commit": "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
     "fork_repository": "skyhuang233/no-mistakes",
-    "fork_release": "workflow-v1.41.2.1",
-    "linux_amd64_sha256": "1e6dc5c2b30271060da987f7bc3146301a11c6c4f1a37b670b5d735156d1abed"
+    "fork_commit": "e073fd0dc51c64004468b04de8cf2ab50cd5d177",
+    "fork_release": "workflow-v1.41.2.2",
+    "linux_amd64_sha256": "bd19d18ba20af1905b0f13ac6b0f9c283d299da48279da7dd0a5ff2242a58d4c"
   },
   "worker": {
     "version": "0.1.0",

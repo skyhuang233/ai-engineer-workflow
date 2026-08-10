@@ -17,10 +17,10 @@ func TestWorkerBuildInputIdentityUsesCanonicalBase64JSON(t *testing.T) {
 	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	b64 := base64.StdEncoding.EncodeToString
-	canonical := fmt.Sprintf(`{"schema_version":4,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"github_cli":{"version":%q,"linux_amd64_sha256":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
+	canonical := fmt.Sprintf(`{"schema_version":5,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"github_cli":{"version":%q,"linux_amd64_sha256":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_commit":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
 		b64([]byte(workerTree)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.GitHubCLI.Version)), b64([]byte(config.GitHubCLI.LinuxAMD64SHA256)), b64([]byte(config.Go.Version)), b64([]byte(config.Go.LinuxAMD64SHA256)), b64([]byte(config.NoMistakes.Version)),
 		b64([]byte(config.NoMistakes.UpstreamRepository)), b64([]byte(config.NoMistakes.UpstreamCommit)),
-		b64([]byte(config.NoMistakes.ForkRepository)), b64([]byte(config.NoMistakes.ForkRelease)),
+		b64([]byte(config.NoMistakes.ForkRepository)), b64([]byte(config.NoMistakes.ForkCommit)), b64([]byte(config.NoMistakes.ForkRelease)),
 		b64([]byte(config.NoMistakes.LinuxAMD64SHA256)), b64([]byte(config.Worker.Version)),
 		b64([]byte(config.Worker.ImageRepository)), b64([]byte(config.Worker.ReleaseRepository)))
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
@@ -54,7 +54,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	filter := `{schema_version:4,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
+	filter := `{schema_version:5,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
 	command := exec.Command(jq, "--compact-output", "--arg", "deploy_worker_tree", workerTree, "--arg", "publish_worker_workflow_blob", publisherWorkflow, filter)
 	command.Stdin = bytes.NewReader(configJSON)
 	publisherJSON, err := command.Output()
@@ -63,7 +63,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	}
 	publisherCanonicalJSON := strings.TrimRight(string(publisherJSON), "\r\n")
 	goJSON, err := json.Marshal(canonicalizeWorkerBuildInputs(workerBuildInputs{
-		SchemaVersion:             4,
+		SchemaVersion:             5,
 		DeployWorkerTree:          workerTree,
 		PublishWorkerWorkflowBlob: publisherWorkflow,
 		Codex:                     config.Codex,
@@ -87,7 +87,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
 	manifest := WorkerReleaseManifest{
-		SchemaVersion:                5,
+		SchemaVersion:                6,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -98,8 +98,9 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
 		NoMistakesVersion:            config.NoMistakes.Version,
 		NoMistakesUpstreamRepository: config.NoMistakes.UpstreamRepository,
-		NoMistakesCommit:             config.NoMistakes.UpstreamCommit,
+		NoMistakesUpstreamCommit:     config.NoMistakes.UpstreamCommit,
 		NoMistakesForkRepository:     config.NoMistakes.ForkRepository,
+		NoMistakesForkCommit:         config.NoMistakes.ForkCommit,
 		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
 		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
 		BuildInputIdentity:           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -132,6 +133,11 @@ func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T)
 		t.Fatal("manifest accepted a different no-mistakes upstream repository")
 	}
 	manifest.NoMistakesUpstreamRepository = config.NoMistakes.UpstreamRepository
+	manifest.NoMistakesForkCommit = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if err := manifest.Validate(config); err == nil {
+		t.Fatal("manifest accepted a different no-mistakes fork commit")
+	}
+	manifest.NoMistakesForkCommit = config.NoMistakes.ForkCommit
 	manifest.SBOMSHA256 = "missing"
 	if err := manifest.Validate(config); err == nil {
 		t.Fatal("manifest accepted an unbound Worker SBOM")

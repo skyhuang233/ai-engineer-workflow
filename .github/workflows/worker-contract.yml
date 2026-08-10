@@ -34,7 +34,8 @@ jobs:
           echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_upstream_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_fork_commit=$(jq -r .no_mistakes.fork_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
@@ -47,7 +48,8 @@ jobs:
             --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
             --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}" \
             --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
-            --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_upstream_commit }}" \
+            --build-arg "NO_MISTAKES_FORK_COMMIT=${{ steps.pins.outputs.no_mistakes_fork_commit }}" \
             --build-arg "NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
             --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
             --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}" \
@@ -87,7 +89,7 @@ jobs:
           mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
           test "${#embedded_no_mistakes_commits[@]}" -eq 1
           embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
-          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_fork_commit }}"
           mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
           test "${#embedded_no_mistakes_modified[@]}" -eq 1
           test "${embedded_no_mistakes_modified[0]}" = false

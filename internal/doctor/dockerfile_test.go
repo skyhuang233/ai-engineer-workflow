@@ -39,6 +39,8 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 		"test ! -e /usr/local/lib/node_modules/npm",
 		"NO_MISTAKES_UPSTREAM_COMMIT",
 		"io.workflow.no-mistakes.upstream-commit",
+		"NO_MISTAKES_FORK_COMMIT=e073fd0dc51c64004468b04de8cf2ab50cd5d177",
+		"io.workflow.no-mistakes.fork-commit",
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("Worker Dockerfile omits immutable provenance input %q", required)

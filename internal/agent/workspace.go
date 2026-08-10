@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -383,7 +384,7 @@ func validateLocalRemotes(ctx context.Context, path string) error {
 				if remoteURL == "" {
 					continue
 				}
-				if !filepath.IsAbs(remoteURL) {
+				if !filepath.IsAbs(remoteURL) && !pathpkg.IsAbs(remoteURL) {
 					return fmt.Errorf("workspace remote %q must use an absolute local path", remote)
 				}
 			}

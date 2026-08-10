@@ -54,6 +54,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	config.NoMistakes.LinuxAMD64SHA256 = hex.EncodeToString(digest[:])
 	var paths []string
 	immutableRelease := true
+	forkIsBasedOnUpstream := true
+	releaseTargetsFork := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -70,6 +72,14 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			_, _ = w.Write([]byte(`{"private":false}`))
 		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
 			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.ForkCommit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.ForkCommit})
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/compare/"+config.NoMistakes.UpstreamCommit+"..."+config.NoMistakes.ForkCommit:
+			mergeBase := config.NoMistakes.UpstreamCommit
+			if !forkIsBasedOnUpstream {
+				mergeBase = strings.Repeat("f", 40)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "behind_by": 0, "merge_base_commit": map[string]string{"sha": mergeBase}})
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes/releases/assets/9":
 			_, _ = w.Write(asset)
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
@@ -77,7 +87,11 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": immutableRelease, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			target := config.NoMistakes.ForkCommit
+			if !releaseTargetsFork {
+				target = config.NoMistakes.UpstreamCommit
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": target, "immutable": immutableRelease, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -106,6 +120,16 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		t.Fatalf("GitHub check accepted a mutable no-mistakes release: %#v", result)
 	}
 	immutableRelease = true
+	releaseTargetsFork = false
+	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "fork release target") {
+		t.Fatalf("GitHub check accepted a release targeting the upstream instead of the fork: %#v", result)
+	}
+	releaseTargetsFork = true
+	forkIsBasedOnUpstream = false
+	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "merge base") {
+		t.Fatalf("GitHub check accepted a fork unrelated to the pinned upstream commit: %#v", result)
+	}
+	forkIsBasedOnUpstream = true
 	asset = []byte("tampered no-mistakes asset")
 	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "checksum") {
 		t.Fatalf("GitHub check accepted tampered no-mistakes asset: %#v", result)
@@ -291,6 +315,10 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 			_, _ = w.Write([]byte(`{"private":false}`))
 		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
 			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.ForkCommit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.ForkCommit})
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/compare/"+config.NoMistakes.UpstreamCommit+"..."+config.NoMistakes.ForkCommit:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "behind_by": 0, "merge_base_commit": map[string]string{"sha": config.NoMistakes.UpstreamCommit}})
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes/releases/assets/9":
 			_, _ = w.Write(asset)
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
@@ -301,7 +329,7 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/8/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.UpstreamCommit, "immutable": true, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.ForkCommit, "immutable": true, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}

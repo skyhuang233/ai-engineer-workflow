@@ -397,6 +397,25 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.UpstreamRepository+"/git/commits/"+c.NoMistakes.UpstreamCommit, &upstreamCommit); err != nil || upstreamCommit.SHA != c.NoMistakes.UpstreamCommit {
 		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository", Err: err}
 	}
+	var forkCommit struct {
+		SHA string `json:"sha"`
+	}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/git/commits/"+c.NoMistakes.ForkCommit, &forkCommit); err != nil || forkCommit.SHA != c.NoMistakes.ForkCommit {
+		return Result{Status: Fail, Summary: "pinned fork commit is unavailable from the configured no-mistakes fork repository", Err: err}
+	}
+	var comparison struct {
+		Status          string `json:"status"`
+		BehindBy        int    `json:"behind_by"`
+		MergeBaseCommit struct {
+			SHA string `json:"sha"`
+		} `json:"merge_base_commit"`
+	}
+	comparePath := "repos/" + c.NoMistakes.ForkRepository + "/compare/" + c.NoMistakes.UpstreamCommit + "..." + c.NoMistakes.ForkCommit
+	if err := githubGET(ctx, c.APIBase, token, comparePath, &comparison); err != nil ||
+		comparison.MergeBaseCommit.SHA != c.NoMistakes.UpstreamCommit || comparison.BehindBy != 0 ||
+		(comparison.Status != "ahead" && comparison.Status != "identical") {
+		return Result{Status: Fail, Summary: "pinned upstream commit is not the merge base of the pinned no-mistakes fork commit", Err: err}
+	}
 	var forkRelease struct {
 		TargetCommitish string `json:"target_commitish"`
 		Immutable       bool   `json:"immutable"`
@@ -406,8 +425,8 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 		} `json:"assets"`
 	}
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
-		forkRelease.TargetCommitish != c.NoMistakes.UpstreamCommit {
-		return Result{Status: Fail, Summary: "fork release target does not equal the pinned upstream commit", Err: err}
+		forkRelease.TargetCommitish != c.NoMistakes.ForkCommit {
+		return Result{Status: Fail, Summary: "fork release target does not equal the pinned fork commit", Err: err}
 	}
 	if !forkRelease.Immutable {
 		return Result{Status: Fail, Summary: "pinned no-mistakes fork release is not immutable"}
@@ -435,7 +454,7 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if hex.EncodeToString(digest[:]) != c.NoMistakes.LinuxAMD64SHA256 {
 		return Result{Status: Fail, Summary: "pinned no-mistakes Linux asset checksum does not match"}
 	}
-	return Result{Status: Pass, Summary: "integration workflow, pinned fork release, and Linux asset checksum verified; owner-only merge remains the governance boundary"}
+	return Result{Status: Pass, Summary: "integration workflow, upstream-to-fork ancestry, pinned fork release, and Linux asset checksum verified; owner-only merge remains the governance boundary"}
 }
 
 func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repository, name string) *Result {
