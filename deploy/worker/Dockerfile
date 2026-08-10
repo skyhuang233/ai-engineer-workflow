@@ -16,7 +16,7 @@ ENV DEBIAN_SNAPSHOT=20260713T000000Z \
     APT_PACKAGES="ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2" \
     PATH="/usr/local/go/bin:${PATH}"
 
-LABEL org.opencontainers.image.source="https://github.com/skyhuang233/workflow"
+LABEL org.opencontainers.image.source="https://github.com/skyhuang233/ai-engineer-workflow"
 LABEL io.workflow.codex.version="${CODEX_VERSION}"
 LABEL io.workflow.github-cli.version="${GITHUB_CLI_VERSION}"
 LABEL io.workflow.github-cli.linux-amd64-sha256="${GITHUB_CLI_LINUX_AMD64_SHA256}"

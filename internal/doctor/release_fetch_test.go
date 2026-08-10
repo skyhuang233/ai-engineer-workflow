@@ -71,42 +71,42 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/repos/skyhuang233/workflow":
+		case "/repos/skyhuang233/ai-engineer-workflow":
 			repositoryMetadataRequested = true
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"full_name":"skyhuang233/workflow","owner":{"login":"skyhuang233"},"private":%t}`, private)))
-		case "/repos/skyhuang233/workflow/releases/tags/" + workerReleaseTag(config.Worker.Version, buildInputIdentity):
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"full_name":"skyhuang233/ai-engineer-workflow","owner":{"login":"skyhuang233"},"private":%t}`, private)))
+		case "/repos/skyhuang233/ai-engineer-workflow/releases/tags/" + workerReleaseTag(config.Worker.Version, buildInputIdentity):
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","immutable":%t,"assets":%s}`, immutableRelease, assets)))
-		case "/repos/skyhuang233/workflow/releases/assets/9":
+		case "/repos/skyhuang233/ai-engineer-workflow/releases/assets/9":
 			_, _ = w.Write([]byte(manifest))
-		case "/repos/skyhuang233/workflow/releases/assets/10":
+		case "/repos/skyhuang233/ai-engineer-workflow/releases/assets/10":
 			_, _ = w.Write(sbom)
-		case "/repos/skyhuang233/workflow/commits/main":
+		case "/repos/skyhuang233/ai-engineer-workflow/commits/main":
 			_, _ = w.Write([]byte(`{"sha":"` + mainSHA + `","commit":{"tree":{"sha":"` + mainRootTree + `"}}}`))
-		case "/repos/skyhuang233/workflow/commits/" + sourceSHA:
+		case "/repos/skyhuang233/ai-engineer-workflow/commits/" + sourceSHA:
 			_, _ = w.Write([]byte(`{"sha":"` + sourceSHA + `","commit":{"tree":{"sha":"` + sourceRootTree + `"}}}`))
-		case "/repos/skyhuang233/workflow/contents/config/toolchain.json":
+		case "/repos/skyhuang233/ai-engineer-workflow/contents/config/toolchain.json":
 			_, _ = w.Write(configData)
-		case "/repos/skyhuang233/workflow/git/trees/" + sourceRootTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceRootTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + sourceDeployTree + `"},{"path":".github","type":"tree","sha":"` + sourceGitHubTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + mainRootTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainRootTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + mainDeployTree + `"},{"path":".github","type":"tree","sha":"` + mainGitHubTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + sourceDeployTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceDeployTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"worker","type":"tree","sha":"` + sourceWorkerTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + mainDeployTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainDeployTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"worker","type":"tree","sha":"` + currentWorkerTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + sourceGitHubTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceGitHubTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"workflows","type":"tree","sha":"` + sourceWorkflowsTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + mainGitHubTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainGitHubTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"workflows","type":"tree","sha":"` + mainWorkflowsTree + `"}]}`))
-		case "/repos/skyhuang233/workflow/git/trees/" + sourceWorkflowsTree, "/repos/skyhuang233/workflow/git/trees/" + mainWorkflowsTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceWorkflowsTree, "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainWorkflowsTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"publish-worker.yml","type":"blob","sha":"` + publisherWorkflowBlob + `"}]}`))
-		case "/repos/skyhuang233/workflow/actions/runs/123":
+		case "/repos/skyhuang233/ai-engineer-workflow/actions/runs/123":
 			_, _ = w.Write([]byte(`{"head_sha":"` + sourceSHA + `","head_branch":"main","event":"push","status":"completed","conclusion":"success","workflow_id":` + fmt.Sprint(workflowID) + `}`))
-		case "/repos/skyhuang233/workflow/actions/workflows/publish-worker.yml":
+		case "/repos/skyhuang233/ai-engineer-workflow/actions/workflows/publish-worker.yml":
 			_, _ = w.Write([]byte(`{"id":77,"path":".github/workflows/publish-worker.yml","state":"active"}`))
-		case "/repos/skyhuang233/workflow/commits/" + sourceSHA + "/pulls":
+		case "/repos/skyhuang233/ai-engineer-workflow/commits/" + sourceSHA + "/pulls":
 			_, _ = w.Write([]byte(`[{"number":17,"merged_at":"2026-08-01T00:00:00Z","merge_commit_sha":"` + sourceSHA + `","base":{"ref":"main"},"merged_by":null}]`))
-		case "/repos/skyhuang233/workflow/pulls/17":
+		case "/repos/skyhuang233/ai-engineer-workflow/pulls/17":
 			fullPullRequested = true
 			_, _ = w.Write([]byte(`{"merged_at":"2026-08-01T00:00:00Z","merge_commit_sha":"` + sourceSHA + `","base":{"ref":"main"},"merged_by":{"login":"` + mergedBy + `","type":"User"}}`))
 		default:

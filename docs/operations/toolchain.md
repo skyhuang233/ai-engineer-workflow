@@ -71,7 +71,7 @@ Run the complete target-host contract with:
 ```powershell
 go run ./cmd/workflow doctor `
   --config config/toolchain.json `
-  --workflow-repository skyhuang233/workflow `
+  --workflow-repository skyhuang233/ai-engineer-workflow `
   --database C:\ProgramData\workflow\workflow.db `
   --codex-auth-file $env:USERPROFILE\.codex\auth.json `
   --report docs/operations/doctor-report.md

@@ -23,7 +23,7 @@
   "worker": {
     "version": "0.1.0",
     "image_repository": "ghcr.io/skyhuang233/workflow-worker",
-    "release_repository": "skyhuang233/workflow"
+    "release_repository": "skyhuang233/ai-engineer-workflow"
   },
   "runtime": {
     "max_worker_attempts": 3
