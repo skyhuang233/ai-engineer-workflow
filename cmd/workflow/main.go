@@ -100,7 +100,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
-	fmt.Fprintln(os.Stderr, "  workflow credential provision [--config path] [--database path]")
+	fmt.Fprintln(os.Stderr, "  workflow credential provision --app-id <GITHUB_APP_ID> [--config path] [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
 	fmt.Fprintln(os.Stderr, "  workflow poll-github [options]")
