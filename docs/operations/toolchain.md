@@ -21,10 +21,11 @@ prerequisite, not the approval itself.
   manifest-pinned Worker image has one full Go `vcs.revision` equal to that
   fork commit and one `vcs.modified=false` setting. Its abbreviated
   human-readable version output and any repository-external bootstrap
-  installation on the host are not Worker provenance. The image pins
-  `procps=2:4.0.2-3` from the immutable Debian snapshot because the supported
-  container fallback for the `no-mistakes` daemon requires `ps`; candidate CI
-  and Doctor both start the daemon and require its status check to succeed.
+  installation on the host are not Worker provenance. The
+  [Worker Dockerfile](../../deploy/worker/Dockerfile) pins `procps` to an exact
+  version from the immutable Debian snapshot because the supported container
+  fallback for the `no-mistakes` daemon requires `ps`; candidate CI and Doctor
+  both start the daemon and require its status check to succeed.
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
