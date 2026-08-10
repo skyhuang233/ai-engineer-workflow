@@ -105,6 +105,9 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 	if !validGitPushArtifact(gitArtifact) {
 		return errors.New("Git HTTPS push verification returned an invalid temporary artifact")
 	}
+	if _, err := v.call(ctx, token, http.MethodGet, fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=1", repository, gitArtifact.Commit), nil, &struct{}{}); err != nil {
+		return fmt.Errorf("verify Checks read permission: %w", err)
+	}
 	var issue struct {
 		Number int `json:"number"`
 	}

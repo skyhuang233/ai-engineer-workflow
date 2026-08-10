@@ -32,6 +32,8 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 			_, _ = w.Write([]byte(`[]`))
 		case r.URL.Path == "/repos/owner/integration/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/contents/"):
 			_, _ = w.Write([]byte(`{"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues"):
@@ -68,6 +70,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	for _, wanted := range []string{
 		"GET /user",
 		"GET /repos/owner/integration/actions/workflows",
+		"GET /repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
 		"POST /repos/owner/integration/issues",
 		"POST /repos/owner/integration/labels",
 		"POST /repos/owner/integration/issues/12/labels",
@@ -82,6 +85,57 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 			t.Fatalf("missing %q in calls:\n%s", wanted, joined)
 		}
 	}
+}
+
+func TestVerifyRejectsCredentialWithoutChecksReadAfterCandidatePush(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"owner"}`))
+		case "/repos/owner/integration":
+			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main","private":true}`))
+		case "/repos/owner/integration/actions/workflows":
+			_, _ = w.Write([]byte(`{"workflows":[]}`))
+		case "/repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
+		case "/repos/owner/integration/git/ref/heads/workflow-credential-contract-0123456789abcdef01234567":
+			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
+		case "/repos/owner/integration/git/refs/heads/workflow-credential-contract-0123456789abcdef01234567":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(context.Context, string, string, string) (GitPushArtifact, error) {
+		calls = append(calls, "PUSH workflow-credential-contract-0123456789abcdef01234567@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
+	}}).Verify(context.Background(), "github_pat_actions_only", "owner", "owner/integration")
+	if err == nil || !strings.Contains(err.Error(), "verify Checks read permission") || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("missing Checks read rejection = %v", err)
+	}
+	joined := strings.Join(calls, "\n")
+	for _, wanted := range []string{
+		"GET /repos/owner/integration/actions/workflows",
+		"PUSH workflow-credential-contract-0123456789abcdef01234567@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"GET /repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
+		"DELETE /repos/owner/integration/git/refs/heads/workflow-credential-contract-0123456789abcdef01234567",
+	} {
+		if !strings.Contains(joined, wanted) {
+			t.Fatalf("missing %q in calls:\n%s", wanted, joined)
+		}
+	}
+	for _, forbidden := range []string{"/issues", "/pulls", "/labels"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("credential contract continued to %q after Checks read rejection:\n%s", forbidden, joined)
+		}
+	}
+	t.Logf("Actions read succeeded, temporary Candidate %s was pushed, check-runs returned 403, credential admission stopped, and the temporary branch was deleted.\nAPI transcript:\n%s\nVerifier result: %v", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", joined, err)
 }
 
 func TestVerifyRejectsCanonicalRepositoryOwnedByAnotherAccountBeforeMutations(t *testing.T) {

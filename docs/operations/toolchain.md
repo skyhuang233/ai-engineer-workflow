@@ -51,16 +51,24 @@ prerequisite, not the approval itself.
   values. Its contract workflow fails closed unless the variables, runner
   repository, and canonical GitHub repository metadata all agree.
 - The Gateway uses one fine-grained PAT for all owner repositories with exactly
-  metadata/actions read and contents/issues/pull-requests write. The secret
+  metadata/actions/checks read and contents/issues/pull-requests write. Checks
+  read is required separately from Actions read to observe Candidate check runs
+  in private repositories. The secret
   exists only in Windows Credential Manager and Control Plane memory. SQLite
   records only its SHA-256 fingerprint and successful live-contract evidence.
   GitHub does not expose an API that proves a fine-grained PAT has no additional
   permissions; selecting exactly this configuration is the owner's declaration,
   while the live contract machine-verifies every required positive capability.
 
-Provision or rotate the Gateway Credential. This hidden-input command performs
-real, idempotent writes in the dedicated integration repository and cleans up
-its temporary branch, issue, and PR. During replacement, the durable Gateway
+Provision or rotate the Gateway Credential. Configure `Metadata: read`,
+`Actions: read`, `Checks: read`, `Contents: write`, `Issues: write`, and
+`Pull requests: write` for all owner repositories. This hidden-input command
+verifies Actions read, pushes a temporary Candidate commit, and calls that
+commit's check-runs endpoint to verify Checks read before performing the
+remaining idempotent writes in the dedicated integration repository. Only
+after the complete live contract passes does it replace the previously verified
+credential; it then cleans up its temporary branch, issue, and PR. During
+replacement, the durable Gateway
 rotation pauses new writes and safely recovers an expired claim before the live
 contract runs; a failed replacement leaves writes paused. A Gateway that starts
 without its verified credential likewise persists the pause and projects one
