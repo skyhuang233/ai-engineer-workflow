@@ -69,6 +69,35 @@ func rootCause(err error) error {
 
 type DockerCheck struct {
 	Manifest WorkerReleaseManifest
+	Executor Executor
+}
+
+func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
+	var revision, modified string
+	var revisionCount, modifiedCount int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "build" {
+			continue
+		}
+		key, value, ok := strings.Cut(fields[1], "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "vcs.revision":
+			revision, revisionCount = value, revisionCount+1
+		case "vcs.modified":
+			modified, modifiedCount = value, modifiedCount+1
+		}
+	}
+	if revisionCount != 1 || revision != expectedCommit {
+		return fmt.Errorf("Worker no-mistakes VCS revision %q does not equal pinned fork commit %q", revision, expectedCommit)
+	}
+	if modifiedCount != 1 || modified != "false" {
+		return fmt.Errorf("Worker no-mistakes VCS modified state %q is not a clean build", modified)
+	}
+	return nil
 }
 
 type WorkerCodexSessionCheck struct {
@@ -166,7 +195,10 @@ func workerCodexFailure(action string, output []byte, err error) Result {
 func (DockerCheck) Name() string { return "Docker Worker contract" }
 
 func (c DockerCheck) Run(ctx context.Context) Result {
-	executor := OSExecutor{}
+	var executor Executor = c.Executor
+	if executor == nil {
+		executor = OSExecutor{}
+	}
 	info, err := executor.Run(ctx, []string{"docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"})
 	if err != nil || strings.TrimSpace(string(info)) != "linux/x86_64" {
 		return Result{Status: Fail, Summary: fmt.Sprintf("Docker Engine must be linux/x86_64: %v (%s)", err, strings.TrimSpace(string(info)))}
@@ -251,6 +283,17 @@ env | cut -d= -f1`
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
 		}
+	}
+	metadataOutput, err := executor.Run(ctx, []string{
+		"docker", "run", "--rm",
+		"--entrypoint", "/usr/local/go/bin/go",
+		image, "version", "-m", "/usr/local/bin/no-mistakes",
+	})
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read Worker no-mistakes build metadata: %v (%s)", err, strings.TrimSpace(string(metadataOutput)))}
+	}
+	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.NoMistakesForkCommit); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
 	}
 	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, and absence of GitHub write credentials verified"}
 }

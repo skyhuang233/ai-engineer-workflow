@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,110 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+type dockerCheckExecutor struct {
+	commands [][]string
+	metadata []byte
+}
+
+func (e *dockerCheckExecutor) Run(_ context.Context, command []string) ([]byte, error) {
+	e.commands = append(e.commands, append([]string(nil), command...))
+	joined := strings.Join(command, " ")
+	switch {
+	case joined == "docker info --format {{.OSType}}/{{.Architecture}}":
+		return []byte("linux/x86_64\n"), nil
+	case strings.HasPrefix(joined, "docker pull "):
+		return []byte("pulled\n"), nil
+	case strings.Contains(joined, " sh -ceu "):
+		for _, arg := range command {
+			const prefix = "type=bind,src="
+			const suffix = ",dst=/workspace"
+			if strings.HasPrefix(arg, prefix) && strings.HasSuffix(arg, suffix) {
+				workspace := strings.TrimSuffix(strings.TrimPrefix(arg, prefix), suffix)
+				if err := os.WriteFile(filepath.Join(workspace, "container-marker"), []byte("worker"), 0o600); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return []byte("gateway=ok\nmount=ok\n0.147.0\ngh version 2.97.0\ngo1.25.12\nv1.41.2\n\tbuild\tvcs.revision=e073fd0dc51c64004468b04de8cf2ab50cd5d177\n\tbuild\tvcs.modified=false\n"), nil
+	case strings.Contains(joined, " --entrypoint /usr/local/go/bin/go "):
+		return e.metadata, nil
+	default:
+		return nil, nil
+	}
+}
+
+func TestWorkerNoMistakesBuildMetadataRequiresExactCleanForkRevision(t *testing.T) {
+	const forkCommit = "e073fd0dc51c64004468b04de8cf2ab50cd5d177"
+	tests := []struct {
+		name     string
+		metadata string
+		wantErr  string
+	}{
+		{
+			name:     "exact clean fork",
+			metadata: "\tbuild\tvcs.revision=" + forkCommit + "\n\tbuild\tvcs.modified=false\n",
+		},
+		{
+			name:     "upstream revision",
+			metadata: "\tbuild\tvcs.revision=867d64d9c2df89f3f204ad1f5528e5bf7b460caa\n\tbuild\tvcs.modified=false\n",
+			wantErr:  "does not equal pinned fork commit",
+		},
+		{
+			name:     "modified fork build",
+			metadata: "\tbuild\tvcs.revision=" + forkCommit + "\n\tbuild\tvcs.modified=true\n",
+			wantErr:  "is not a clean build",
+		},
+		{
+			name:     "missing metadata",
+			metadata: "no VCS settings",
+			wantErr:  "does not equal pinned fork commit",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyWorkerNoMistakesBuildMetadata(test.metadata, forkCommit)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("verifyWorkerNoMistakesBuildMetadata() error = %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("verifyWorkerNoMistakesBuildMetadata() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
+	const forkCommit = "e073fd0dc51c64004468b04de8cf2ab50cd5d177"
+	executor := &dockerCheckExecutor{metadata: []byte("/usr/local/bin/no-mistakes: go1.25.12\n")}
+	result := (DockerCheck{
+		Executor: executor,
+		Manifest: WorkerReleaseManifest{
+			Image:                "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			CodexVersion:         "0.147.0",
+			GitHubCLIVersion:     "2.97.0",
+			GoVersion:            "1.25.12",
+			NoMistakesVersion:    "v1.41.2",
+			NoMistakesForkCommit: forkCommit,
+		},
+	}).Run(context.Background())
+
+	if result.Status != Fail || !strings.Contains(result.Summary, "does not equal pinned fork commit") {
+		t.Fatalf("DockerCheck.Run() = %#v, want isolated metadata failure", result)
+	}
+	if len(executor.commands) != 4 {
+		t.Fatalf("DockerCheck command count = %d, want 4", len(executor.commands))
+	}
+	probeScript := executor.commands[2][len(executor.commands[2])-1]
+	if strings.Contains(probeScript, "go version -m") {
+		t.Fatalf("general Worker probe contains build metadata command: %q", probeScript)
+	}
+	metadataCommand := strings.Join(executor.commands[3], " ")
+	wantMetadataCommand := "docker run --rm --entrypoint /usr/local/go/bin/go ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb version -m /usr/local/bin/no-mistakes"
+	if metadataCommand != wantMetadataCommand {
+		t.Fatalf("metadata command = %q, want %q", metadataCommand, wantMetadataCommand)
+	}
+}
 
 func TestSQLiteCheckReportsBackupAndRecoveryMetrics(t *testing.T) {
 	ctx := context.Background()

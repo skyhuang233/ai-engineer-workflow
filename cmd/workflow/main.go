@@ -268,16 +268,6 @@ func runDoctor(args []string) {
 				Contains: []string{"resume", "--json", "--output-schema", "--ephemeral"},
 			}},
 		},
-		doctor.CommandCheck{
-			CheckName: "no-mistakes CLI",
-			Executor:  doctor.OSExecutor{},
-			Version: doctor.CommandExpectation{
-				Command:      []string{"no-mistakes", "--version"},
-				Tool:         "no-mistakes",
-				ExactVersion: config.NoMistakes.Version,
-				ExactCommit:  config.NoMistakes.ForkCommit,
-			},
-		},
 		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Image, AuthFile: *codexAuthFile},
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},

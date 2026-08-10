@@ -17,9 +17,11 @@ prerequisite, not the approval itself.
 - `no-mistakes` is pinned to a verified upstream commit plus a distinct fork
   commit, immutable fork release, and Linux release-asset checksum. Doctor
   proves the upstream commit is the fork commit's merge base, the release
-  targets the fork commit, and the installed executable's full immutable Go
-  `vcs.revision` equals that fork commit. Its abbreviated human-readable
-  version output is not used as provenance.
+  targets the fork commit, and the executable packaged in the exact
+  manifest-pinned Worker image has one full Go `vcs.revision` equal to that
+  fork commit and one `vcs.modified=false` setting. Its abbreviated
+  human-readable version output and any repository-external bootstrap
+  installation on the host are not Worker provenance.
 - The Worker source inputs name a version and GHCR repository. The exact
   registry digest is recorded only after an accepted main commit is published
   in its source-keyed `worker-release.json` GitHub Release asset.
