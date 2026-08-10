@@ -16,6 +16,46 @@ import (
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
+func TestWorkerNoMistakesBuildMetadataRequiresExactCleanForkRevision(t *testing.T) {
+	const forkCommit = "e073fd0dc51c64004468b04de8cf2ab50cd5d177"
+	tests := []struct {
+		name     string
+		metadata string
+		wantErr  string
+	}{
+		{
+			name:     "exact clean fork",
+			metadata: "\tbuild\tvcs.revision=" + forkCommit + "\n\tbuild\tvcs.modified=false\n",
+		},
+		{
+			name:     "upstream revision",
+			metadata: "\tbuild\tvcs.revision=867d64d9c2df89f3f204ad1f5528e5bf7b460caa\n\tbuild\tvcs.modified=false\n",
+			wantErr:  "does not equal pinned fork commit",
+		},
+		{
+			name:     "modified fork build",
+			metadata: "\tbuild\tvcs.revision=" + forkCommit + "\n\tbuild\tvcs.modified=true\n",
+			wantErr:  "is not a clean build",
+		},
+		{
+			name:     "missing metadata",
+			metadata: "no VCS settings",
+			wantErr:  "does not equal pinned fork commit",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyWorkerNoMistakesBuildMetadata(test.metadata, forkCommit)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("verifyWorkerNoMistakesBuildMetadata() error = %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("verifyWorkerNoMistakesBuildMetadata() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestSQLiteCheckReportsBackupAndRecoveryMetrics(t *testing.T) {
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "workflow.db")

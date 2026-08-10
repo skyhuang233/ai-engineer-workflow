@@ -71,6 +71,34 @@ type DockerCheck struct {
 	Manifest WorkerReleaseManifest
 }
 
+func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
+	var revision, modified string
+	var revisionCount, modifiedCount int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "build" {
+			continue
+		}
+		key, value, ok := strings.Cut(fields[1], "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "vcs.revision":
+			revision, revisionCount = value, revisionCount+1
+		case "vcs.modified":
+			modified, modifiedCount = value, modifiedCount+1
+		}
+	}
+	if revisionCount != 1 || revision != expectedCommit {
+		return fmt.Errorf("Worker no-mistakes VCS revision %q does not equal pinned fork commit %q", revision, expectedCommit)
+	}
+	if modifiedCount != 1 || modified != "false" {
+		return fmt.Errorf("Worker no-mistakes VCS modified state %q is not a clean build", modified)
+	}
+	return nil
+}
+
 type WorkerCodexSessionCheck struct {
 	Executor Executor
 	Image    string
@@ -220,6 +248,7 @@ codex --version
 gh --version
 go version
 no-mistakes --version
+go version -m /usr/local/bin/no-mistakes
 env | cut -d= -f1`
 	dockerCommand := []string{"docker", "run", "--rm"}
 	dockerCommand = append(dockerCommand, worker.CodexSandboxDockerArgs()...)
@@ -251,6 +280,9 @@ env | cut -d= -f1`
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
 		}
+	}
+	if err := verifyWorkerNoMistakesBuildMetadata(text, c.Manifest.NoMistakesForkCommit); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
 	}
 	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, and absence of GitHub write credentials verified"}
 }
