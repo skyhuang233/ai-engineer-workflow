@@ -13,6 +13,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 	toon "github.com/toon-format/toon-go"
 )
 
@@ -393,17 +394,12 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
 	}
-	var releaseManifest struct {
-		CodexVersion      string `json:"codex_version"`
-		GitHubCLIVersion  string `json:"github_cli_version"`
-		GoVersion         string `json:"go_version"`
-		NoMistakesVersion string `json:"no_mistakes_version"`
-	}
-	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
-		releaseManifest.CodexVersion == "" || releaseManifest.GitHubCLIVersion == "" || releaseManifest.GoVersion == "" || releaseManifest.NoMistakesVersion == "" {
+	provenance, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
+	if err != nil {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}
-	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "github-cli": releaseManifest.GitHubCLIVersion, "go": releaseManifest.GoVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
+	toolVersions, _ := provenance.ToolVersions()
+	return activeRelease.ImageReference, toolVersions, nil
 }
 
 func launchedWorkerAudit(claim store.TicketClaim, result worker.Result, spec worker.Spec) store.WorkerAudit {

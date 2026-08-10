@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 func TestWorkerBuildInputIdentityUsesCanonicalBase64JSON(t *testing.T) {
@@ -87,16 +89,16 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
 	config := validConfig()
 	manifest := WorkerReleaseManifest{
+		ToolProvenance: workerrelease.ToolProvenance{
+			CodexVersion: config.Codex.Version, GitHubCLIVersion: config.GitHubCLI.Version,
+			GoVersion: config.Go.Version, NoMistakesVersion: config.NoMistakes.Version,
+		},
 		SchemaVersion:                6,
 		WorkerVersion:                config.Worker.Version,
 		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		CodexVersion:                 config.Codex.Version,
-		GitHubCLIVersion:             config.GitHubCLI.Version,
 		GitHubCLILinuxAMD64SHA256:    config.GitHubCLI.LinuxAMD64SHA256,
-		GoVersion:                    config.Go.Version,
 		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
-		NoMistakesVersion:            config.NoMistakes.Version,
 		NoMistakesUpstreamRepository: config.NoMistakes.UpstreamRepository,
 		NoMistakesUpstreamCommit:     config.NoMistakes.UpstreamCommit,
 		NoMistakesForkRepository:     config.NoMistakes.ForkRepository,
