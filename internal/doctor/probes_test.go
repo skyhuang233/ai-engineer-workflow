@@ -20,6 +20,7 @@ import (
 type dockerCheckExecutor struct {
 	commands [][]string
 	metadata []byte
+	probe    []byte
 }
 
 func (e *dockerCheckExecutor) Run(_ context.Context, command []string) ([]byte, error) {
@@ -41,7 +42,10 @@ func (e *dockerCheckExecutor) Run(_ context.Context, command []string) ([]byte, 
 				}
 			}
 		}
-		return []byte("gateway=ok\nmount=ok\n0.147.0\ngh version 2.97.0\ngo1.25.12\nv1.41.2\n\tbuild\tvcs.revision=e073fd0dc51c64004468b04de8cf2ab50cd5d177\n\tbuild\tvcs.modified=false\n"), nil
+		if e.probe != nil {
+			return e.probe, nil
+		}
+		return []byte("gateway=ok\nmount=ok\n0.147.0\ngh version 2.97.0\ngo1.25.12\nv1.41.2\n  ● daemon running (pid 123)\n\tbuild\tvcs.revision=e073fd0dc51c64004468b04de8cf2ab50cd5d177\n\tbuild\tvcs.modified=false\n"), nil
 	case strings.Contains(joined, " --entrypoint /usr/local/go/bin/go "):
 		return e.metadata, nil
 	default:
@@ -114,10 +118,36 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 	if strings.Contains(probeScript, "go version -m") {
 		t.Fatalf("general Worker probe contains build metadata command: %q", probeScript)
 	}
+	for _, required := range []string{"no-mistakes daemon start", "daemon_status=\"$(no-mistakes daemon status)\"", "*\"daemon running\"*"} {
+		if !strings.Contains(probeScript, required) {
+			t.Fatalf("general Worker probe omits Delivery Controller runtime check %q: %q", required, probeScript)
+		}
+	}
+	if command := strings.Join(executor.commands[2], " "); !strings.Contains(command, "--env NM_HOME=/codex-state/no-mistakes") {
+		t.Fatalf("general Worker probe omits persistent no-mistakes home: %q", command)
+	}
 	metadataCommand := strings.Join(executor.commands[3], " ")
 	wantMetadataCommand := "docker run --rm --entrypoint /usr/local/go/bin/go ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb version -m /usr/local/bin/no-mistakes"
 	if metadataCommand != wantMetadataCommand {
 		t.Fatalf("metadata command = %q, want %q", metadataCommand, wantMetadataCommand)
+	}
+}
+
+func TestDockerCheckRejectsStoppedNoMistakesDaemon(t *testing.T) {
+	executor := &dockerCheckExecutor{probe: []byte("gateway=ok\nmount=ok\n0.147.0\ngh version 2.97.0\ngo1.25.12\nv1.41.2\n  ○ daemon not running\n")}
+	result := (DockerCheck{
+		Executor: executor,
+		Manifest: WorkerReleaseManifest{
+			Image:             "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			CodexVersion:      "0.147.0",
+			GitHubCLIVersion:  "2.97.0",
+			GoVersion:         "1.25.12",
+			NoMistakesVersion: "v1.41.2",
+		},
+	}).Run(context.Background())
+
+	if result.Status != Fail || !strings.Contains(result.Summary, `omitted required evidence "daemon running"`) {
+		t.Fatalf("DockerCheck.Run() = %#v, want stopped daemon failure", result)
 	}
 }
 
