@@ -72,6 +72,27 @@ func TestProviderCachesInstallationTokenUntilRefreshWindow(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDefaultsAreBoundedAndPreserveInjection(t *testing.T) {
+	if got := httpClientOrDefault(nil); got != defaultHTTPClient || got.Timeout != 30*time.Second {
+		t.Fatalf("default HTTP client = %#v, want shared client with 30s timeout", got)
+	}
+	injected := &http.Client{Timeout: time.Second}
+	if got := httpClientOrDefault(injected); got != injected {
+		t.Fatalf("injected HTTP client = %#v, want %#v", got, injected)
+	}
+
+	provider, err := NewProvider(Config{
+		AppID: 123, InstallationID: 42, PrivateKeyPEM: testPrivateKeyPEM(t),
+		RequiredPermissions: map[string]string{"metadata": "read"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.client != defaultHTTPClient {
+		t.Fatalf("provider HTTP client = %#v, want shared default", provider.client)
+	}
+}
+
 func TestDiscoverInstallationRequiresConfiguredOwnerAndAllRepositories(t *testing.T) {
 	privateKey := testPrivateKeyPEM(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

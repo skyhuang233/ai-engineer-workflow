@@ -22,7 +22,12 @@ import (
 	githubapi "github.com/skyhuang233/workflow/internal/github"
 )
 
-const refreshWindow = 5 * time.Minute
+const (
+	refreshWindow      = 5 * time.Minute
+	defaultHTTPTimeout = 30 * time.Second
+)
+
+var defaultHTTPClient = &http.Client{Timeout: defaultHTTPTimeout}
 
 type credentialUnavailableError struct{}
 
@@ -134,10 +139,7 @@ func NewProvider(config Config) (*Provider, error) {
 	if apiBase == "" {
 		apiBase = "https://api.github.com"
 	}
-	client := config.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := httpClientOrDefault(config.Client)
 	now := config.Now
 	if now == nil {
 		now = time.Now
@@ -206,10 +208,7 @@ func DiscoverInstallation(ctx context.Context, config DiscoveryConfig) (Installa
 	if apiBase == "" {
 		apiBase = "https://api.github.com"
 	}
-	client := config.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := httpClientOrDefault(config.Client)
 	now := config.Now
 	if now == nil {
 		now = time.Now
@@ -266,6 +265,13 @@ func VerifyInstallation(ctx context.Context, config DiscoveryConfig, expectedIns
 		return Installation{}, fmt.Errorf("%w: live installation ID %d does not match verified installation ID %d", ErrCredentialUnavailable, installation.ID, expectedInstallationID)
 	}
 	return installation, nil
+}
+
+func httpClientOrDefault(client *http.Client) *http.Client {
+	if client != nil {
+		return client
+	}
+	return defaultHTTPClient
 }
 
 func signAppJWT(appID int64, privateKey *rsa.PrivateKey, now time.Time) (string, error) {
