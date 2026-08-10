@@ -54,6 +54,9 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 		if token != "installation_token" || repository != "owner/integration" || defaultBranch != "main" {
 			t.Fatalf("Git push contract inputs = %q, %q, %q", token, repository, defaultBranch)
 		}
+		mu.Lock()
+		calls = append(calls, "PUSH workflow-credential-contract-0123456789abcdef01234567@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		mu.Unlock()
 		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
 	}}).Verify(
 		context.Background(), "installation_token", "owner", "owner/integration",
@@ -67,6 +70,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	joined := strings.Join(calls, "\n")
 	for _, wanted := range []string{
 		"GET /repos/owner/integration/actions/workflows",
+		"PUSH workflow-credential-contract-0123456789abcdef01234567@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"GET /repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
 		"POST /repos/owner/integration/issues",
 		"POST /repos/owner/integration/labels",
@@ -82,6 +86,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 			t.Fatalf("missing %q in calls:\n%s", wanted, joined)
 		}
 	}
+	t.Logf("the installation token completed the full owner-guarded repository contract and cleaned up its temporary PR, issue, and branch.\nGitHub API transcript:\n%s", joined)
 }
 
 func TestVerifyRejectsCredentialWithoutChecksReadAfterCandidatePush(t *testing.T) {

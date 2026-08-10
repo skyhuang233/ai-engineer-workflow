@@ -82,6 +82,11 @@ go run ./cmd/workflow credential provision `
   --app-id <GITHUB_APP_ID>
 ```
 
+After a successful replacement, the long-running Gateway and poller hot-load the
+new verified App ID, installation ID, and PEM fingerprint on their next token
+request and discard the previous installation-token cache; credential rotation
+does not require restarting either process.
+
 Run the complete target-host contract with:
 
 ```powershell

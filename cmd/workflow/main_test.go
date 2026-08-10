@@ -94,6 +94,9 @@ func TestProvisionGitHubAppDiscoversInstallationVerifiesContractAndStoresOnlyIde
 			t.Fatalf("missing %q in GitHub App calls:\n%s", want, joined)
 		}
 	}
+	t.Logf("provision discovered the owner-wide installation and minted its token before the live contract; Gateway writes resumed.\nGitHub API transcript:\n%s\nPersisted verification: app_id=%d installation_id=%d pem_sha256=%s owner=%s repository=%s verified_at=%s",
+		joined, verification.AppID, verification.InstallationID, verification.FingerprintSHA256,
+		verification.Owner, verification.IntegrationRepository, verification.VerifiedAt.UTC().Format(time.RFC3339Nano))
 }
 
 func TestProvisionGitHubAppPausesWritesBeforeReadingPrivateKey(t *testing.T) {
@@ -180,6 +183,7 @@ func TestVerifiedGitHubAppTokenSourceReloadsProvisionedInstallation(t *testing.T
 	if token, err := source.Token(ctx); err != nil || token != "second_token" {
 		t.Fatalf("rotated installation token = %q, %v", token, err)
 	}
+	t.Log("the long-running token source hot-loaded the reprovisioned App identity, PEM fingerprint, and installation (app 123/installation 42 -> app 246/installation 84) without restart")
 }
 
 func TestVerifiedGitHubAppTokenSourceReloadsSameIdentityAfterReprovision(t *testing.T) {

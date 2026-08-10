@@ -1211,6 +1211,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[0].Environment["NO_MISTAKES_RUN_ID"] != "" {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
 	}
+	t.Log("Ticket Agent Worker launched with no GitHub token and can reach GitHub writes only through the credential-isolated Gateway")
 	if first.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("worker did not use Active Worker Image: %#v", first.specs[0])
 	}

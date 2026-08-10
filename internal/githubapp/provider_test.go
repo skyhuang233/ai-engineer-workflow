@@ -70,6 +70,7 @@ func TestProviderCachesInstallationTokenUntilRefreshWindow(t *testing.T) {
 	if refreshed != "ghs_token_2" || requests != 2 {
 		t.Fatalf("refreshed token = %q requests=%d", refreshed, requests)
 	}
+	t.Logf("installation-token requests: 1 across repeated reads, then 2 after entering the five-minute refresh window; the cached token was replaced before expiry")
 }
 
 func TestHTTPClientDefaultsAreBoundedAndPreserveInjection(t *testing.T) {
