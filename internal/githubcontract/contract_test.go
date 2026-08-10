@@ -32,6 +32,8 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 			_, _ = w.Write([]byte(`[]`))
 		case r.URL.Path == "/repos/owner/integration/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/contents/"):
 			_, _ = w.Write([]byte(`{"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues"):
@@ -68,6 +70,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	for _, wanted := range []string{
 		"GET /user",
 		"GET /repos/owner/integration/actions/workflows",
+		"GET /repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
 		"POST /repos/owner/integration/issues",
 		"POST /repos/owner/integration/labels",
 		"POST /repos/owner/integration/issues/12/labels",

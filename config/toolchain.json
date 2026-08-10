@@ -39,6 +39,7 @@
       "all_repositories": true,
       "permissions": {
         "actions": "read",
+        "checks": "read",
         "contents": "write",
         "issues": "write",
         "metadata": "read",

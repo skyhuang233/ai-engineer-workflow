@@ -189,7 +189,7 @@ func repositoryOwnedBy(repository, owner string) bool {
 
 func validGatewayPermissions(actual map[string]string) bool {
 	expected := map[string]string{
-		"actions": "read", "contents": "write", "issues": "write",
+		"actions": "read", "checks": "read", "contents": "write", "issues": "write",
 		"metadata": "read", "pull_requests": "write",
 	}
 	if len(actual) != len(expected) {

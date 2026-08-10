@@ -45,6 +45,7 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
 		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
 		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
+		{"checks read permission", func(c *Config) { delete(c.GitHub.Credential.Permissions, "checks") }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -242,7 +243,7 @@ func validConfig() Config {
 				Owner:           "skyhuang233",
 				AllRepositories: true,
 				Permissions: map[string]string{
-					"actions": "read", "contents": "write", "issues": "write",
+					"actions": "read", "checks": "read", "contents": "write", "issues": "write",
 					"metadata": "read", "pull_requests": "write",
 				},
 			},
