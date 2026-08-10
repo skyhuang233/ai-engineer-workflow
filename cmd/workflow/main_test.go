@@ -234,7 +234,7 @@ func TestVerifiedGitHubAppTokenSourceReloadsSameIdentityAfterReprovision(t *test
 	}
 }
 
-func TestVerifiedGitHubAppTokenSourceRejectsLiveSelectionDriftBeforeCachedToken(t *testing.T) {
+func TestVerifiedGitHubAppTokenSourceCachesLiveSelectionAndRejectsDriftAfterTTL(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -248,10 +248,13 @@ func TestVerifiedGitHubAppTokenSourceRejectsLiveSelectionDriftBeforeCachedToken(
 	}
 	var selectionMu sync.RWMutex
 	selection := "all"
+	now := time.Now().UTC()
+	installationRequests := 0
 	tokenRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/owner/integration/installation":
+			installationRequests++
 			selectionMu.RLock()
 			liveSelection := selection
 			selectionMu.RUnlock()
@@ -273,15 +276,25 @@ func TestVerifiedGitHubAppTokenSourceRejectsLiveSelectionDriftBeforeCachedToken(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	source := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: server.URL, Client: server.Client()}
+	source := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: server.URL, Client: server.Client(), Now: func() time.Time { return now }}
 	if token, err := source.Token(ctx); err != nil || token != "cached_token" {
 		t.Fatalf("initial installation token = %q, %v", token, err)
 	}
 	selectionMu.Lock()
 	selection = "selected"
 	selectionMu.Unlock()
+	if token, err := source.Token(ctx); err != nil || token != "cached_token" {
+		t.Fatalf("installation verification cache token = %q, err=%v", token, err)
+	}
+	if installationRequests != 1 {
+		t.Fatalf("live installation requests inside cache TTL = %d, want 1", installationRequests)
+	}
+	now = now.Add(liveInstallationVerificationTTL + time.Second)
 	if token, err := source.Token(ctx); token != "" || !errors.Is(err, githubapp.ErrCredentialUnavailable) {
 		t.Fatalf("selection drift token = %q, err=%v", token, err)
+	}
+	if installationRequests != 2 {
+		t.Fatalf("live installation requests after cache TTL = %d, want 2", installationRequests)
 	}
 	if tokenRequests != 1 {
 		t.Fatalf("installation token requests = %d, want cached token blocked before refresh", tokenRequests)

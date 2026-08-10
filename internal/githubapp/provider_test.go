@@ -169,6 +169,28 @@ func TestProviderKeepsSecondaryRateLimitWithoutHeadersRetryable(t *testing.T) {
 	}
 }
 
+func TestProviderDefaultsHeaderlessTooManyRequestsToOneMinute(t *testing.T) {
+	now := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"slow down"}`))
+	}))
+	defer server.Close()
+	provider, err := NewProvider(Config{
+		AppID: 123, InstallationID: 42, PrivateKeyPEM: testPrivateKeyPEM(t),
+		RequiredPermissions: map[string]string{"metadata": "read"},
+		APIBase:             server.URL, Client: server.Client(), Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.Token(context.Background())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.AuthenticationFailure() || !apiErr.RetryAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("headerless 429 error = %#v", err)
+	}
+}
+
 func TestProviderClassifiesMissingInstallationAsCredentialUnavailable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

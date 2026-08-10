@@ -1132,11 +1132,15 @@ type verifiedGitHubAppTokenSource struct {
 	Config   doctor.Config
 	APIBase  string
 	Client   *http.Client
+	Now      func() time.Time
 
-	mu       sync.Mutex
-	identity string
-	provider *githubapp.Provider
+	mu                            sync.Mutex
+	identity                      string
+	liveInstallationVerifiedUntil time.Time
+	provider                      *githubapp.Provider
 }
+
+const liveInstallationVerificationTTL = 5 * time.Minute
 
 func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error) {
 	s.mu.Lock()
@@ -1145,17 +1149,25 @@ func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error
 	if err != nil {
 		return "", err
 	}
-	if _, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
-		AppID: verification.AppID, PrivateKeyPEM: privateKeyPEM, Owner: s.Config.GitHub.Credential.Owner,
-		Repository: s.Config.GitHub.TestRepository, APIBase: s.APIBase, Client: s.Client,
-	}, verification.InstallationID); err != nil {
-		return "", err
+	now := time.Now().UTC()
+	if s.Now != nil {
+		now = s.Now().UTC()
 	}
 	identity := fmt.Sprintf("%d/%d/%s/%s", verification.AppID, verification.InstallationID, verification.FingerprintSHA256, verification.VerifiedAt.UTC().Format(time.RFC3339Nano))
-	if s.provider == nil || s.identity != identity {
+	identityChanged := s.provider == nil || s.identity != identity
+	if identityChanged || !now.Before(s.liveInstallationVerifiedUntil) {
+		if _, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
+			AppID: verification.AppID, PrivateKeyPEM: privateKeyPEM, Owner: s.Config.GitHub.Credential.Owner,
+			Repository: s.Config.GitHub.TestRepository, APIBase: s.APIBase, Client: s.Client, Now: s.Now,
+		}, verification.InstallationID); err != nil {
+			return "", err
+		}
+		s.liveInstallationVerifiedUntil = now.Add(liveInstallationVerificationTTL)
+	}
+	if identityChanged {
 		s.provider, err = githubapp.NewProvider(githubapp.Config{
 			AppID: verification.AppID, InstallationID: verification.InstallationID, PrivateKeyPEM: privateKeyPEM,
-			RequiredPermissions: s.Config.GitHub.Credential.Permissions, APIBase: s.APIBase, Client: s.Client,
+			RequiredPermissions: s.Config.GitHub.Credential.Permissions, APIBase: s.APIBase, Client: s.Client, Now: s.Now,
 		})
 		if err != nil {
 			return "", fmt.Errorf("%w: load verified GitHub App: %v", delivery.ErrGatewayCredentialRejected, err)

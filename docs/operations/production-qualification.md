@@ -26,9 +26,10 @@ or complete diffs into it.
    PEM at the configured host path, and provision it exactly as documented in
    [toolchain.md](toolchain.md) using `workflow credential provision --app-id`.
    Retain evidence that installation discovery and permission validation passed,
-   and that the live contract queried check runs for its temporary Candidate commit before it recorded the verified installation, then
-   created, reconciled, and cleaned up its temporary branch, issue, pull request,
-   label and evidence reply.
+   and that the live contract created its temporary branch, queried check runs
+   for the Candidate commit, exercised and reconciled its issue, label, pull
+   request, and evidence reply, and cleaned up every temporary object before the
+   verified installation was recorded and Gateway writes resumed.
 4. Run `workflow doctor` exactly as documented in
    [toolchain.md](toolchain.md), using the production SQLite path and an evidence
    report path. Every check must pass.

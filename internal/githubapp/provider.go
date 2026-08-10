@@ -317,11 +317,11 @@ func requirePermissions(actual, required map[string]string) error {
 }
 
 func responseRetryAt(response *http.Response, message string, now time.Time) time.Time {
-	if response.StatusCode == http.StatusTooManyRequests {
-		return retryAfter(response.Header.Get("Retry-After"), now)
-	}
-	if response.StatusCode != http.StatusForbidden {
+	if response.StatusCode != http.StatusTooManyRequests && response.StatusCode != http.StatusForbidden {
 		return time.Time{}
+	}
+	if retryAt := retryAfter(response.Header.Get("Retry-After"), now); !retryAt.IsZero() {
+		return retryAt
 	}
 	if response.Header.Get("X-RateLimit-Remaining") == "0" {
 		if reset, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil && reset > 0 {
@@ -330,10 +330,10 @@ func responseRetryAt(response *http.Response, message string, now time.Time) tim
 		return now.Add(time.Minute).UTC()
 	}
 	lowerMessage := strings.ToLower(message)
-	if strings.Contains(lowerMessage, "secondary rate limit") || strings.Contains(lowerMessage, "abuse detection mechanism") {
+	if response.StatusCode == http.StatusTooManyRequests || strings.Contains(lowerMessage, "secondary rate limit") || strings.Contains(lowerMessage, "abuse detection mechanism") {
 		return now.Add(time.Minute).UTC()
 	}
-	return retryAfter(response.Header.Get("Retry-After"), now)
+	return time.Time{}
 }
 
 func retryAfter(value string, now time.Time) time.Time {

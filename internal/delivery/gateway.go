@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	ErrGatewayCredentialRejected = errors.New("Gateway Credential was rejected")
+	ErrGatewayCredentialRejected = errors.New("Control Plane GitHub App Credential was rejected")
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
 	ErrGatewayStore              = errors.New("Gateway persistence is temporarily unavailable")
 )
