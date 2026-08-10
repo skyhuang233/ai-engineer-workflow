@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	githubapi "github.com/skyhuang233/workflow/internal/github"
 )
 
 const refreshWindow = 5 * time.Minute
@@ -180,8 +182,8 @@ func DiscoverInstallation(ctx context.Context, config DiscoveryConfig) (Installa
 	if config.AppID <= 0 || strings.TrimSpace(config.Owner) == "" || strings.TrimSpace(config.Repository) == "" {
 		return Installation{}, errors.New("GitHub App discovery requires app ID, owner, and repository")
 	}
-	if !strings.HasPrefix(config.Repository, config.Owner+"/") {
-		return Installation{}, errors.New("GitHub App discovery repository must belong to the configured owner")
+	if err := githubapi.ValidateOwnerGuardedRepositoryName(config.Repository, config.Owner); err != nil {
+		return Installation{}, fmt.Errorf("GitHub App discovery repository must belong to the configured owner: %w", err)
 	}
 	key, err := parsePrivateKey(config.PrivateKeyPEM)
 	if err != nil {
@@ -230,7 +232,7 @@ func DiscoverInstallation(ctx context.Context, config DiscoveryConfig) (Installa
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return Installation{}, fmt.Errorf("decode GitHub App installation: %w", err)
 	}
-	if payload.ID <= 0 || payload.Account.Login != config.Owner || payload.RepositorySelection != "all" {
+	if payload.ID <= 0 || !strings.EqualFold(payload.Account.Login, strings.TrimSpace(config.Owner)) || payload.RepositorySelection != "all" {
 		return Installation{}, errors.New("GitHub App must be installed for all repositories on the configured owner")
 	}
 	return Installation{ID: payload.ID, Owner: payload.Account.Login, AllRepositories: true}, nil

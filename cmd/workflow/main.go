@@ -1155,7 +1155,7 @@ func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error
 	if err != nil {
 		return "", err
 	}
-	identity := fmt.Sprintf("%d/%d/%s", verification.AppID, verification.InstallationID, verification.FingerprintSHA256)
+	identity := fmt.Sprintf("%d/%d/%s/%s", verification.AppID, verification.InstallationID, verification.FingerprintSHA256, verification.VerifiedAt.UTC().Format(time.RFC3339Nano))
 	if s.provider == nil || s.identity != identity {
 		s.provider, err = githubapp.NewProvider(githubapp.Config{
 			AppID: verification.AppID, InstallationID: verification.InstallationID, PrivateKeyPEM: privateKeyPEM,
@@ -1196,7 +1196,7 @@ func verifiedGitHubAppInputs(ctx context.Context, database *store.Store, config 
 	if privateKeyFingerprint(privateKeyPEM) != verification.FingerprintSHA256 {
 		return store.GitHubAppVerification{}, nil, fmt.Errorf("%w: GitHub App private key differs from the verified key", delivery.ErrGatewayCredentialRejected)
 	}
-	if verification.Owner != config.GitHub.Credential.Owner || verification.IntegrationRepository != config.GitHub.TestRepository {
+	if !strings.EqualFold(verification.Owner, config.GitHub.Credential.Owner) || !strings.EqualFold(verification.IntegrationRepository, config.GitHub.TestRepository) {
 		return store.GitHubAppVerification{}, nil, fmt.Errorf("%w: GitHub App verification does not match the configured owner and integration repository", delivery.ErrGatewayCredentialRejected)
 	}
 	return verification, privateKeyPEM, nil

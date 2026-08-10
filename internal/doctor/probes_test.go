@@ -2,9 +2,13 @@ package doctor
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -194,6 +198,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 456, "repository_selection": "all", "account": map[string]string{"login": "SKYHUANG233"}})
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
@@ -232,17 +238,17 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}))
 	defer server.Close()
 	credentials := memoryCredential{secret: token}
-	privateKeyPEM := []byte("test-private-key")
+	privateKeyPEM := doctorTestPrivateKeyPEM(t)
 	verification := store.GitHubAppVerification{
-		FingerprintSHA256:     credential.Fingerprint(string(privateKeyPEM)),
+		FingerprintSHA256:     doctorTestPrivateKeyFingerprint(privateKeyPEM),
 		AppID:                 123,
 		InstallationID:        456,
-		Owner:                 config.GitHub.Credential.Owner,
-		IntegrationRepository: config.GitHub.TestRepository,
+		Owner:                 strings.ToUpper(config.GitHub.Credential.Owner),
+		IntegrationRepository: strings.ToUpper(config.GitHub.TestRepository),
 	}
 	if result := (GitHubCredentialCheck{
 		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, PrivateKeyPEM: privateKeyPEM,
-		Verification: verification,
+		Verification: verification, APIBase: server.URL, Client: server.Client(),
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("credential check = %#v", result)
 	}
@@ -276,6 +282,57 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
 		}
 	}
+}
+
+func TestGitHubCredentialCheckRejectsLiveInstallationDrift(t *testing.T) {
+	config := validConfig()
+	privateKeyPEM := doctorTestPrivateKeyPEM(t)
+	verification := store.GitHubAppVerification{
+		FingerprintSHA256: doctorTestPrivateKeyFingerprint(privateKeyPEM), AppID: 123, InstallationID: 456,
+		Owner: config.GitHub.Credential.Owner, IntegrationRepository: config.GitHub.TestRepository,
+	}
+	tests := []struct {
+		name                string
+		installationID      int64
+		owner               string
+		repositorySelection string
+	}{
+		{name: "installation ID", installationID: 999, owner: config.GitHub.Credential.Owner, repositorySelection: "all"},
+		{name: "owner", installationID: 456, owner: "different-owner", repositorySelection: "all"},
+		{name: "repository selection", installationID: 456, owner: config.GitHub.Credential.Owner, repositorySelection: "selected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": tt.installationID, "repository_selection": tt.repositorySelection,
+					"account": map[string]string{"login": tt.owner},
+				})
+			}))
+			defer server.Close()
+			result := (GitHubCredentialCheck{
+				Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
+				PrivateKeyPEM: privateKeyPEM, Verification: verification, APIBase: server.URL, Client: server.Client(),
+			}).Run(context.Background())
+			if result.Status != Fail {
+				t.Fatalf("credential check accepted live %s drift: %#v", tt.name, result)
+			}
+		})
+	}
+}
+
+func doctorTestPrivateKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
+
+func doctorTestPrivateKeyFingerprint(privateKeyPEM []byte) string {
+	digest := sha256.Sum256(privateKeyPEM)
+	return hex.EncodeToString(digest[:])
 }
 
 func TestGitHubCheckRejectsCanonicalIntegrationRepositoryOwnedByAnotherAccount(t *testing.T) {

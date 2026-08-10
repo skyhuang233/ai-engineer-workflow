@@ -167,6 +167,55 @@ func TestVerifiedGitHubAppTokenSourceReloadsProvisionedInstallation(t *testing.T
 	}
 }
 
+func TestVerifiedGitHubAppTokenSourceReloadsSameIdentityAfterReprovision(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	keyFile := filepath.Join(t.TempDir(), "github-app.pem")
+	privateKeyPEM := testGitHubAppPrivateKeyPEM(t)
+	if err := os.WriteFile(keyFile, privateKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	permissions := map[string]string{"metadata": "read"}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/app/installations/42/access_tokens" {
+			http.NotFound(w, r)
+			return
+		}
+		requests++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token": fmt.Sprintf("token_%d", requests), "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions,
+		})
+	}))
+	defer server.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{TestRepository: "owner/integration", Credential: doctor.GitHubCredentialPin{
+		Owner: "owner", PrivateKeyFile: keyFile, Permissions: permissions,
+	}}}
+	verifiedAt := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	record := func(at time.Time) {
+		t.Helper()
+		if err := db.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
+			FingerprintSHA256: privateKeyFingerprint(privateKeyPEM), AppID: 123, InstallationID: 42,
+			Owner: "OWNER", IntegrationRepository: "OWNER/INTEGRATION", VerifiedAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(verifiedAt)
+	source := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: server.URL, Client: server.Client()}
+	if token, err := source.Token(ctx); err != nil || token != "token_1" {
+		t.Fatalf("initial installation token = %q, %v", token, err)
+	}
+	record(verifiedAt.Add(time.Second))
+	if token, err := source.Token(ctx); err != nil || token != "token_2" || requests != 2 {
+		t.Fatalf("reprovisioned installation token = %q, requests=%d, err=%v", token, requests, err)
+	}
+}
+
 func testGitHubAppPrivateKeyPEM(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

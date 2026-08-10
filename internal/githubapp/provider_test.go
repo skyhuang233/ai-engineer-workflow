@@ -98,6 +98,31 @@ func TestDiscoverInstallationRequiresConfiguredOwnerAndAllRepositories(t *testin
 	}
 }
 
+func TestDiscoverInstallationAcceptsCaseInsensitiveOwnerIdentity(t *testing.T) {
+	privateKey := testPrivateKeyPEM(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/integration/installation" {
+			t.Fatalf("installation discovery path = %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": 42, "repository_selection": "all",
+			"account": map[string]string{"login": "OWNER"},
+		})
+	}))
+	defer server.Close()
+
+	installation, err := DiscoverInstallation(context.Background(), DiscoveryConfig{
+		AppID: 123, PrivateKeyPEM: privateKey, Owner: "Owner", Repository: "owner/integration",
+		APIBase: server.URL, Client: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.ID != 42 || installation.Owner != "OWNER" || !installation.AllRepositories {
+		t.Fatalf("installation = %#v", installation)
+	}
+}
+
 func TestProviderKeepsRateLimitedTokenRequestsRetryable(t *testing.T) {
 	now := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

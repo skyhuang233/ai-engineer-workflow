@@ -20,6 +20,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	githubapi "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -325,6 +326,8 @@ type GitHubCredentialCheck struct {
 	IntegrationRepository string
 	PrivateKeyPEM         []byte
 	Verification          store.GitHubAppVerification
+	APIBase               string
+	Client                *http.Client
 }
 
 func (GitHubCredentialCheck) Name() string { return "Control Plane GitHub App contract" }
@@ -337,13 +340,26 @@ func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 	if hex.EncodeToString(digest[:]) != c.Verification.FingerprintSHA256 {
 		return Result{Status: Fail, Summary: "GitHub App private key differs from the live-contract verification"}
 	}
-	if c.Verification.Owner != c.Pin.Owner {
+	if !strings.EqualFold(c.Verification.Owner, c.Pin.Owner) {
 		return Result{Status: Fail, Summary: "GitHub App installation owner does not match the verified owner"}
 	}
-	if c.Verification.IntegrationRepository != c.IntegrationRepository {
+	if !strings.EqualFold(c.Verification.IntegrationRepository, c.IntegrationRepository) {
 		return Result{Status: Fail, Summary: "GitHub App verification does not match the configured integration repository"}
 	}
-	return Result{Status: Pass, Summary: "GitHub App private key, installation identity, owner, and integration repository match the live-contract verification"}
+	installation, err := githubapp.DiscoverInstallation(ctx, githubapp.DiscoveryConfig{
+		AppID: c.Verification.AppID, PrivateKeyPEM: c.PrivateKeyPEM, Owner: c.Pin.Owner,
+		Repository: c.IntegrationRepository, APIBase: c.APIBase, Client: c.Client,
+	})
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("discover live GitHub App installation: %v", err), Err: err}
+	}
+	if installation.ID != c.Verification.InstallationID {
+		return Result{Status: Fail, Summary: "live GitHub App installation does not match the verified installation ID"}
+	}
+	if !strings.EqualFold(installation.Owner, c.Pin.Owner) || !installation.AllRepositories {
+		return Result{Status: Fail, Summary: "live GitHub App installation must cover all repositories on the configured owner"}
+	}
+	return Result{Status: Pass, Summary: "GitHub App private key, live all-repositories installation, owner, and verification metadata match"}
 }
 
 type GitHubCheck struct {
