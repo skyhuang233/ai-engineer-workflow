@@ -51,6 +51,15 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	if !strings.Contains(string(workflow), "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_sha256 }}") {
 		t.Fatal("publisher workflow does not pass the pinned GitHub CLI checksum to the Worker build")
 	}
+	for _, required := range []string{
+		"draft: true",
+		`gh release edit "$tag" --draft=false`,
+		"(.immutable == true)",
+	} {
+		if !strings.Contains(string(workflow), required) {
+			t.Fatalf("publisher workflow does not enforce immutable Worker releases: missing %q", required)
+		}
+	}
 }
 
 func TestPublishWorkflowLoadsFullPullBeforeOwnerAdmission(t *testing.T) {

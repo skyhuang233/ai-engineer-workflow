@@ -158,6 +158,10 @@ jobs:
               echo "Worker version already belongs to a different accepted commit" >&2
               exit 1
             }
+            jq --exit-status '(.immutable == true)' <<<"$release" > /dev/null || {
+              echo "Existing Worker Release is not immutable" >&2
+              exit 1
+            }
             manifest_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-release.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
             sbom_asset_id="$(jq -r 'if (.assets | length) == 2 then [.assets[] | select(.name == "worker-sbom.spdx.json") | .id] | if length == 1 then .[0] else empty end else empty end' <<<"$release")"
             test -n "$manifest_asset_id" && test -n "$sbom_asset_id" || {
@@ -338,7 +342,7 @@ jobs:
               github_actions_run_id:$github_actions_run_id}' \
             > worker-release.json
           jq --exit-status . worker-release.json
-      - name: Publish Worker Release Manifest
+      - name: Stage authoritative Worker Release
         if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
@@ -346,6 +350,27 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Worker ${{ steps.build-inputs.outputs.release_identity }}
           body: Immutable Worker image and cross-host release manifest for an owner-accepted main commit.
+          draft: true
           files: |
             worker-release.json
             worker-sbom.spdx.json
+      - name: Publish and verify immutable Worker Release
+        if: steps.changes.outputs.required == 'true' && steps.existing.outputs.exists != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.build-inputs.outputs.release_identity }}"
+          gh release edit "$tag" --draft=false
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          jq --exit-status --arg source_commit "$GITHUB_SHA" '
+            (.draft == false) and
+            (.immutable == true) and
+            (.target_commitish == $source_commit) and
+            (.assets | length == 2) and
+            ([.assets[] | select(.name == "worker-release.json")] | length == 1) and
+            ([.assets[] | select(.name == "worker-sbom.spdx.json")] | length == 1)
+          ' <<<"$release" > /dev/null || {
+            echo "Published Worker Release is not immutable or has unexpected provenance assets" >&2
+            exit 1
+          }

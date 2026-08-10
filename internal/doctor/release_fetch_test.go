@@ -65,6 +65,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	}
 	workflowID := int64(77)
 	mergedBy := "skyhuang233"
+	immutableRelease := true
 	fullPullRequested := false
 	repositoryMetadataRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +75,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 			repositoryMetadataRequested = true
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"full_name":"skyhuang233/workflow","owner":{"login":"skyhuang233"},"private":%t}`, private)))
 		case "/repos/skyhuang233/workflow/releases/tags/" + workerReleaseTag(config.Worker.Version, buildInputIdentity):
-			_, _ = w.Write([]byte(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":` + assets + `}`))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","immutable":%t,"assets":%s}`, immutableRelease, assets)))
 		case "/repos/skyhuang233/workflow/releases/assets/9":
 			_, _ = w.Write([]byte(manifest))
 		case "/repos/skyhuang233/workflow/releases/assets/10":
@@ -124,6 +125,11 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	if !fullPullRequested {
 		t.Fatal("fetch did not load the full merged pull request")
 	}
+	immutableRelease = false
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("accepted a mutable authoritative Worker Release: %v", err)
+	}
+	immutableRelease = true
 	assets = `[{"id":9,"name":"worker-release.json"},{"id":10,"name":"worker-release.json"},{"id":11,"name":"worker-sbom.spdx.json"}]`
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a release with duplicate worker-release.json assets")
