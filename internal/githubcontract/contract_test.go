@@ -14,7 +14,7 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	var mu sync.Mutex
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer github_pat_test" {
+		if r.Header.Get("Authorization") != "Bearer installation_token" {
 			t.Error("missing in-memory bearer credential")
 		}
 		mu.Lock()
@@ -22,8 +22,6 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.URL.Path == "/user":
-			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case r.URL.Path == "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main","private":true}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls"):
@@ -53,12 +51,12 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	gitPushes := 0
 	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(_ context.Context, token, repository, defaultBranch string) (GitPushArtifact, error) {
 		gitPushes++
-		if token != "github_pat_test" || repository != "owner/integration" || defaultBranch != "main" {
+		if token != "installation_token" || repository != "owner/integration" || defaultBranch != "main" {
 			t.Fatalf("Git push contract inputs = %q, %q, %q", token, repository, defaultBranch)
 		}
 		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
 	}}).Verify(
-		context.Background(), "github_pat_test", "owner", "owner/integration",
+		context.Background(), "installation_token", "owner", "owner/integration",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +66,6 @@ func TestVerifyExercisesEveryGatewayPermissionAndCleansUpInPrivateRepository(t *
 	}
 	joined := strings.Join(calls, "\n")
 	for _, wanted := range []string{
-		"GET /user",
 		"GET /repos/owner/integration/actions/workflows",
 		"GET /repos/owner/integration/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
 		"POST /repos/owner/integration/issues",
@@ -93,8 +90,6 @@ func TestVerifyRejectsCredentialWithoutChecksReadAfterCandidatePush(t *testing.T
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/user":
-			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main","private":true}`))
 		case "/repos/owner/integration/actions/workflows":
@@ -115,7 +110,7 @@ func TestVerifyRejectsCredentialWithoutChecksReadAfterCandidatePush(t *testing.T
 	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(context.Context, string, string, string) (GitPushArtifact, error) {
 		calls = append(calls, "PUSH workflow-credential-contract-0123456789abcdef01234567@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
-	}}).Verify(context.Background(), "github_pat_actions_only", "owner", "owner/integration")
+	}}).Verify(context.Background(), "installation_token", "owner", "owner/integration")
 	if err == nil || !strings.Contains(err.Error(), "verify Checks read permission") || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("missing Checks read rejection = %v", err)
 	}
@@ -144,8 +139,6 @@ func TestVerifyRejectsCanonicalRepositoryOwnedByAnotherAccountBeforeMutations(t 
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/user":
-			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"full_name":"collaborator/integration","owner":{"login":"collaborator"},"default_branch":"main","private":true}`))
 		default:
@@ -155,7 +148,7 @@ func TestVerifyRejectsCanonicalRepositoryOwnedByAnotherAccountBeforeMutations(t 
 	defer server.Close()
 
 	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
-		context.Background(), "github_pat_test", "owner", "owner/integration",
+		context.Background(), "installation_token", "owner", "owner/integration",
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not match configured owner") {
 		t.Fatalf("canonical repository owner admission error = %v", err)
@@ -171,8 +164,6 @@ func TestVerifyRejectsRepositoryOwnedByAnotherAccountBeforeMutations(t *testing.
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/user":
-			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"default_branch":"main","private":true}`))
 		default:
@@ -182,7 +173,7 @@ func TestVerifyRejectsRepositoryOwnedByAnotherAccountBeforeMutations(t *testing.
 	defer server.Close()
 
 	err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(
-		context.Background(), "github_pat_test", "owner", "collaborator/integration",
+		context.Background(), "installation_token", "owner", "collaborator/integration",
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not match configured owner") {
 		t.Fatalf("repository owner admission error = %v", err)
@@ -198,8 +189,6 @@ func TestVerifyRefusesToDeleteAChangedTemporaryBranch(t *testing.T) {
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/user":
-			_, _ = w.Write([]byte(`{"login":"owner"}`))
 		case "/repos/owner/integration":
 			_, _ = w.Write([]byte(`{"full_name":"owner/integration","owner":{"login":"owner"},"default_branch":"main"}`))
 		case "/repos/owner/integration/git/ref/heads/workflow-credential-contract-0123456789abcdef01234567":
@@ -212,7 +201,7 @@ func TestVerifyRefusesToDeleteAChangedTemporaryBranch(t *testing.T) {
 
 	err := (Verifier{APIBase: server.URL, Client: server.Client(), Push: func(context.Context, string, string, string) (GitPushArtifact, error) {
 		return GitPushArtifact{Branch: contractBranchPrefix + "0123456789abcdef01234567", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
-	}}).Verify(context.Background(), "github_pat_test", "owner", "owner/integration")
+	}}).Verify(context.Background(), "installation_token", "owner", "owner/integration")
 	if err == nil || !strings.Contains(err.Error(), "head changed") {
 		t.Fatalf("Verify error = %v", err)
 	}

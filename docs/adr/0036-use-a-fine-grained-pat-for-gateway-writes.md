@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0041
 ---
 
 # Use a fine-grained PAT for Gateway writes

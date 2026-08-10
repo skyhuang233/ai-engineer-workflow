@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -13,12 +19,162 @@ import (
 	"testing"
 	"time"
 
-	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+func TestProvisionGitHubAppDiscoversInstallationVerifiesContractAndStoresOnlyIdentity(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	permissions := map[string]string{
+		"actions": "read", "checks": "read", "contents": "write", "issues": "write", "metadata": "read", "pull_requests": "write",
+	}
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/integration/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "repository_selection": "all", "account": map[string]string{"login": "owner"}})
+		case "/app/installations/42/access_tokens":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "installation_token", "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{
+		TestRepository: "owner/integration",
+		Credential:     doctor.GitHubCredentialPin{Owner: "owner", AllRepositories: true, Permissions: permissions},
+	}}
+	verified := false
+	err = provisionGitHubApp(ctx, db, config, 123, privateKeyPEM, githubAppProvisionDependencies{
+		APIBase: server.URL, Client: server.Client(),
+		Verify: func(_ context.Context, token, owner, repository string) error {
+			verified = token == "installation_token" && owner == "owner" && repository == "owner/integration"
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verified {
+		t.Fatal("live contract did not receive the installation token and configured repository identity")
+	}
+	verification, err := db.GitHubAppVerification(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.AppID != 123 || verification.InstallationID != 42 || verification.FingerprintSHA256 != privateKeyFingerprint(privateKeyPEM) {
+		t.Fatalf("GitHub App verification = %#v", verification)
+	}
+	if paused, _, err := db.GatewayWritesPaused(ctx); err != nil || paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
+	}
+	joined := strings.Join(paths, "\n")
+	for _, want := range []string{"GET /repos/owner/integration/installation", "POST /app/installations/42/access_tokens"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in GitHub App calls:\n%s", want, joined)
+		}
+	}
+}
+
+func TestProvisionGitHubAppPausesWritesBeforeReadingPrivateKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{
+		TestRepository: "owner/integration",
+		Credential: doctor.GitHubCredentialPin{
+			Owner: "owner", PrivateKeyFile: filepath.Join(t.TempDir(), "missing.pem"),
+			Permissions: map[string]string{"metadata": "read"},
+		},
+	}}
+	err = provisionGitHubApp(ctx, db, config, 123, nil, githubAppProvisionDependencies{})
+	if err == nil || !strings.Contains(err.Error(), "read GitHub App private key") {
+		t.Fatalf("provision missing private key error = %v", err)
+	}
+	paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || !paused {
+		t.Fatalf("Gateway writes paused before private-key read = %t, %v", paused, pauseErr)
+	}
+}
+
+func TestVerifiedGitHubAppTokenSourceReloadsProvisionedInstallation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	keyFile := filepath.Join(t.TempDir(), "github-app.pem")
+	firstKey := testGitHubAppPrivateKeyPEM(t)
+	secondKey := testGitHubAppPrivateKeyPEM(t)
+	if err := os.WriteFile(keyFile, firstKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	permissions := map[string]string{"metadata": "read"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/app/installations/42/access_tokens":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "first_token", "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions})
+		case "/app/installations/84/access_tokens":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "second_token", "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{TestRepository: "owner/integration", Credential: doctor.GitHubCredentialPin{
+		Owner: "owner", PrivateKeyFile: keyFile, Permissions: permissions,
+	}}}
+	record := func(appID, installationID int64, key []byte) {
+		t.Helper()
+		if err := db.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
+			FingerprintSHA256: privateKeyFingerprint(key), AppID: appID, InstallationID: installationID,
+			Owner: "owner", IntegrationRepository: "owner/integration", VerifiedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(123, 42, firstKey)
+	source := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: server.URL, Client: server.Client()}
+	if token, err := source.Token(ctx); err != nil || token != "first_token" {
+		t.Fatalf("first installation token = %q, %v", token, err)
+	}
+	if err := os.WriteFile(keyFile, secondKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record(246, 84, secondKey)
+	if token, err := source.Token(ctx); err != nil || token != "second_token" {
+		t.Fatalf("rotated installation token = %q, %v", token, err)
+	}
+}
+
+func testGitHubAppPrivateKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
 
 func TestDefaultCodexAuthFileFollowsCodexHome(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codex-home")
@@ -212,7 +368,7 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{name: "missing", err: credential.ErrNotFound, want: true},
+		{name: "missing", err: fmt.Errorf("%w: private key file is missing", delivery.ErrGatewayCredentialRejected), want: true},
 		{name: "rejected", err: fmt.Errorf("%w: fingerprint mismatch", delivery.ErrGatewayCredentialRejected), want: true},
 		{name: "transient store error", err: errors.New("database temporarily unavailable")},
 		{name: "cancelled", err: context.Canceled},
@@ -272,8 +428,8 @@ func TestGatewayControlProjectorSendsHostInboxProjectionToOverride(t *testing.T)
 	t.Logf("Inbox projection reached the host control Gateway at %s while Worker routing remains %s", controlGateway.URL, "http://host.docker.internal:8787")
 }
 
-func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
-	err := gatewayCredentialVerificationError(store.ErrNotFound)
+func TestMissingGitHubAppVerificationIsRejected(t *testing.T) {
+	err := githubAppVerificationError(store.ErrNotFound)
 	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("missing verification error = %v, want rejected credential", err)
 	}
@@ -282,8 +438,8 @@ func TestMissingGatewayCredentialVerificationIsRejected(t *testing.T) {
 	}
 }
 
-func TestGatewayCredentialVerificationReadFailureIsRetryable(t *testing.T) {
-	err := gatewayCredentialVerificationError(errors.New("database temporarily unavailable"))
+func TestGitHubAppVerificationReadFailureIsRetryable(t *testing.T) {
+	err := githubAppVerificationError(errors.New("database temporarily unavailable"))
 	if errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("verification read failure = %v, want retryable error", err)
 	}
@@ -292,7 +448,7 @@ func TestGatewayCredentialVerificationReadFailureIsRetryable(t *testing.T) {
 	}
 }
 
-func TestPersistGatewayCredentialPauseCreatesLocalRecoveryInbox(t *testing.T) {
+func TestPersistGitHubAppPauseCreatesLocalRecoveryInbox(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -316,8 +472,8 @@ func TestPersistGatewayCredentialPauseCreatesLocalRecoveryInbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
-	credentialErr := fmt.Errorf("load credential: %w", credential.ErrNotFound)
-	if err := persistGatewayCredentialPause(ctx, db, credentialErr, now); !errors.Is(err, credential.ErrNotFound) {
+	credentialErr := fmt.Errorf("%w: private key file is missing", delivery.ErrGatewayCredentialRejected)
+	if err := persistGitHubAppPause(ctx, db, credentialErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("credential pause error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)
@@ -334,7 +490,7 @@ func TestPersistGatewayCredentialPauseCreatesLocalRecoveryInbox(t *testing.T) {
 	}
 }
 
-func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testing.T) {
+func TestPersistGitHubAppPauseLeavesTransientFailuresRetryable(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -342,7 +498,7 @@ func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testin
 	}
 	defer db.Close()
 	transient := errors.New("Credential Manager temporarily unavailable")
-	if err := persistGatewayCredentialPause(ctx, db, transient, time.Now().UTC()); !errors.Is(err, transient) {
+	if err := persistGitHubAppPause(ctx, db, transient, time.Now().UTC()); !errors.Is(err, transient) {
 		t.Fatalf("transient credential error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)
@@ -351,7 +507,7 @@ func TestPersistGatewayCredentialPauseLeavesTransientFailuresRetryable(t *testin
 	}
 }
 
-func TestPersistGatewayCredentialAdmissionErrorPausesForRejectedGitHubCredential(t *testing.T) {
+func TestPersistGitHubAppAdmissionErrorPausesForRejectedCredential(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -376,7 +532,7 @@ func TestPersistGatewayCredentialAdmissionErrorPausesForRejectedGitHubCredential
 	}
 	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
 	pollErr := fmt.Errorf("repository admission: %w", &github.APIError{StatusCode: http.StatusUnauthorized})
-	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+	if err := persistGitHubAppAdmissionError(ctx, db, pollErr, now); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("poll credential error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)
@@ -389,7 +545,7 @@ func TestPersistGatewayCredentialAdmissionErrorPausesForRejectedGitHubCredential
 	}
 }
 
-func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *testing.T) {
+func TestPersistGitHubAppAdmissionErrorLeavesRateLimitsRetryable(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -398,7 +554,7 @@ func TestPersistGatewayCredentialAdmissionErrorLeavesRateLimitsRetryable(t *test
 	defer db.Close()
 	retryAt := time.Date(2026, 8, 4, 0, 1, 0, 0, time.UTC)
 	pollErr := &github.APIError{StatusCode: http.StatusForbidden, RetryAt: retryAt}
-	if err := persistGatewayCredentialAdmissionError(ctx, db, pollErr, time.Now().UTC()); !errors.Is(err, pollErr) {
+	if err := persistGitHubAppAdmissionError(ctx, db, pollErr, time.Now().UTC()); !errors.Is(err, pollErr) {
 		t.Fatalf("rate limited poll error = %v", err)
 	}
 	paused, _, err := db.GatewayWritesPaused(ctx)
@@ -412,7 +568,7 @@ func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *test
 		name string
 		err  error
 	}{
-		{name: "missing credential", err: credential.ErrNotFound},
+		{name: "missing credential", err: fmt.Errorf("%w: private key file is missing", delivery.ErrGatewayCredentialRejected)},
 		{name: "rejected by GitHub", err: &github.APIError{StatusCode: http.StatusUnauthorized}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -452,7 +608,7 @@ func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *test
 				db.Close()
 				t.Fatal(err)
 			}
-			admissionErr := persistGatewayCredentialAdmissionError(ctx, db, test.err, now.Add(time.Second))
+			admissionErr := persistGitHubAppAdmissionError(ctx, db, test.err, now.Add(time.Second))
 			err = recordPollAdmissionFailure(ctx, github.Poller{Store: db, MaxFailures: 5, Now: func() time.Time { return now.Add(time.Second) }}, repository, admissionErr)
 			if !errors.Is(err, test.err) && !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 				db.Close()
@@ -499,7 +655,7 @@ func TestPollAdmissionHonorsNextAttemptBeforeCredentialAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	authenticated := false
-	_, err = admitPollGitHubCredential(ctx, github.Poller{Store: db, Now: func() time.Time { return now }}, db, repository, func(string) error {
+	_, err = admitPollGitHubCredential(ctx, github.Poller{Store: db, Now: func() time.Time { return now }}, nil, repository, func(string) error {
 		authenticated = true
 		return nil
 	})

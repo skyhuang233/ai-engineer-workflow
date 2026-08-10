@@ -1345,7 +1345,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		t.Fatal(err)
 	}
 	for _, statement := range []string{
-		"DELETE FROM schema_migrations WHERE version = 48",
+		"DELETE FROM schema_migrations WHERE version IN (48, 49)",
 		"ALTER TABLE worker_runs DROP COLUMN delivery_runtime_candidate_run_id",
 		"ALTER TABLE worker_audits DROP COLUMN lease_generation",
 		"DROP TABLE worker_container_results",

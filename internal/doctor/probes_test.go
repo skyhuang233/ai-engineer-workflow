@@ -232,14 +232,17 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}))
 	defer server.Close()
 	credentials := memoryCredential{secret: token}
-	verification := store.GatewayCredentialVerification{
-		FingerprintSHA256:     credential.Fingerprint(token),
+	privateKeyPEM := []byte("test-private-key")
+	verification := store.GitHubAppVerification{
+		FingerprintSHA256:     credential.Fingerprint(string(privateKeyPEM)),
+		AppID:                 123,
+		InstallationID:        456,
 		Owner:                 config.GitHub.Credential.Owner,
 		IntegrationRepository: config.GitHub.TestRepository,
 	}
 	if result := (GitHubCredentialCheck{
-		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: credentials,
-		Verification: verification, APIBase: server.URL,
+		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, PrivateKeyPEM: privateKeyPEM,
+		Verification: verification,
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("credential check = %#v", result)
 	}
@@ -325,23 +328,14 @@ func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
 
 func TestGitHubCredentialCheckRejectsDifferentIntegrationRepository(t *testing.T) {
 	config := validConfig()
-	token := "github_pat_test"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/user" {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
-	}))
-	defer server.Close()
+	privateKeyPEM := []byte("test-private-key")
 	result := (GitHubCredentialCheck{
 		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
-		Credentials: memoryCredential{secret: token},
-		Verification: store.GatewayCredentialVerification{
-			FingerprintSHA256: credential.Fingerprint(token), Owner: config.GitHub.Credential.Owner,
+		PrivateKeyPEM: privateKeyPEM,
+		Verification: store.GitHubAppVerification{
+			FingerprintSHA256: credential.Fingerprint(string(privateKeyPEM)), AppID: 123, InstallationID: 456, Owner: config.GitHub.Credential.Owner,
 			IntegrationRepository: "skyhuang233/different-integration",
 		},
-		APIBase: server.URL,
 	}).Run(context.Background())
 	if result.Status != Fail || !strings.Contains(result.Summary, "integration repository") {
 		t.Fatalf("credential check = %#v", result)

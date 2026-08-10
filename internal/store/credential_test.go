@@ -7,22 +7,23 @@ import (
 	"time"
 )
 
-func TestGatewayCredentialVerificationStoresOnlyFingerprintAndContract(t *testing.T) {
+func TestGitHubAppVerificationStoresOnlyFingerprintAndInstallationIdentity(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	want := GatewayCredentialVerification{
+	want := GitHubAppVerification{
 		FingerprintSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Owner:             "owner", IntegrationRepository: "owner/integration",
+		AppID:             123, InstallationID: 456,
+		Owner: "owner", IntegrationRepository: "owner/integration",
 		VerifiedAt: time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC),
 	}
-	if err := db.RecordGatewayCredentialVerification(ctx, want); err != nil {
+	if err := db.RecordGitHubAppVerification(ctx, want); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.GatewayCredentialVerification(ctx)
+	got, err := db.GitHubAppVerification(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

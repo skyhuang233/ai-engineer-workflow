@@ -46,7 +46,8 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
 		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
 		{"checks read permission", func(c *Config) { delete(c.GitHub.Credential.Permissions, "checks") }},
-		{"checks write permission", func(c *Config) { c.GitHub.Credential.Permissions["checks"] = "write" }},
+		{"GitHub App private key file", func(c *Config) { c.GitHub.Credential.PrivateKeyFile = "" }},
+		{"GitHub App private key fixed path", func(c *Config) { c.GitHub.Credential.PrivateKeyFile = `D:\workflow\github-app.pem` }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -240,9 +241,10 @@ func validConfig() Config {
 			RequiredCheck:  "workflow-contract",
 			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
-				Kind:            "fine-grained-pat",
+				Kind:            "github-app",
 				Owner:           "skyhuang233",
 				AllRepositories: true,
+				PrivateKeyFile:  `C:\ProgramData\workflow\github-app.pem`,
 				Permissions: map[string]string{
 					"actions": "read", "checks": "read", "contents": "write", "issues": "write",
 					"metadata": "read", "pull_requests": "write",

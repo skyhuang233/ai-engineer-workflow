@@ -19,17 +19,16 @@ import (
 	"github.com/skyhuang233/workflow/internal/agent"
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
-	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/githubcontract"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
-	"golang.org/x/term"
 )
 
 const (
@@ -56,6 +55,10 @@ func (c admittedCredential) Get(context.Context, string) (string, error) {
 
 func (admittedCredential) Set(context.Context, string, string) error {
 	return errors.New("admitted credentials cannot be replaced")
+}
+
+type githubTokenProvider interface {
+	Token(context.Context) (string, error)
 }
 
 func main() {
@@ -234,12 +237,17 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	defer database.Close()
-	verification, verificationErr := database.GatewayCredentialVerification(context.Background())
+	verification, verificationErr := database.GitHubAppVerification(context.Background())
 	if verificationErr != nil && !errors.Is(verificationErr, store.ErrNotFound) {
 		fmt.Fprintln(os.Stderr, verificationErr)
 		os.Exit(1)
 	}
-	secret, err := admitGatewayCredential(context.Background(), database, func(token string) error {
+	provider, err := loadVerifiedGitHubAppProvider(context.Background(), database, config, "", nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, persistGitHubAppAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		os.Exit(1)
+	}
+	secret, err := admitControlPlaneGitHubApp(context.Background(), database, provider, func(token string) error {
 		client := github.NewClient("", token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		return requireOwnerGuardedControlPlaneRepository(context.Background(), client, config.GitHub.TestRepository)
 	})
@@ -247,10 +255,15 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	privateKeyPEM, err := os.ReadFile(config.GitHub.Credential.PrivateKeyFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	releaseFetcher := doctor.ReleaseFetcher{WorkflowRepository: *workflowRepository}
 	manifest, manifestJSON, err := releaseFetcher.Fetch(context.Background(), config, secret)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		fmt.Fprintln(os.Stderr, persistGitHubAppAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
 	}
 	admittedCredentials := admittedCredential(secret)
@@ -272,7 +285,7 @@ func runDoctor(args []string) {
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},
 		doctor.WorkerRegistryCheck{Image: manifest.Image},
-		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: admittedCredentials, Verification: verification},
+		doctor.GitHubCredentialCheck{Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, PrivateKeyPEM: privateKeyPEM, Verification: verification},
 		doctor.GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: admittedCredentials},
 	}, Secrets: []string{secret}}
 	ctx, cancel := context.WithTimeout(context.Background(), doctorVerificationTimeout)
@@ -287,7 +300,7 @@ func runDoctor(args []string) {
 	encoded, _ := json.MarshalIndent(report, "", "  ")
 	fmt.Println(string(encoded))
 	if err := report.AuthenticationFailure(); err != nil {
-		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		fmt.Fprintln(os.Stderr, persistGitHubAppAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
 	}
 	if !report.Passed() {
@@ -302,7 +315,7 @@ func runDoctor(args []string) {
 	}
 	currentManifest, currentManifestJSON, err := releaseFetcher.Fetch(context.Background(), config, secret)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, persistGatewayCredentialAdmissionError(context.Background(), database, err, time.Now().UTC()))
+		fmt.Fprintln(os.Stderr, persistGitHubAppAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
 	}
 	if currentManifest != manifest || string(currentManifestJSON) != string(manifestJSON) {
@@ -328,22 +341,15 @@ func credentialCommand() {
 	flags := flag.NewFlagSet("credential provision", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "control-plane SQLite database")
+	appID := flags.Int64("app-id", 0, "GitHub App ID")
 	_ = flags.Parse(os.Args[3:])
+	if *appID <= 0 {
+		exitError(errors.New("credential provision requires a positive --app-id"))
+	}
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
 		exitError(err)
 	}
-	fmt.Fprint(os.Stderr, "Fine-grained PAT (input hidden): ")
-	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
-		exitError(fmt.Errorf("read credential: %w", err))
-	}
-	token := strings.TrimSpace(string(raw))
-	if !strings.HasPrefix(token, "github_pat_") {
-		exitError(fmt.Errorf("a fine-grained PAT is required"))
-	}
-	credentialStore := credential.NewStore()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	database, err := store.Open(ctx, *databasePath)
@@ -351,62 +357,102 @@ func credentialCommand() {
 		exitError(err)
 	}
 	defer database.Close()
-	if err := provisionGatewayCredential(ctx, database, credentialStore, config, token); err != nil {
+	if err := provisionGitHubApp(ctx, database, config, *appID, nil, githubAppProvisionDependencies{}); err != nil {
 		exitError(err)
 	}
-	fmt.Println("Gateway Credential stored in Windows Credential Manager and live write contract verified")
+	fmt.Println("Control Plane GitHub App installation and live contract verified")
 }
 
-func provisionGatewayCredential(ctx context.Context, database *store.Store, credentialStore credential.Store, config doctor.Config, token string) (resultErr error) {
+type githubAppProvisionDependencies struct {
+	APIBase string
+	Client  *http.Client
+	Now     func() time.Time
+	Verify  func(context.Context, string, string, string) error
+}
+
+func provisionGitHubApp(ctx context.Context, database *store.Store, config doctor.Config, appID int64, privateKeyPEM []byte, dependencies githubAppProvisionDependencies) (resultErr error) {
 	owner, err := credentialRotationOwner()
 	if err != nil {
 		return err
 	}
-	rotation, err := database.BeginGatewayCredentialRotation(ctx, owner, "Gateway Credential rotation is in progress", time.Now().UTC())
+	now := dependencies.Now
+	if now == nil {
+		now = time.Now
+	}
+	rotation, err := database.BeginGatewayCredentialRotation(ctx, owner, "Control Plane GitHub App verification is in progress", now().UTC())
 	if err != nil {
 		return err
 	}
 	resumed := false
 	defer func() {
 		if !resumed {
-			resultErr = errors.Join(resultErr, database.EndGatewayCredentialRotation(context.Background(), rotation, time.Now().UTC()))
+			resultErr = errors.Join(resultErr, database.EndGatewayCredentialRotation(context.Background(), rotation, now().UTC()))
 		}
 	}()
-	if err := database.RecoverExpiredGatewayDeliveryClaims(ctx, time.Now().UTC()); err != nil {
+	if err := database.RecoverExpiredGatewayDeliveryClaims(ctx, now().UTC()); err != nil {
 		return fmt.Errorf("recover expired Gateway delivery claims before credential rotation: %w", err)
 	}
 	if err := database.WaitForGatewayWritesQuiesced(ctx); err != nil {
 		return fmt.Errorf("wait for Gateway writes to finish before credential rotation: %w", err)
 	}
-	if err := database.RenewGatewayCredentialRotation(ctx, rotation, time.Now().UTC()); err != nil {
+	if err := database.RenewGatewayCredentialRotation(ctx, rotation, now().UTC()); err != nil {
 		return err
 	}
-	if err := (githubcontract.Verifier{}).Verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
-		return fmt.Errorf("live contract failed; the existing Gateway Credential was not replaced: %w", err)
+	if len(privateKeyPEM) == 0 {
+		privateKeyPEM, err = os.ReadFile(config.GitHub.Credential.PrivateKeyFile)
+		if err != nil {
+			return fmt.Errorf("read GitHub App private key; Gateway writes remain paused: %w", err)
+		}
 	}
-	previousToken, previousErr := credentialStore.Get(context.Background(), credential.GatewayTarget)
-	if err := credentialStore.Set(context.Background(), credential.GatewayTarget, token); err != nil {
-		return fmt.Errorf("replace Gateway Credential; writes remain paused because replacement state is uncertain: %w", err)
+	installation, err := githubapp.DiscoverInstallation(ctx, githubapp.DiscoveryConfig{
+		AppID: appID, PrivateKeyPEM: privateKeyPEM, Owner: config.GitHub.Credential.Owner,
+		Repository: config.GitHub.TestRepository, APIBase: dependencies.APIBase, Client: dependencies.Client, Now: now,
+	})
+	if err != nil {
+		return fmt.Errorf("discover GitHub App installation: %w", err)
 	}
-	if err := database.RenewGatewayCredentialRotation(ctx, rotation, time.Now().UTC()); err != nil {
+	provider, err := githubapp.NewProvider(githubapp.Config{
+		AppID: appID, InstallationID: installation.ID, PrivateKeyPEM: privateKeyPEM,
+		RequiredPermissions: config.GitHub.Credential.Permissions, APIBase: dependencies.APIBase, Client: dependencies.Client, Now: now,
+	})
+	if err != nil {
 		return err
 	}
-	if err := database.RecordGatewayCredentialVerification(ctx, store.GatewayCredentialVerification{
-		FingerprintSHA256:     credential.Fingerprint(token),
+	token, err := provider.Token(ctx)
+	if err != nil {
+		return err
+	}
+	verify := dependencies.Verify
+	if verify == nil {
+		verifier := githubcontract.Verifier{APIBase: dependencies.APIBase, Client: dependencies.Client}
+		verify = verifier.Verify
+	}
+	if err := verify(ctx, token, config.GitHub.Credential.Owner, config.GitHub.TestRepository); err != nil {
+		return fmt.Errorf("live contract failed; the existing Control Plane GitHub App verification was not replaced: %w", err)
+	}
+	if err := database.RenewGatewayCredentialRotation(ctx, rotation, now().UTC()); err != nil {
+		return err
+	}
+	if err := database.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
+		FingerprintSHA256:     privateKeyFingerprint(privateKeyPEM),
+		AppID:                 appID,
+		InstallationID:        installation.ID,
 		Owner:                 config.GitHub.Credential.Owner,
 		IntegrationRepository: config.GitHub.TestRepository,
-		VerifiedAt:            time.Now().UTC(),
+		VerifiedAt:            now().UTC(),
 	}); err != nil {
-		if previousErr == nil && previousToken != "" {
-			_ = credentialStore.Set(context.Background(), credential.GatewayTarget, previousToken)
-		}
-		return fmt.Errorf("record verification; Gateway writes remain paused and the prior credential was restored when available: %w", err)
+		return fmt.Errorf("record GitHub App verification; Gateway writes remain paused: %w", err)
 	}
-	if err := database.ResumeGatewayWrites(ctx, rotation, time.Now().UTC()); err != nil {
+	if err := database.ResumeGatewayWrites(ctx, rotation, now().UTC()); err != nil {
 		return err
 	}
 	resumed = true
 	return nil
+}
+
+func privateKeyFingerprint(privateKeyPEM []byte) string {
+	digest := sha256.Sum256(privateKeyPEM)
+	return hex.EncodeToString(digest[:])
 }
 
 func credentialRotationOwner() (string, error) {
@@ -457,11 +503,7 @@ func runTicket(args []string) {
 	}
 	defer db.Close()
 	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
-	var client *github.Client
-	_, err = admitGatewayCredential(ctx, db, func(token string) error {
-		client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-		return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
-	})
+	client, err := admittedControlPlaneGitHubClient(ctx, db, config, *githubURL, *repository)
 	if err != nil {
 		fail(err)
 	}
@@ -599,17 +641,13 @@ func runReconcileDelivered(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	var client *github.Client
-	_, err = admitGatewayCredential(ctx, db, func(token string) error {
-		client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
-		return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
-	})
+	client, err := admittedControlPlaneGitHubClient(ctx, db, config, *githubURL, *repository)
 	if err != nil {
 		fail(err)
 	}
 	marked, err := (github.DeliveredReconciler{Store: db, Client: client}).Reconcile(ctx, *repository)
 	if err != nil {
-		fail(persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC()))
+		fail(persistGitHubAppAdmissionError(ctx, db, err, time.Now().UTC()))
 	}
 	fmt.Println(marked)
 }
@@ -657,6 +695,7 @@ func runPollGitHub(args []string) {
 	if err != nil {
 		fail(err)
 	}
+	provider := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: *githubURL}
 	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
 	if reason, err := runtime.Inspect(context.Background()); err != nil {
@@ -737,7 +776,7 @@ func runPollGitHub(args []string) {
 			return err
 		}
 		var client *github.Client
-		_, err = admitPollGitHubCredential(ctx, poller, db, *repository, func(token string) error {
+		_, err = admitPollGitHubCredential(ctx, poller, provider, *repository, func(token string) error {
 			client = github.NewClient(*githubURL, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 			return requireOwnerGuardedControlPlaneRepository(ctx, client, *repository)
 		})
@@ -835,7 +874,7 @@ func runPollGitHub(args []string) {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		if err != nil && !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNeedsAttention) {
-			err = persistGatewayCredentialAdmissionError(ctx, db, err, time.Now().UTC())
+			err = persistGitHubAppAdmissionError(ctx, db, err, time.Now().UTC())
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
@@ -1023,6 +1062,19 @@ func requireOwnerGuardedControlPlaneRepository(ctx context.Context, client *gith
 	return nil
 }
 
+func admittedControlPlaneGitHubClient(ctx context.Context, database *store.Store, config doctor.Config, apiBase, repository string) (*github.Client, error) {
+	provider, err := loadVerifiedGitHubAppProvider(ctx, database, config, apiBase, nil)
+	if err != nil {
+		return nil, persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+	}
+	var client *github.Client
+	_, err = admitControlPlaneGitHubApp(ctx, database, provider, func(token string) error {
+		client = github.NewClient(apiBase, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
+		return requireOwnerGuardedControlPlaneRepository(ctx, client, repository)
+	})
+	return client, err
+}
+
 func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
@@ -1046,8 +1098,9 @@ func runGateway(args []string) {
 		_ = db.Close()
 		fail(err)
 	}
+	provider := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: *githubURL}
 	credentialSource := func(ctx context.Context) (string, error) {
-		return admitGatewayCredential(ctx, db, nil)
+		return admitControlPlaneGitHubApp(ctx, db, provider, nil)
 	}
 	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
 	gateway, err := delivery.NewGateway(db, remote)
@@ -1056,7 +1109,7 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	if _, err := credentialSource(context.Background()); shouldPauseGatewayForCredential(err) {
-		if pauseErr := db.PauseGatewayWrites(context.Background(), "Gateway Credential is unavailable; replace and verify it to resume writes", time.Now().UTC()); pauseErr != nil {
+		if pauseErr := db.PauseGatewayWrites(context.Background(), "Control Plane GitHub App is unavailable; provision it to resume writes", time.Now().UTC()); pauseErr != nil {
 			_ = db.Close()
 			fail(pauseErr)
 		}
@@ -1084,107 +1137,146 @@ func runGateway(args []string) {
 	_ = db.Close()
 }
 
-func gatewayCredential(ctx context.Context) (string, error) {
-	token, err := credential.NewStore().Get(ctx, credential.GatewayTarget)
-	if err != nil {
-		return "", fmt.Errorf("load Gateway Credential from Windows Credential Manager: %w", err)
-	}
-	token = strings.TrimSpace(token)
-	if !strings.HasPrefix(token, "github_pat_") {
-		return "", fmt.Errorf("%w: Gateway Credential is not a fine-grained PAT", delivery.ErrGatewayCredentialRejected)
-	}
-	return token, nil
+type verifiedGitHubAppTokenSource struct {
+	Database *store.Store
+	Config   doctor.Config
+	APIBase  string
+	Client   *http.Client
+
+	mu       sync.Mutex
+	identity string
+	provider *githubapp.Provider
 }
 
-func verifiedGatewayCredential(ctx context.Context, database *store.Store) (string, error) {
-	token, err := gatewayCredential(ctx)
+func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	verification, privateKeyPEM, err := verifiedGitHubAppInputs(ctx, s.Database, s.Config)
 	if err != nil {
 		return "", err
 	}
-	verification, err := database.GatewayCredentialVerification(ctx)
+	identity := fmt.Sprintf("%d/%d/%s", verification.AppID, verification.InstallationID, verification.FingerprintSHA256)
+	if s.provider == nil || s.identity != identity {
+		s.provider, err = githubapp.NewProvider(githubapp.Config{
+			AppID: verification.AppID, InstallationID: verification.InstallationID, PrivateKeyPEM: privateKeyPEM,
+			RequiredPermissions: s.Config.GitHub.Credential.Permissions, APIBase: s.APIBase, Client: s.Client,
+		})
+		if err != nil {
+			return "", fmt.Errorf("%w: load verified GitHub App: %v", delivery.ErrGatewayCredentialRejected, err)
+		}
+		s.identity = identity
+	}
+	return s.provider.Token(ctx)
+}
+
+func loadVerifiedGitHubAppProvider(ctx context.Context, database *store.Store, config doctor.Config, apiBase string, client *http.Client) (*githubapp.Provider, error) {
+	verification, privateKeyPEM, err := verifiedGitHubAppInputs(ctx, database, config)
 	if err != nil {
-		return "", gatewayCredentialVerificationError(err)
+		return nil, err
 	}
-	if credential.Fingerprint(token) != verification.FingerprintSHA256 {
-		return "", fmt.Errorf("%w: Gateway Credential differs from the verified credential", delivery.ErrGatewayCredentialRejected)
+	provider, err := githubapp.NewProvider(githubapp.Config{
+		AppID: verification.AppID, InstallationID: verification.InstallationID, PrivateKeyPEM: privateKeyPEM,
+		RequiredPermissions: config.GitHub.Credential.Permissions, APIBase: apiBase, Client: client,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: load verified GitHub App: %v", delivery.ErrGatewayCredentialRejected, err)
 	}
-	return token, nil
+	return provider, nil
 }
 
-func gatewayCredentialVerificationError(err error) error {
+func verifiedGitHubAppInputs(ctx context.Context, database *store.Store, config doctor.Config) (store.GitHubAppVerification, []byte, error) {
+	verification, err := database.GitHubAppVerification(ctx)
+	if err != nil {
+		return store.GitHubAppVerification{}, nil, githubAppVerificationError(err)
+	}
+	privateKeyPEM, err := os.ReadFile(config.GitHub.Credential.PrivateKeyFile)
+	if err != nil {
+		return store.GitHubAppVerification{}, nil, fmt.Errorf("%w: read Control Plane GitHub App private key: %v", delivery.ErrGatewayCredentialRejected, err)
+	}
+	if privateKeyFingerprint(privateKeyPEM) != verification.FingerprintSHA256 {
+		return store.GitHubAppVerification{}, nil, fmt.Errorf("%w: GitHub App private key differs from the verified key", delivery.ErrGatewayCredentialRejected)
+	}
+	if verification.Owner != config.GitHub.Credential.Owner || verification.IntegrationRepository != config.GitHub.TestRepository {
+		return store.GitHubAppVerification{}, nil, fmt.Errorf("%w: GitHub App verification does not match the configured owner and integration repository", delivery.ErrGatewayCredentialRejected)
+	}
+	return verification, privateKeyPEM, nil
+}
+
+func githubAppVerificationError(err error) error {
 	if errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("%w: Gateway Credential has no persisted verification", delivery.ErrGatewayCredentialRejected)
+		return fmt.Errorf("%w: Control Plane GitHub App has no persisted verification", delivery.ErrGatewayCredentialRejected)
 	}
-	return gatewayCredentialVerificationStoreError{err: fmt.Errorf("read Gateway Credential verification: %w", err)}
+	return githubAppVerificationStoreError{err: fmt.Errorf("read GitHub App verification: %w", err)}
 }
 
-type gatewayCredentialVerificationStoreError struct {
+type githubAppVerificationStoreError struct {
 	err error
 }
 
-func (e gatewayCredentialVerificationStoreError) Error() string          { return e.err.Error() }
-func (e gatewayCredentialVerificationStoreError) Unwrap() error          { return e.err }
-func (e gatewayCredentialVerificationStoreError) PollStoreFailure() bool { return true }
+func (e githubAppVerificationStoreError) Error() string          { return e.err.Error() }
+func (e githubAppVerificationStoreError) Unwrap() error          { return e.err }
+func (e githubAppVerificationStoreError) PollStoreFailure() bool { return true }
 
 func shouldPauseGatewayForCredential(err error) bool {
-	return errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected)
+	return errors.Is(err, delivery.ErrGatewayCredentialRejected)
 }
 
 func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
 	if shouldPauseGatewayForCredential(admissionErr) && !errors.Is(admissionErr, delivery.ErrGatewayCredentialRejected) {
-		admissionErr = fmt.Errorf("%w: Gateway Credential is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
+		admissionErr = fmt.Errorf("%w: Control Plane GitHub App is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
 	}
 	_, err := poller.RecordAdmissionFailure(ctx, repository, admissionErr)
 	return err
 }
 
-func admitPollGitHubCredential(ctx context.Context, poller github.Poller, database *store.Store, repository string, authenticate func(string) error) (string, error) {
+func admitPollGitHubCredential(ctx context.Context, poller github.Poller, provider githubTokenProvider, repository string, authenticate func(string) error) (string, error) {
 	if err := poller.Ready(ctx, repository); err != nil {
 		return "", err
 	}
-	token, err := verifiedGatewayCredential(ctx, database)
+	if provider == nil {
+		return "", errors.New("GitHub App token provider is unavailable")
+	}
+	token, err := provider.Token(ctx)
 	if err == nil && authenticate != nil {
 		err = authenticate(token)
 	}
 	if err != nil {
 		var authenticationFailure interface{ AuthenticationFailure() bool }
 		if errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
-			err = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, err)
-		} else if errors.Is(err, credential.ErrNotFound) {
-			err = fmt.Errorf("%w: Gateway Credential is missing: %w", delivery.ErrGatewayCredentialRejected, err)
+			err = fmt.Errorf("%w: GitHub rejected the Control Plane GitHub App credential: %w", delivery.ErrGatewayCredentialRejected, err)
 		}
 		return "", err
 	}
 	return token, nil
 }
 
-func persistGatewayCredentialPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {
+func persistGitHubAppPause(ctx context.Context, database *store.Store, credentialErr error, now time.Time) error {
 	if !shouldPauseGatewayForCredential(credentialErr) {
 		return credentialErr
 	}
-	if err := database.PauseGatewayWrites(ctx, "Gateway Credential is unavailable; replace and verify it to resume writes", now); err != nil {
-		return errors.Join(credentialErr, fmt.Errorf("persist Gateway Credential pause: %w", err))
+	if err := database.PauseGatewayWrites(ctx, "Control Plane GitHub App is unavailable; provision it to resume writes", now); err != nil {
+		return errors.Join(credentialErr, fmt.Errorf("persist Control Plane GitHub App pause: %w", err))
 	}
 	return credentialErr
 }
 
-func admitGatewayCredential(ctx context.Context, database *store.Store, authenticate func(string) error) (string, error) {
-	token, err := verifiedGatewayCredential(ctx, database)
+func admitControlPlaneGitHubApp(ctx context.Context, database *store.Store, provider githubTokenProvider, authenticate func(string) error) (string, error) {
+	token, err := provider.Token(ctx)
 	if err == nil && authenticate != nil {
 		err = authenticate(token)
 	}
 	if err != nil {
-		return "", persistGatewayCredentialAdmissionError(ctx, database, err, time.Now().UTC())
+		return "", persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
 	}
 	return token, nil
 }
 
-func persistGatewayCredentialAdmissionError(ctx context.Context, database *store.Store, admissionErr error, now time.Time) error {
+func persistGitHubAppAdmissionError(ctx context.Context, database *store.Store, admissionErr error, now time.Time) error {
 	var authenticationFailure interface{ AuthenticationFailure() bool }
 	if errors.As(admissionErr, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
-		admissionErr = fmt.Errorf("%w: GitHub rejected Gateway Credential: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
+		admissionErr = fmt.Errorf("%w: GitHub rejected the Control Plane GitHub App credential: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
 	}
-	return persistGatewayCredentialPause(ctx, database, admissionErr, now)
+	return persistGitHubAppPause(ctx, database, admissionErr, now)
 }
 
 func fail(err error) {

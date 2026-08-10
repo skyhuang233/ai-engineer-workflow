@@ -20,13 +20,13 @@ or complete diffs into it.
 1. Confirm Docker Desktop uses a Linux `amd64` engine and `codex login status`
    reports the configured ChatGPT identity.
 2. Read the integration repository metadata and fail the attempt unless its
-   canonical owner matches the configured Gateway Credential owner and
+   canonical owner matches the configured Control Plane GitHub App owner and
    `private` is `true`.
-3. Provision or rotate the all-repositories fine-grained Gateway Credential
-   exactly as documented in [toolchain.md](toolchain.md), using `workflow
-   credential provision`. Enter the PAT only through the command's hidden-input
-   prompt. Retain evidence that the live contract queried check runs for its
-   temporary Candidate commit before it replaced the verified credential, then
+3. Create the GitHub App, install it for All repositories, place its private-key
+   PEM at the configured host path, and provision it exactly as documented in
+   [toolchain.md](toolchain.md) using `workflow credential provision --app-id`.
+   Retain evidence that installation discovery and permission validation passed,
+   and that the live contract queried check runs for its temporary Candidate commit before it recorded the verified installation, then
    created, reconciled, and cleaned up its temporary branch, issue, pull request,
    label and evidence reply.
 4. Run `workflow doctor` exactly as documented in
@@ -113,9 +113,9 @@ Use fresh fixture plans where a terminal decision would prevent later steps.
   path, and reconcile dry-run before replacing any production database. Verify
   sessions, leases, outbox, cursors and Inbox questions converge without remote
   duplication.
-- Rotate the Gateway Credential through the hidden-input command. Writes must
-  stay paused until the replacement passes the live contract; no Worker state
-  may contain either credential.
+- Replace or revoke the GitHub App private key, then rerun `credential provision`.
+  Writes must stay paused until installation discovery and the live contract pass;
+  no Worker state may contain the PEM, App JWT, or installation token.
 
 ## 4. Automated negative evidence
 

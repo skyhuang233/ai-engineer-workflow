@@ -39,7 +39,7 @@ prerequisite, not the approval itself.
   executable in the Worker contract.
 - The dedicated GitHub integration repository and its required workflow path
   are explicit. The repository may be public or private, but its owner must
-  match the configured Gateway Credential owner. Branch protection is not a
+  match the configured Control Plane GitHub App owner. Branch protection is not a
   prerequisite: that owner retains sole merge authority. Its deployable
   workflow verifies only the live GitHub repository contract and does not
   require a copy of the Control Plane source tree. It can be manually rerun
@@ -50,25 +50,25 @@ prerequisite, not the approval itself.
   `WORKFLOW_GATEWAY_CREDENTIAL_OWNER` Actions variables to those configured
   values. Its contract workflow fails closed unless the variables, runner
   repository, and canonical GitHub repository metadata all agree.
-- The Gateway uses one fine-grained PAT for all owner repositories with exactly
-  metadata/actions/checks read and contents/issues/pull-requests write. Checks
-  read is required separately from Actions read to observe Candidate check runs
-  in private repositories. The secret
-  exists only in Windows Credential Manager and Control Plane memory. SQLite
-  records only its SHA-256 fingerprint and successful live-contract evidence.
-  GitHub does not expose an API that proves a fine-grained PAT has no additional
-  permissions; selecting exactly this configuration is the owner's declaration,
-  while the live contract machine-verifies every required positive capability.
+- The trusted host uses one GitHub App installed for all owner repositories with
+  at least metadata/actions/checks read and contents/issues/pull-requests write.
+  The same installation serves host-side observations and Gateway mutations.
+  Its private key is the fixed PEM file configured by `private_key_file`; SQLite
+  records only the App and installation IDs, PEM SHA-256 fingerprint, owner,
+  integration repository, and successful live-contract time. Each process
+  caches the installation token until shortly before GitHub's forced expiry.
 
-Provision or rotate the Gateway Credential. Configure `Metadata: read`,
+Create and install one GitHub App for **All repositories**. Configure `Metadata: read`,
 `Actions: read`, `Checks: read`, `Contents: write`, `Issues: write`, and
-`Pull requests: write` for all owner repositories. This hidden-input command
+`Pull requests: write`, download its private key, and place it at
+`C:\ProgramData\workflow\github-app.pem`.
+This command
 verifies Actions read, pushes a temporary Candidate commit, and calls that
 commit's check-runs endpoint to verify Checks read before performing the
 remaining idempotent writes in the dedicated integration repository. Only
-after the complete live contract passes does it replace the previously verified
-credential; it then cleans up its temporary branch, issue, and PR. During
-replacement, the durable Gateway
+after the complete live contract passes does it record the discovered installation
+and resume writes; it then cleans up its temporary branch, issue, and PR. During
+verification, the durable Gateway
 rotation pauses new writes and safely recovers an expired claim before the live
 contract runs; a failed replacement leaves writes paused. A Gateway that starts
 without its verified credential likewise persists the pause and projects one
@@ -77,7 +77,8 @@ recovery request to each affected repository Workflow Inbox:
 ```powershell
 go run ./cmd/workflow credential provision `
   --config config/toolchain.json `
-  --database C:\ProgramData\workflow\workflow.db
+  --database C:\ProgramData\workflow\workflow.db `
+  --app-id <GITHUB_APP_ID>
 ```
 
 Run the complete target-host contract with:
@@ -137,7 +138,7 @@ dispatches GitHub mutations itself; it requires the credential-isolated Gateway
 URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
 applies retry backoff, and acquires a fenced per-repository SQLite poll lease
-before loading the Gateway Credential or making GitHub requests. Concurrent
+before minting a Control Plane GitHub App installation token or making GitHub requests. Concurrent
 pollers therefore cannot both pass the same `NextAttemptAt` boundary. It runs
 the approved Plan Root control pass before
 projecting the repository Workflow Inbox, so an eligible Delivery Plan is

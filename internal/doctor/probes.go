@@ -323,41 +323,27 @@ func (c WorkerRegistryCheck) Run(ctx context.Context) Result {
 type GitHubCredentialCheck struct {
 	Pin                   GitHubCredentialPin
 	IntegrationRepository string
-	Credentials           credential.Store
-	Verification          store.GatewayCredentialVerification
-	APIBase               string
+	PrivateKeyPEM         []byte
+	Verification          store.GitHubAppVerification
 }
 
-func (GitHubCredentialCheck) Name() string { return "Gateway Credential contract" }
+func (GitHubCredentialCheck) Name() string { return "Control Plane GitHub App contract" }
 
 func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
-	if c.Credentials == nil || !sha256Pattern.MatchString(c.Verification.FingerprintSHA256) {
-		return Result{Status: Fail, Summary: "Gateway Credential has not completed its live write contract"}
+	if !sha256Pattern.MatchString(c.Verification.FingerprintSHA256) || c.Verification.AppID <= 0 || c.Verification.InstallationID <= 0 {
+		return Result{Status: Fail, Summary: "Control Plane GitHub App has not completed its live contract"}
 	}
-	token, err := c.Credentials.Get(ctx, credential.GatewayTarget)
-	if err != nil {
-		return Result{Status: Fail, Summary: "Gateway Credential is unavailable in Windows Credential Manager"}
+	digest := sha256.Sum256(c.PrivateKeyPEM)
+	if hex.EncodeToString(digest[:]) != c.Verification.FingerprintSHA256 {
+		return Result{Status: Fail, Summary: "GitHub App private key differs from the live-contract verification"}
 	}
-	if credential.Fingerprint(token) != c.Verification.FingerprintSHA256 {
-		return Result{Status: Fail, Summary: "Gateway Credential differs from the live-contract verification"}
-	}
-	if !strings.HasPrefix(strings.TrimSpace(token), "github_pat_") {
-		return Result{Status: Fail, Summary: "Gateway Credential is not a fine-grained PAT"}
-	}
-	var identity struct {
-		Login string `json:"login"`
-	}
-	err = githubGET(ctx, c.APIBase, token, "user", &identity)
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("read Gateway identity: %v", err), Err: err}
-	}
-	if identity.Login != c.Pin.Owner || c.Verification.Owner != c.Pin.Owner {
-		return Result{Status: Fail, Summary: "Gateway Credential owner does not match the verified owner"}
+	if c.Verification.Owner != c.Pin.Owner {
+		return Result{Status: Fail, Summary: "GitHub App installation owner does not match the verified owner"}
 	}
 	if c.Verification.IntegrationRepository != c.IntegrationRepository {
-		return Result{Status: Fail, Summary: "Gateway Credential verification does not match the configured integration repository"}
+		return Result{Status: Fail, Summary: "GitHub App verification does not match the configured integration repository"}
 	}
-	return Result{Status: Pass, Summary: "Credential Manager secret matches the verified fine-grained PAT, owner, and integration repository"}
+	return Result{Status: Pass, Summary: "GitHub App private key, installation identity, owner, and integration repository match the live-contract verification"}
 }
 
 type GitHubCheck struct {
@@ -371,11 +357,11 @@ func (GitHubCheck) Name() string { return "GitHub Owner-Guarded integration cont
 
 func (c GitHubCheck) Run(ctx context.Context) Result {
 	if c.Credentials == nil {
-		return Result{Status: Fail, Summary: "Gateway Credential store is unavailable"}
+		return Result{Status: Fail, Summary: "Control Plane GitHub App token source is unavailable"}
 	}
 	token, err := c.Credentials.Get(ctx, credential.GatewayTarget)
 	if err != nil {
-		return Result{Status: Fail, Summary: "Gateway Credential is unavailable"}
+		return Result{Status: Fail, Summary: "Control Plane GitHub App installation token is unavailable"}
 	}
 	var repo githubapi.RepositoryMetadata
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository, &repo); err != nil {
