@@ -229,7 +229,7 @@ func validConfig() Config {
 		Worker: WorkerPin{
 			Version:           "0.1.0",
 			ImageRepository:   "ghcr.io/skyhuang233/workflow-worker",
-			ReleaseRepository: "skyhuang233/workflow",
+			ReleaseRepository: "skyhuang233/ai-engineer-workflow",
 		},
 		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
