@@ -22,11 +22,13 @@ or complete diffs into it.
 2. Read the integration repository metadata and fail the attempt unless its
    canonical owner matches the configured Gateway Credential owner and
    `private` is `true`.
-3. Provision or rotate the all-repositories fine-grained Gateway Credential with
-   Metadata, Actions, and Checks read plus Contents, Issues, and Pull requests
-   write, using `workflow credential provision`. Enter the PAT only through the command's hidden-input
-   prompt. The live contract must create, reconcile, and clean up its temporary
-   branch, issue, pull request, label and evidence reply.
+3. Provision or rotate the all-repositories fine-grained Gateway Credential
+   exactly as documented in [toolchain.md](toolchain.md), using `workflow
+   credential provision`. Enter the PAT only through the command's hidden-input
+   prompt. Retain evidence that the live contract queried check runs for its
+   temporary Candidate commit before it replaced the verified credential, then
+   created, reconciled, and cleaned up its temporary branch, issue, pull request,
+   label and evidence reply.
 4. Run `workflow doctor` exactly as documented in
    [toolchain.md](toolchain.md), using the production SQLite path and an evidence
    report path. Every check must pass.
