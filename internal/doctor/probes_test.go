@@ -15,6 +15,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 type dockerCheckExecutor struct {
@@ -99,11 +100,10 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 	result := (DockerCheck{
 		Executor: executor,
 		Manifest: WorkerReleaseManifest{
+			ToolProvenance: workerrelease.ToolProvenance{
+				CodexVersion: "0.147.0", GitHubCLIVersion: "2.97.0", GoVersion: "1.25.12", NoMistakesVersion: "v1.41.2",
+			},
 			Image:                "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			CodexVersion:         "0.147.0",
-			GitHubCLIVersion:     "2.97.0",
-			GoVersion:            "1.25.12",
-			NoMistakesVersion:    "v1.41.2",
 			NoMistakesForkCommit: forkCommit,
 		},
 	}).Run(context.Background())
@@ -138,11 +138,10 @@ func TestDockerCheckRejectsStoppedNoMistakesDaemon(t *testing.T) {
 	result := (DockerCheck{
 		Executor: executor,
 		Manifest: WorkerReleaseManifest{
-			Image:             "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			CodexVersion:      "0.147.0",
-			GitHubCLIVersion:  "2.97.0",
-			GoVersion:         "1.25.12",
-			NoMistakesVersion: "v1.41.2",
+			ToolProvenance: workerrelease.ToolProvenance{
+				CodexVersion: "0.147.0", GitHubCLIVersion: "2.97.0", GoVersion: "1.25.12", NoMistakesVersion: "v1.41.2",
+			},
+			Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}).Run(context.Background())
 

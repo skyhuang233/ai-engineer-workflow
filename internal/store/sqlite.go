@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 47
+	latestSchemaVersion = 48
 )
 
 var (
@@ -1283,6 +1283,57 @@ SET plan_version_ids_json = COALESCE((
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (47, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 48 {
+		columns := []struct {
+			table      string
+			name       string
+			definition string
+		}{
+			{table: "worker_runs", name: "delivery_runtime_candidate_run_id", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "worker_audits", name: "lease_generation", definition: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, column.table, column.name)
+			if err != nil {
+				return fmt.Errorf("migration 48: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.name, column.definition)); err != nil {
+					return fmt.Errorf("migration 48: %w", err)
+				}
+			}
+		}
+		statements := []string{
+			`UPDATE worker_audits SET lease_generation = (SELECT lease_generation FROM worker_runs WHERE worker_runs.run_id = worker_audits.run_id)`,
+			`CREATE TABLE IF NOT EXISTS worker_container_results (
+    run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
+    lease_generation INTEGER NOT NULL,
+    container_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+)`,
+			`INSERT OR IGNORE INTO worker_container_results(run_id, lease_generation, container_id, recorded_at)
+SELECT run_id, lease_generation, container_id, created_at FROM worker_audits WHERE container_id != ''`,
+			`UPDATE worker_runs AS delivery_run
+SET delivery_runtime_candidate_run_id = (
+    SELECT session.accepted_candidate_run_id FROM ticket_sessions session WHERE session.current_run_id = delivery_run.run_id
+)
+WHERE delivery_run.run_kind = 'delivery_controller' AND delivery_run.launch_state = 'ready'
+AND EXISTS (SELECT 1 FROM ticket_sessions session WHERE session.current_run_id = delivery_run.run_id AND session.accepted_candidate_run_id != '')
+AND NOT EXISTS (
+    SELECT 1 FROM worker_runs earlier
+    WHERE earlier.session_id = delivery_run.session_id AND earlier.recovery_epoch = delivery_run.recovery_epoch
+    AND earlier.run_kind = 'delivery_controller' AND earlier.lease_generation < delivery_run.lease_generation
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 48: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (48, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

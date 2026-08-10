@@ -11,6 +11,7 @@ import (
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 var ErrSessionConflict = errors.New("ticket session identity conflict")
@@ -90,12 +91,12 @@ type AgentBinding struct {
 
 type WorkerAudit struct {
 	RunID                  string
-	LeaseToken             string
+	LeaseGeneration        int64
 	ContainerID            string
 	ImageDigest            string
 	Mounts                 any
 	ExtraHosts             any
-	ToolVersions           any
+	ToolVersions           map[string]string
 	GitHubWriteCredentials bool
 }
 
@@ -144,6 +145,7 @@ const (
 
 type WorkerAuditRecord struct {
 	RunID                  string
+	LeaseGeneration        int64
 	ContainerID            string
 	ImageDigest            string
 	MountsJSON             string
@@ -423,25 +425,14 @@ func (s *Store) BindAgent(ctx context.Context, binding AgentBinding) (TicketSess
 	return session, nil
 }
 
-func (s *Store) RecordWorkerAudit(ctx context.Context, audit WorkerAudit) error {
-	if audit.RunID == "" || audit.LeaseToken == "" || audit.ImageDigest == "" {
+func (s *Store) RecordWorkerContainer(ctx context.Context, runID string, leaseGeneration int64, containerID string) error {
+	if runID == "" || leaseGeneration <= 0 || containerID == "" {
 		return ErrInvalidClaim
 	}
-	mounts, err := json.Marshal(audit.Mounts)
-	if err != nil {
-		return err
-	}
-	versions, err := json.Marshal(audit.ToolVersions)
-	if err != nil {
-		return err
-	}
-	extraHosts, err := json.Marshal(audit.ExtraHosts)
-	if err != nil {
-		return err
-	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_audits(run_id, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials, created_at)
-SELECT r.run_id, ?, ?, ?, ?, ?, ?, ? FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(extraHosts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_container_results(run_id, lease_generation, container_id, recorded_at)
+SELECT run_id, lease_generation, ?, ? FROM worker_audits WHERE run_id = ? AND lease_generation = ?
+ON CONFLICT(run_id) DO UPDATE SET container_id = excluded.container_id
+WHERE worker_container_results.lease_generation = excluded.lease_generation AND worker_container_results.container_id = excluded.container_id`, containerID, formatTimestamp(time.Now()), runID, leaseGeneration)
 	if err != nil {
 		return err
 	}
@@ -455,8 +446,10 @@ WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit
 func (s *Store) WorkerAudit(ctx context.Context, runID string) (WorkerAuditRecord, error) {
 	var record WorkerAuditRecord
 	var credentials int
-	err := s.db.QueryRowContext(ctx, `SELECT run_id, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials FROM worker_audits WHERE run_id = ?`, runID).
-		Scan(&record.RunID, &record.ContainerID, &record.ImageDigest, &record.MountsJSON, &record.ExtraHostsJSON, &record.ToolVersionsJSON, &credentials)
+	err := s.db.QueryRowContext(ctx, `SELECT audit.run_id, audit.lease_generation, COALESCE(result.container_id, audit.container_id), audit.image_digest, audit.mounts_json, audit.extra_hosts_json, audit.tool_versions_json, audit.github_write_credentials
+FROM worker_audits audit LEFT JOIN worker_container_results result ON result.run_id = audit.run_id
+WHERE audit.run_id = ?`, runID).
+		Scan(&record.RunID, &record.LeaseGeneration, &record.ContainerID, &record.ImageDigest, &record.MountsJSON, &record.ExtraHostsJSON, &record.ToolVersionsJSON, &credentials)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerAuditRecord{}, ErrNotFound
 	}
@@ -539,10 +532,69 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).
 		return "", nil, err
 	}
 	var toolVersions map[string]string
-	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || toolVersions["codex"] == "" || toolVersions["no-mistakes"] == "" {
+	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validCandidateToolVersions(toolVersions) {
 		return "", nil, ErrInvalidClaim
 	}
 	return imageDigest, toolVersions, nil
+}
+
+func (s *Store) DeliveryWorkerRuntime(ctx context.Context, claim TicketClaim) (string, map[string]string, bool, error) {
+	if claim.RunID == "" || claim.LeaseGeneration <= 0 {
+		return "", nil, false, ErrInvalidClaim
+	}
+	var candidateRunID, imageDigest, toolVersionsJSON, manifestJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT r.delivery_runtime_candidate_run_id, COALESCE(c.image_digest, ''), COALESCE(c.tool_versions_json, '{}'), COALESCE(release.manifest_json, '')
+FROM worker_runs r
+LEFT JOIN candidate_revisions c ON c.run_id = r.delivery_runtime_candidate_run_id AND c.session_id = r.session_id
+LEFT JOIN worker_releases release ON release.image_digest = c.image_digest
+WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ?`, claim.RunID, claim.LeaseGeneration, RunDelivery).
+		Scan(&candidateRunID, &imageDigest, &toolVersionsJSON, &manifestJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, false, ErrInvalidClaim
+	}
+	if err != nil {
+		return "", nil, false, err
+	}
+	if candidateRunID == "" {
+		return "", nil, false, nil
+	}
+	var toolVersions map[string]string
+	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validCandidateToolVersions(toolVersions) {
+		return "", nil, false, ErrInvalidClaim
+	}
+	if !validWorkerToolVersions(toolVersions) {
+		provenance, err := workerrelease.DecodeToolProvenance([]byte(manifestJSON))
+		if err != nil {
+			return "", nil, false, ErrInvalidClaim
+		}
+		manifestTools, _ := provenance.ToolVersions()
+		for _, tool := range []string{"codex", "go", "no-mistakes"} {
+			if strings.TrimSpace(toolVersions[tool]) != strings.TrimSpace(manifestTools[tool]) {
+				return "", nil, false, ErrInvalidClaim
+			}
+		}
+		toolVersions = manifestTools
+	}
+	return imageDigest, toolVersions, true, nil
+}
+
+func validCandidateToolVersions(toolVersions map[string]string) bool {
+	for _, tool := range []string{"codex", "go", "no-mistakes"} {
+		if strings.TrimSpace(toolVersions[tool]) == "" {
+			return false
+		}
+	}
+	githubCLI, present := toolVersions["github-cli"]
+	return !present || strings.TrimSpace(githubCLI) != ""
+}
+
+func validWorkerToolVersions(toolVersions map[string]string) bool {
+	for _, tool := range []string{"codex", "github-cli", "go", "no-mistakes"} {
+		if strings.TrimSpace(toolVersions[tool]) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision, deliveryLeaseTTL time.Duration) (TicketClaim, error) {
@@ -619,7 +671,7 @@ validated_base_commit = '', validated_head_commit = '', checks_etag = '', update
 	}
 	var delivery TicketClaim
 	if deliveryLeaseTTL > 0 {
-		if delivery, err = claimDeliveryControllerTx(ctx, tx, sessionID, deliveryLeaseTTL, candidate.Now); err != nil {
+		if delivery, err = claimDeliveryControllerTx(ctx, tx, sessionID, deliveryLeaseTTL, candidate.Now, candidate.RunID); err != nil {
 			return TicketClaim{}, err
 		}
 	}
@@ -629,7 +681,7 @@ validated_base_commit = '', validated_head_commit = '', checks_etag = '', update
 	return delivery, nil
 }
 
-func claimDeliveryControllerTx(ctx context.Context, tx *sql.Tx, sessionID string, leaseTTL time.Duration, now time.Time) (TicketClaim, error) {
+func claimDeliveryControllerTx(ctx context.Context, tx *sql.Tx, sessionID string, leaseTTL time.Duration, now time.Time, runtimeCandidateRunID string) (TicketClaim, error) {
 	var claim TicketClaim
 	var generation, recoveryEpoch int64
 	err := tx.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id, s.owner, s.current_lease_generation, s.recovery_epoch, t.issue_number, t.title
@@ -652,7 +704,7 @@ WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.
 		return TicketClaim{}, err
 	}
 	expiresAt := now.Add(leaseTTL)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at, run_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, -int(generation), recoveryEpoch, generation, RunRunning, formatTimestamp(now), RunDelivery); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_runs(run_id, session_id, attempt, recovery_epoch, lease_generation, state, started_at, run_kind, delivery_runtime_candidate_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, sessionID, -int(generation), recoveryEpoch, generation, RunRunning, formatTimestamp(now), RunDelivery, runtimeCandidateRunID); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO run_leases(lease_token, run_id, session_id, generation, state, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, leaseToken, runID, sessionID, generation, LeaseActive, formatTimestamp(expiresAt), formatTimestamp(now)); err != nil {

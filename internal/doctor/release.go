@@ -11,19 +11,17 @@ import (
 	"strings"
 
 	githubapi "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 type WorkerReleaseManifest struct {
+	workerrelease.ToolProvenance
 	SchemaVersion                int                     `json:"schema_version"`
 	WorkerVersion                string                  `json:"worker_version"`
 	SourceCommit                 string                  `json:"source_commit"`
 	Image                        string                  `json:"image"`
-	CodexVersion                 string                  `json:"codex_version"`
-	GitHubCLIVersion             string                  `json:"github_cli_version"`
 	GitHubCLILinuxAMD64SHA256    string                  `json:"github_cli_linux_amd64_sha256"`
-	GoVersion                    string                  `json:"go_version"`
 	GoLinuxAMD64SHA256           string                  `json:"go_linux_amd64_sha256"`
-	NoMistakesVersion            string                  `json:"no_mistakes_version"`
 	NoMistakesUpstreamRepository string                  `json:"no_mistakes_upstream_repository"`
 	NoMistakesUpstreamCommit     string                  `json:"no_mistakes_upstream_commit"`
 	NoMistakesForkRepository     string                  `json:"no_mistakes_fork_repository"`
@@ -241,6 +239,9 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 }
 
 func (m WorkerReleaseManifest) Validate(config Config) error {
+	if _, err := m.ToolVersions(); err != nil {
+		return err
+	}
 	switch {
 	case m.SchemaVersion != 6:
 		return errors.New("unsupported Worker Release Manifest schema")

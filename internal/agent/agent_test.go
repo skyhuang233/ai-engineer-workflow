@@ -3,12 +3,14 @@ package agent_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -21,20 +23,22 @@ import (
 )
 
 type fakeRuntime struct {
-	results          []worker.Result
-	specs            []worker.Spec
-	err              error
-	dirty            bool
-	failAfterCommit  bool
-	switchBranch     bool
-	ignoredFile      bool
-	deliveryOutput   []byte
-	deliveryDeadline time.Time
-	workspaceContent string
-	corruptCodexAuth bool
-	deleteCodexAuth  bool
-	blockDiagnostics bool
-	refreshedAuth    []byte
+	results                       []worker.Result
+	specs                         []worker.Spec
+	err                           error
+	dirty                         bool
+	failAfterCommit               bool
+	switchBranch                  bool
+	ignoredFile                   bool
+	deliveryOutput                []byte
+	deliveryDeadline              time.Time
+	workspaceContent              string
+	corruptCodexAuth              bool
+	deleteCodexAuth               bool
+	blockDiagnostics              bool
+	refreshedAuth                 []byte
+	deleteCodexAuthDuringDelivery bool
+	beforeDeliveryReturn          func(time.Time) error
 }
 
 type blockingFailureRuntime struct {
@@ -55,12 +59,23 @@ func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Re
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
+		if r.deleteCodexAuthDuringDelivery {
+			if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
+				return worker.Result{}, err
+			}
+		}
 		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: checks-passed\n")
 		if len(r.deliveryOutput) > 0 {
 			output = r.deliveryOutput
 		}
 		r.deliveryDeadline, _ = ctx.Deadline()
-		return worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}, nil
+		result := worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}
+		if r.beforeDeliveryReturn != nil {
+			if err := r.beforeDeliveryReturn(r.deliveryDeadline); err != nil {
+				return result, err
+			}
+		}
+		return result, nil
 	}
 	marker := "initial"
 	if slices.Contains(spec.Command, "resume") {
@@ -726,6 +741,169 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("authentication-corrupt Run projection = %#v", projection.Tickets)
 	}
+	audit, err := db.WorkerAudit(ctx, claim.RunID)
+	if err != nil || audit.ContainerID != "container-failed" {
+		t.Fatalf("authentication-corrupt Run audit = %#v, %v", audit, err)
+	}
+}
+
+func TestControllerAuditsDeliveryBeforePostRunAuthenticationInspection(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("delivery-auth"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		results:                       []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deleteCodexAuthDuringDelivery: true,
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "authentication cache is unavailable") {
+		t.Fatalf("post-delivery authentication error = %v", err)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime specs = %#v", runtime.specs)
+	}
+	audit, err := db.WorkerAudit(ctx, runtime.specs[1].RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != runtime.specs[1].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !strings.Contains(audit.ToolVersionsJSON, `"github-cli":"2.97.0"`) {
+		t.Fatalf("post-delivery authentication audit = %#v", audit)
+	}
+}
+
+func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
+	runtime.beforeDeliveryReturn = func(deadline time.Time) error {
+		if deadline.IsZero() {
+			return errors.New("Delivery Controller deadline is missing")
+		}
+		runs, err := db.ActiveRecoveryRuns(context.Background(), version.ID, deadline.Add(time.Second))
+		if err != nil {
+			return err
+		}
+		if len(runs) != 0 {
+			return fmt.Errorf("active recovery runs after expiry = %#v", runs)
+		}
+		return nil
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("expired Delivery Controller completion = %v, want active-lease rejection", err)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime specs = %#v", runtime.specs)
+	}
+	deliverySpec := runtime.specs[1]
+	deliveryGeneration := claim.LeaseGeneration + 1
+	audit, err := db.WorkerAudit(ctx, deliverySpec.RunID)
+	if err != nil {
+		t.Fatalf("expired Delivery Controller audit: %v", err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != deliverySpec.ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) {
+		t.Fatalf("expired Delivery Controller audit = %#v", audit)
+	}
+	if err := db.RecordWorkerContainer(ctx, deliverySpec.RunID, deliveryGeneration, "replacement-container"); err == nil {
+		t.Fatal("expired Delivery Controller audit was mutable")
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var auditCount int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_audits WHERE run_id = ?`, deliverySpec.RunID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expired Delivery Controller audits = %d, want 1", auditCount)
+	}
+	var runState, leaseState string
+	if err := raw.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, deliverySpec.RunID).Scan(&runState, &leaseState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" || leaseState != "expired" {
+		t.Fatalf("expired Delivery Controller state = %q/%q", runState, leaseState)
+	}
+}
+
+func TestControllerPersistsDeliveryAuditBeforePostDockerProcessLoss(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
+	runtime.beforeDeliveryReturn = func(time.Time) error {
+		deliverySpec := runtime.specs[1]
+		audit, err := db.WorkerAudit(context.Background(), deliverySpec.RunID)
+		if err != nil {
+			t.Fatalf("audit was absent after Docker start: %v", err)
+		}
+		if audit.ContainerID != "" || audit.LeaseGeneration != claim.LeaseGeneration+1 || audit.ImageDigest != deliverySpec.ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.MountsJSON, `"/workspace"`) || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !strings.Contains(audit.ToolVersionsJSON, `"github-cli":"2.97.0"`) {
+			t.Fatalf("pre-return Delivery Controller audit = %#v", audit)
+		}
+		panic("control plane process lost")
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	var processLost bool
+	func() {
+		defer func() {
+			processLost = recover() == "control plane process lost"
+		}()
+		_, _ = controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
+	}()
+	if !processLost || len(runtime.specs) != 2 {
+		t.Fatalf("post-Docker process loss = %v, specs = %#v", processLost, runtime.specs)
+	}
+	deliverySpec := runtime.specs[1]
+	deliveryGeneration := claim.LeaseGeneration + 1
+	if err := db.RecordWorkerContainer(ctx, deliverySpec.RunID, deliveryGeneration, "reconciled-container"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordWorkerContainer(ctx, deliverySpec.RunID, deliveryGeneration, "reconciled-container"); err != nil {
+		t.Fatalf("idempotent container result: %v", err)
+	}
+	if err := db.RecordWorkerContainer(ctx, deliverySpec.RunID, deliveryGeneration, "different-container"); err == nil {
+		t.Fatal("container result was mutable")
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var auditCount, resultCount int
+	if err := raw.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM worker_audits WHERE run_id = ?), (SELECT COUNT(*) FROM worker_container_results WHERE run_id = ?)`, deliverySpec.RunID, deliverySpec.RunID).Scan(&auditCount, &resultCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 || resultCount != 1 {
+		t.Fatalf("post-loss audit/result counts = %d/%d, want 1/1", auditCount, resultCount)
+	}
 }
 
 func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *testing.T) {
@@ -1113,7 +1291,103 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	}
 }
 
-func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T) {
+func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	t.Cleanup(func() { _ = db.Close() })
+	workspacePath := filepath.Join(root, "workspace")
+	for _, command := range [][]string{
+		{"clone", "--config", "core.autocrlf=false", source, workspacePath},
+		{"-C", workspacePath, "checkout", "-b", "ticket-1"},
+		{"-C", workspacePath, "config", "user.name", "Test"},
+		{"-C", workspacePath, "config", "user.email", "test@example.com"},
+	} {
+		if output, err := exec.Command("git", command...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", command, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workspacePath, "candidate.txt"), []byte("accepted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range [][]string{{"-C", workspacePath, "add", "candidate.txt"}, {"-C", workspacePath, "commit", "-m", "candidate"}} {
+		if output, err := exec.Command("git", command...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", command, err, output)
+		}
+	}
+	head, err := exec.Command("git", "-C", workspacePath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexStatePath := filepath.Join(root, "codex", claim.SessionID)
+	if err := os.MkdirAll(codexStatePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-" + claim.SessionID, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	oldImage := "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	oldTools := map[string]string{"codex": "1.0.0", "go": "1.25.12", "no-mistakes": "v1.0.0"}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{
+		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: strings.TrimSpace(string(head)),
+		StructuredOutput: []byte(`{"summary":"accepted","checks":[{"command":"go test","outcome":"passed"}]}`), ImageDigest: oldImage, ToolVersions: oldTools, Now: time.Now().UTC(),
+		Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DELETE FROM schema_migrations WHERE version = 48",
+		"ALTER TABLE worker_runs DROP COLUMN delivery_runtime_candidate_run_id",
+		"ALTER TABLE worker_audits DROP COLUMN lease_generation",
+		"DROP TABLE worker_container_results",
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(ctx, filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version: "0.2.0", SourceCommit: "cccccccccccccccccccccccccccccccccccccccc",
+		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`, VerifiedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{}, Runtime: runtime, GatewayURL: "http://gateway.test"}
+	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
+		t.Fatalf("resume original ready Delivery Worker Run: %v", err)
+	}
+	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != "2.97.0" {
+		t.Fatalf("original Delivery Worker runtime = %#v, want Candidate runtime", runtime.specs)
+	}
+	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
+	if err != nil || candidateTools["github-cli"] != "" {
+		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
+	}
+	audit, err := db.WorkerAudit(ctx, deliveryClaim.RunID)
+	if err != nil || audit.ImageDigest != oldImage || audit.LeaseGeneration != deliveryClaim.LeaseGeneration || audit.ContainerID != "delivery-container" {
+		t.Fatalf("original Delivery Worker audit = %#v, %v", audit, err)
+	}
+}
+
+func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWorker(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1124,7 +1398,8 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "did not pass") {
 		t.Fatalf("failed Delivery Controller error = %v", err)
 	}
-	if _, err := db.CandidateRevision(ctx, claim.RunID); err != nil {
+	candidate, err := db.CandidateRevision(ctx, claim.RunID)
+	if err != nil {
 		t.Fatalf("Candidate acceptance was not durable: %v", err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
@@ -1141,11 +1416,15 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending delivery claims = %#v, %v", pending, err)
 	}
+	retryRunID := pending[0].RunID
+	if _, _, pinned, err := db.DeliveryWorkerRuntime(ctx, pending[0]); err != nil || pinned {
+		t.Fatalf("recovery Delivery Worker runtime pin = %v, %v; want Active selection", pinned, err)
+	}
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
 		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1158,13 +1437,75 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
 	}
-	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
-		t.Fatalf("retried delivery image = %q, want accepted Candidate image", retryRuntime.specs[0].ImageDigest)
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
+		t.Fatalf("retried delivery image = %q, want Active Worker image", retryRuntime.specs[0].ImageDigest)
 	}
+	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["github-cli"] != "2.98.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
+		t.Fatalf("retried delivery tools = %#v, want Active Worker tools", retryRuntime.specs[0].ToolVersions)
+	}
+	candidateImage, candidateTools, err := db.CandidateWorkerRuntime(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidateImage != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
+		t.Fatalf("accepted Candidate runtime changed during delivery recovery: image=%q tools=%#v", candidateImage, candidateTools)
+	}
+	audit, err := db.WorkerAudit(ctx, retryRunID)
+	if err != nil {
+		t.Fatalf("retried Delivery Controller audit: %v", err)
+	}
+	var auditedTools map[string]string
+	if err := json.Unmarshal([]byte(audit.ToolVersionsJSON), &auditedTools); err != nil {
+		t.Fatalf("decode retried Delivery Controller tools audit: %v", err)
+	}
+	var auditedMounts []worker.Mount
+	if err := json.Unmarshal([]byte(audit.MountsJSON), &auditedMounts); err != nil {
+		t.Fatalf("decode retried Delivery Controller mounts audit: %v", err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != retryRuntime.specs[0].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !reflect.DeepEqual(auditedTools, retryRuntime.specs[0].ToolVersions) || !reflect.DeepEqual(auditedMounts, retryRuntime.specs[0].Mounts) {
+		t.Fatalf("retried Delivery Controller audit = %#v", audit)
+	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.AcceptedCandidateRunID != claim.RunID || session.AcceptedCommit != candidate.CommitSHA {
+		t.Fatalf("accepted Candidate identity changed during recovery: session=%#v candidate=%#v", session, candidate)
+	}
+	t.Logf("accepted Candidate preserved: run=%s commit=%s image=%s tools=%v", claim.RunID, candidate.CommitSHA, candidateImage, candidateTools)
+	t.Logf("recovery Delivery Worker launched: run=%s image=%s tools=%v mounts=%s extra_hosts=%s github_write_credentials=%t container=%s", retryRunID, audit.ImageDigest, auditedTools, audit.MountsJSON, audit.ExtraHostsJSON, audit.GitHubWriteCredentials, audit.ContainerID)
 	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, claim.RunID, pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
+	}
+}
+
+func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version:        "0.2.0",
+		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
+		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "invalid release manifest") {
+		t.Fatalf("missing GitHub CLI manifest error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with incomplete tool provenance: %#v", runtime.specs)
 	}
 }
 
@@ -1314,7 +1655,7 @@ func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
 	if len(runtime.specs) != 0 {
 		t.Fatal("worker started with a credential-bearing workspace source")
 	}
-	if err := db.ReserveWorkerLaunch(ctx, claim, time.Now().UTC()); err != nil {
+	if err := db.ReserveWorkerLaunch(ctx, claim, store.WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, time.Now().UTC()); err != nil {
 		t.Fatalf("preflight failure reserved worker launch: %v", err)
 	}
 }
@@ -1502,7 +1843,7 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 		Version:        "0.1.0",
 		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","github_cli_version":"2.97.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)

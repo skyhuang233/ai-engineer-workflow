@@ -13,6 +13,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 	toon "github.com/toon-format/toon-go"
 )
 
@@ -58,7 +59,10 @@ type Candidate struct {
 	StructuredOutput []byte
 }
 
-const codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
+const (
+	codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
+	workerAuditTimeout         = 10 * time.Second
+)
 
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
 	if c.Store == nil || c.Runtime == nil {
@@ -123,7 +127,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err := spec.Validate(); err != nil {
 		return Candidate{}, err
 	}
-	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, c.now()); err != nil {
+	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, workerLaunchAudit(request.Claim, spec), c.now()); err != nil {
 		return Candidate{}, err
 	}
 	runCtx := ctx
@@ -133,16 +137,17 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	result, runErr := c.Runtime.Run(runCtx, spec)
 	defer cancelRun()
+	auditErr := c.recordWorkerContainer(request.Claim, result)
 	handoffCtx := context.WithoutCancel(ctx)
+	if auditErr != nil {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, preRunRedactor.String(auditErr.Error()), "", nil)
+	}
 	output := runtimeOutput(result)
 	postRunRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, codexAuthenticationFailure, "", nil)
 	}
 	runRedactor := preRunRedactor.Merge(postRunRedactor)
-	if err := c.Store.RecordWorkerAudit(handoffCtx, store.WorkerAudit{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, ContainerID: result.ContainerID, ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions}); err != nil {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
-	}
 	codexOutput := runtimeStdout(result)
 	codexSessionID, _ := parseSessionID(codexOutput, session.CodexSessionID)
 	if codexSessionID != "" && codexSessionID != session.CodexSessionID {
@@ -207,7 +212,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	session.AcceptedCommit = commit
 	session.AcceptedCandidateRunID = request.Claim.RunID
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
-	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt, imageDigest, toolVersions); err != nil {
+	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt); err != nil {
 		return candidate, err
 	}
 	return candidate, nil
@@ -244,10 +249,6 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err := validateLocalRemotes(finalizationCtx, ws.Path); err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	imageDigest, toolVersions, err := c.Store.CandidateWorkerRuntime(finalizationCtx, claim.VersionID, claim.TicketID)
-	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("resolve accepted Candidate runtime: %w", err))
-	}
 	publication := store.CandidatePublication{
 		Repository:         delivery.Repository,
 		Branch:             delivery.Branch,
@@ -257,16 +258,20 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		Body:               "Retry delivery of the accepted Candidate Revision.",
 	}
 	intent := fmt.Sprintf("Retry delivery of accepted Candidate Revision %s for ticket #%d.", delivery.CandidateCommit, claim.TicketNumber)
-	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent, imageDigest, toolVersions)
+	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent)
 }
 
-func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent, imageDigest string, toolVersions map[string]string) error {
+func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
 	}
 	if session.SessionID == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Delivery Cycle or Revision Round is incomplete"))
+	}
+	imageDigest, toolVersions, err := c.deliveryWorkerRuntime(ctx, deliveryClaim)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
@@ -320,7 +325,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
-	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, c.now()); err != nil {
+	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now()); err != nil {
 		if errors.Is(err, store.ErrWorkerLaunched) {
 			return err
 		}
@@ -329,8 +334,12 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
+	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
+	if auditErr != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(auditErr.Error())))
+	}
 	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
@@ -385,16 +394,43 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
 	}
-	var releaseManifest struct {
-		CodexVersion      string `json:"codex_version"`
-		GoVersion         string `json:"go_version"`
-		NoMistakesVersion string `json:"no_mistakes_version"`
-	}
-	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
-		releaseManifest.CodexVersion == "" || releaseManifest.GoVersion == "" || releaseManifest.NoMistakesVersion == "" {
+	provenance, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
+	if err != nil {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}
-	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "go": releaseManifest.GoVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
+	toolVersions, _ := provenance.ToolVersions()
+	return activeRelease.ImageReference, toolVersions, nil
+}
+
+func (c Controller) deliveryWorkerRuntime(ctx context.Context, claim store.TicketClaim) (string, map[string]string, error) {
+	imageDigest, toolVersions, pinned, err := c.Store.DeliveryWorkerRuntime(ctx, claim)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve Delivery Worker runtime: %w", err)
+	}
+	if pinned {
+		return imageDigest, toolVersions, nil
+	}
+	imageDigest, toolVersions, err = c.activeWorkerRuntime(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve Active Worker runtime for delivery recovery: %w", err)
+	}
+	return imageDigest, toolVersions, nil
+}
+
+func workerLaunchAudit(claim store.TicketClaim, spec worker.Spec) store.WorkerAudit {
+	return store.WorkerAudit{
+		RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration,
+		ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions,
+	}
+}
+
+func (c Controller) recordWorkerContainer(claim store.TicketClaim, result worker.Result) error {
+	if strings.TrimSpace(result.ContainerID) == "" {
+		return nil
+	}
+	auditCtx, cancelAudit := context.WithTimeout(context.Background(), workerAuditTimeout)
+	defer cancelAudit()
+	return c.Store.RecordWorkerContainer(auditCtx, claim.RunID, claim.LeaseGeneration, result.ContainerID)
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {

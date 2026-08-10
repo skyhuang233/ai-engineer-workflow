@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -590,7 +591,7 @@ ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.S
 		if updated != 1 {
 			continue
 		}
-		claim, err := claimDeliveryControllerTx(ctx, tx, sessionID, leaseTTL, now)
+		claim, err := claimDeliveryControllerTx(ctx, tx, sessionID, leaseTTL, now, "")
 		if err != nil {
 			return nil, err
 		}
@@ -602,26 +603,43 @@ ORDER BY s.updated_at, s.session_id LIMIT ?`, repository, SessionRunning, plan.S
 	return claims, nil
 }
 
-func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.reserveWorkerLaunch(ctx, claim, now, "")
+func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time) error {
+	return s.reserveWorkerLaunch(ctx, claim, audit, now, "")
 }
 
-func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.reserveWorkerLaunch(ctx, claim, now, RunDelivery)
+func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time) error {
+	return s.reserveWorkerLaunch(ctx, claim, audit, now, RunDelivery)
 }
 
-func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, now time.Time, runKind string) error {
+func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time, runKind string) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 || audit.RunID != claim.RunID || audit.LeaseGeneration != claim.LeaseGeneration || audit.ContainerID != "" || audit.ImageDigest == "" || !validWorkerToolVersions(audit.ToolVersions) || audit.GitHubWriteCredentials {
 		return ErrInvalidClaim
+	}
+	mounts, err := json.Marshal(audit.Mounts)
+	if err != nil {
+		return err
+	}
+	versions, err := json.Marshal(audit.ToolVersions)
+	if err != nil {
+		return err
+	}
+	extraHosts, err := json.Marshal(audit.ExtraHosts)
+	if err != nil {
+		return err
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE worker_runs
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE worker_runs
 SET launch_state = 'launched', launched_at = ?
 WHERE run_id = ? AND lease_generation = ? AND state = ? AND launch_state = 'ready'
 AND (? = '' OR run_kind = ?)
@@ -640,7 +658,11 @@ AND EXISTS (
 	if count != 1 {
 		return ErrWorkerLaunched
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_audits(run_id, lease_generation, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials, created_at)
+VALUES (?, ?, '', ?, ?, ?, ?, 0, ?)`, audit.RunID, audit.LeaseGeneration, audit.ImageDigest, string(mounts), string(extraHosts), string(versions), formatTimestamp(now)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RequireCurrentDeliveryLease(ctx context.Context, claim TicketClaim, now time.Time) error {

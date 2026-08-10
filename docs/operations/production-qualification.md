@@ -88,6 +88,13 @@ Use fresh fixture plans where a terminal decision would prevent later steps.
 - Stop an old Worker after its lease is visible, let a replacement generation
   take ownership, then resume the old Worker. Its push, PR and reply attempts
   must be rejected by both the SQLite and Gateway fences.
+- Exercise [ADR-0009](../adr/0009-adopt-no-mistakes-as-delivery-controller.md)'s
+  historical-Worker recovery contract. Preserve an accepted Candidate from a
+  Worker Image that cannot start the Delivery Controller, activate a corrected
+  release only after Doctor passes, and retry delivery. The retry must use the
+  Active Worker Image without changing the accepted commit or its original
+  runtime provenance. Retain both Worker audits and verify each launch's image,
+  tools, mounts, Gateway host mapping, and absence of GitHub write credentials.
 - Kill and restart the Control Plane around each outbox boundary: before the
   remote call, after an unknown remote result, and after remote confirmation.
   Reconciliation must find the same branch, PR, comment or projection rather
@@ -126,6 +133,7 @@ baseline mapping and add the successful run URL beside every row in the issue:
 | New and recovered workspaces use the non-owner ticket-agent Git identity | `TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF`, `TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery` |
 | Implementation Candidate names its exact lowercase full workspace HEAD | `TestSchemaMeetsOpenAIStrictObjectRequirements`, `TestValidateStrictCandidateOutput`, `TestControllerRejectsImplementationCandidateWithNullCommit` |
 | Workspace/Codex state outlive containers; dirty exits restore accepted commit | `TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun`, `TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement` |
+| Delivery recovery preserves the Candidate while a new Run uses the Active Worker | `TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfterRestart`, `TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWorker` |
 | Feedback is owner-classified, deduplicated and batched once | `TestActionablePullRequestFeedbackIncludesOwnerEventsOnly`, `TestReviewFeedbackDeduplicatesAndBatchesOneRevision` |
 | Agent cannot merge, resolve threads or write `main` | `TestGatewayRejectsAgentPhasePublicationBeforeDeliveryController`, `TestGatewayAllowsDeliveryControllerCommandFromAcceptedCandidate` plus the real Gateway capability drill |
 | Delivered requires owner merge and main reachability | `TestPullRequestReachedMainRejectsNonOwnerAndBotMergers`, `TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier` |
