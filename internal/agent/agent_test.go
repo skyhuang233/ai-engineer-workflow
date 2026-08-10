@@ -3,6 +3,7 @@ package agent_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ type fakeRuntime struct {
 	blockDiagnostics              bool
 	refreshedAuth                 []byte
 	deleteCodexAuthDuringDelivery bool
+	beforeDeliveryReturn          func(time.Time) error
 }
 
 type blockingFailureRuntime struct {
@@ -66,7 +68,13 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 			output = r.deliveryOutput
 		}
 		r.deliveryDeadline, _ = ctx.Deadline()
-		return worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}, nil
+		result := worker.Result{Output: output, Stdout: output, ContainerID: "delivery-container"}
+		if r.beforeDeliveryReturn != nil {
+			if err := r.beforeDeliveryReturn(r.deliveryDeadline); err != nil {
+				return result, err
+			}
+		}
+		return result, nil
 	}
 	marker := "initial"
 	if slices.Contains(spec.Command, "resume") {
@@ -774,6 +782,69 @@ func TestControllerAuditsDeliveryBeforePostRunAuthenticationInspection(t *testin
 	}
 	if audit.ContainerID != "delivery-container" || audit.ImageDigest != runtime.specs[1].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !strings.Contains(audit.ToolVersionsJSON, `"github-cli":"2.97.0"`) {
 		t.Fatalf("post-delivery authentication audit = %#v", audit)
+	}
+}
+
+func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
+	runtime.beforeDeliveryReturn = func(deadline time.Time) error {
+		if deadline.IsZero() {
+			return errors.New("Delivery Controller deadline is missing")
+		}
+		runs, err := db.ActiveRecoveryRuns(context.Background(), version.ID, deadline.Add(time.Second))
+		if err != nil {
+			return err
+		}
+		if len(runs) != 0 {
+			return fmt.Errorf("active recovery runs after expiry = %#v", runs)
+		}
+		return nil
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); !errors.Is(err, store.ErrInvalidClaim) {
+		t.Fatalf("expired Delivery Controller completion = %v, want active-lease rejection", err)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime specs = %#v", runtime.specs)
+	}
+	deliverySpec := runtime.specs[1]
+	deliveryGeneration := claim.LeaseGeneration + 1
+	audit, err := db.WorkerAudit(ctx, deliverySpec.RunID)
+	if err != nil {
+		t.Fatalf("expired Delivery Controller audit: %v", err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != deliverySpec.ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) {
+		t.Fatalf("expired Delivery Controller audit = %#v", audit)
+	}
+	if err := db.RecordWorkerAudit(ctx, store.WorkerAudit{RunID: deliverySpec.RunID, LeaseGeneration: deliveryGeneration, ImageDigest: "sha256:replacement"}); err == nil {
+		t.Fatal("expired Delivery Controller audit was mutable")
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var auditCount int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_audits WHERE run_id = ?`, deliverySpec.RunID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expired Delivery Controller audits = %d, want 1", auditCount)
+	}
+	var runState, leaseState string
+	if err := raw.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, deliverySpec.RunID).Scan(&runState, &leaseState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != "failed" || leaseState != "expired" {
+		t.Fatalf("expired Delivery Controller state = %q/%q", runState, leaseState)
 	}
 }
 

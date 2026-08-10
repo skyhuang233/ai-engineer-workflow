@@ -90,7 +90,7 @@ type AgentBinding struct {
 
 type WorkerAudit struct {
 	RunID                  string
-	LeaseToken             string
+	LeaseGeneration        int64
 	ContainerID            string
 	ImageDigest            string
 	Mounts                 any
@@ -424,7 +424,7 @@ func (s *Store) BindAgent(ctx context.Context, binding AgentBinding) (TicketSess
 }
 
 func (s *Store) RecordWorkerAudit(ctx context.Context, audit WorkerAudit) error {
-	if audit.RunID == "" || audit.LeaseToken == "" || audit.ImageDigest == "" {
+	if audit.RunID == "" || audit.LeaseGeneration <= 0 || audit.ImageDigest == "" {
 		return ErrInvalidClaim
 	}
 	mounts, err := json.Marshal(audit.Mounts)
@@ -440,8 +440,8 @@ func (s *Store) RecordWorkerAudit(ctx context.Context, audit WorkerAudit) error 
 		return err
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO worker_audits(run_id, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials, created_at)
-SELECT r.run_id, ?, ?, ?, ?, ?, ?, ? FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND r.state = ? AND l.state = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(extraHosts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseToken, RunRunning, LeaseActive)
+SELECT r.run_id, ?, ?, ?, ?, ?, ?, ? FROM worker_runs r
+WHERE r.run_id = ? AND r.lease_generation = ?`, audit.ContainerID, audit.ImageDigest, string(mounts), string(extraHosts), string(versions), boolInt(audit.GitHubWriteCredentials), formatTimestamp(time.Now()), audit.RunID, audit.LeaseGeneration)
 	if err != nil {
 		return err
 	}

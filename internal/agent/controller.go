@@ -58,7 +58,10 @@ type Candidate struct {
 	StructuredOutput []byte
 }
 
-const codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
+const (
+	codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
+	workerAuditTimeout         = 10 * time.Second
+)
 
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
 	if c.Store == nil || c.Runtime == nil {
@@ -133,9 +136,10 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	result, runErr := c.Runtime.Run(runCtx, spec)
 	defer cancelRun()
+	auditErr := c.recordLaunchedWorkerAudit(request.Claim, result, spec)
 	handoffCtx := context.WithoutCancel(ctx)
-	if err := c.Store.RecordWorkerAudit(handoffCtx, launchedWorkerAudit(request.Claim, result, spec)); err != nil {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, preRunRedactor.String(err.Error()), "", nil)
+	if auditErr != nil {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, preRunRedactor.String(auditErr.Error()), "", nil)
 	}
 	output := runtimeOutput(result)
 	postRunRedactor, err := c.Workspace.authenticationRedactor(ws)
@@ -329,10 +333,11 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
+	auditErr := c.recordLaunchedWorkerAudit(deliveryClaim, deliveryResult, deliverySpec)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
-	if err := c.Store.RecordWorkerAudit(finalizationCtx, launchedWorkerAudit(deliveryClaim, deliveryResult, deliverySpec)); err != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(err.Error())))
+	if auditErr != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(auditErr.Error())))
 	}
 	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
@@ -403,9 +408,15 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 
 func launchedWorkerAudit(claim store.TicketClaim, result worker.Result, spec worker.Spec) store.WorkerAudit {
 	return store.WorkerAudit{
-		RunID: claim.RunID, LeaseToken: claim.LeaseToken, ContainerID: result.ContainerID,
+		RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ContainerID: result.ContainerID,
 		ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions,
 	}
+}
+
+func (c Controller) recordLaunchedWorkerAudit(claim store.TicketClaim, result worker.Result, spec worker.Spec) error {
+	auditCtx, cancelAudit := context.WithTimeout(context.Background(), workerAuditTimeout)
+	defer cancelAudit()
+	return c.Store.RecordWorkerAudit(auditCtx, launchedWorkerAudit(claim, result, spec))
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
