@@ -1295,7 +1295,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	source := initRepository(t)
 	root := t.TempDir()
 	db, _, claim := createClaim(t, ctx, root)
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	workspacePath := filepath.Join(root, "workspace")
 	for _, command := range [][]string{
 		{"clone", "--config", "core.autocrlf=false", source, workspacePath},
@@ -1327,12 +1327,37 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		t.Fatal(err)
 	}
 	oldImage := "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	oldTools := map[string]string{"codex": "1.0.0", "github-cli": "2.97.0", "go": "1.25.12", "no-mistakes": "v1.0.0"}
+	oldTools := map[string]string{"codex": "1.0.0", "go": "1.25.12", "no-mistakes": "v1.0.0"}
 	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{
 		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: strings.TrimSpace(string(head)),
 		StructuredOutput: []byte(`{"summary":"accepted","checks":[{"command":"go test","outcome":"passed"}]}`), ImageDigest: oldImage, ToolVersions: oldTools, Now: time.Now().UTC(),
 		Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"},
 	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", filepath.Join(root, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DELETE FROM schema_migrations WHERE version = 48",
+		"ALTER TABLE worker_runs DROP COLUMN delivery_runtime_candidate_run_id",
+		"ALTER TABLE worker_audits DROP COLUMN lease_generation",
+		"DROP TABLE worker_container_results",
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(ctx, filepath.Join(root, "workflow.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1348,8 +1373,12 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
 		t.Fatalf("resume original ready Delivery Worker Run: %v", err)
 	}
-	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != oldTools["github-cli"] {
+	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != "2.97.0" {
 		t.Fatalf("original Delivery Worker runtime = %#v, want Candidate runtime", runtime.specs)
+	}
+	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
+	if err != nil || candidateTools["github-cli"] != "" {
+		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
 	}
 	audit, err := db.WorkerAudit(ctx, deliveryClaim.RunID)
 	if err != nil || audit.ImageDigest != oldImage || audit.LeaseGeneration != deliveryClaim.LeaseGeneration || audit.ContainerID != "delivery-container" {

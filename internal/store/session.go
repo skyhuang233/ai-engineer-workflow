@@ -11,6 +11,7 @@ import (
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 var ErrSessionConflict = errors.New("ticket session identity conflict")
@@ -531,7 +532,7 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).
 		return "", nil, err
 	}
 	var toolVersions map[string]string
-	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validWorkerToolVersions(toolVersions) {
+	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validCandidateToolVersions(toolVersions) {
 		return "", nil, ErrInvalidClaim
 	}
 	return imageDigest, toolVersions, nil
@@ -541,12 +542,13 @@ func (s *Store) DeliveryWorkerRuntime(ctx context.Context, claim TicketClaim) (s
 	if claim.RunID == "" || claim.LeaseGeneration <= 0 {
 		return "", nil, false, ErrInvalidClaim
 	}
-	var candidateRunID, imageDigest, toolVersionsJSON string
-	err := s.db.QueryRowContext(ctx, `SELECT r.delivery_runtime_candidate_run_id, COALESCE(c.image_digest, ''), COALESCE(c.tool_versions_json, '{}')
+	var candidateRunID, imageDigest, toolVersionsJSON, manifestJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT r.delivery_runtime_candidate_run_id, COALESCE(c.image_digest, ''), COALESCE(c.tool_versions_json, '{}'), COALESCE(release.manifest_json, '')
 FROM worker_runs r
 LEFT JOIN candidate_revisions c ON c.run_id = r.delivery_runtime_candidate_run_id AND c.session_id = r.session_id
+LEFT JOIN worker_releases release ON release.image_digest = c.image_digest
 WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ?`, claim.RunID, claim.LeaseGeneration, RunDelivery).
-		Scan(&candidateRunID, &imageDigest, &toolVersionsJSON)
+		Scan(&candidateRunID, &imageDigest, &toolVersionsJSON, &manifestJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil, false, ErrInvalidClaim
 	}
@@ -557,10 +559,33 @@ WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ?`, claim.RunID, 
 		return "", nil, false, nil
 	}
 	var toolVersions map[string]string
-	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validWorkerToolVersions(toolVersions) {
+	if imageDigest == "" || json.Unmarshal([]byte(toolVersionsJSON), &toolVersions) != nil || !validCandidateToolVersions(toolVersions) {
 		return "", nil, false, ErrInvalidClaim
 	}
+	if !validWorkerToolVersions(toolVersions) {
+		provenance, err := workerrelease.DecodeToolProvenance([]byte(manifestJSON))
+		if err != nil {
+			return "", nil, false, ErrInvalidClaim
+		}
+		manifestTools, _ := provenance.ToolVersions()
+		for _, tool := range []string{"codex", "go", "no-mistakes"} {
+			if strings.TrimSpace(toolVersions[tool]) != strings.TrimSpace(manifestTools[tool]) {
+				return "", nil, false, ErrInvalidClaim
+			}
+		}
+		toolVersions = manifestTools
+	}
 	return imageDigest, toolVersions, true, nil
+}
+
+func validCandidateToolVersions(toolVersions map[string]string) bool {
+	for _, tool := range []string{"codex", "go", "no-mistakes"} {
+		if strings.TrimSpace(toolVersions[tool]) == "" {
+			return false
+		}
+	}
+	githubCLI, present := toolVersions["github-cli"]
+	return !present || strings.TrimSpace(githubCLI) != ""
 }
 
 func validWorkerToolVersions(toolVersions map[string]string) bool {
