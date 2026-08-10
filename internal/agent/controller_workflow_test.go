@@ -29,13 +29,13 @@ func TestDeliveryControllerFailsClosedWithoutWorkflowIdentity(t *testing.T) {
 
 	for name, session := range map[string]store.TicketSession{
 		"missing delivery cycle": {AcceptedCandidateRunID: "candidate-run"},
-		"missing revision round":  {SessionID: "ticket-session"},
+		"missing revision round": {SessionID: "ticket-session"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runtime := &recordingDeliveryRuntime{}
 			controller := Controller{Store: db, Runtime: runtime, GatewayURL: "http://gateway.test"}
 
-			err := controller.runDeliveryController(ctx, store.TicketClaim{}, session, workspace{}, store.CandidatePublication{}, "deliver", "sha256:image", map[string]string{"no-mistakes": "v1"})
+			err := controller.runDeliveryController(ctx, store.TicketClaim{}, session, workspace{}, store.CandidatePublication{}, "deliver")
 			if err == nil || !strings.Contains(err.Error(), "Delivery Cycle or Revision Round is incomplete") {
 				t.Fatalf("missing workflow identity error = %v", err)
 			}

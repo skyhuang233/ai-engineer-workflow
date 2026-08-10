@@ -335,7 +335,7 @@ func TestRecoverIsolatesExpiredContainerBeforeReplacementRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordWorkerAudit(ctx, store.WorkerAudit{RunID: expired.RunID, LeaseGeneration: expired.LeaseGeneration, ImageDigest: "sha256:old", ToolVersions: map[string]string{"codex": "1"}}); err != nil {
+	if err := db.ReserveWorkerLaunch(ctx, expired, store.WorkerAudit{RunID: expired.RunID, LeaseGeneration: expired.LeaseGeneration, ImageDigest: "sha256:old", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, claimedAt); err != nil {
 		t.Fatal(err)
 	}
 	var isolated []string

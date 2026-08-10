@@ -631,10 +631,11 @@ func TestReserveWorkerLaunchAllowsOnlyOneStarter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ReserveWorkerLaunch(ctx, claim, now); err != nil {
+	audit := WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}
+	if err := db.ReserveWorkerLaunch(ctx, claim, audit, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ReserveWorkerLaunch(ctx, claim, now); !errors.Is(err, ErrWorkerLaunched) {
+	if err := db.ReserveWorkerLaunch(ctx, claim, audit, now); !errors.Is(err, ErrWorkerLaunched) {
 		t.Fatalf("second launch reservation = %v, want ErrWorkerLaunched", err)
 	}
 }
