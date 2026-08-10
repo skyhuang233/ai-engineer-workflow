@@ -9,8 +9,9 @@ import (
 
 func TestValidateLocalRemotesAcceptsContainerAbsoluteGateAndRejectsNetworkURL(t *testing.T) {
 	dir := t.TempDir()
+	origin := t.TempDir()
 	gitTestCommand(t, dir, "init")
-	gitTestCommand(t, dir, "remote", "add", "origin", `C:\host\source`)
+	gitTestCommand(t, dir, "remote", "add", "origin", origin)
 	gitTestCommand(t, dir, "remote", "add", "no-mistakes", "/codex-state/no-mistakes/repos/ticket.git")
 	if err := validateLocalRemotes(context.Background(), dir); err != nil {
 		t.Fatalf("container-local gate remote rejected: %v", err)
