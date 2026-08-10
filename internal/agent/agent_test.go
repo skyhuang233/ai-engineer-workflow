@@ -1113,7 +1113,7 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	}
 }
 
-func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T) {
+func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWorker(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1141,6 +1141,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending delivery claims = %#v, %v", pending, err)
 	}
+	retryRunID := pending[0].RunID
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
@@ -1158,8 +1159,25 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundary(t *testing.T
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
 	}
-	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
-		t.Fatalf("retried delivery image = %q, want accepted Candidate image", retryRuntime.specs[0].ImageDigest)
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
+		t.Fatalf("retried delivery image = %q, want Active Worker image", retryRuntime.specs[0].ImageDigest)
+	}
+	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
+		t.Fatalf("retried delivery tools = %#v, want Active Worker tools", retryRuntime.specs[0].ToolVersions)
+	}
+	candidateImage, candidateTools, err := db.CandidateWorkerRuntime(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidateImage != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
+		t.Fatalf("accepted Candidate runtime changed during delivery recovery: image=%q tools=%#v", candidateImage, candidateTools)
+	}
+	audit, err := db.WorkerAudit(ctx, retryRunID)
+	if err != nil {
+		t.Fatalf("retried Delivery Controller audit: %v", err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != retryRuntime.specs[0].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) {
+		t.Fatalf("retried Delivery Controller audit = %#v", audit)
 	}
 	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, claim.RunID, pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())

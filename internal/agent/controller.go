@@ -244,9 +244,9 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err := validateLocalRemotes(finalizationCtx, ws.Path); err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	imageDigest, toolVersions, err := c.Store.CandidateWorkerRuntime(finalizationCtx, claim.VersionID, claim.TicketID)
+	imageDigest, toolVersions, err := c.activeWorkerRuntime(finalizationCtx)
 	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("resolve accepted Candidate runtime: %w", err))
+		return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("resolve Active Worker runtime for delivery recovery: %w", err))
 	}
 	publication := store.CandidatePublication{
 		Repository:         delivery.Repository,
@@ -336,6 +336,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
 	deliveryRedactor := preDeliveryRedactor.Merge(postDeliveryRedactor)
+	if err := c.Store.RecordWorkerAudit(finalizationCtx, store.WorkerAudit{RunID: deliveryClaim.RunID, LeaseToken: deliveryClaim.LeaseToken, ContainerID: deliveryResult.ContainerID, ImageDigest: deliverySpec.ImageDigest, Mounts: deliverySpec.Mounts, ExtraHosts: deliverySpec.ExtraHosts, ToolVersions: deliverySpec.ToolVersions}); err != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(err.Error())))
+	}
 	if outcome, parseErr := parseDeliveryOutcome(runtimeStdout(deliveryResult)); parseErr == nil && outcome.Gate != nil {
 		if _, err := c.Store.PauseDeliveryControllerForQualityGate(finalizationCtx, deliveryClaim, *outcome.Gate, c.now()); err != nil {
 			return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
