@@ -82,6 +82,8 @@ jobs:
             echo "no-mistakes emitted an unrecognized version string: $no_mistakes_output" >&2
             exit 1
           fi
+          docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu \
+            'no-mistakes daemon start; no-mistakes daemon status'
           worker_container="$(docker create "workflow-worker:${{ steps.pins.outputs.worker_version }}")"
           trap 'docker rm --force "$worker_container" >/dev/null' EXIT
           worker_binary="$RUNNER_TEMP/no-mistakes"

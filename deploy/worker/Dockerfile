@@ -13,7 +13,7 @@ ARG NO_MISTAKES_FORK_RELEASE=workflow-v1.41.2.2
 ARG NO_MISTAKES_SHA256=bd19d18ba20af1905b0f13ac6b0f9c283d299da48279da7dd0a5ff2242a58d4c
 
 ENV DEBIAN_SNAPSHOT=20260713T000000Z \
-    APT_PACKAGES="ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2" \
+    APT_PACKAGES="ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 procps=2:4.0.2-3 sqlite3=3.40.1-2+deb12u2" \
     PATH="/usr/local/go/bin:${PATH}"
 
 LABEL org.opencontainers.image.source="https://github.com/skyhuang233/ai-engineer-workflow"

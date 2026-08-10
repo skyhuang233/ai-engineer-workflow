@@ -114,6 +114,14 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 	if strings.Contains(probeScript, "go version -m") {
 		t.Fatalf("general Worker probe contains build metadata command: %q", probeScript)
 	}
+	for _, required := range []string{"no-mistakes daemon start", "no-mistakes daemon status"} {
+		if !strings.Contains(probeScript, required) {
+			t.Fatalf("general Worker probe omits Delivery Controller runtime check %q: %q", required, probeScript)
+		}
+	}
+	if command := strings.Join(executor.commands[2], " "); !strings.Contains(command, "--env NM_HOME=/codex-state/no-mistakes") {
+		t.Fatalf("general Worker probe omits persistent no-mistakes home: %q", command)
+	}
 	metadataCommand := strings.Join(executor.commands[3], " ")
 	wantMetadataCommand := "docker run --rm --entrypoint /usr/local/go/bin/go ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb version -m /usr/local/bin/no-mistakes"
 	if metadataCommand != wantMetadataCommand {

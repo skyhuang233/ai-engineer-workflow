@@ -23,7 +23,7 @@ func TestWorkerDockerfilePinsAPTInputsAndNoMistakesCommit(t *testing.T) {
 		"https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}",
 		"apt-get update -o Acquire::Check-Valid-Until=false -o Acquire::https::Verify-Peer=false",
 		"apt-get install --yes --no-install-recommends -o Acquire::https::Verify-Peer=false ca-certificates=20230311+deb12u1",
-		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 sqlite3=3.40.1-2+deb12u2\"",
+		"APT_PACKAGES=\"ca-certificates=20230311+deb12u1 curl=7.88.1-10+deb12u15 git=1:2.39.5-0+deb12u3 jq=1.6-2.1+deb12u2 procps=2:4.0.2-3 sqlite3=3.40.1-2+deb12u2\"",
 		"io.workflow.debian.snapshot",
 		"io.workflow.apt.packages",
 		"GO_VERSION=1.25.12",
@@ -67,6 +67,8 @@ func TestWorkerContractRequiresCleanNoMistakesBuild(t *testing.T) {
 		"vcs\\.revision",
 		"vcs\\.modified",
 		"test \"${embedded_no_mistakes_modified[0]}\" = false",
+		"no-mistakes daemon start",
+		"no-mistakes daemon status",
 	} {
 		if !strings.Contains(string(contents), required) {
 			t.Fatalf("Worker contract omits immutable no-mistakes build check %q", required)

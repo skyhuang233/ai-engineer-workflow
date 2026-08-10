@@ -252,6 +252,8 @@ codex --version
 gh --version
 go version
 no-mistakes --version
+no-mistakes daemon start
+no-mistakes daemon status
 env | cut -d= -f1`
 	dockerCommand := []string{"docker", "run", "--rm"}
 	dockerCommand = append(dockerCommand, worker.CodexSandboxDockerArgs()...)
@@ -260,6 +262,7 @@ env | cut -d= -f1`
 		"--mount", "type=bind,src="+workspace+",dst=/workspace",
 		"--mount", "type=bind,src="+codexState+",dst=/codex-state",
 		"--env", "CODEX_HOME=/codex-state",
+		"--env", "NM_HOME=/codex-state/no-mistakes",
 		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN="+token,
 		"--env", fmt.Sprintf("WORKFLOW_GATEWAY_PROBE_PORT=%d", port),
 		image, "sh", "-ceu", script,
@@ -295,7 +298,7 @@ env | cut -d= -f1`
 	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.NoMistakesForkCommit); err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, and absence of GitHub write credentials verified"}
+	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, no-mistakes daemon, and absence of GitHub write credentials verified"}
 }
 
 type WorkerRegistryCheck struct {
