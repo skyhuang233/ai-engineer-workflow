@@ -288,6 +288,53 @@ func TestVerifiedGitHubAppTokenSourceRejectsLiveSelectionDriftBeforeCachedToken(
 	}
 }
 
+func TestLoadVerifiedGitHubAppProviderRejectsLiveDriftBeforeTokenUse(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	keyFile := filepath.Join(t.TempDir(), "github-app.pem")
+	privateKeyPEM := testGitHubAppPrivateKeyPEM(t)
+	if err := os.WriteFile(keyFile, privateKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/repos/owner/integration/installation" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "repository_selection": "selected", "account": map[string]string{"login": "owner"}})
+	}))
+	defer server.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{TestRepository: "owner/integration", Credential: doctor.GitHubCredentialPin{
+		Owner: "owner", PrivateKeyFile: keyFile, Permissions: map[string]string{"metadata": "read"},
+	}}}
+	if err := db.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
+		FingerprintSHA256: privateKeyFingerprint(privateKeyPEM), AppID: 123, InstallationID: 42,
+		Owner: "owner", IntegrationRepository: "owner/integration", VerifiedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = loadVerifiedGitHubAppProvider(ctx, db, config, server.URL, server.Client())
+	if !errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		t.Fatalf("live installation drift error = %v", err)
+	}
+	if len(paths) != 1 || paths[0] != "/repos/owner/integration/installation" {
+		t.Fatalf("GitHub calls before drift rejection = %#v", paths)
+	}
+	if err := persistGitHubAppAdmissionError(ctx, db, err, time.Now().UTC()); !errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		t.Fatalf("persist live drift pause = %v", err)
+	}
+	paused, reason, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || !paused || reason != store.ControlPlaneGitHubAppRecoveryRemediation {
+		t.Fatalf("live drift pause = %t, %q, %v", paused, reason, pauseErr)
+	}
+}
+
 func testGitHubAppPrivateKeyPEM(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -626,7 +673,7 @@ func TestPersistGitHubAppPauseCreatesLocalRecoveryInbox(t *testing.T) {
 		t.Fatalf("Gateway writes paused = %t, %v", paused, err)
 	}
 	inbox, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
-	if err != nil || inbox.State != "open" {
+	if err != nil || inbox.State != "open" || inbox.Title != store.ControlPlaneGitHubAppRecoveryTitle || inbox.Body != store.ControlPlaneGitHubAppRecoveryRemediation {
 		t.Fatalf("credential recovery inbox = %#v, %v", inbox, err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)

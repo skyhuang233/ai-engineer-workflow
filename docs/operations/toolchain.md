@@ -65,9 +65,10 @@ Create and install one GitHub App for **All repositories**. Configure `Metadata:
 This command
 verifies Actions read, pushes a temporary Candidate commit, and calls that
 commit's check-runs endpoint to verify Checks read before performing the
-remaining idempotent writes in the dedicated integration repository. Only
-after the complete live contract passes does it record the discovered installation
-and resume writes; it then cleans up its temporary branch, issue, and PR. During
+remaining idempotent writes and cleaning up its temporary branch, issue, and PR
+in the dedicated integration repository. Only after the complete live contract,
+including cleanup, passes does it record the discovered installation and resume
+writes. During
 verification, the durable Gateway
 rotation pauses new writes and safely recovers an expired claim before the live
 contract runs; a failed replacement leaves writes paused. A Gateway that starts

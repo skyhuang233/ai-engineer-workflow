@@ -237,12 +237,7 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	defer database.Close()
-	verification, verificationErr := database.GitHubAppVerification(context.Background())
-	if verificationErr != nil && !errors.Is(verificationErr, store.ErrNotFound) {
-		fmt.Fprintln(os.Stderr, verificationErr)
-		os.Exit(1)
-	}
-	provider, err := loadVerifiedGitHubAppProvider(context.Background(), database, config, "", nil)
+	provider, verification, privateKeyPEM, err := loadVerifiedGitHubAppProvider(context.Background(), database, config, "", nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, persistGitHubAppAdmissionError(context.Background(), database, err, time.Now().UTC()))
 		os.Exit(1)
@@ -251,11 +246,6 @@ func runDoctor(args []string) {
 		client := github.NewClient("", token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		return requireOwnerGuardedControlPlaneRepository(context.Background(), client, config.GitHub.TestRepository)
 	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	privateKeyPEM, err := os.ReadFile(config.GitHub.Credential.PrivateKeyFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1063,7 +1053,7 @@ func requireOwnerGuardedControlPlaneRepository(ctx context.Context, client *gith
 }
 
 func admittedControlPlaneGitHubClient(ctx context.Context, database *store.Store, config doctor.Config, apiBase, repository string) (*github.Client, error) {
-	provider, err := loadVerifiedGitHubAppProvider(ctx, database, config, apiBase, nil)
+	provider, _, _, err := loadVerifiedGitHubAppProvider(ctx, database, config, apiBase, nil)
 	if err != nil {
 		return nil, persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
 	}
@@ -1109,7 +1099,7 @@ func runGateway(args []string) {
 		fail(err)
 	}
 	if _, err := credentialSource(context.Background()); shouldPauseGatewayForCredential(err) {
-		if pauseErr := db.PauseGatewayWrites(context.Background(), "Control Plane GitHub App is unavailable; provision it to resume writes", time.Now().UTC()); pauseErr != nil {
+		if pauseErr := db.PauseGatewayWrites(context.Background(), store.ControlPlaneGitHubAppRecoveryRemediation, time.Now().UTC()); pauseErr != nil {
 			_ = db.Close()
 			fail(pauseErr)
 		}
@@ -1175,19 +1165,25 @@ func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error
 	return s.provider.Token(ctx)
 }
 
-func loadVerifiedGitHubAppProvider(ctx context.Context, database *store.Store, config doctor.Config, apiBase string, client *http.Client) (*githubapp.Provider, error) {
+func loadVerifiedGitHubAppProvider(ctx context.Context, database *store.Store, config doctor.Config, apiBase string, client *http.Client) (*githubapp.Provider, store.GitHubAppVerification, []byte, error) {
 	verification, privateKeyPEM, err := verifiedGitHubAppInputs(ctx, database, config)
 	if err != nil {
-		return nil, err
+		return nil, store.GitHubAppVerification{}, nil, err
+	}
+	if _, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
+		AppID: verification.AppID, PrivateKeyPEM: privateKeyPEM, Owner: config.GitHub.Credential.Owner,
+		Repository: config.GitHub.TestRepository, APIBase: apiBase, Client: client,
+	}, verification.InstallationID); err != nil {
+		return nil, store.GitHubAppVerification{}, nil, err
 	}
 	provider, err := githubapp.NewProvider(githubapp.Config{
 		AppID: verification.AppID, InstallationID: verification.InstallationID, PrivateKeyPEM: privateKeyPEM,
 		RequiredPermissions: config.GitHub.Credential.Permissions, APIBase: apiBase, Client: client,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: load verified GitHub App: %v", delivery.ErrGatewayCredentialRejected, err)
+		return nil, store.GitHubAppVerification{}, nil, fmt.Errorf("%w: load verified GitHub App: %v", delivery.ErrGatewayCredentialRejected, err)
 	}
-	return provider, nil
+	return provider, verification, privateKeyPEM, nil
 }
 
 func verifiedGitHubAppInputs(ctx context.Context, database *store.Store, config doctor.Config) (store.GitHubAppVerification, []byte, error) {
@@ -1253,7 +1249,7 @@ func persistGitHubAppPause(ctx context.Context, database *store.Store, credentia
 	if !shouldPauseGatewayForCredential(credentialErr) {
 		return credentialErr
 	}
-	if err := database.PauseGatewayWrites(ctx, "Control Plane GitHub App is unavailable; provision it to resume writes", now); err != nil {
+	if err := database.PauseGatewayWrites(ctx, store.ControlPlaneGitHubAppRecoveryRemediation, now); err != nil {
 		return errors.Join(credentialErr, fmt.Errorf("persist Control Plane GitHub App pause: %w", err))
 	}
 	return credentialErr

@@ -24,6 +24,9 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 	if err := db.PauseGatewayWrites(ctx, "credential rejected", first); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE workflow_inbox SET title = 'Gateway Credential requires attention' WHERE item_key = ?`, GatewayCredentialInboxKey); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.PauseGatewayWrites(ctx, "credential still rejected", first.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +35,7 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 		t.Fatalf("pause = %t, %q, %v", paused, reason, err)
 	}
 	item, err := db.WorkflowInboxItem(ctx, GatewayCredentialInboxKey)
-	if err != nil || item.State != "open" || !item.CreatedAt.Equal(first) {
+	if err != nil || item.State != "open" || item.Title != ControlPlaneGitHubAppRecoveryTitle || !item.CreatedAt.Equal(first) {
 		t.Fatalf("inbox item = %#v, %v", item, err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repository", 0)
