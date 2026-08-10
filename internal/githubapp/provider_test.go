@@ -169,6 +169,57 @@ func TestProviderKeepsSecondaryRateLimitWithoutHeadersRetryable(t *testing.T) {
 	}
 }
 
+func TestProviderClassifiesMissingInstallationAsCredentialUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	provider, err := NewProvider(Config{
+		AppID: 123, InstallationID: 42, PrivateKeyPEM: testPrivateKeyPEM(t),
+		RequiredPermissions: map[string]string{"metadata": "read"}, APIBase: server.URL, Client: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.Token(context.Background())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !errors.Is(err, ErrCredentialUnavailable) || !apiErr.AuthenticationFailure() {
+		t.Fatalf("missing installation error = %#v", err)
+	}
+}
+
+func TestVerifyInstallationClassifiesLiveIdentityAndSelectionDrift(t *testing.T) {
+	privateKey := testPrivateKeyPEM(t)
+	for _, test := range []struct {
+		name                string
+		installationID      int64
+		owner               string
+		repositorySelection string
+		expectedID          int64
+	}{
+		{name: "installation ID", installationID: 84, owner: "owner", repositorySelection: "all", expectedID: 42},
+		{name: "owner", installationID: 42, owner: "different-owner", repositorySelection: "all", expectedID: 42},
+		{name: "repository selection", installationID: 42, owner: "owner", repositorySelection: "selected", expectedID: 42},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": test.installationID, "repository_selection": test.repositorySelection,
+					"account": map[string]string{"login": test.owner},
+				})
+			}))
+			defer server.Close()
+			_, err := VerifyInstallation(context.Background(), DiscoveryConfig{
+				AppID: 123, PrivateKeyPEM: privateKey, Owner: "owner", Repository: "owner/integration",
+				APIBase: server.URL, Client: server.Client(),
+			}, test.expectedID)
+			if !errors.Is(err, ErrCredentialUnavailable) {
+				t.Fatalf("live drift error = %v", err)
+			}
+		})
+	}
+}
+
 func testPrivateKeyPEM(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

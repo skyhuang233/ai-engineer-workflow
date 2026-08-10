@@ -346,18 +346,12 @@ func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
 	if !strings.EqualFold(c.Verification.IntegrationRepository, c.IntegrationRepository) {
 		return Result{Status: Fail, Summary: "GitHub App verification does not match the configured integration repository"}
 	}
-	installation, err := githubapp.DiscoverInstallation(ctx, githubapp.DiscoveryConfig{
+	_, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
 		AppID: c.Verification.AppID, PrivateKeyPEM: c.PrivateKeyPEM, Owner: c.Pin.Owner,
 		Repository: c.IntegrationRepository, APIBase: c.APIBase, Client: c.Client,
-	})
+	}, c.Verification.InstallationID)
 	if err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("discover live GitHub App installation: %v", err), Err: err}
-	}
-	if installation.ID != c.Verification.InstallationID {
-		return Result{Status: Fail, Summary: "live GitHub App installation does not match the verified installation ID"}
-	}
-	if !strings.EqualFold(installation.Owner, c.Pin.Owner) || !installation.AllRepositories {
-		return Result{Status: Fail, Summary: "live GitHub App installation must cover all repositories on the configured owner"}
 	}
 	return Result{Status: Pass, Summary: "GitHub App private key, live all-repositories installation, owner, and verification metadata match"}
 }

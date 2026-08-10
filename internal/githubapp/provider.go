@@ -24,6 +24,13 @@ import (
 
 const refreshWindow = 5 * time.Minute
 
+type credentialUnavailableError struct{}
+
+func (*credentialUnavailableError) Error() string               { return "GitHub App credential is unavailable" }
+func (*credentialUnavailableError) AuthenticationFailure() bool { return true }
+
+var ErrCredentialUnavailable = &credentialUnavailableError{}
+
 type Config struct {
 	AppID               int64
 	InstallationID      int64
@@ -67,14 +74,20 @@ func (e *PermissionError) Error() string {
 	return fmt.Sprintf("GitHub App installation permission %s=%q, require at least %q", e.Name, e.Actual, e.Wanted)
 }
 
-func (*PermissionError) AuthenticationFailure() bool { return true }
+func (*PermissionError) Is(target error) bool { return target == ErrCredentialUnavailable }
+
+func (e *PermissionError) AuthenticationFailure() bool { return errors.Is(e, ErrCredentialUnavailable) }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("%s: HTTP %d: %s", e.Operation, e.StatusCode, e.Message)
 }
 
+func (e *APIError) Is(target error) bool {
+	return target == ErrCredentialUnavailable && (e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusNotFound || (e.StatusCode == http.StatusForbidden && e.RetryAt.IsZero()))
+}
+
 func (e *APIError) AuthenticationFailure() bool {
-	return e.StatusCode == http.StatusUnauthorized || (e.StatusCode == http.StatusForbidden && e.RetryAt.IsZero())
+	return errors.Is(e, ErrCredentialUnavailable)
 }
 
 func (e *APIError) RetryAtTime() time.Time { return e.RetryAt }
@@ -232,10 +245,27 @@ func DiscoverInstallation(ctx context.Context, config DiscoveryConfig) (Installa
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return Installation{}, fmt.Errorf("decode GitHub App installation: %w", err)
 	}
-	if payload.ID <= 0 || !strings.EqualFold(payload.Account.Login, strings.TrimSpace(config.Owner)) || payload.RepositorySelection != "all" {
-		return Installation{}, errors.New("GitHub App must be installed for all repositories on the configured owner")
+	if payload.ID <= 0 {
+		return Installation{}, fmt.Errorf("%w: live installation returned an invalid ID", ErrCredentialUnavailable)
+	}
+	if !strings.EqualFold(payload.Account.Login, strings.TrimSpace(config.Owner)) {
+		return Installation{}, fmt.Errorf("%w: live installation owner %q does not match configured owner %q", ErrCredentialUnavailable, payload.Account.Login, strings.TrimSpace(config.Owner))
+	}
+	if payload.RepositorySelection != "all" {
+		return Installation{}, fmt.Errorf("%w: live installation repository_selection=%q, require %q", ErrCredentialUnavailable, payload.RepositorySelection, "all")
 	}
 	return Installation{ID: payload.ID, Owner: payload.Account.Login, AllRepositories: true}, nil
+}
+
+func VerifyInstallation(ctx context.Context, config DiscoveryConfig, expectedInstallationID int64) (Installation, error) {
+	installation, err := DiscoverInstallation(ctx, config)
+	if err != nil {
+		return Installation{}, err
+	}
+	if expectedInstallationID <= 0 || installation.ID != expectedInstallationID {
+		return Installation{}, fmt.Errorf("%w: live installation ID %d does not match verified installation ID %d", ErrCredentialUnavailable, installation.ID, expectedInstallationID)
+	}
+	return installation, nil
 }
 
 func signAppJWT(appID int64, privateKey *rsa.PrivateKey, now time.Time) (string, error) {

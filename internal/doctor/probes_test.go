@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/credential"
+	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
@@ -314,7 +316,7 @@ func TestGitHubCredentialCheckRejectsLiveInstallationDrift(t *testing.T) {
 				Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
 				PrivateKeyPEM: privateKeyPEM, Verification: verification, APIBase: server.URL, Client: server.Client(),
 			}).Run(context.Background())
-			if result.Status != Fail {
+			if result.Status != Fail || !errors.Is(result.Err, githubapp.ErrCredentialUnavailable) || (Report{Results: []Result{result}}).AuthenticationFailure() == nil {
 				t.Fatalf("credential check accepted live %s drift: %#v", tt.name, result)
 			}
 		})

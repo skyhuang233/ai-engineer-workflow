@@ -1155,6 +1155,12 @@ func (s *verifiedGitHubAppTokenSource) Token(ctx context.Context) (string, error
 	if err != nil {
 		return "", err
 	}
+	if _, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
+		AppID: verification.AppID, PrivateKeyPEM: privateKeyPEM, Owner: s.Config.GitHub.Credential.Owner,
+		Repository: s.Config.GitHub.TestRepository, APIBase: s.APIBase, Client: s.Client,
+	}, verification.InstallationID); err != nil {
+		return "", err
+	}
 	identity := fmt.Sprintf("%d/%d/%s/%s", verification.AppID, verification.InstallationID, verification.FingerprintSHA256, verification.VerifiedAt.UTC().Format(time.RFC3339Nano))
 	if s.provider == nil || s.identity != identity {
 		s.provider, err = githubapp.NewProvider(githubapp.Config{
@@ -1218,13 +1224,10 @@ func (e githubAppVerificationStoreError) Unwrap() error          { return e.err 
 func (e githubAppVerificationStoreError) PollStoreFailure() bool { return true }
 
 func shouldPauseGatewayForCredential(err error) bool {
-	return errors.Is(err, delivery.ErrGatewayCredentialRejected)
+	return errors.Is(err, delivery.ErrGatewayCredentialRejected) || errors.Is(err, githubapp.ErrCredentialUnavailable)
 }
 
 func recordPollAdmissionFailure(ctx context.Context, poller github.Poller, repository string, admissionErr error) error {
-	if shouldPauseGatewayForCredential(admissionErr) && !errors.Is(admissionErr, delivery.ErrGatewayCredentialRejected) {
-		admissionErr = fmt.Errorf("%w: Control Plane GitHub App is unavailable: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
-	}
 	_, err := poller.RecordAdmissionFailure(ctx, repository, admissionErr)
 	return err
 }
@@ -1241,11 +1244,7 @@ func admitPollGitHubCredential(ctx context.Context, poller github.Poller, provid
 		err = authenticate(token)
 	}
 	if err != nil {
-		var authenticationFailure interface{ AuthenticationFailure() bool }
-		if errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
-			err = fmt.Errorf("%w: GitHub rejected the Control Plane GitHub App credential: %w", delivery.ErrGatewayCredentialRejected, err)
-		}
-		return "", err
+		return "", normalizeGitHubAppCredentialError(err)
 	}
 	return token, nil
 }
@@ -1272,11 +1271,21 @@ func admitControlPlaneGitHubApp(ctx context.Context, database *store.Store, prov
 }
 
 func persistGitHubAppAdmissionError(ctx context.Context, database *store.Store, admissionErr error, now time.Time) error {
-	var authenticationFailure interface{ AuthenticationFailure() bool }
-	if errors.As(admissionErr, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
-		admissionErr = fmt.Errorf("%w: GitHub rejected the Control Plane GitHub App credential: %w", delivery.ErrGatewayCredentialRejected, admissionErr)
+	return persistGitHubAppPause(ctx, database, normalizeGitHubAppCredentialError(admissionErr), now)
+}
+
+func normalizeGitHubAppCredentialError(err error) error {
+	if err == nil || errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		return err
 	}
-	return persistGitHubAppPause(ctx, database, admissionErr, now)
+	if errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		return fmt.Errorf("%w: Control Plane GitHub App is unavailable: %w", delivery.ErrGatewayCredentialRejected, err)
+	}
+	var authenticationFailure interface{ AuthenticationFailure() bool }
+	if errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure() {
+		return fmt.Errorf("%w: GitHub rejected the Control Plane GitHub App credential: %w", delivery.ErrGatewayCredentialRejected, err)
+	}
+	return err
 }
 
 func fail(err error) {

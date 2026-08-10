@@ -22,9 +22,14 @@ import (
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+type githubTokenProviderFunc func(context.Context) (string, error)
+
+func (f githubTokenProviderFunc) Token(ctx context.Context) (string, error) { return f(ctx) }
 
 func TestProvisionGitHubAppDiscoversInstallationVerifiesContractAndStoresOnlyIdentity(t *testing.T) {
 	ctx := context.Background()
@@ -129,9 +134,16 @@ func TestVerifiedGitHubAppTokenSourceReloadsProvisionedInstallation(t *testing.T
 		t.Fatal(err)
 	}
 	permissions := map[string]string{"metadata": "read"}
+	var liveInstallationMu sync.RWMutex
+	liveInstallationID := int64(42)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/repos/owner/integration/installation":
+			liveInstallationMu.RLock()
+			installationID := liveInstallationID
+			liveInstallationMu.RUnlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": installationID, "repository_selection": "all", "account": map[string]string{"login": "owner"}})
 		case "/app/installations/42/access_tokens":
 			_ = json.NewEncoder(w).Encode(map[string]any{"token": "first_token", "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions})
 		case "/app/installations/84/access_tokens":
@@ -146,6 +158,9 @@ func TestVerifiedGitHubAppTokenSourceReloadsProvisionedInstallation(t *testing.T
 	}}}
 	record := func(appID, installationID int64, key []byte) {
 		t.Helper()
+		liveInstallationMu.Lock()
+		liveInstallationID = installationID
+		liveInstallationMu.Unlock()
 		if err := db.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
 			FingerprintSHA256: privateKeyFingerprint(key), AppID: appID, InstallationID: installationID,
 			Owner: "owner", IntegrationRepository: "owner/integration", VerifiedAt: time.Now().UTC(),
@@ -182,14 +197,17 @@ func TestVerifiedGitHubAppTokenSourceReloadsSameIdentityAfterReprovision(t *test
 	permissions := map[string]string{"metadata": "read"}
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/app/installations/42/access_tokens" {
+		switch r.URL.Path {
+		case "/repos/owner/integration/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "repository_selection": "all", "account": map[string]string{"login": "owner"}})
+		case "/app/installations/42/access_tokens":
+			requests++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token": fmt.Sprintf("token_%d", requests), "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions,
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		requests++
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"token": fmt.Sprintf("token_%d", requests), "expires_at": time.Now().UTC().Add(time.Hour), "permissions": permissions,
-		})
 	}))
 	defer server.Close()
 	config := doctor.Config{GitHub: doctor.GitHubPin{TestRepository: "owner/integration", Credential: doctor.GitHubCredentialPin{
@@ -213,6 +231,60 @@ func TestVerifiedGitHubAppTokenSourceReloadsSameIdentityAfterReprovision(t *test
 	record(verifiedAt.Add(time.Second))
 	if token, err := source.Token(ctx); err != nil || token != "token_2" || requests != 2 {
 		t.Fatalf("reprovisioned installation token = %q, requests=%d, err=%v", token, requests, err)
+	}
+}
+
+func TestVerifiedGitHubAppTokenSourceRejectsLiveSelectionDriftBeforeCachedToken(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	keyFile := filepath.Join(t.TempDir(), "github-app.pem")
+	privateKeyPEM := testGitHubAppPrivateKeyPEM(t)
+	if err := os.WriteFile(keyFile, privateKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var selectionMu sync.RWMutex
+	selection := "all"
+	tokenRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/integration/installation":
+			selectionMu.RLock()
+			liveSelection := selection
+			selectionMu.RUnlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "repository_selection": liveSelection, "account": map[string]string{"login": "owner"}})
+		case "/app/installations/42/access_tokens":
+			tokenRequests++
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "cached_token", "expires_at": time.Now().UTC().Add(time.Hour), "permissions": map[string]string{"metadata": "read"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config := doctor.Config{GitHub: doctor.GitHubPin{TestRepository: "owner/integration", Credential: doctor.GitHubCredentialPin{
+		Owner: "owner", PrivateKeyFile: keyFile, Permissions: map[string]string{"metadata": "read"},
+	}}}
+	if err := db.RecordGitHubAppVerification(ctx, store.GitHubAppVerification{
+		FingerprintSHA256: privateKeyFingerprint(privateKeyPEM), AppID: 123, InstallationID: 42,
+		Owner: "owner", IntegrationRepository: "owner/integration", VerifiedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: server.URL, Client: server.Client()}
+	if token, err := source.Token(ctx); err != nil || token != "cached_token" {
+		t.Fatalf("initial installation token = %q, %v", token, err)
+	}
+	selectionMu.Lock()
+	selection = "selected"
+	selectionMu.Unlock()
+	if token, err := source.Token(ctx); token != "" || !errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		t.Fatalf("selection drift token = %q, err=%v", token, err)
+	}
+	if tokenRequests != 1 {
+		t.Fatalf("installation token requests = %d, want cached token blocked before refresh", tokenRequests)
 	}
 }
 
@@ -419,6 +491,7 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 	}{
 		{name: "missing", err: fmt.Errorf("%w: private key file is missing", delivery.ErrGatewayCredentialRejected), want: true},
 		{name: "rejected", err: fmt.Errorf("%w: fingerprint mismatch", delivery.ErrGatewayCredentialRejected), want: true},
+		{name: "live installation unavailable", err: fmt.Errorf("%w: repository selection drift", githubapp.ErrCredentialUnavailable), want: true},
 		{name: "transient store error", err: errors.New("database temporarily unavailable")},
 		{name: "cancelled", err: context.Canceled},
 	} {
@@ -427,6 +500,29 @@ func TestShouldPauseGatewayForCredential(t *testing.T) {
 				t.Fatalf("should pause = %t, want %t", got, test.want)
 			}
 		})
+	}
+}
+
+func TestGitHubAppAdmissionsNormalizeAndPersistMissingInstallation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	missing := &githubapp.APIError{Operation: "create GitHub App installation token", StatusCode: http.StatusNotFound}
+	provider := githubTokenProviderFunc(func(context.Context) (string, error) { return "", missing })
+	_, err = admitPollGitHubCredential(ctx, github.Poller{Store: db}, provider, "owner/repo", nil)
+	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) || !errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		t.Fatalf("poll-github missing installation error = %v", err)
+	}
+	_, err = admitControlPlaneGitHubApp(ctx, db, provider, nil)
+	if !errors.Is(err, delivery.ErrGatewayCredentialRejected) || !errors.Is(err, githubapp.ErrCredentialUnavailable) {
+		t.Fatalf("Gateway missing installation error = %v", err)
+	}
+	paused, _, pauseErr := db.GatewayWritesPaused(ctx)
+	if pauseErr != nil || !paused {
+		t.Fatalf("Gateway writes paused = %t, %v", paused, pauseErr)
 	}
 }
 
@@ -619,6 +715,7 @@ func TestCredentialAdmissionConsumesBootstrapWithoutTerminalizingWorkers(t *test
 	}{
 		{name: "missing credential", err: fmt.Errorf("%w: private key file is missing", delivery.ErrGatewayCredentialRejected)},
 		{name: "rejected by GitHub", err: &github.APIError{StatusCode: http.StatusUnauthorized}},
+		{name: "missing installation", err: &githubapp.APIError{Operation: "create GitHub App installation token", StatusCode: http.StatusNotFound}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
