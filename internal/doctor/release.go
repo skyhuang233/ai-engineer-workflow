@@ -122,6 +122,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	tag := workerReleaseTag(currentInputs.Config.Worker.Version, currentInputs.Identity)
 	var release struct {
 		TargetCommitish string `json:"target_commitish"`
+		Immutable       bool   `json:"immutable"`
 		Assets          []struct {
 			ID   int64  `json:"id"`
 			Name string `json:"name"`
@@ -130,6 +131,9 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	releasePath := "/repos/" + config.Worker.ReleaseRepository + "/releases/tags/" + tag
 	if err := client.RequestJSON(ctx, http.MethodGet, releasePath, nil, &release); err != nil {
 		return WorkerReleaseManifest{}, nil, fmt.Errorf("read authoritative Worker Release: %w", err)
+	}
+	if !release.Immutable {
+		return WorkerReleaseManifest{}, nil, errors.New("authoritative Worker Release must be immutable")
 	}
 	var manifestAssetID, sbomAssetID int64
 	manifestAssets, sbomAssets := 0, 0
