@@ -21,20 +21,21 @@ import (
 )
 
 type fakeRuntime struct {
-	results          []worker.Result
-	specs            []worker.Spec
-	err              error
-	dirty            bool
-	failAfterCommit  bool
-	switchBranch     bool
-	ignoredFile      bool
-	deliveryOutput   []byte
-	deliveryDeadline time.Time
-	workspaceContent string
-	corruptCodexAuth bool
-	deleteCodexAuth  bool
-	blockDiagnostics bool
-	refreshedAuth    []byte
+	results                       []worker.Result
+	specs                         []worker.Spec
+	err                           error
+	dirty                         bool
+	failAfterCommit               bool
+	switchBranch                  bool
+	ignoredFile                   bool
+	deliveryOutput                []byte
+	deliveryDeadline              time.Time
+	workspaceContent              string
+	corruptCodexAuth              bool
+	deleteCodexAuth               bool
+	blockDiagnostics              bool
+	refreshedAuth                 []byte
+	deleteCodexAuthDuringDelivery bool
 }
 
 type blockingFailureRuntime struct {
@@ -55,6 +56,11 @@ func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Re
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
+		if r.deleteCodexAuthDuringDelivery {
+			if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
+				return worker.Result{}, err
+			}
+		}
 		output := []byte("run:\n  id: delivery-1\n  status: completed\noutcome: checks-passed\n")
 		if len(r.deliveryOutput) > 0 {
 			output = r.deliveryOutput
@@ -726,6 +732,49 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 	if len(projection.Tickets) == 0 || projection.Tickets[0].State != "Needs Attention" {
 		t.Fatalf("authentication-corrupt Run projection = %#v", projection.Tickets)
 	}
+	audit, err := db.WorkerAudit(ctx, claim.RunID)
+	if err != nil || audit.ContainerID != "container-failed" {
+		t.Fatalf("authentication-corrupt Run audit = %#v, %v", audit, err)
+	}
+}
+
+func TestControllerAuditsDeliveryBeforePostRunAuthenticationInspection(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	authSource := filepath.Join(root, "host-auth.json")
+	if err := os.WriteFile(authSource, testChatGPTAuth("delivery-auth"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{
+		results:                       []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deleteCodexAuthDuringDelivery: true,
+	}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource,
+		},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "authentication cache is unavailable") {
+		t.Fatalf("post-delivery authentication error = %v", err)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime specs = %#v", runtime.specs)
+	}
+	audit, err := db.WorkerAudit(ctx, runtime.specs[1].RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != runtime.specs[1].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !strings.Contains(audit.ToolVersionsJSON, `"github-cli":"2.97.0"`) {
+		t.Fatalf("post-delivery authentication audit = %#v", audit)
+	}
 }
 
 func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *testing.T) {
@@ -1146,7 +1195,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
 		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1162,7 +1211,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
 		t.Fatalf("retried delivery image = %q, want Active Worker image", retryRuntime.specs[0].ImageDigest)
 	}
-	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
+	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["github-cli"] != "2.98.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
 		t.Fatalf("retried delivery tools = %#v, want Active Worker tools", retryRuntime.specs[0].ToolVersions)
 	}
 	candidateImage, candidateTools, err := db.CandidateWorkerRuntime(ctx, version.ID, claim.TicketID)
@@ -1183,6 +1232,34 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
+	}
+}
+
+func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
+		Version:        "0.2.0",
+		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
+		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		VerifiedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "invalid release manifest") {
+		t.Fatalf("missing GitHub CLI manifest error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("worker launched with incomplete tool provenance: %#v", runtime.specs)
 	}
 }
 
@@ -1520,7 +1597,7 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 		Version:        "0.1.0",
 		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
+		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","github_cli_version":"2.97.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)

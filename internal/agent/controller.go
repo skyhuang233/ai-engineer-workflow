@@ -134,15 +134,15 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	result, runErr := c.Runtime.Run(runCtx, spec)
 	defer cancelRun()
 	handoffCtx := context.WithoutCancel(ctx)
+	if err := c.Store.RecordWorkerAudit(handoffCtx, launchedWorkerAudit(request.Claim, result, spec)); err != nil {
+		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, preRunRedactor.String(err.Error()), "", nil)
+	}
 	output := runtimeOutput(result)
 	postRunRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, codexAuthenticationFailure, "", nil)
 	}
 	runRedactor := preRunRedactor.Merge(postRunRedactor)
-	if err := c.Store.RecordWorkerAudit(handoffCtx, store.WorkerAudit{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, ContainerID: result.ContainerID, ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions}); err != nil {
-		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
-	}
 	codexOutput := runtimeStdout(result)
 	codexSessionID, _ := parseSessionID(codexOutput, session.CodexSessionID)
 	if codexSessionID != "" && codexSessionID != session.CodexSessionID {
@@ -331,14 +331,14 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
+	if err := c.Store.RecordWorkerAudit(finalizationCtx, launchedWorkerAudit(deliveryClaim, deliveryResult, deliverySpec)); err != nil {
+		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(err.Error())))
+	}
 	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
 	deliveryRedactor := preDeliveryRedactor.Merge(postDeliveryRedactor)
-	if err := c.Store.RecordWorkerAudit(finalizationCtx, store.WorkerAudit{RunID: deliveryClaim.RunID, LeaseToken: deliveryClaim.LeaseToken, ContainerID: deliveryResult.ContainerID, ImageDigest: deliverySpec.ImageDigest, Mounts: deliverySpec.Mounts, ExtraHosts: deliverySpec.ExtraHosts, ToolVersions: deliverySpec.ToolVersions}); err != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(err.Error())))
-	}
 	if outcome, parseErr := parseDeliveryOutcome(runtimeStdout(deliveryResult)); parseErr == nil && outcome.Gate != nil {
 		if _, err := c.Store.PauseDeliveryControllerForQualityGate(finalizationCtx, deliveryClaim, *outcome.Gate, c.now()); err != nil {
 			return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
@@ -390,14 +390,22 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	}
 	var releaseManifest struct {
 		CodexVersion      string `json:"codex_version"`
+		GitHubCLIVersion  string `json:"github_cli_version"`
 		GoVersion         string `json:"go_version"`
 		NoMistakesVersion string `json:"no_mistakes_version"`
 	}
 	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &releaseManifest); err != nil ||
-		releaseManifest.CodexVersion == "" || releaseManifest.GoVersion == "" || releaseManifest.NoMistakesVersion == "" {
+		releaseManifest.CodexVersion == "" || releaseManifest.GitHubCLIVersion == "" || releaseManifest.GoVersion == "" || releaseManifest.NoMistakesVersion == "" {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}
-	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "go": releaseManifest.GoVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
+	return activeRelease.ImageReference, map[string]string{"codex": releaseManifest.CodexVersion, "github-cli": releaseManifest.GitHubCLIVersion, "go": releaseManifest.GoVersion, "no-mistakes": releaseManifest.NoMistakesVersion}, nil
+}
+
+func launchedWorkerAudit(claim store.TicketClaim, result worker.Result, spec worker.Spec) store.WorkerAudit {
+	return store.WorkerAudit{
+		RunID: claim.RunID, LeaseToken: claim.LeaseToken, ContainerID: result.ContainerID,
+		ImageDigest: spec.ImageDigest, Mounts: spec.Mounts, ExtraHosts: spec.ExtraHosts, ToolVersions: spec.ToolVersions,
+	}
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
