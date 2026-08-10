@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1397,7 +1398,8 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "did not pass") {
 		t.Fatalf("failed Delivery Controller error = %v", err)
 	}
-	if _, err := db.CandidateRevision(ctx, claim.RunID); err != nil {
+	candidate, err := db.CandidateRevision(ctx, claim.RunID)
+	if err != nil {
 		t.Fatalf("Candidate acceptance was not durable: %v", err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
@@ -1452,9 +1454,26 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if err != nil {
 		t.Fatalf("retried Delivery Controller audit: %v", err)
 	}
-	if audit.ContainerID != "delivery-container" || audit.ImageDigest != retryRuntime.specs[0].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) {
+	var auditedTools map[string]string
+	if err := json.Unmarshal([]byte(audit.ToolVersionsJSON), &auditedTools); err != nil {
+		t.Fatalf("decode retried Delivery Controller tools audit: %v", err)
+	}
+	var auditedMounts []worker.Mount
+	if err := json.Unmarshal([]byte(audit.MountsJSON), &auditedMounts); err != nil {
+		t.Fatalf("decode retried Delivery Controller mounts audit: %v", err)
+	}
+	if audit.ContainerID != "delivery-container" || audit.ImageDigest != retryRuntime.specs[0].ImageDigest || audit.GitHubWriteCredentials || !strings.Contains(audit.ExtraHostsJSON, worker.GatewayHostMapping) || !reflect.DeepEqual(auditedTools, retryRuntime.specs[0].ToolVersions) || !reflect.DeepEqual(auditedMounts, retryRuntime.specs[0].Mounts) {
 		t.Fatalf("retried Delivery Controller audit = %#v", audit)
 	}
+	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.AcceptedCandidateRunID != claim.RunID || session.AcceptedCommit != candidate.CommitSHA {
+		t.Fatalf("accepted Candidate identity changed during recovery: session=%#v candidate=%#v", session, candidate)
+	}
+	t.Logf("accepted Candidate preserved: run=%s commit=%s image=%s tools=%v", claim.RunID, candidate.CommitSHA, candidateImage, candidateTools)
+	t.Logf("recovery Delivery Worker launched: run=%s image=%s tools=%v mounts=%s extra_hosts=%s github_write_credentials=%t container=%s", retryRunID, audit.ImageDigest, auditedTools, audit.MountsJSON, audit.ExtraHostsJSON, audit.GitHubWriteCredentials, audit.ContainerID)
 	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, claim.RunID, pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {

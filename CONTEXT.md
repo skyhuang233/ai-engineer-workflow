@@ -69,7 +69,7 @@ One ordered candidate-and-validation round within a Delivery Cycle, created for 
 _Avoid_: Delivery Cycle, Worker Run, new pull request
 
 **Worker Run（执行单元）**:
-A numbered, bounded execution episode in which the Ticket Agent actively works on its Executable Ticket.
+A numbered, bounded execution episode in which a Ticket Agent or Delivery Controller operates under a fenced Run Lease for one Ticket Session.
 _Avoid_: Ticket Agent, agent session, Docker task
 
 **Worker Image Release（Worker 镜像发布）**:

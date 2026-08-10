@@ -190,11 +190,10 @@ source-keyed Worker release and must be published by the fixed
 `publish-worker` push workflow after an unambiguous non-bot merge by the
 configured owner. A successful complete run atomically makes that digest the
 Active Worker Image for new Worker Runs; existing runs remain pinned to their
-recorded image. A Delivery Controller recovery retry is itself a new Worker Run
-and uses the Active Worker Image, but the accepted Candidate keeps the original
-Agent Run's runtime provenance. Both the initial Delivery Controller and every
-retry record their actual runtime in the Worker audit. After a production
-activation, save the redacted doctor report and record its result in Issue #7.
+recorded image. [ADR-0009](../adr/0009-adopt-no-mistakes-as-delivery-controller.md)
+owns Delivery Controller recovery runtime selection, Candidate provenance, and
+Worker audit requirements. After a production activation, save the redacted
+doctor report and record its result in Issue #7.
 
 ## Upgrade rule
 
