@@ -69,6 +69,7 @@ func rootCause(err error) error {
 
 type DockerCheck struct {
 	Manifest WorkerReleaseManifest
+	Executor Executor
 }
 
 func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
@@ -194,7 +195,10 @@ func workerCodexFailure(action string, output []byte, err error) Result {
 func (DockerCheck) Name() string { return "Docker Worker contract" }
 
 func (c DockerCheck) Run(ctx context.Context) Result {
-	executor := OSExecutor{}
+	var executor Executor = c.Executor
+	if executor == nil {
+		executor = OSExecutor{}
+	}
 	info, err := executor.Run(ctx, []string{"docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"})
 	if err != nil || strings.TrimSpace(string(info)) != "linux/x86_64" {
 		return Result{Status: Fail, Summary: fmt.Sprintf("Docker Engine must be linux/x86_64: %v (%s)", err, strings.TrimSpace(string(info)))}
@@ -248,7 +252,6 @@ codex --version
 gh --version
 go version
 no-mistakes --version
-go version -m /usr/local/bin/no-mistakes
 env | cut -d= -f1`
 	dockerCommand := []string{"docker", "run", "--rm"}
 	dockerCommand = append(dockerCommand, worker.CodexSandboxDockerArgs()...)
@@ -281,7 +284,15 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
 		}
 	}
-	if err := verifyWorkerNoMistakesBuildMetadata(text, c.Manifest.NoMistakesForkCommit); err != nil {
+	metadataOutput, err := executor.Run(ctx, []string{
+		"docker", "run", "--rm",
+		"--entrypoint", "/usr/local/go/bin/go",
+		image, "version", "-m", "/usr/local/bin/no-mistakes",
+	})
+	if err != nil {
+		return Result{Status: Fail, Summary: fmt.Sprintf("read Worker no-mistakes build metadata: %v (%s)", err, strings.TrimSpace(string(metadataOutput)))}
+	}
+	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.NoMistakesForkCommit); err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
 	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, and absence of GitHub write credentials verified"}
