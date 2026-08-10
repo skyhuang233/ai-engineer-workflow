@@ -83,7 +83,7 @@ jobs:
             exit 1
           fi
           docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu \
-            'no-mistakes daemon start; no-mistakes daemon status'
+            'no-mistakes daemon start; daemon_status="$(no-mistakes daemon status)"; printf "%s\n" "$daemon_status"; case "$daemon_status" in *"daemon running"*) ;; *) echo "no-mistakes daemon is not running" >&2; exit 1 ;; esac'
           worker_container="$(docker create "workflow-worker:${{ steps.pins.outputs.worker_version }}")"
           trap 'docker rm --force "$worker_container" >/dev/null' EXIT
           worker_binary="$RUNNER_TEMP/no-mistakes"

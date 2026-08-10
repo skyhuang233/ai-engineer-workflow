@@ -68,7 +68,8 @@ func TestWorkerContractRequiresCleanNoMistakesBuild(t *testing.T) {
 		"vcs\\.modified",
 		"test \"${embedded_no_mistakes_modified[0]}\" = false",
 		"no-mistakes daemon start",
-		"no-mistakes daemon status",
+		"daemon_status=\"$(no-mistakes daemon status)\"",
+		"*\"daemon running\"*",
 	} {
 		if !strings.Contains(string(contents), required) {
 			t.Fatalf("Worker contract omits immutable no-mistakes build check %q", required)

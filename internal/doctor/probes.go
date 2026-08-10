@@ -253,7 +253,12 @@ gh --version
 go version
 no-mistakes --version
 no-mistakes daemon start
-no-mistakes daemon status
+daemon_status="$(no-mistakes daemon status)"
+printf "%s\n" "$daemon_status"
+case "$daemon_status" in
+  *"daemon running"*) ;;
+  *) echo "no-mistakes daemon is not running" >&2; exit 1 ;;
+esac
 env | cut -d= -f1`
 	dockerCommand := []string{"docker", "run", "--rm"}
 	dockerCommand = append(dockerCommand, worker.CodexSandboxDockerArgs()...)
@@ -281,7 +286,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "gh version " + c.Manifest.GitHubCLIVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "gh version " + c.Manifest.GitHubCLIVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion, "daemon running"}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
