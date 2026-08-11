@@ -244,24 +244,21 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	expectedSourceDigest, err := c.Store.CandidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
+	expectedSourceDigest, err := c.candidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
 	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
-	}
-	if strings.TrimSpace(expectedSourceDigest) == "" {
-		return c.Store.RevalidateDeliverySource(finalizationCtx, claim, "The accepted Candidate Revision lacks verifiable Delivery Source provenance. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain.", c.now())
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 	}
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
 	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
 	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 	}
 	_, statErr := os.Stat(deliverySource)
 	sourceWasMissing := errors.Is(statErr, os.ErrNotExist)
 	if statErr != nil && !sourceWasMissing {
-		return c.failDeliveryControllerWithClass(finalizationCtx, claim, statErr, store.FailureInfrastructure)
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("inspect persisted Delivery Source: %w", statErr)))
 	}
 	sourceRepository, err := admittedSourceRepository(finalizationCtx, session.WorkspacePath, c.SourceRepository)
 	if err != nil {
@@ -270,30 +267,23 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if sourceWasMissing {
 		sourceRepository, err = localSourceRepository(sourceRepository)
 		if err != nil {
-			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
+			return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 		}
 		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
-			return c.failDeliveryControllerWithClass(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err), store.FailureInfrastructure)
+			return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("restore ticket workspace origin: %w", err)))
 		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
 	} else {
 		err = validateDeliverySource(finalizationCtx, deliverySource)
 	}
 	if err != nil {
-		if isDeliverySourceAuthenticationFailure(err) {
-			deferErr := c.Store.DeferDeliveryControllerForCredentialPause(finalizationCtx, claim, c.now())
-			return errors.Join(err, deferErr)
-		}
-		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 	}
-	if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
-		if sourceWasMissing {
-			if removeErr := os.RemoveAll(deliverySource); removeErr != nil {
-				return c.failDeliveryControllerWithClass(finalizationCtx, claim, errors.Join(err, removeErr), store.FailureInfrastructure)
-			}
-			return c.Store.RevalidateDeliverySource(finalizationCtx, claim, "The accepted Candidate Revision's Delivery Source is no longer available at its pinned revision. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain.", c.now())
+	if sourceWasMissing {
+		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
+			removeErr := os.RemoveAll(deliverySource)
+			return c.failDeliverySourcePreflight(finalizationCtx, claim, errors.Join(err, removeErr))
 		}
-		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 	}
 	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
@@ -326,20 +316,17 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if session.SessionID == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Delivery Cycle or Revision Round is incomplete"))
 	}
-	imageDigest, toolVersions, err := c.deliveryWorkerRuntime(ctx, deliveryClaim)
-	if err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, err)
-	}
 	noMistakes := c.NoMistakes
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
-	defaultBranch, err := trustedSourceDefaultBranch(ctx, ws.DeliverySource)
+	defaultBranch, err := c.validateDeliverySourceForLaunch(ctx, session, ws.DeliverySource)
 	if err != nil {
-		return c.failDeliverySourcePreflight(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
-	}
-	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
+	}
+	imageDigest, toolVersions, err := c.deliveryWorkerRuntime(ctx, deliveryClaim)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
@@ -480,16 +467,50 @@ func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string,
 	return branch, err
 }
 
+var (
+	errDeliverySourceProvenanceUnavailable = errors.New("Delivery Source provenance is unavailable")
+	errDeliverySourceDigestMismatch        = errors.New("Delivery Source does not match its pinned Candidate Revision")
+)
+
+func (c Controller) candidateDeliverySourceDigest(ctx context.Context, candidateRunID string) (string, error) {
+	expected, err := c.Store.CandidateDeliverySourceDigest(ctx, candidateRunID)
+	if err != nil {
+		return "", deliverySourceInfrastructureError(fmt.Errorf("load Candidate Delivery Source provenance: %w", err))
+	}
+	if strings.TrimSpace(expected) == "" {
+		return "", deliverySourceIntegrityError(errDeliverySourceProvenanceUnavailable)
+	}
+	return strings.TrimSpace(expected), nil
+}
+
+func (c Controller) validateDeliverySourceForLaunch(ctx context.Context, session store.TicketSession, sourcePath string) (string, error) {
+	expected, err := c.candidateDeliverySourceDigest(ctx, session.AcceptedCandidateRunID)
+	if err != nil {
+		return "", err
+	}
+	if err := validateDeliverySource(ctx, sourcePath); err != nil {
+		return "", err
+	}
+	if err := verifyDeliverySourceDigest(ctx, sourcePath, expected); err != nil {
+		return "", err
+	}
+	branch, err := trustedSourceDefaultBranch(ctx, sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve trusted default branch: %w", err)
+	}
+	return branch, nil
+}
+
 func verifyDeliverySourceDigest(ctx context.Context, sourcePath, expected string) error {
-	if expected == "" {
-		return errors.New("Delivery Source provenance is unavailable")
+	if strings.TrimSpace(expected) == "" {
+		return deliverySourceIntegrityError(errDeliverySourceProvenanceUnavailable)
 	}
 	actual, err := digestDeliverySource(ctx, sourcePath)
 	if err != nil {
 		return err
 	}
-	if actual != expected {
-		return errors.New("Delivery Source does not match its pinned Candidate Revision")
+	if actual != strings.TrimSpace(expected) {
+		return deliverySourceIntegrityError(errDeliverySourceDigestMismatch)
 	}
 	return nil
 }
@@ -686,6 +707,20 @@ func isDeliverySourceAuthenticationFailure(err error) bool {
 }
 
 func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store.TicketClaim, err error) error {
+	if isDeliverySourceAuthenticationFailure(err) {
+		deferErr := c.Store.DeferDeliveryControllerForCredentialPause(ctx, claim, c.now())
+		return errors.Join(err, deferErr)
+	}
+	var integrityFailure *deliverySourceIntegrityFailure
+	if errors.As(err, &integrityFailure) {
+		reason := "The accepted Candidate Revision's Delivery Source failed integrity revalidation. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain."
+		if errors.Is(err, errDeliverySourceProvenanceUnavailable) {
+			reason = "The accepted Candidate Revision lacks verifiable Delivery Source provenance. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain."
+		} else if errors.Is(err, errDeliverySourceDigestMismatch) {
+			reason = "The accepted Candidate Revision's Delivery Source is no longer available at its pinned revision. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain."
+		}
+		return c.Store.RevalidateDeliverySource(ctx, claim, reason, c.now())
+	}
 	var infrastructureFailure *deliverySourceInfrastructureFailure
 	if errors.As(err, &infrastructureFailure) {
 		return c.failDeliveryControllerWithClass(ctx, claim, err, store.FailureInfrastructure)

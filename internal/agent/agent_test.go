@@ -40,6 +40,7 @@ type fakeRuntime struct {
 	refreshedAuth                 []byte
 	deleteCodexAuthDuringDelivery bool
 	beforeDeliveryReturn          func(time.Time) error
+	afterCandidate                func() error
 	deliveryErr                   error
 	deliveryOrigin                string
 }
@@ -166,6 +167,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 			return worker.Result{}, err
 		}
 		*output = bytes.ReplaceAll(*output, []byte(candidateCommitPlaceholder), []byte(strings.TrimSpace(string(commit))))
+	}
+	if r.afterCandidate != nil {
+		if err := r.afterCandidate(); err != nil {
+			return worker.Result{}, err
+		}
 	}
 	return result, nil
 }
@@ -1498,6 +1504,90 @@ func TestControllerRetryDeliveryUsesRetainedSourceWhenCheckoutIsUnavailable(t *t
 	}
 	if len(retryRuntime.specs) != 1 || retryRuntime.deliveryOrigin != "/source-repository" {
 		t.Fatalf("Delivery Controller launch = %#v, origin %q", retryRuntime.specs, retryRuntime.deliveryOrigin)
+	}
+}
+
+func TestControllerRevalidatesDeliverySourceDigestBeforeInitialLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	runtime := &fakeRuntime{
+		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		afterCandidate: func() error {
+			command := exec.Command("git", "--git-dir", deliverySource, "update-ref", "refs/tags/tampered", "refs/heads/main")
+			if output, err := command.CombinedOutput(); err != nil {
+				return fmt.Errorf("tamper Delivery Source: %w (%s)", err, output)
+			}
+			return nil
+		},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: manager, Runtime: runtime,
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("initial Delivery Source revalidation: %v", err)
+	}
+	if len(runtime.specs) != 1 {
+		t.Fatalf("Delivery Controller launched with a mutated source: %#v", runtime.specs)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatalf("claim Delivery Source revalidation: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "no longer available at its pinned revision") {
+		t.Fatalf("Delivery Source revalidation = %#v, prompt %q", revision, prompt)
+	}
+}
+
+func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	controller := agent.Controller{
+		Store: db, Workspace: manager,
+		Runtime: &fakeRuntime{
+			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+		},
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("initial delivery infrastructure failure returned nil error")
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
+	}
+	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	command := exec.Command("git", "--git-dir", deliverySource, "update-ref", "refs/tags/tampered", "refs/heads/main")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("tamper Delivery Source: %v\n%s", err, output)
+	}
+	now = now.Add(2 * time.Minute)
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("revalidate retained Delivery Source: %v", err)
+	}
+	if len(retryRuntime.specs) != 0 {
+		t.Fatalf("Delivery Controller launched with a corrupt retained source: %#v", retryRuntime.specs)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, now.Add(time.Minute), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatalf("claim retained Delivery Source revalidation: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "no longer available at its pinned revision") {
+		t.Fatalf("retained Delivery Source revalidation = %#v, prompt %q", revision, prompt)
 	}
 }
 

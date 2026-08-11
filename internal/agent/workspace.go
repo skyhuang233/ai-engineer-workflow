@@ -636,11 +636,11 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	}
 	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
 	if err != nil {
-		return "", fmt.Errorf("read Delivery Source identity: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source identity: %w", err))
 	}
 	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags")
 	if err != nil {
-		return "", fmt.Errorf("read Delivery Source refs: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source refs: %w", err))
 	}
 	digest := sha256.Sum256([]byte(head + "\n" + strings.TrimSpace(identity) + "\n" + strings.TrimSpace(refs)))
 	return fmt.Sprintf("%x", digest), nil
