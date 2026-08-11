@@ -3,13 +3,35 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/skyhuang233/workflow/internal/delivery"
 )
+
+func TestDeliverySourceAuthenticationFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "credential rejection", err: delivery.ErrGatewayCredentialRejected, want: true},
+		{name: "transient refresh", err: errors.New("network unavailable"), want: false},
+		{name: "filesystem failure", err: os.ErrPermission, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isDeliverySourceAuthenticationFailure(test.err); got != test.want {
+				t.Fatalf("isDeliverySourceAuthenticationFailure() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
 
 func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	ctx := context.Background()

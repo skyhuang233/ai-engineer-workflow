@@ -11,6 +11,7 @@ import (
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	"github.com/skyhuang233/workflow/internal/workerrelease"
@@ -250,7 +251,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
 		if err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
+			if isDeliverySourceAuthenticationFailure(err) {
+				return c.failDeliveryController(finalizationCtx, claim, err)
+			}
+			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 		}
 	} else {
 		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
@@ -307,9 +311,6 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err))
-	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
 		"NM_HOME":                          "/codex-state/no-mistakes",
@@ -363,6 +364,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 			return err
 		}
 		return c.failDeliveryController(ctx, deliveryClaim, err)
+	}
+	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
+		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
 	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
@@ -637,6 +641,14 @@ func failureClass(err error) store.FailureClass {
 		return store.FailureInfrastructure
 	}
 	return store.FailureCodeQuality
+}
+
+func isDeliverySourceAuthenticationFailure(err error) bool {
+	if errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		return true
+	}
+	var authenticationFailure interface{ AuthenticationFailure() bool }
+	return errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure()
 }
 
 func redactFailureError(err error, redactor *codexauth.Redactor) error {
