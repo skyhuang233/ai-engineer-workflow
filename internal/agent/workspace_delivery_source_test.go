@@ -128,6 +128,27 @@ func TestRetainedDeliverySourceStructuralCorruptionIsIntegrity(t *testing.T) {
 		}
 	})
 
+	t.Run("missing reachable object", func(t *testing.T) {
+		manager, source := newManager(t)
+		path, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := gitOutput(ctx, path, "rev-parse", "refs/heads/main^{tree}")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree = strings.TrimSpace(tree)
+		if err := os.Remove(filepath.Join(path, "objects", tree[:2], tree[2:])); err != nil {
+			t.Fatal(err)
+		}
+		_, err = manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		var integrityFailure *deliverySourceIntegrityFailure
+		if !errors.As(err, &integrityFailure) {
+			t.Fatalf("missing retained object classification = %T %v", err, err)
+		}
+	})
+
 	t.Run("context expiry", func(t *testing.T) {
 		manager, source := newManager(t)
 		if _, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source); err != nil {

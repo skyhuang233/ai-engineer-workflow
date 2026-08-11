@@ -19,16 +19,17 @@ import (
 )
 
 type Controller struct {
-	Store            *store.Store
-	Workspace        WorkspaceManager
-	Runtime          worker.Runtime
-	ImageDigest      string
-	ToolVersions     map[string]string
-	NoMistakes       string
-	GatewayURL       string
-	SourceRepository string
-	DeliveryLeaseTTL time.Duration
-	Now              func() time.Time
+	Store             *store.Store
+	Workspace         WorkspaceManager
+	Runtime           worker.Runtime
+	ImageDigest       string
+	ToolVersions      map[string]string
+	NoMistakes        string
+	GatewayURL        string
+	SourceRepository  string
+	DeliveryLeaseTTL  time.Duration
+	MaxWorkerAttempts int
+	Now               func() time.Time
 }
 
 func (c Controller) now() time.Time {
@@ -43,6 +44,13 @@ func (c Controller) deliveryLeaseTTL() time.Duration {
 		return c.DeliveryLeaseTTL
 	}
 	return 30 * time.Minute
+}
+
+func (c Controller) maxWorkerAttempts() int {
+	if c.MaxWorkerAttempts > 0 {
+		return c.MaxWorkerAttempts
+	}
+	return store.DefaultMaxWorkerAttempts
 }
 
 type RunRequest struct {
@@ -339,6 +347,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
+	if err := c.Store.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, c.now()); err != nil {
+		return err
+	}
 	defaultBranch, expectedSourceDigest, err := c.validateDeliverySourceForLaunch(ctx, session, ws.DeliverySource)
 	if err != nil {
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
@@ -384,19 +395,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
-	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, ws.RevisionRoundID); err != nil {
-		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
-	}
-	sealedSource, cleanupSealedSource, err := c.Workspace.sealDeliverySource(ctx, session.SessionID, ws.RevisionRoundID, deliveryClaim.RunID, ws.DeliverySource, expectedSourceDigest)
+	sealedSource, err := c.Workspace.sealedDeliverySourcePath(session.SessionID, ws.RevisionRoundID, deliveryClaim.RunID, ws.DeliverySource)
 	if err != nil {
-		if cleanupSealedSource != nil {
-			err = errors.Join(err, cleanupSealedSource())
-		}
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, cleanupSealedSource())
-	}()
 	deliverySpec := worker.Spec{
 		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
@@ -413,6 +415,19 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
+	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, ws.RevisionRoundID); err != nil {
+		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
+	}
+	sealedSource, cleanupSealedSource, err := c.Workspace.sealDeliverySource(ctx, session.SessionID, ws.RevisionRoundID, deliveryClaim.RunID, ws.DeliverySource, expectedSourceDigest)
+	if err != nil {
+		if cleanupSealedSource != nil {
+			err = errors.Join(err, cleanupSealedSource())
+		}
+		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, cleanupSealedSource())
+	}()
 	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now()); err != nil {
 		if errors.Is(err, store.ErrWorkerLaunched) {
 			return err
@@ -447,17 +462,16 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
 	deliveryRedactor := preDeliveryRedactor.Merge(postDeliveryRedactor)
-	if outcome, parseErr := parseDeliveryOutcome(runtimeStdout(deliveryResult)); parseErr == nil && outcome.Gate != nil {
-		if _, err := c.Store.PauseDeliveryControllerForQualityGate(finalizationCtx, deliveryClaim, *outcome.Gate, c.now()); err != nil {
-			return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
-		}
-		return nil
-	} else if deliveryErr != nil || deliveryResult.ExitCode != 0 {
+	outcome, parseErr := parseDeliveryOutcome(runtimeStdout(deliveryResult))
+	if deliveryErr != nil || deliveryResult.ExitCode != 0 {
 		return c.failDeliveryControllerWithClass(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(errorText(deliveryErr, deliveryResult.ExitCode))), failureClass(deliveryErr))
 	} else if parseErr != nil {
 		return c.failDeliveryControllerWithClass(finalizationCtx, deliveryClaim, errors.New(deliveryRedactor.String(parseErr.Error())), store.FailureCodeQuality)
 	} else if outcome.Gate != nil {
-		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New("Delivery Controller reported a human gate without pausing"))
+		if _, err := c.Store.PauseDeliveryControllerForQualityGate(finalizationCtx, deliveryClaim, *outcome.Gate, c.now()); err != nil {
+			return c.failDeliveryController(finalizationCtx, deliveryClaim, err)
+		}
+		return nil
 	} else if !outcome.Passed {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New("Delivery Controller did not pass"))
 	}
@@ -659,11 +673,11 @@ func (c Controller) failDeliveryController(ctx context.Context, claim store.Tick
 }
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	return errors.Join(cause, c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now()))
+	return errors.Join(cause, c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts()))
 }
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	return errors.Join(cause, c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now()))
+	return errors.Join(cause, c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts()))
 }
 
 func runtimeStdout(result worker.Result) []byte {

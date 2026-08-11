@@ -498,7 +498,7 @@ JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 JOIN plan_versions v ON v.version_id = s.version_id
 JOIN plans p ON p.id = v.plan_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
-WHERE p.repository = ? AND s.state = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'ready'
+WHERE p.repository = ? AND s.state = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 0
 AND l.state = ? AND l.expires_at > ? ORDER BY r.started_at, r.run_id`, repository, SessionRunning, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
 	if err != nil {
 		return nil, err
@@ -605,6 +605,38 @@ func (s *Store) ReserveWorkerLaunch(ctx context.Context, claim TicketClaim, audi
 	return s.reserveWorkerLaunch(ctx, claim, audit, now, "")
 }
 
+func (s *Store) ReserveDeliveryControllerPrelaunch(ctx context.Context, claim TicketClaim, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE worker_runs
+SET prelaunch_reserved = 1
+WHERE run_id = ? AND lease_generation = ? AND run_kind = ? AND state = ? AND launch_state = 'ready' AND prelaunch_reserved = 0
+AND EXISTS (
+    SELECT 1 FROM ticket_sessions s
+    JOIN run_leases l ON l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation
+    WHERE s.current_run_id = worker_runs.run_id AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?
+)`, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrWorkerLaunched
+	}
+	return nil
+}
+
 func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time) error {
 	return s.reserveWorkerLaunch(ctx, claim, audit, now, RunDelivery)
 }
@@ -640,7 +672,7 @@ func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, audi
 	result, err := tx.ExecContext(ctx, `UPDATE worker_runs
 SET launch_state = 'launched', launched_at = ?
 WHERE run_id = ? AND lease_generation = ? AND state = ? AND launch_state = 'ready'
-AND (? = '' OR run_kind = ?)
+AND (? = '' OR (run_kind = ? AND prelaunch_reserved = 1))
 AND EXISTS (
     SELECT 1 FROM ticket_sessions s
     JOIN run_leases l ON l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation
@@ -916,7 +948,7 @@ LIMIT 1`, sessionID).Scan(&latest)
 // tickets. The caller is expected to have already verified the merged revision
 // and reachability at the GitHub boundary.
 func (s *Store) MarkTicketDelivered(ctx context.Context, versionID string, issueID int64) error {
-	_, err := s.markTicketDelivered(ctx, versionID, issueID, "")
+	_, err := s.markTicketDelivered(ctx, versionID, issueID, "", nil)
 	return err
 }
 
@@ -926,10 +958,42 @@ func (s *Store) MarkTicketDeliveredAtMerge(ctx context.Context, versionID string
 	if mergeCommit == "" {
 		return false, ErrInvalidClaim
 	}
-	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit)
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, nil)
 }
 
-func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string) (bool, error) {
+func (s *Store) DeliveryContainerIsolationTarget(ctx context.Context, versionID string, issueID int64) (TicketClaim, error) {
+	if versionID == "" || issueID == 0 {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	var claim TicketClaim
+	var expiresText string
+	err := s.db.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id, s.session_id, r.run_id, r.lease_generation, l.lease_token, l.expires_at
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'launched'`, versionID, issueID, RunDelivery, RunRunning).
+		Scan(&claim.VersionID, &claim.TicketID, &claim.SessionID, &claim.RunID, &claim.LeaseGeneration, &claim.LeaseToken, &expiresText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, ErrNotFound
+	}
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	claim.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	return claim, nil
+}
+
+func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated TicketClaim) (bool, error) {
+	if mergeCommit == "" || isolated.VersionID != versionID || isolated.TicketID != issueID || isolated.RunID == "" || isolated.LeaseGeneration <= 0 {
+		return false, ErrInvalidClaim
+	}
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, &isolated)
+}
+
+func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated *TicketClaim) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -939,6 +1003,22 @@ func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issue
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	nowText := formatTimestamp(now)
+	var launchedRunID string
+	var launchedGeneration int64
+	err = tx.QueryRowContext(ctx, `SELECT r.run_id, r.lease_generation
+FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'launched'`, versionID, issueID, RunDelivery, RunRunning).Scan(&launchedRunID, &launchedGeneration)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if err == nil {
+		if isolated == nil {
+			return false, ErrWorkerLaunched
+		}
+		if isolated.RunID != launchedRunID || isolated.LeaseGeneration != launchedGeneration {
+			return false, ErrInvalidClaim
+		}
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, delivered = 1, updated_at = ?
 WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, nowText, versionID, issueID)
 	if err != nil {

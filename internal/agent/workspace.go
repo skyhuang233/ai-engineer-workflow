@@ -586,23 +586,9 @@ func (m WorkspaceManager) reclaimSupersededDeliverySources(ctx context.Context, 
 }
 
 func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, revisionRoundID, launchID, sourcePath, expectedDigest string) (string, func() error, error) {
-	current, err := m.deliverySourcePath(sessionID, revisionRoundID)
+	launchPath, err := m.sealedDeliverySourcePath(sessionID, revisionRoundID, launchID, sourcePath)
 	if err != nil {
 		return "", nil, err
-	}
-	if filepath.Clean(sourcePath) != current {
-		return "", nil, deliverySourceIntegrityError(errors.New("Delivery Source path does not match the accepted Revision Round"))
-	}
-	if launchID == "" || filepath.Base(launchID) != launchID {
-		return "", nil, deliverySourceIntegrityError(errors.New("Delivery Controller launch ID is invalid"))
-	}
-	root := filepath.Dir(current)
-	launchPath, err := canonicalPath(filepath.Join(root, ".launch-"+launchID+".git"))
-	if err != nil {
-		return "", nil, deliverySourceInfrastructureError(fmt.Errorf("resolve sealed Delivery Source path: %w", err))
-	}
-	if _, err := managedPath(root, launchPath); err != nil {
-		return "", nil, deliverySourceIntegrityError(err)
 	}
 	temporaryPath := launchPath + ".tmp"
 	for _, path := range []string{launchPath, temporaryPath} {
@@ -639,6 +625,28 @@ func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, rev
 		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("seal Delivery Source permissions: %w", err))
 	}
 	return launchPath, cleanup, nil
+}
+
+func (m WorkspaceManager) sealedDeliverySourcePath(sessionID, revisionRoundID, launchID, sourcePath string) (string, error) {
+	current, err := m.deliverySourcePath(sessionID, revisionRoundID)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Clean(sourcePath) != current {
+		return "", deliverySourceIntegrityError(errors.New("Delivery Source path does not match the accepted Revision Round"))
+	}
+	if launchID == "" || filepath.Base(launchID) != launchID {
+		return "", deliverySourceIntegrityError(errors.New("Delivery Controller launch ID is invalid"))
+	}
+	root := filepath.Dir(current)
+	launchPath, err := canonicalPath(filepath.Join(root, ".launch-"+launchID+".git"))
+	if err != nil {
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve sealed Delivery Source path: %w", err))
+	}
+	if _, err := managedPath(root, launchPath); err != nil {
+		return "", deliverySourceIntegrityError(err)
+	}
+	return launchPath, nil
 }
 
 func makeDeliverySourceReadOnly(root string) error {
@@ -685,6 +693,13 @@ func validateDeliverySource(ctx context.Context, path string) error {
 	if strings.TrimSpace(remotes) != "" {
 		return deliverySourceIntegrityError(errors.New("persisted Delivery Source contains a remote configuration"))
 	}
+	return validateDeliverySourceConnectivity(ctx, path)
+}
+
+func validateDeliverySourceConnectivity(ctx context.Context, path string) error {
+	if err := runGit(ctx, path, "fsck", "--connectivity-only", "--no-dangling"); err != nil {
+		return deliverySourceProbeError(ctx, "validate Delivery Source connectivity", err)
+	}
 	return nil
 }
 
@@ -728,11 +743,8 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	if err != nil {
 		return "", err
 	}
-	if err := runGit(ctx, sourcePath, "fsck", "--connectivity-only", "--no-dangling"); err != nil {
-		if ctx.Err() != nil {
-			return "", deliverySourceInfrastructureError(fmt.Errorf("validate Delivery Source connectivity: %w", ctx.Err()))
-		}
-		return "", deliverySourceIntegrityError(fmt.Errorf("Delivery Source contains missing or corrupt reachable objects: %w", err))
+	if err := validateDeliverySourceConnectivity(ctx, sourcePath); err != nil {
+		return "", err
 	}
 	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
 	if err != nil {
@@ -748,7 +760,7 @@ func deliverySourceProbeError(ctx context.Context, operation string, err error) 
 		return deliverySourceInfrastructureError(wrapped)
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), string(exitErr.Stderr)) {
+	if errors.As(err, &exitErr) && (isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), string(exitErr.Stderr)) || isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), err.Error()+"\n"+string(exitErr.Stderr))) {
 		return deliverySourceIntegrityError(wrapped)
 	}
 	return deliverySourceInfrastructureError(wrapped)
@@ -782,6 +794,12 @@ func isDeliverySourceStructuralGitFailure(exitCode int, stderr string) bool {
 		"invalid ref",
 		"not a valid object",
 		"not a symbolic ref",
+		"missing blob",
+		"missing tree",
+		"missing commit",
+		"missing tag",
+		"invalid sha1 pointer",
+		"does not point to a valid object",
 		"needed a single revision",
 		"unknown revision",
 		"ambiguous argument",

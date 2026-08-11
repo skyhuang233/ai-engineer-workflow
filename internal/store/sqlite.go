@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 51
+	latestSchemaVersion = 52
 )
 
 var (
@@ -1427,6 +1427,20 @@ WHERE runtime.delivered = 1 AND (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (51, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 52 {
+		exists, err := tableHasColumnTx(ctx, tx, "worker_runs", "prelaunch_reserved")
+		if err != nil {
+			return fmt.Errorf("migration 52: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE worker_runs ADD COLUMN prelaunch_reserved INTEGER NOT NULL DEFAULT 0 CHECK (prelaunch_reserved IN (0, 1))"); err != nil {
+				return fmt.Errorf("migration 52: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (52, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

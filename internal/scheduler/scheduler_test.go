@@ -391,6 +391,9 @@ func TestRecoverIsolatesExpiredDeliveryBeforeTerminalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, claimedAt); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, store.WorkerAudit{RunID: deliveryClaim.RunID, LeaseGeneration: deliveryClaim.LeaseGeneration, ImageDigest: "sha256:delivery", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, claimedAt); err != nil {
 		t.Fatal(err)
 	}

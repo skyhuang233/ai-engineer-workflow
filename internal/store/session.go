@@ -288,7 +288,7 @@ func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string,
 		return err
 	}
 	if launchState == "ready" {
-		reason := "Delivery Controller lease expired before launch reservation"
+		reason := "Delivery Controller lease expired before container launch"
 		if err := recordRunFailureDetailTx(ctx, tx, runID, FailureInfrastructure, reason, now); err != nil {
 			return err
 		}
@@ -803,12 +803,12 @@ func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, r
 // FailDeliveryControllerWithClass releases the failed Delivery Controller and
 // schedules a fenced retry of its accepted Candidate Revision. The bounded
 // retry count is per recovery epoch; escalation remains the explicit fallback.
-func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now)
+func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts ...int) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, maxAttempts...)
 }
 
-func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now)
+func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts ...int) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, maxAttempts...)
 }
 
 func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
@@ -909,7 +909,7 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 	return sessionID, candidateRunID.String, nil
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time) error {
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, maxAttempts ...int) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -1020,7 +1020,11 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
 			return err
 		}
-		if attempts < DefaultMaxWorkerAttempts {
+		limit := DefaultMaxWorkerAttempts
+		if len(maxAttempts) > 0 {
+			limit = maxWorkerAttempts(maxAttempts[0])
+		}
+		if attempts < limit {
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
 				return err
 			}

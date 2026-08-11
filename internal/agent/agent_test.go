@@ -2062,6 +2062,71 @@ func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T
 	}
 }
 
+func TestControllerCertifiedNoLaunchHonorsConfiguredAttemptLimit(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	runtime := &fakeRuntime{
+		results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		MaxWorkerAttempts: 1, Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("configured-limit delivery failure returned nil error")
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 || questions[0].Kind != "needs_attention" {
+		t.Fatalf("configured-limit delivery questions = %#v, %v", questions, err)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("configured-limit delivery retry = %#v, %v", pending, err)
+	}
+}
+
+func TestControllerRejectsQualityGateWhenOriginRestorationFails(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  action: ask-user\n  reason: choose the migration strategy\n  allowed_answers[1]: proceed\n")
+	workspacePath := ""
+	runtime := &fakeRuntime{
+		results:        []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryOutput: gateOutput,
+		beforeDelivery: func(spec worker.Spec) error {
+			workspacePath = spec.WorkspacePath
+			return nil
+		},
+		beforeDeliveryReturn: func(time.Time) error {
+			return os.WriteFile(filepath.Join(workspacePath, ".git", "config.lock"), []byte("locked"), 0o600)
+		},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
+	if workspacePath != "" {
+		_ = os.Remove(filepath.Join(workspacePath, ".git", "config.lock"))
+	}
+	if err == nil || !strings.Contains(err.Error(), "restore Ticket Workspace origin") {
+		t.Fatalf("origin restoration failure = %v", err)
+	}
+	questions, questionErr := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if questionErr != nil || len(questions) != 0 {
+		t.Fatalf("quality gate persisted despite restoration failure: %#v, %v", questions, questionErr)
+	}
+}
+
 func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

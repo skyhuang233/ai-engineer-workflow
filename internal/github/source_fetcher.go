@@ -18,6 +18,7 @@ import (
 type DeliverySourceFetcher struct {
 	Repository string
 	Token      string
+	APIBase    string
 }
 
 type deliverySourceAuthenticationError struct {
@@ -39,12 +40,27 @@ func (f DeliverySourceFetcher) Fetch(ctx context.Context, snapshotPath, headRef 
 	if branch == "" {
 		return errors.New("Delivery Source branch is required")
 	}
-	remoteURL := "https://github.com/" + f.Repository + ".git"
-	endpoint, err := url.Parse(remoteURL)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
-		return errors.New("credential-owning Delivery Source fetch adapter requires an HTTPS URL without embedded credentials")
+	remoteURL, err := deliverySourceRemoteURL(f.APIBase, f.Repository)
+	if err != nil {
+		return err
 	}
 	return fetchDeliverySource(ctx, snapshotPath, remoteURL, headRef, &http.BasicAuth{Username: "x-access-token", Password: f.Token})
+}
+
+func deliverySourceRemoteURL(apiBase, repository string) (string, error) {
+	endpoint, err := url.Parse(strings.TrimSpace(apiBase))
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return "", errors.New("credential-owning Delivery Source fetch adapter requires an admitted HTTPS GitHub API origin without embedded credentials")
+	}
+	host := endpoint.Host
+	if strings.EqualFold(endpoint.Hostname(), "api.github.com") {
+		if endpoint.Port() != "" {
+			return "", errors.New("public GitHub API origin must not specify a port")
+		}
+		host = "github.com"
+	}
+	remote := &url.URL{Scheme: "https", Host: host, Path: "/" + repository + ".git"}
+	return remote.String(), nil
 }
 
 func fetchDeliverySource(ctx context.Context, snapshotPath, remoteURL, headRef string, auth transport.AuthMethod) error {

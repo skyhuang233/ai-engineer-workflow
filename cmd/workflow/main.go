@@ -522,7 +522,7 @@ func runTicket(args []string) {
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 	}
-	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
+	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: *branch, Prompt: *prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: *branch, ExpectedRemoteHead: *expectedHead, ExpectRemoteAbsent: *expectAbsent, Title: claim.TicketTitle}})
 	if err != nil {
 		fail(err)
@@ -535,7 +535,7 @@ func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Cli
 	var feedback []store.ReviewFeedback
 	delivery, err := db.TicketDelivery(ctx, versionID, ticketID)
 	if err == nil {
-		terminal, err := (github.DeliveredReconciler{Store: db, Client: client}).ReconcileTicket(ctx, delivery)
+		terminal, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: worker.DockerRuntime{}}).ReconcileTicket(ctx, delivery)
 		if err != nil {
 			return err
 		}
@@ -638,7 +638,7 @@ func runReconcileDelivered(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	marked, err := (github.DeliveredReconciler{Store: db, Client: client}).Reconcile(ctx, *repository)
+	marked, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: worker.DockerRuntime{}}).Reconcile(ctx, *repository)
 	if err != nil {
 		fail(persistGitHubAppAdmissionError(ctx, db, err, time.Now().UTC()))
 	}
@@ -712,7 +712,7 @@ func runPollGitHub(args []string) {
 		}
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
-			err := runClaimWorker(workerCtx, db, *repository, *source, workspaceManager, *gatewayURL, claim, prompt, branch, expectedHead, expectAbsent)
+			err := runClaimWorker(workerCtx, db, *repository, *source, workspaceManager, *gatewayURL, config.Runtime.MaxWorkerAttempts, claim, prompt, branch, expectedHead, expectAbsent)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
 				if *once {
@@ -745,7 +745,7 @@ func runPollGitHub(args []string) {
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
-		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, SourceRepository: *source}
+		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, SourceRepository: *source, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
@@ -756,7 +756,7 @@ func runPollGitHub(args []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		projector := gatewayControlProjector(*gatewayURL, *gatewayControlURLOverride, *gatewayControlToken)
-		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns, ProvisionSession: workspaceManager.ProvisionCodexSession}
+		poller := github.Poller{Store: db, InboxProjector: projector, MaxFailures: config.Runtime.MaxWorkerAttempts, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, MaxParallelRuns: *maxParallelRuns, ProvisionSession: workspaceManager.ProvisionCodexSession, ContainerIsolator: runtime}
 		leasedCtx, releasePollLease, err := poller.AcquireLease(ctx, *repository)
 		if err != nil {
 			if errors.Is(err, store.ErrNotReady) {
@@ -948,8 +948,8 @@ func nextPollDelay(db *store.Store, repository string, interval time.Duration, r
 	return interval
 }
 
-func runClaimWorker(ctx context.Context, db *store.Store, repository, source string, workspaceManager agent.WorkspaceManager, gatewayURL string, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
-	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: gatewayURL}
+func runClaimWorker(ctx context.Context, db *store.Store, repository, source string, workspaceManager agent.WorkspaceManager, gatewayURL string, maxWorkerAttempts int, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: gatewayURL, MaxWorkerAttempts: maxWorkerAttempts}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: repository, Branch: branch, ExpectedRemoteHead: expectedHead, ExpectRemoteAbsent: expectAbsent, Title: claim.TicketTitle}})
 	return err
 }
@@ -1084,7 +1084,7 @@ func deliverySourceRefresher(database *store.Store, provider githubTokenProvider
 			return "", persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
 		}
 		headRef := "refs/heads/" + defaultBranch.Name
-		err = (github.DeliverySourceFetcher{Repository: repository, Token: token}).Fetch(ctx, snapshotPath, headRef)
+		err = (github.DeliverySourceFetcher{Repository: repository, Token: token, APIBase: apiBase}).Fetch(ctx, snapshotPath, headRef)
 		if err := persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC()); err != nil {
 			return "", err
 		}

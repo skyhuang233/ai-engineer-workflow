@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +16,12 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+type containerIsolatorFunc func(context.Context, string) error
+
+func (f containerIsolatorFunc) IsolateContainer(ctx context.Context, runID string) error {
+	return f(ctx, runID)
+}
 
 func TestPullRequestReachedMainRequiresMappedCandidateReachability(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +138,12 @@ func TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier(t *test
 	}, 7, "PR_node", "accepted-candidate", now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, store.WorkerAudit{RunID: deliveryClaim.RunID, LeaseGeneration: deliveryClaim.LeaseGeneration, ImageDigest: "sha256:delivery", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/owner/repo":
@@ -153,9 +166,18 @@ func TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier(t *test
 	defer server.Close()
 
 	launched := 0
+	var isolated []string
 	var downstream store.TicketClaim
 	poller := Poller{
 		Store: db, Client: NewClient(server.URL, "", server.Client()).WithRepositoryOwner("owner"), Now: func() time.Time { return now.Add(time.Minute) },
+		ContainerIsolator: containerIsolatorFunc(func(_ context.Context, runID string) error {
+			target, err := db.DeliveryContainerIsolationTarget(ctx, version.ID, 1)
+			if err != nil || target.RunID != runID {
+				return fmt.Errorf("delivery isolation target = %#v, %v", target, err)
+			}
+			isolated = append(isolated, runID)
+			return nil
+		}),
 		AfterDelivered: func(ctx context.Context) error {
 			launched++
 			var err error
@@ -166,6 +188,9 @@ func TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier(t *test
 	result, err := poller.Poll(ctx, snapshot.Repository)
 	if err != nil || result.Delivered != 1 || launched != 1 || downstream.TicketID != 2 {
 		t.Fatalf("first poll result=%#v launched=%d claim=%#v err=%v", result, launched, downstream, err)
+	}
+	if len(isolated) != 1 || isolated[0] != deliveryClaim.RunID {
+		t.Fatalf("isolated delivery runs = %#v, want [%q]", isolated, deliveryClaim.RunID)
 	}
 	stored, err := db.CandidateDelivery(ctx, version.ID, 1)
 	if err != nil {

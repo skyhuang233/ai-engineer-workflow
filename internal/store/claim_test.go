@@ -327,6 +327,16 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); !errors.Is(err, ErrWorkerLaunched) {
+		t.Fatalf("duplicate prelaunch reservation = %v, want ErrWorkerLaunched", err)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, snapshot.Repository, now)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("prelaunch-reserved delivery remained dispatchable = %#v, %v", pending, err)
+	}
 	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
 		t.Fatal(err)
 	}
@@ -542,6 +552,47 @@ func TestCertifiedNoLaunchRetriesExpiredReadyDelivery(t *testing.T) {
 	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
 	if err != nil || len(pending) != 1 || pending[0].SessionID != claim.SessionID {
 		t.Fatalf("certified ready-state retry = %#v, %v", pending, err)
+	}
+}
+
+func TestCertifiedNoLaunchHonorsConfiguredDeliveryAttemptLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryControllerLaunchWithClass(ctx, delivery, context.DeadlineExceeded.Error(), FailureInfrastructure, now.Add(2*time.Hour), 1); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("retry beyond configured delivery limit = %#v, %v", pending, err)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(3*time.Hour))
+	if err != nil || projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("configured delivery limit projection = %#v, %v", projection, err)
 	}
 }
 

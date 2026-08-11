@@ -118,6 +118,7 @@ type Poller struct {
 	MaxFailures           int
 	MaxWorkerAttempts     int
 	ProvisionSession      store.SessionProvisioner
+	ContainerIsolator     ContainerIsolator
 	MaxParallelRuns       int
 	FullReconcileInterval time.Duration
 }
@@ -807,7 +808,7 @@ func (p Poller) poll(ctx context.Context, repository string, now, since time.Tim
 			return PollResult{}, err
 		}
 	}
-	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client}
+	reconciler := DeliveredReconciler{Store: p.Store, Client: p.Client, Isolator: p.ContainerIsolator}
 	for _, delivery := range deliveries {
 		if err := p.renewPollLease(ctx, repository); err != nil {
 			return PollResult{}, err

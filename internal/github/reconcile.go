@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -11,8 +12,13 @@ import (
 )
 
 type DeliveredReconciler struct {
-	Store  *store.Store
-	Client *Client
+	Store    *store.Store
+	Client   *Client
+	Isolator ContainerIsolator
+}
+
+type ContainerIsolator interface {
+	IsolateContainer(context.Context, string) error
 }
 
 func (r DeliveredReconciler) Reconcile(ctx context.Context, repository string) (int, error) {
@@ -57,7 +63,7 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 	}
 	switch deliveryState.State {
 	case pullRequestDelivered:
-		if _, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, deliveryState.MergeCommit); err != nil {
+		if err := r.markDelivered(ctx, delivery, deliveryState.MergeCommit); err != nil {
 			return pullRequestPending, wrapPollStoreError(err)
 		}
 	case pullRequestClosedUnmerged:
@@ -66,6 +72,28 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 		}
 	}
 	return deliveryState.State, nil
+}
+
+func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {
+	if _, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit); !errors.Is(err, store.ErrWorkerLaunched) {
+		return err
+	}
+	if r.Isolator == nil {
+		return errors.New("delivered reconciler cannot isolate an active Delivery Controller")
+	}
+	target, err := r.Store.DeliveryContainerIsolationTarget(ctx, delivery.VersionID, delivery.IssueID)
+	if errors.Is(err, store.ErrNotFound) {
+		_, err = r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if err := r.Isolator.IsolateContainer(ctx, target.RunID); err != nil {
+		return fmt.Errorf("isolate delivered Delivery Controller %s: %w", target.RunID, err)
+	}
+	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, target)
+	return err
 }
 
 type pullRequestState int

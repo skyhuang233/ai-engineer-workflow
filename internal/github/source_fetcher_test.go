@@ -46,6 +46,29 @@ func TestFetchDeliverySourceUpdatesHeadWithoutPersistingRemote(t *testing.T) {
 	}
 }
 
+func TestDeliverySourceRemoteURLUsesAdmittedAPIOrigin(t *testing.T) {
+	tests := []struct {
+		name    string
+		apiBase string
+		want    string
+		wantErr bool
+	}{
+		{name: "public GitHub", apiBase: "https://api.github.com", want: "https://github.com/owner/repo.git"},
+		{name: "GitHub Enterprise", apiBase: "https://github.example.com/api/v3", want: "https://github.example.com/owner/repo.git"},
+		{name: "GitHub Enterprise port", apiBase: "https://github.example.com:8443/api/v3", want: "https://github.example.com:8443/owner/repo.git"},
+		{name: "insecure origin", apiBase: "http://github.example.com/api/v3", wantErr: true},
+		{name: "embedded credentials", apiBase: "https://token@github.example.com/api/v3", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := deliverySourceRemoteURL(test.apiBase, "owner/repo")
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("deliverySourceRemoteURL() = %q, %v; want %q, error=%t", got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
 func runSourceFetcherGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
