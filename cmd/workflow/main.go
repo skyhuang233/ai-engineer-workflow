@@ -498,7 +498,7 @@ func runTicket(args []string) {
 	}
 	workspaceManager := agent.WorkspaceManager{
 		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
-		RefreshDeliverySource: deliverySourceRefresher(db, provider, *repository),
+		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
 	if err != nil {
@@ -691,7 +691,7 @@ func runPollGitHub(args []string) {
 	provider := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: *githubURL}
 	workspaceManager := agent.WorkspaceManager{
 		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
-		RefreshDeliverySource: deliverySourceRefresher(db, provider, *repository),
+		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
 	if reason, err := runtime.Inspect(context.Background()); err != nil {
@@ -1073,14 +1073,22 @@ func admittedControlPlaneGitHubClientAndProvider(ctx context.Context, database *
 	return client, provider, err
 }
 
-func deliverySourceRefresher(database *store.Store, provider githubTokenProvider, repository string) func(context.Context, string, string) error {
-	return func(ctx context.Context, snapshotPath, headRef string) error {
+func deliverySourceRefresher(database *store.Store, provider githubTokenProvider, apiBase, repository string) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, snapshotPath string) (string, error) {
 		token, err := provider.Token(ctx)
 		if err != nil {
-			return persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+			return "", persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
 		}
+		defaultBranch, err := github.NewClient(apiBase, token, nil).DefaultBranchHead(ctx, repository)
+		if err != nil {
+			return "", persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+		}
+		headRef := "refs/heads/" + defaultBranch.Name
 		err = (github.DeliverySourceFetcher{Repository: repository, Token: token}).Fetch(ctx, snapshotPath, headRef)
-		return persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+		if err := persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC()); err != nil {
+			return "", err
+		}
+		return headRef, nil
 	}
 }
 

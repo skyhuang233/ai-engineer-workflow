@@ -307,6 +307,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
+	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err))
+	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
 		"NM_HOME":                          "/codex-state/no-mistakes",

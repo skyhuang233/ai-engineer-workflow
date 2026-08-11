@@ -110,7 +110,7 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	assertGitRefMissing(t, ctx, retry.Path, "refs/tags/v3")
 }
 
-func TestDeliverySourceRefreshesAdvancedRemoteBaseAndPinsRevision(t *testing.T) {
+func TestDeliverySourceUsesCanonicalDefaultBranchAndPinsRevision(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -129,15 +129,27 @@ func TestDeliverySourceRefreshesAdvancedRemoteBaseAndPinsRevision(t *testing.T) 
 	if err := runGit(ctx, source, "push", "-u", "origin", "main"); err != nil {
 		t.Fatal(err)
 	}
+	if err := runGit(ctx, source, "checkout", "-b", "feature"); err != nil {
+		t.Fatal(err)
+	}
+	writeDeliverySourceCommit(t, ctx, source, "feature")
 	manager := WorkspaceManager{
 		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
-		RefreshDeliverySource: func(ctx context.Context, snapshotPath, headRef string) error {
-			return runGit(ctx, snapshotPath, "fetch", "--force", "--no-tags", remote, "+"+headRef+":"+headRef)
+		RefreshDeliverySource: func(ctx context.Context, snapshotPath string) (string, error) {
+			headRef := "refs/heads/main"
+			return headRef, runGit(ctx, snapshotPath, "fetch", "--force", "--no-tags", remote, "+"+headRef+":"+headRef)
 		},
 	}
 	first, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
 	if err != nil {
 		t.Fatal(err)
+	}
+	firstHead, err := gitOutput(ctx, first.DeliverySource, "symbolic-ref", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(firstHead) != "refs/heads/main" {
+		t.Fatalf("Delivery Source HEAD = %q, want canonical default branch", firstHead)
 	}
 	firstMain, err := gitOutput(ctx, first.DeliverySource, "rev-parse", "refs/heads/main")
 	if err != nil {
@@ -185,6 +197,42 @@ func TestDeliverySourceRefreshesAdvancedRemoteBaseAndPinsRevision(t *testing.T) 
 	}
 	if strings.TrimSpace(retryMain) != strings.TrimSpace(secondMain) {
 		t.Fatalf("revision retry refreshed pinned base: retry=%q second=%q", retryMain, secondMain)
+	}
+}
+
+func TestReclaimSupersededDeliverySourcesKeepsAcceptedRevision(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, source)
+	writeDeliverySourceCommit(t, ctx, source, "first")
+	manager := WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	first, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDeliverySourceCommit(t, ctx, source, "second")
+	current, err := manager.ensureDeliverySource(ctx, "session-1", "revision-2", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(filepath.Dir(current), ".delivery-orphan")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.reclaimSupersededDeliverySources(ctx, "session-1", "revision-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(current); err != nil {
+		t.Fatalf("accepted Delivery Source was reclaimed: %v", err)
+	}
+	for _, stale := range []string{first, orphan} {
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			t.Fatalf("superseded Delivery Source %q still exists: %v", stale, err)
+		}
 	}
 }
 

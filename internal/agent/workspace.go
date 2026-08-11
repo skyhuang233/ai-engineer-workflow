@@ -21,7 +21,7 @@ type WorkspaceManager struct {
 	RootDir               string
 	CodexStateRoot        string
 	CodexAuthFile         string
-	RefreshDeliverySource func(context.Context, string, string) error
+	RefreshDeliverySource func(context.Context, string) (string, error)
 }
 
 type workspace struct {
@@ -469,18 +469,6 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 		return "", err
 	}
 	defer os.RemoveAll(temporaryPath)
-	head, err := gitOutput(ctx, sourceRepository, "symbolic-ref", "--quiet", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("resolve Delivery Source HEAD: %w", err)
-	}
-	head = strings.TrimSpace(head)
-	if !strings.HasPrefix(head, "refs/heads/") {
-		return "", errors.New("Delivery Source HEAD is not a branch")
-	}
-	branch := strings.TrimPrefix(head, "refs/heads/")
-	if _, err := gitOutput(ctx, sourceRepository, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("invalid Delivery Source branch %q: %w", branch, err)
-	}
 	if err := runGit(ctx, "", "-c", "core.longpaths=true", "init", "--bare", "--template=", temporaryPath); err != nil {
 		return "", fmt.Errorf("initialize Delivery Source: %w", err)
 	}
@@ -490,10 +478,25 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); err != nil {
 		return "", fmt.Errorf("copy admitted Delivery Source: %w", err)
 	}
+	var head string
 	if m.RefreshDeliverySource != nil {
-		if err := m.RefreshDeliverySource(ctx, temporaryPath, head); err != nil {
+		head, err = m.RefreshDeliverySource(ctx, temporaryPath)
+		if err != nil {
 			return "", fmt.Errorf("refresh Delivery Source from admitted remote: %w", err)
 		}
+	} else {
+		head, err = gitOutput(ctx, sourceRepository, "symbolic-ref", "--quiet", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("resolve Delivery Source HEAD: %w", err)
+		}
+	}
+	head = strings.TrimSpace(head)
+	if !strings.HasPrefix(head, "refs/heads/") {
+		return "", errors.New("Delivery Source HEAD is not a branch")
+	}
+	branch := strings.TrimPrefix(head, "refs/heads/")
+	if _, err := gitOutput(ctx, temporaryPath, "check-ref-format", "--branch", branch); err != nil {
+		return "", fmt.Errorf("invalid Delivery Source branch %q: %w", branch, err)
 	}
 	if _, err := gitOutput(ctx, temporaryPath, "rev-parse", "--verify", head+"^{commit}"); err != nil {
 		return "", fmt.Errorf("verify Delivery Source HEAD: %w", err)
@@ -511,6 +514,35 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 		return "", fmt.Errorf("persist Delivery Source: %w", err)
 	}
 	return path, nil
+}
+
+func (m WorkspaceManager) reclaimSupersededDeliverySources(ctx context.Context, sessionID, revisionRoundID string) error {
+	current, err := m.deliverySourcePath(sessionID, revisionRoundID)
+	if err != nil {
+		return err
+	}
+	if err := validateDeliverySource(ctx, current); err != nil {
+		return err
+	}
+	root := filepath.Dir(current)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		candidate := filepath.Join(root, entry.Name())
+		if strings.EqualFold(candidate, current) {
+			continue
+		}
+		candidate, err = managedPath(root, candidate)
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(candidate); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateDeliverySource(ctx context.Context, path string) error {
