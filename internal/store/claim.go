@@ -947,11 +947,23 @@ WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, n
 		return false, err
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
-		var exists int
-		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM plan_tickets WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		var repository string
+		if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plan_tickets ticket
+JOIN plan_versions version ON version.version_id = ticket.version_id
+JOIN plans p ON p.id = version.plan_id
+WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&repository); errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		} else if err != nil {
 			return false, err
+		}
+		resolved, err := resolveDeliveredQuestionsTx(ctx, tx, versionID, issueID, nowText)
+		if err != nil {
+			return false, err
+		}
+		if resolved > 0 {
+			if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
+				return false, err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return false, err
@@ -967,15 +979,21 @@ WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, n
 			return false, ErrNotFound
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions
-SET state = 'answered', answer = ?, answered_at = ?
-WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID); err != nil {
+	resolvedQuestions, err := resolveDeliveredQuestionsTx(ctx, tx, versionID, issueID, nowText)
+	if err != nil {
 		return false, err
 	}
+	var completionQueued bool
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
-		if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+		completionQueued, err = s.markPlanCompletedTx(ctx, tx, versionID, now)
+		if err != nil {
 			return false, err
+		}
+		if resolvedQuestions > 0 && !completionQueued {
+			if err := s.queueDeliveredQuestionRepairTx(ctx, tx, versionID, now); err != nil {
+				return false, err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return false, err
@@ -995,8 +1013,14 @@ WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_g
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
 		return false, err
 	}
-	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+	completionQueued, err = s.markPlanCompletedTx(ctx, tx, versionID, now)
+	if err != nil {
 		return false, err
+	}
+	if resolvedQuestions > 0 && !completionQueued {
+		if err := s.queueDeliveredQuestionRepairTx(ctx, tx, versionID, now); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
@@ -1004,33 +1028,53 @@ WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_g
 	return true, nil
 }
 
-func (s *Store) markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
-	var remaining, liveRuns int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID).Scan(&remaining); err != nil {
+func resolveDeliveredQuestionsTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, nowText string) (int64, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE workflow_questions
+SET state = 'answered', answer = ?, answered_at = ?
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Store) queueDeliveredQuestionRepairTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
+	var repository string
+	if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions version ON version.plan_id = p.id WHERE version.version_id = ?`, versionID).Scan(&repository); err != nil {
 		return err
 	}
+	_, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now)
+	return err
+}
+
+func (s *Store) markPlanCompletedTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) (bool, error) {
+	var remaining, liveRuns int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID).Scan(&remaining); err != nil {
+		return false, err
+	}
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE s.version_id = ? AND r.state = ?`, versionID, RunRunning).Scan(&liveRuns); err != nil {
-		return err
+		return false, err
 	}
 	if remaining == 0 && liveRuns == 0 {
 		result, err := tx.ExecContext(ctx, `INSERT INTO completed_plan_versions(version_id, completed_at) VALUES (?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, formatTimestamp(now))
 		if err != nil {
-			return err
+			return false, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO plan_terminal_states(version_id, state, recorded_at) VALUES (?, ?, ?) ON CONFLICT(version_id) DO NOTHING`, versionID, StateCompleted, formatTimestamp(now)); err != nil {
-			return err
+			return false, err
 		}
 		if count, _ := result.RowsAffected(); count > 0 {
 			var repository string
 			if err := tx.QueryRowContext(ctx, `SELECT p.repository FROM plans p JOIN plan_versions v ON v.plan_id = p.id WHERE v.version_id = ?`, versionID).Scan(&repository); err != nil {
-				return err
+				return false, err
 			}
 			if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
-				return err
+				return false, err
 			}
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 type frontierRows interface {

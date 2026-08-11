@@ -1587,7 +1587,7 @@ func (s *Store) MarkActive(ctx context.Context, versionID string) error {
 			return ErrVersionConflict
 		}
 	}
-	if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
+	if _, err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {
 		return err
 	}
 	var repository string

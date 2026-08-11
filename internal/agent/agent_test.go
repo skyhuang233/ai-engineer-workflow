@@ -1143,7 +1143,20 @@ func TestControllerRejectsImplementationCandidateWithNullCommit(t *testing.T) {
 
 func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	ctx := context.Background()
-	source := initRepository(t)
+	repository := initRepository(t)
+	if output, err := exec.Command("git", "-C", repository, "checkout", "--detach").CombinedOutput(); err != nil {
+		t.Fatalf("detach source repository: %v\n%s", err, output)
+	}
+	source := filepath.Join(t.TempDir(), "linked-worktree")
+	if output, err := exec.Command("git", "-C", repository, "worktree", "add", source, "main").CombinedOutput(); err != nil {
+		t.Fatalf("create linked source worktree: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", source, "config", "--local", "credential.helper", "source-secret-helper").CombinedOutput(); err != nil {
+		t.Fatalf("configure source credential helper: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(source, "untracked-credential.txt"), []byte("source-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	db, err := store.Open(ctx, filepath.Join(root, "workflow.db"))
 	if err != nil {
@@ -1326,6 +1339,19 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	if err := os.MkdirAll(codexStatePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	deliverySourcePath := filepath.Join(root, ".delivery-sources", claim.SessionID+".git")
+	if err := os.MkdirAll(filepath.Dir(deliverySourcePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range [][]string{
+		{"init", "--bare", "--template=", deliverySourcePath},
+		{"-C", deliverySourcePath, "fetch", "--no-tags", source, "+refs/heads/*:refs/heads/*"},
+		{"-C", deliverySourcePath, "symbolic-ref", "HEAD", "refs/heads/main"},
+	} {
+		if output, err := exec.Command("git", command...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", command, err, output)
+		}
+	}
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-" + claim.SessionID, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1372,7 +1398,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		t.Fatal(err)
 	}
 	runtime := &fakeRuntime{}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{}, Runtime: runtime, GatewayURL: "http://gateway.test"}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test"}
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
 		t.Fatalf("resume original ready Delivery Worker Run: %v", err)
 	}
@@ -1607,8 +1633,23 @@ func assertDeliveryOriginMount(t *testing.T, spec worker.Spec, source string) {
 	}
 	for _, mount := range spec.Mounts {
 		if mount.Target == "/source-repository" {
-			if mount.Source != source || !mount.ReadOnly {
-				t.Fatalf("Delivery Controller source mount = %#v, want read-only %q", mount, source)
+			if mount.Source == source || !mount.ReadOnly {
+				t.Fatalf("Delivery Controller source mount = %#v, want credential-free snapshot distinct from %q", mount, source)
+			}
+			bare := exec.Command("git", "-C", mount.Source, "rev-parse", "--is-bare-repository")
+			if output, err := bare.Output(); err != nil || strings.TrimSpace(string(output)) != "true" {
+				t.Fatalf("Delivery Controller source snapshot is not bare: %q, %v", output, err)
+			}
+			remotes := exec.Command("git", "-C", mount.Source, "remote")
+			if output, err := remotes.Output(); err != nil || strings.TrimSpace(string(output)) != "" {
+				t.Fatalf("Delivery Controller source snapshot remotes = %q, %v", output, err)
+			}
+			credentials := exec.Command("git", "-C", mount.Source, "config", "--local", "--get-regexp", "credential")
+			if output, err := credentials.CombinedOutput(); err == nil || len(output) != 0 {
+				t.Fatalf("Delivery Controller source snapshot exposed credential config: %q, %v", output, err)
+			}
+			if _, err := os.Stat(filepath.Join(mount.Source, "untracked-credential.txt")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Delivery Controller source snapshot exposed untracked credential file: %v", err)
 			}
 			return
 		}

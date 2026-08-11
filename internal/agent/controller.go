@@ -238,7 +238,14 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
-	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, Branch: session.Branch}
+	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, session.WorkspacePath)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, err)
+	}
+	if err := validateDeliverySource(finalizationCtx, deliverySource); err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, err)
+	}
+	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
@@ -277,13 +284,12 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
-	defaultBranch, err := trustedWorkspaceDefaultBranch(ctx, ws.Path)
+	defaultBranch, err := trustedSourceDefaultBranch(ctx, ws.DeliverySource)
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
 	}
-	trustedOrigin, err := trustedWorkspaceOrigin(ctx, ws.Path)
-	if err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted workspace origin: %w", err))
+	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
@@ -325,7 +331,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		Mounts: []worker.Mount{
 			{Source: ws.Path, Target: "/workspace"},
 			{Source: ws.CodexState, Target: "/codex-state"},
-			{Source: trustedOrigin, Target: "/source-repository", ReadOnly: true},
+			{Source: ws.DeliverySource, Target: "/source-repository", ReadOnly: true},
 		},
 		ExtraHosts: []string{worker.GatewayHostMapping},
 	}
@@ -376,39 +382,26 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	return nil
 }
 
-func trustedWorkspaceDefaultBranch(ctx context.Context, workspacePath string) (string, error) {
-	if strings.TrimSpace(workspacePath) == "" {
-		return "", errors.New("Ticket Workspace path is required")
+func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string, error) {
+	if strings.TrimSpace(sourcePath) == "" {
+		return "", errors.New("Delivery Source path is required")
 	}
-	output, err := gitOutput(ctx, workspacePath, "ls-remote", "--symref", "origin", "HEAD")
+	output, err := gitOutput(ctx, sourcePath, "symbolic-ref", "HEAD")
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "ref:" && strings.HasPrefix(fields[1], "refs/heads/") {
-			branch := strings.TrimPrefix(fields[1], "refs/heads/")
-			if branch == "" {
-				break
-			}
-			if _, err := gitOutput(ctx, workspacePath, "check-ref-format", "--branch", branch); err != nil {
-				return "", fmt.Errorf("invalid source default branch %q: %w", branch, err)
-			}
-			return branch, nil
-		}
+	ref := strings.TrimSpace(output)
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return "", errors.New("Delivery Source did not identify a default branch")
 	}
-	return "", errors.New("source repository did not advertise a default branch")
-}
-
-func trustedWorkspaceOrigin(ctx context.Context, workspacePath string) (string, error) {
-	if strings.TrimSpace(workspacePath) == "" {
-		return "", errors.New("Ticket Workspace path is required")
+	branch := strings.TrimPrefix(ref, "refs/heads/")
+	if _, err := gitOutput(ctx, sourcePath, "check-ref-format", "--branch", branch); err != nil {
+		return "", fmt.Errorf("invalid source default branch %q: %w", branch, err)
 	}
-	origin, err := gitOutput(ctx, workspacePath, "remote", "get-url", "origin")
-	if err != nil {
-		return "", err
+	if _, err := gitOutput(ctx, sourcePath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
+		return "", fmt.Errorf("resolve source default branch %q: %w", branch, err)
 	}
-	return localSourceRepository(strings.TrimSpace(origin))
+	return branch, nil
 }
 
 func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {

@@ -2124,6 +2124,70 @@ func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	}
 }
 
+func TestMarkTicketDeliveredRepairsProjectedQuestionsIdempotently(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.QueueWorkflowInboxProjection(ctx, snapshot.Repository, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"needs_attention", "quality_gate"} {
+		if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, kind, "stale delivery recovery", now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.QueueWorkflowInboxProjection(ctx, snapshot.Repository, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 0 {
+		t.Fatalf("stale delivered questions remained open: %#v", questions)
+	}
+	after, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before)+1 {
+		t.Fatalf("Inbox projection repairs = %d before, %d after", len(before), len(after))
+	}
+}
+
 func TestPlanProjectionUsesBlockerIssueNumbers(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
