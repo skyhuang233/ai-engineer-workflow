@@ -922,12 +922,15 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		if deadline.IsZero() {
 			return errors.New("Delivery Controller deadline is missing")
 		}
-		runs, err := db.ActiveRecoveryRuns(context.Background(), version.ID, deadline.Add(time.Second))
+		runs, err := db.ExpiredLaunchedRecoveryRuns(context.Background(), version.ID, deadline.Add(time.Second))
 		if err != nil {
 			return err
 		}
-		if len(runs) != 0 {
-			return fmt.Errorf("active recovery runs after expiry = %#v", runs)
+		if len(runs) != 1 {
+			return fmt.Errorf("expired launched recovery runs = %#v", runs)
+		}
+		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second)); err != nil {
+			return err
 		}
 		return nil
 	}

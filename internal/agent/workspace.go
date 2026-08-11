@@ -493,9 +493,9 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 		if !info.IsDir() {
 			return "", deliverySourceIntegrityError(errors.New("persisted Delivery Source is not a directory"))
 		}
-		storedIdentity, err := gitOutput(ctx, path, "config", "--local", "--get", "workflow.sourceIdentity")
+		storedIdentity, err := deliverySourceIdentity(ctx, path, "read persisted Delivery Source identity")
 		if err != nil {
-			return "", deliverySourceProbeError(ctx, "read persisted Delivery Source identity", err)
+			return "", err
 		}
 		if strings.TrimSpace(storedIdentity) != identity {
 			return "", deliverySourceIntegrityError(errors.New("persisted Delivery Source identity does not match the admitted source repository"))
@@ -616,9 +616,9 @@ func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, rev
 	cleanup := func() error {
 		return errors.Join(makeDeliverySourceWritable(launchPath), os.RemoveAll(launchPath), makeDeliverySourceWritable(temporaryPath), os.RemoveAll(temporaryPath))
 	}
-	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
+	identity, err := deliverySourceIdentity(ctx, sourcePath, "read Delivery Source identity")
 	if err != nil {
-		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source identity: %w", err))
+		return "", cleanup, err
 	}
 	if err := runGit(ctx, "", "clone", "--bare", "--no-hardlinks", sourcePath, temporaryPath); err != nil {
 		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("seal Delivery Source: %w", err))
@@ -724,9 +724,9 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	if err != nil {
 		return "", err
 	}
-	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
+	identity, err := deliverySourceIdentity(ctx, sourcePath, "read Delivery Source identity")
 	if err != nil {
-		return "", deliverySourceProbeError(ctx, "read Delivery Source identity", err)
+		return "", err
 	}
 	if err := runGit(ctx, sourcePath, "fsck", "--connectivity-only", "--no-dangling"); err != nil {
 		if ctx.Err() != nil {
@@ -748,10 +748,49 @@ func deliverySourceProbeError(ctx context.Context, operation string, err error) 
 		return deliverySourceInfrastructureError(wrapped)
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if errors.As(err, &exitErr) && isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), string(exitErr.Stderr)) {
 		return deliverySourceIntegrityError(wrapped)
 	}
 	return deliverySourceInfrastructureError(wrapped)
+}
+
+func deliverySourceIdentity(ctx context.Context, sourcePath, operation string) (string, error) {
+	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
+	if err != nil {
+		return "", deliverySourceProbeError(ctx, operation, err)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", deliverySourceIntegrityError(errors.New("Delivery Source identity is missing"))
+	}
+	return identity, nil
+}
+
+func isDeliverySourceStructuralGitFailure(exitCode int, stderr string) bool {
+	detail := strings.ToLower(strings.TrimSpace(stderr))
+	if exitCode == 1 && detail == "" {
+		return true
+	}
+	for _, marker := range []string{
+		"not a git repository",
+		"bad config line",
+		"invalid config",
+		"bad object",
+		"broken link",
+		"corrupt",
+		"invalid object",
+		"invalid ref",
+		"not a valid object",
+		"not a symbolic ref",
+		"needed a single revision",
+		"unknown revision",
+		"ambiguous argument",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateLocalRemotes(ctx context.Context, path string) error {

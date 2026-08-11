@@ -105,6 +105,29 @@ func TestRetainedDeliverySourceStructuralCorruptionIsIntegrity(t *testing.T) {
 		}
 	})
 
+	t.Run("missing identity while sealing", func(t *testing.T) {
+		manager, source := newManager(t)
+		path, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest, err := digestDeliverySource(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runGit(ctx, path, "config", "--local", "--unset-all", "workflow.sourceIdentity"); err != nil {
+			t.Fatal(err)
+		}
+		_, cleanup, err := manager.sealDeliverySource(ctx, "session-1", "revision-1", "delivery-1", path, digest)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		var integrityFailure *deliverySourceIntegrityFailure
+		if !errors.As(err, &integrityFailure) {
+			t.Fatalf("sealing missing identity classification = %T %v", err, err)
+		}
+	})
+
 	t.Run("context expiry", func(t *testing.T) {
 		manager, source := newManager(t)
 		if _, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source); err != nil {
@@ -118,6 +141,41 @@ func TestRetainedDeliverySourceStructuralCorruptionIsIntegrity(t *testing.T) {
 			t.Fatalf("retained source context classification = %T %v", err, err)
 		}
 	})
+}
+
+func TestDeliverySourceProbeDistinguishesStructuralAndOperationalFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitCode   int
+		stderr     string
+		structural bool
+	}{
+		{name: "missing config value", exitCode: 1, structural: true},
+		{name: "not a repository", exitCode: 128, stderr: "fatal: not a git repository", structural: true},
+		{name: "permission failure", exitCode: 128, stderr: "fatal: cannot open config file: Permission denied"},
+		{name: "device IO failure", exitCode: 128, stderr: "fatal: failed to read object: Input/output error"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isDeliverySourceStructuralGitFailure(test.exitCode, test.stderr); got != test.structural {
+				t.Fatalf("structural failure = %t, want %t", got, test.structural)
+			}
+		})
+	}
+}
+
+func TestPreRuntimeContextExpiryIsCertifiedNoLaunch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	invoked := false
+	runtime := deliveryWorkspaceRuntimeFunc(func(context.Context, worker.Spec) (worker.Result, error) {
+		invoked = true
+		return worker.Result{}, nil
+	})
+	_, err := runInValidatedDeliveryWorkspace(ctx, runtime, worker.Spec{WorkspacePath: t.TempDir()}, "", "", "")
+	if invoked || !worker.IsCertifiedNoLaunchFailure(err) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-runtime expiry = invoked %t, error %T %v", invoked, err, err)
+	}
 }
 
 func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {

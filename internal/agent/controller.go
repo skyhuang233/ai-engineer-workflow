@@ -423,13 +423,13 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
+		if worker.IsCertifiedNoLaunchFailure(deliveryErr) {
+			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		}
 		var integrityFailure *deliverySourceIntegrityFailure
 		var infrastructureFailure *deliverySourceInfrastructureFailure
 		if errors.As(deliveryErr, &integrityFailure) || errors.As(deliveryErr, &infrastructureFailure) {
 			return c.failDeliverySourcePreflight(context.WithoutCancel(ctx), deliveryClaim, deliveryErr)
-		}
-		if worker.IsCertifiedNoLaunchFailure(deliveryErr) {
-			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
 		}
 		return c.failDeliveryController(context.WithoutCancel(ctx), deliveryClaim, fmt.Errorf("Delivery Controller launch outcome is uncertain: %w", deliveryErr))
 	}
@@ -474,6 +474,9 @@ func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec wo
 func runInValidatedDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository, sealedSource, expectedSourceDigest string) (result worker.Result, resultErr error) {
 	restore, err := prepareDeliveryWorkspace(ctx, spec.WorkspacePath, sourceRepository)
 	if err != nil {
+		if ctx.Err() != nil {
+			return worker.Result{}, worker.CertifiedNoLaunchError{Err: errors.Join(ctx.Err(), err)}
+		}
 		var integrityFailure *deliverySourceIntegrityFailure
 		var infrastructureFailure *deliverySourceInfrastructureFailure
 		if errors.As(err, &integrityFailure) || errors.As(err, &infrastructureFailure) {
@@ -490,6 +493,9 @@ func runInValidatedDeliveryWorkspace(ctx context.Context, runtime worker.Runtime
 	}()
 	if sealedSource != "" || expectedSourceDigest != "" {
 		if err := verifyDeliverySourceDigest(ctx, sealedSource, expectedSourceDigest); err != nil {
+			if ctx.Err() != nil {
+				return worker.Result{}, worker.CertifiedNoLaunchError{Err: errors.Join(ctx.Err(), err)}
+			}
 			return worker.Result{}, err
 		}
 	}
@@ -805,6 +811,10 @@ func isDeliverySourceAuthenticationFailure(err error) bool {
 }
 
 func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store.TicketClaim, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		cause := worker.CertifiedNoLaunchError{Err: err}
+		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), claim, cause, store.FailureInfrastructure)
+	}
 	if isDeliverySourceAuthenticationFailure(err) {
 		deferErr := c.Store.DeferDeliveryControllerForCredentialPause(ctx, claim, c.now())
 		return errors.Join(err, deferErr)

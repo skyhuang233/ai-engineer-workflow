@@ -330,6 +330,12 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Hour)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("claim before delivery isolation = %v, want ErrNotReady", err)
+	}
+	if err := db.CompleteDeliveryController(ctx, delivery, now.Add(2*time.Hour)); !errors.Is(err, ErrWorkerLaunched) {
+		t.Fatalf("finalization before delivery isolation = %v, want ErrWorkerLaunched", err)
+	}
 	expired, err := db.ExpiredLaunchedRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -453,6 +459,89 @@ func TestExpiredReadyDeliveryFeedbackSchedulesDeliveryRetry(t *testing.T) {
 	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
 	if err != nil || len(pending) != 1 || pending[0].SessionID != claim.SessionID {
 		t.Fatalf("feedback-path delivery retry = %#v, %v", pending, err)
+	}
+}
+
+func TestExpiredReadyDeliveryFeedbackHonorsRetryLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "1", Body: "Please revise."}}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("expired delivery feedback recovery = %v, want ErrNotReady", err)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" || len(projection.Questions) != 1 {
+		t.Fatalf("retry-limited feedback projection = %#v", projection)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("retry-limited delivery claims = %#v, %v", pending, err)
+	}
+}
+
+func TestCertifiedNoLaunchRetriesExpiredReadyDelivery(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailDeliveryControllerLaunchWithClass(ctx, delivery, context.DeadlineExceeded.Error(), FailureInfrastructure, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 1 || pending[0].SessionID != claim.SessionID {
+		t.Fatalf("certified ready-state retry = %#v, %v", pending, err)
 	}
 }
 

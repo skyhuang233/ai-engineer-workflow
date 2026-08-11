@@ -250,7 +250,7 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 		return nil, err
 	}
 	for _, delivery := range expired {
-		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, DefaultMaxWorkerAttempts, now); err != nil {
 			return nil, err
 		}
 	}
@@ -280,7 +280,7 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 	return runs, nil
 }
 
-func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, now time.Time) error {
+func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, maxAttempts int, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), runID, RunRunning); err != nil {
 		return err
 	}
@@ -299,7 +299,7 @@ func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string,
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
 			return err
 		}
-		if attempts < DefaultMaxWorkerAttempts {
+		if attempts < maxWorkerAttempts(maxAttempts) {
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
 				return err
 			}
@@ -368,7 +368,7 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 		if launchState != "launched" {
 			return ErrInvalidClaim
 		}
-		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, DefaultMaxWorkerAttempts, now); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -931,11 +931,11 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
-	var sessionID, expiresText string
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, l.expires_at
+	var sessionID, launchState, expiresText string
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, r.launch_state, l.expires_at
 FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID, &expiresText)
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID, &launchState, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -947,14 +947,16 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 		return err
 	}
 	if allowExpiredUnstarted {
-		var unstarted bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		unstarted := launchState == "ready"
+		if launchState == "launched" {
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM worker_audits audit
 JOIN worker_runs run ON run.run_id = audit.run_id AND run.lease_generation = audit.lease_generation
 WHERE audit.run_id = ? AND audit.lease_generation = ? AND run.launch_state = 'launched'
 AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_id = audit.run_id AND result.lease_generation = audit.lease_generation)
 )`, claim.RunID, claim.LeaseGeneration).Scan(&unstarted); err != nil {
-			return err
+				return err
+			}
 		}
 		if !unstarted {
 			return ErrWorkerLaunched
@@ -962,6 +964,9 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 	}
 	expired := !expiresAt.After(now)
 	if expired && !allowExpiredUnstarted {
+		if launchState == "launched" {
+			return ErrWorkerLaunched
+		}
 		nowText := formatTimestamp(now)
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
 			return err

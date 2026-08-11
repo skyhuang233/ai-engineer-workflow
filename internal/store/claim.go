@@ -244,7 +244,10 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &launchState, &runR
 					return TicketClaim{}, ErrFencingConflict
 				}
 				if runKind == RunDelivery && runState == RunRunning {
-					if err := recoverExpiredDeliveryTx(ctx, tx, request.VersionID, selected.IssueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, request.Now); err != nil {
+					if launchState != "ready" {
+						return TicketClaim{}, ErrNotReady
+					}
+					if err := recoverExpiredDeliveryTx(ctx, tx, request.VersionID, selected.IssueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, request.MaxAttempts, request.Now); err != nil {
 						return TicketClaim{}, err
 					}
 					if err := tx.Commit(); err != nil {
