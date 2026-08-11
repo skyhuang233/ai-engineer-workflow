@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -40,11 +44,33 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspace := filepath.Join(t.TempDir(), "workspace")
+	workspaceRoot := t.TempDir()
+	if runtime.GOOS == "windows" {
+		workspaceRoot, err = os.MkdirTemp(filepath.VolumeName(os.TempDir())+string(os.PathSeparator), "wf-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(workspaceRoot) })
+	}
+	workspace := filepath.Join(workspaceRoot, "workspace")
 	diagnostics := filepath.Join(t.TempDir(), "artifacts", "run.log")
 	if err := os.MkdirAll(filepath.Join(workspace, ".codex"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	socketPath := filepath.Join(workspace, ".codex", "no-mistakes", "socket")
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionState := []byte(`{"thread":"ticket-2"}`)
+	sessionStatePath := filepath.Join(workspace, ".codex", "session.json")
+	if err := os.WriteFile(sessionStatePath, sessionState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socket, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
 	if err := os.MkdirAll(filepath.Dir(diagnostics), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +114,15 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	if metadata.SchemaVersion != latestSchemaVersion || metadata.ChecksumSHA256 == "" || !metadata.LastDrill.Succeeded || len(metadata.WorkspaceReferences) != 2 || len(metadata.ArtifactReferences) != 1 || !metadata.WorkspaceReferences[0].Available || metadata.WorkspaceReferences[0].ChecksumSHA256 == "" || !metadata.ArtifactReferences[0].Available || metadata.ArtifactReferences[0].ChecksumSHA256 == "" {
 		t.Fatalf("backup metadata = %#v", metadata)
 	}
+	workspaceHash := sha256.New()
+	_, _ = workspaceHash.Write([]byte(filepath.Join(".codex", "session.json")))
+	_, _ = workspaceHash.Write([]byte{0})
+	_, _ = workspaceHash.Write(sessionState)
+	wantWorkspaceChecksum := hex.EncodeToString(workspaceHash.Sum(nil))
+	if metadata.WorkspaceReferences[0].Path != workspace || metadata.WorkspaceReferences[0].ChecksumSHA256 != wantWorkspaceChecksum {
+		t.Fatalf("workspace checksum = %#v, want regular Ticket Session file checksum %s", metadata.WorkspaceReferences[0], wantWorkspaceChecksum)
+	}
+	t.Logf("online backup accepted an active AF_UNIX socket and hashed the regular Ticket Session file: workspace_checksum=%s automatic_restore_drill=%t", metadata.WorkspaceReferences[0].ChecksumSHA256, metadata.LastDrill.Succeeded)
 	var persistedReferences int
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM control_plane_backup_references WHERE backup_path = ? AND available = 1`, backupPath).Scan(&persistedReferences); err != nil || persistedReferences != 3 {
 		t.Fatalf("persisted backup references = %d, %v", persistedReferences, err)
@@ -136,6 +171,7 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	if preview.ActiveLeases != 0 || preview.OpenInbox != 1 {
 		t.Fatalf("restored recovery preview = %#v", preview)
 	}
+	t.Logf("isolated restore reconciled durable state: active_sessions=%d active_leases=%d processing_outbox=%d poll_cursors=%d open_inbox=%d", preview.ActiveSessions, preview.ActiveLeases, preview.ProcessingOutbox, preview.PollCursors, preview.OpenInbox)
 	metrics, err := restored.OperationalMetrics(ctx, backupPath, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatal(err)

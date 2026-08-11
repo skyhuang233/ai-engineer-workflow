@@ -315,7 +315,7 @@ func resolveWorkerBuildInputs(ctx context.Context, client *githubapi.Client, rep
 	if err := decoder.Decode(&config); err != nil {
 		return resolvedWorkerBuildInputs{}, fmt.Errorf("decode toolchain config at %q: %w", ref, err)
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.validateWorkerBuildInputs(); err != nil {
 		return resolvedWorkerBuildInputs{}, fmt.Errorf("validate toolchain config at %q: %w", ref, err)
 	}
 	deployTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "deploy", "tree")
