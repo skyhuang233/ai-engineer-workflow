@@ -79,6 +79,13 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	ws, err := c.Workspace.ensure(ctx, session.SessionID, request.Claim.RunID, request.SourceRepository, request.Branch)
 	if err != nil {
+		if isDeliverySourceAuthenticationFailure(err) {
+			return Candidate{}, err
+		}
+		var refreshFailure *deliverySourceRefreshFailure
+		if errors.As(err, &refreshFailure) {
+			return c.failInitialSourceRefresh(context.WithoutCancel(ctx), request, err)
+		}
 		return Candidate{}, err
 	}
 	identity := session.AgentIdentity
@@ -608,6 +615,14 @@ func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspac
 		return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, reason, "", nil)
 	}
 	return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, reason, output, &redactor)
+}
+
+func (c Controller) failInitialSourceRefresh(ctx context.Context, request RunRequest, refreshErr error) (Candidate, error) {
+	recordErr := c.Store.RecordRunFailure(ctx, store.RunFailure{
+		RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken,
+		Error: refreshErr.Error(), Class: store.FailureInfrastructure, Now: c.now(),
+	})
+	return Candidate{}, errors.Join(refreshErr, recordErr)
 }
 
 func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string, redactor *codexauth.Redactor) (Candidate, error) {

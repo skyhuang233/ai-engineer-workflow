@@ -10,6 +10,7 @@ import (
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
@@ -54,16 +55,21 @@ func fetchDeliverySource(ctx context.Context, snapshotPath, remoteURL, headRef s
 	remote := git.NewRemote(repositoryStore.Storer, &config.RemoteConfig{Name: "workflow-source-refresh", URLs: []string{remoteURL}})
 	err = remote.FetchContext(ctx, &git.FetchOptions{
 		RefSpecs: []config.RefSpec{
-			config.RefSpec("+" + headRef + ":" + headRef),
+			config.RefSpec("+refs/heads/*:refs/heads/*"),
 			config.RefSpec("+refs/tags/*:refs/tags/*"),
 		},
-		Auth: auth,
+		Auth:  auth,
+		Tags:  git.NoTags,
+		Prune: true,
 	})
 	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		if errors.Is(err, transport.ErrAuthenticationRequired) || errors.Is(err, transport.ErrAuthorizationFailed) {
 			return deliverySourceAuthenticationError{err: fmt.Errorf("fetch admitted GitHub source: %w", err)}
 		}
 		return fmt.Errorf("fetch admitted GitHub source: %w", err)
+	}
+	if _, err := repositoryStore.Reference(plumbing.ReferenceName(headRef), true); err != nil {
+		return fmt.Errorf("resolve admitted GitHub source head: %w", err)
 	}
 	return nil
 }

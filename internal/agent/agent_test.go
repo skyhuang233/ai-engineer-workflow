@@ -640,6 +640,35 @@ func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
 	}
 }
 
+func TestControllerBacksOffInitialDeliverySourceRefreshFailure(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	failureNow := claim.LeaseExpiresAt.Add(-30 * time.Second)
+	manager := agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		RefreshDeliverySource: func(context.Context, string) (string, error) {
+			return "", errors.New("GitHub source temporarily unavailable")
+		},
+	}
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, Now: func() time.Time { return failureNow }}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "GitHub source temporarily unavailable") {
+		t.Fatalf("initial Delivery Source refresh error = %v", err)
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatal("worker started after initial Delivery Source refresh failed")
+	}
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: failureNow.Add(30 * time.Second),
+	}); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("initial Delivery Source infrastructure retry = %v, want ErrNotReady", err)
+	}
+}
+
 func TestControllerAcceptsCredentialBearingCandidateInTrustedWorkflow(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

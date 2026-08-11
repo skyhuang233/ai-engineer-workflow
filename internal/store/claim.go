@@ -956,7 +956,7 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 		} else if err != nil {
 			return false, err
 		}
-		resolved, err := resolveDeliveredQuestionsTx(ctx, tx, versionID, issueID, nowText)
+		resolved, err := resolveDeliveredAttentionTx(ctx, tx, versionID, issueID, nowText)
 		if err != nil {
 			return false, err
 		}
@@ -979,7 +979,7 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 			return false, ErrNotFound
 		}
 	}
-	resolvedQuestions, err := resolveDeliveredQuestionsTx(ctx, tx, versionID, issueID, nowText)
+	resolvedAttention, err := resolveDeliveredAttentionTx(ctx, tx, versionID, issueID, nowText)
 	if err != nil {
 		return false, err
 	}
@@ -1005,7 +1005,7 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 	if err != nil {
 		return false, err
 	}
-	if resolvedQuestions > 0 && !completionQueued {
+	if resolvedAttention > 0 && !completionQueued {
 		if err := s.queueDeliveredQuestionRepairTx(ctx, tx, versionID, now); err != nil {
 			return false, err
 		}
@@ -1016,14 +1016,26 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 	return true, nil
 }
 
-func resolveDeliveredQuestionsTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, nowText string) (int64, error) {
+func resolveDeliveredAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, nowText string) (int64, error) {
 	result, err := tx.ExecContext(ctx, `UPDATE workflow_questions
 SET state = 'answered', answer = ?, answered_at = ?
-WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID)
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate', 'closed_unmerged_impact') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	result, err = tx.ExecContext(ctx, `DELETE FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, versionID, issueID)
+	if err != nil {
+		return 0, err
+	}
+	cleared, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return resolved + cleared, nil
 }
 
 func (s *Store) queueDeliveredQuestionRepairTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {

@@ -2154,10 +2154,13 @@ func TestMarkTicketDeliveredRepairsProjectedQuestionsIdempotently(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"needs_attention", "quality_gate"} {
+	for _, kind := range []string{"needs_attention", "quality_gate", "closed_unmerged_impact"} {
 		if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, kind, "stale delivery recovery", now.Add(time.Second)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, version.ID, int64(1), "pull request closed without merge", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -2178,6 +2181,13 @@ func TestMarkTicketDeliveredRepairsProjectedQuestionsIdempotently(t *testing.T) 
 	}
 	if len(questions) != 0 {
 		t.Fatalf("stale delivered questions remained open: %#v", questions)
+	}
+	var freezes int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plan_freezes WHERE version_id = ?`, version.ID).Scan(&freezes); err != nil {
+		t.Fatal(err)
+	}
+	if freezes != 0 {
+		t.Fatalf("stale delivered Plan freezes = %d, want 0", freezes)
 	}
 	after, err := db.DueDeliveryOutboxKeys(ctx, now.Add(time.Minute), 10)
 	if err != nil {

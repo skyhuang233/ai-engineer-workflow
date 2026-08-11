@@ -23,10 +23,13 @@ func TestFetchDeliverySourceUpdatesHeadWithoutPersistingRemote(t *testing.T) {
 	}
 	runSourceFetcherGit(t, publisher, "add", "source.txt")
 	runSourceFetcherGit(t, publisher, "commit", "-m", "advanced")
+	runSourceFetcherGit(t, publisher, "branch", "stale")
+	runSourceFetcherGit(t, publisher, "tag", "stale")
 	runSourceFetcherGit(t, publisher, "remote", "add", "origin", remote)
 	runSourceFetcherGit(t, publisher, "push", "origin", "main")
 	snapshot := filepath.Join(root, "snapshot.git")
 	runSourceFetcherGit(t, "", "init", "--bare", snapshot)
+	runSourceFetcherGit(t, snapshot, "fetch", publisher, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
 	if err := fetchDeliverySource(ctx, snapshot, remote, "refs/heads/main", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +37,9 @@ func TestFetchDeliverySourceUpdatesHeadWithoutPersistingRemote(t *testing.T) {
 	got := sourceFetcherGitOutput(t, snapshot, "rev-parse", "refs/heads/main")
 	if got != want {
 		t.Fatalf("fetched Delivery Source head = %q, want %q", got, want)
+	}
+	if refs := sourceFetcherGitOutput(t, snapshot, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags"); refs != "refs/heads/main" {
+		t.Fatalf("fetched Delivery Source refs = %q, want authoritative remote refs", refs)
 	}
 	if remotes := sourceFetcherGitOutput(t, snapshot, "remote"); remotes != "" {
 		t.Fatalf("Delivery Source persisted remote configuration %q", remotes)

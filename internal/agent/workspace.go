@@ -33,6 +33,13 @@ type workspace struct {
 	BaseCommit       string
 }
 
+type deliverySourceRefreshFailure struct {
+	err error
+}
+
+func (e *deliverySourceRefreshFailure) Error() string { return e.err.Error() }
+func (e *deliverySourceRefreshFailure) Unwrap() error { return e.err }
+
 type RecoveryInspector struct {
 	Containers worker.ContainerInspector
 	Workspace  WorkspaceManager
@@ -482,7 +489,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if m.RefreshDeliverySource != nil {
 		head, err = m.RefreshDeliverySource(ctx, temporaryPath)
 		if err != nil {
-			return "", fmt.Errorf("refresh Delivery Source from admitted remote: %w", err)
+			return "", &deliverySourceRefreshFailure{err: fmt.Errorf("refresh Delivery Source from admitted remote: %w", err)}
 		}
 	} else {
 		head, err = gitOutput(ctx, sourceRepository, "symbolic-ref", "--quiet", "HEAD")
