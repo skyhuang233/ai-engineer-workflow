@@ -122,6 +122,42 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.validateWorkerBuildInputs(); err != nil {
+		return err
+	}
+	switch {
+	case c.Runtime.MaxWorkerAttempts < 1:
+		return errors.New("runtime max worker attempts must be positive")
+	case !repoPattern.MatchString(c.GitHub.TestRepository):
+		return errors.New("GitHub test repository must be owner/name")
+	case strings.TrimSpace(c.GitHub.DefaultBranch) == "":
+		return errors.New("GitHub default branch is required")
+	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
+		return errors.New("GitHub required check is required")
+	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
+		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
+	case c.GitHub.Credential.Kind != "github-app":
+		return errors.New("Control Plane GitHub credential must be a GitHub App")
+	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
+		return errors.New("Control Plane GitHub App owner is required")
+	case !strings.EqualFold(strings.TrimSpace(c.GitHub.Credential.PrivateKeyFile), GitHubAppPrivateKeyFile):
+		return fmt.Errorf("Control Plane GitHub App private key file must be %s", GitHubAppPrivateKeyFile)
+	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
+		return errors.New("worker release repository owner must match the Control Plane GitHub App owner")
+	case !repositoryOwnedBy(c.GitHub.TestRepository, c.GitHub.Credential.Owner):
+		return errors.New("GitHub test repository owner must match the Control Plane GitHub App owner")
+	case !c.GitHub.Credential.AllRepositories:
+		return errors.New("Control Plane GitHub App must cover all repositories")
+	case !validGitHubAppPermissions(c.GitHub.Credential.Permissions):
+		return errors.New("Control Plane GitHub App permissions do not satisfy the GitHub contract")
+	case strings.TrimSpace(c.Upgrade.Rule) == "":
+		return errors.New("toolchain upgrade rule is required")
+	default:
+		return nil
+	}
+}
+
+func (c Config) validateWorkerBuildInputs() error {
 	switch {
 	case c.SchemaVersion != 5:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
@@ -157,32 +193,6 @@ func (c Config) Validate() error {
 		return errors.New("worker image repository must be an unpinned GHCR repository")
 	case !repoPattern.MatchString(c.Worker.ReleaseRepository):
 		return errors.New("worker release repository must be owner/name")
-	case c.Runtime.MaxWorkerAttempts < 1:
-		return errors.New("runtime max worker attempts must be positive")
-	case !repoPattern.MatchString(c.GitHub.TestRepository):
-		return errors.New("GitHub test repository must be owner/name")
-	case strings.TrimSpace(c.GitHub.DefaultBranch) == "":
-		return errors.New("GitHub default branch is required")
-	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
-		return errors.New("GitHub required check is required")
-	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
-		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
-	case c.GitHub.Credential.Kind != "github-app":
-		return errors.New("Control Plane GitHub credential must be a GitHub App")
-	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
-		return errors.New("Control Plane GitHub App owner is required")
-	case !strings.EqualFold(strings.TrimSpace(c.GitHub.Credential.PrivateKeyFile), GitHubAppPrivateKeyFile):
-		return fmt.Errorf("Control Plane GitHub App private key file must be %s", GitHubAppPrivateKeyFile)
-	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
-		return errors.New("worker release repository owner must match the Control Plane GitHub App owner")
-	case !repositoryOwnedBy(c.GitHub.TestRepository, c.GitHub.Credential.Owner):
-		return errors.New("GitHub test repository owner must match the Control Plane GitHub App owner")
-	case !c.GitHub.Credential.AllRepositories:
-		return errors.New("Control Plane GitHub App must cover all repositories")
-	case !validGitHubAppPermissions(c.GitHub.Credential.Permissions):
-		return errors.New("Control Plane GitHub App permissions do not satisfy the GitHub contract")
-	case strings.TrimSpace(c.Upgrade.Rule) == "":
-		return errors.New("toolchain upgrade rule is required")
 	default:
 		return nil
 	}

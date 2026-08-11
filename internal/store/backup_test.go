@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -40,11 +42,28 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspace := filepath.Join(t.TempDir(), "workspace")
+	workspaceRoot := t.TempDir()
+	if runtime.GOOS == "windows" {
+		workspaceRoot, err = os.MkdirTemp(filepath.VolumeName(os.TempDir())+string(os.PathSeparator), "wf-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(workspaceRoot) })
+	}
+	workspace := filepath.Join(workspaceRoot, "workspace")
 	diagnostics := filepath.Join(t.TempDir(), "artifacts", "run.log")
 	if err := os.MkdirAll(filepath.Join(workspace, ".codex"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	socketPath := filepath.Join(workspace, ".codex", "no-mistakes", "socket")
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
 	if err := os.MkdirAll(filepath.Dir(diagnostics), 0o700); err != nil {
 		t.Fatal(err)
 	}

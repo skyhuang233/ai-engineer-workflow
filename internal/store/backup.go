@@ -232,6 +232,9 @@ func checksumReference(path string) (string, bool, error) {
 		if info.IsDir() {
 			return nil
 		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 		relative, err := filepath.Rel(path, file)
 		if err != nil {
 			return err

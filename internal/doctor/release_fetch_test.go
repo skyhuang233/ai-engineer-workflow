@@ -65,6 +65,18 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sourceConfig := config
+	sourceConfig.GitHub.Credential.Kind = "fine-grained-pat"
+	sourceConfig.GitHub.Credential.PrivateKeyFile = ""
+	sourceConfig.GitHub.Credential.Permissions = make(map[string]string, len(config.GitHub.Credential.Permissions))
+	for name, access := range config.GitHub.Credential.Permissions {
+		sourceConfig.GitHub.Credential.Permissions[name] = access
+	}
+	delete(sourceConfig.GitHub.Credential.Permissions, "checks")
+	sourceConfigData, err := json.Marshal(sourceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	workflowID := int64(77)
 	mergedBy := "skyhuang233"
 	immutableRelease := true
@@ -87,7 +99,11 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 		case "/repos/skyhuang233/ai-engineer-workflow/commits/" + sourceSHA:
 			_, _ = w.Write([]byte(`{"sha":"` + sourceSHA + `","commit":{"tree":{"sha":"` + sourceRootTree + `"}}}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/contents/config/toolchain.json":
-			_, _ = w.Write(configData)
+			if r.URL.Query().Get("ref") == sourceSHA {
+				_, _ = w.Write(sourceConfigData)
+			} else {
+				_, _ = w.Write(configData)
+			}
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceRootTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + sourceDeployTree + `"},{"path":".github","type":"tree","sha":"` + sourceGitHubTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainRootTree:
