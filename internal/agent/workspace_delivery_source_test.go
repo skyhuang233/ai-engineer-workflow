@@ -49,6 +49,13 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	if first.DeliverySource != pinnedFirst || strings.TrimSpace(firstWorkspaceMain) != strings.TrimSpace(firstMain) || strings.TrimSpace(firstWorkspaceMain) == strings.TrimSpace(sourceMain) {
 		t.Fatalf("workspace did not use pinned revision source: snapshot=%q workspace=%q source=%q", firstMain, firstWorkspaceMain, sourceMain)
 	}
+	firstOrigin, err := gitOutput(ctx, first.Path, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(firstOrigin), source) {
+		t.Fatalf("Ticket Workspace origin = %q, want admitted source %q", firstOrigin, source)
+	}
 	second, err := manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +85,7 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	}
 }
 
-func TestPrepareDeliveryWorkspaceReplacesAllOriginURLs(t *testing.T) {
+func TestPrepareDeliveryWorkspaceScopesOriginReplacement(t *testing.T) {
 	ctx := context.Background()
 	repository := filepath.Join(t.TempDir(), "workspace")
 	if err := runGit(ctx, "", "init", "-b", "main", repository); err != nil {
@@ -89,7 +96,8 @@ func TestPrepareDeliveryWorkspaceReplacesAllOriginURLs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := prepareDeliveryWorkspace(ctx, repository); err != nil {
+	restore, err := prepareDeliveryWorkspace(ctx, repository, `C:\source\repository`)
+	if err != nil {
 		t.Fatal(err)
 	}
 	urls, err := gitOutput(ctx, repository, "config", "--local", "--get-all", "remote.origin.url")
@@ -98,6 +106,16 @@ func TestPrepareDeliveryWorkspaceReplacesAllOriginURLs(t *testing.T) {
 	}
 	if strings.TrimSpace(urls) != "/source-repository" {
 		t.Fatalf("prepared Delivery Worker origins = %q", urls)
+	}
+	if err := restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	urls, err = gitOutput(ctx, repository, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(urls) != `C:\source\repository` {
+		t.Fatalf("restored Ticket Workspace origins = %q", urls)
 	}
 }
 

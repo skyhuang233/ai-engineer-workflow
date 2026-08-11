@@ -24,11 +24,12 @@ type WorkspaceManager struct {
 }
 
 type workspace struct {
-	Path           string
-	CodexState     string
-	DeliverySource string
-	Branch         string
-	BaseCommit     string
+	Path             string
+	CodexState       string
+	DeliverySource   string
+	SourceRepository string
+	Branch           string
+	BaseCommit       string
 }
 
 type RecoveryInspector struct {
@@ -344,7 +345,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 		return workspace{}, err
 	}
 	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
-		if err := runGit(ctx, "", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--local", "--no-hardlinks", deliverySource, path); err != nil {
+		if err := runGit(ctx, "", "-c", "core.longpaths=true", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--config", "core.longpaths=true", "--local", "--no-hardlinks", deliverySource, path); err != nil {
 			return workspace{}, fmt.Errorf("clone ticket workspace: %w", err)
 		}
 		if err := runGit(ctx, path, "checkout", "-b", branch); err != nil {
@@ -364,6 +365,9 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", deliverySource, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return workspace{}, fmt.Errorf("refresh ticket workspace source: %w", err)
 	}
+	if err := replaceWorkspaceOriginURLs(ctx, path, []string{sourceRepository}); err != nil {
+		return workspace{}, fmt.Errorf("restore ticket workspace origin: %w", err)
+	}
 	if err := configureTicketWorkspaceLineEndings(ctx, path); err != nil {
 		return workspace{}, err
 	}
@@ -380,7 +384,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	if err != nil {
 		return workspace{}, err
 	}
-	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
+	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
 }
 
 func (m WorkspaceManager) deliverySourceSessionPath(sessionID, workspacePath string) (string, error) {
@@ -448,7 +452,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", err
 	}
-	temporaryPath, err := os.MkdirTemp(filepath.Dir(root), ".delivery-")
+	temporaryPath, err := os.MkdirTemp(root, ".delivery-")
 	if err != nil {
 		return "", err
 	}
@@ -465,8 +469,11 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if _, err := gitOutput(ctx, sourceRepository, "check-ref-format", "--branch", branch); err != nil {
 		return "", fmt.Errorf("invalid Delivery Source branch %q: %w", branch, err)
 	}
-	if err := runGit(ctx, "", "init", "--bare", "--template=", temporaryPath); err != nil {
+	if err := runGit(ctx, "", "-c", "core.longpaths=true", "init", "--bare", "--template=", temporaryPath); err != nil {
 		return "", fmt.Errorf("initialize Delivery Source: %w", err)
+	}
+	if err := runGit(ctx, temporaryPath, "config", "--local", "core.longpaths", "true"); err != nil {
+		return "", fmt.Errorf("configure Delivery Source long paths: %w", err)
 	}
 	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*"); err != nil {
 		return "", fmt.Errorf("copy admitted Delivery Source: %w", err)
@@ -530,6 +537,31 @@ func validateLocalRemotes(ctx context.Context, path string) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func replaceWorkspaceOriginURLs(ctx context.Context, workspacePath string, urls []string) error {
+	if len(urls) == 0 || strings.TrimSpace(urls[0]) == "" {
+		return errors.New("Ticket Workspace origin is required")
+	}
+	if err := runGit(ctx, workspacePath, "config", "--local", "--replace-all", "remote.origin.url", urls[0]); err != nil {
+		return err
+	}
+	for _, remoteURL := range urls[1:] {
+		if strings.TrimSpace(remoteURL) == "" {
+			return errors.New("Ticket Workspace origin is required")
+		}
+		if err := runGit(ctx, workspacePath, "config", "--local", "--add", "remote.origin.url", remoteURL); err != nil {
+			return err
+		}
+	}
+	selected, err := gitOutput(ctx, workspacePath, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(selected) != strings.Join(urls, "\n") {
+		return errors.New("Ticket Workspace origin URLs were not configured exactly")
 	}
 	return nil
 }
@@ -681,6 +713,9 @@ func (m WorkspaceManager) restore(ctx context.Context, ws workspace, commit stri
 }
 
 func configureTicketWorkspaceLineEndings(ctx context.Context, path string) error {
+	if err := runGit(ctx, path, "config", "--local", "core.longpaths", "true"); err != nil {
+		return fmt.Errorf("configure Ticket Workspace long paths: %w", err)
+	}
 	if err := runGit(ctx, path, "config", "--local", "core.autocrlf", "false"); err != nil {
 		return fmt.Errorf("configure Ticket Workspace autocrlf: %w", err)
 	}

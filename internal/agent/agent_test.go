@@ -39,6 +39,7 @@ type fakeRuntime struct {
 	refreshedAuth                 []byte
 	deleteCodexAuthDuringDelivery bool
 	beforeDeliveryReturn          func(time.Time) error
+	deliveryOrigin                string
 }
 
 type blockingFailureRuntime struct {
@@ -59,6 +60,12 @@ func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Re
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
+		origin := exec.Command("git", "-C", spec.WorkspacePath, "config", "--local", "--get-all", "remote.origin.url")
+		originOutput, err := origin.Output()
+		if err != nil {
+			return worker.Result{}, err
+		}
+		r.deliveryOrigin = strings.TrimSpace(string(originOutput))
 		if r.deleteCodexAuthDuringDelivery {
 			if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
 				return worker.Result{}, err
@@ -167,12 +174,16 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
-	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace")); err == nil {
+	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace"))
+	if runErr == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
 	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if session.WorkspacePath == "" {
+		t.Fatalf("Ticket Workspace was not bound: %v", runErr)
 	}
 	origin := exec.Command("git", "remote", "get-url", "origin")
 	origin.Dir = session.WorkspacePath
@@ -216,12 +227,16 @@ func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T)
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
 	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
-	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace")); err == nil {
+	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace"))
+	if runErr == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
 	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if session.WorkspacePath == "" {
+		t.Fatalf("Ticket Workspace was not bound: %v", runErr)
 	}
 	readme, err := os.ReadFile(filepath.Join(session.WorkspacePath, "README.md"))
 	if err != nil {
@@ -231,10 +246,11 @@ func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T)
 		t.Fatalf("Ticket Workspace README uses CRLF: %q", readme)
 	}
 	for key, want := range map[string]string{
-		"core.autocrlf": "false",
-		"core.eol":      "lf",
-		"user.name":     "workflow-ticket-agent",
-		"user.email":    "workflow-ticket-agent@users.noreply.github.com",
+		"core.autocrlf":  "false",
+		"core.eol":       "lf",
+		"core.longpaths": "true",
+		"user.name":      "workflow-ticket-agent",
+		"user.email":     "workflow-ticket-agent@users.noreply.github.com",
 	} {
 		command := exec.Command("git", "config", "--local", "--get", key)
 		command.Dir = session.WorkspacePath
@@ -1235,7 +1251,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[1].Environment["NO_MISTAKES_GATEWAY_URL"] != "http://gateway.test" {
 		t.Fatalf("Delivery Controller Gateway URL = %#v", first.specs[1].Environment)
 	}
-	assertDeliveryOriginMount(t, first.specs[1], source)
+	assertDeliveryOriginMount(t, first, first.specs[1], source)
 	if !first.deliveryDeadline.After(claim.LeaseExpiresAt) {
 		t.Fatalf("Delivery Controller deadline = %s, want after Agent deadline %s", first.deliveryDeadline, claim.LeaseExpiresAt)
 	}
@@ -1392,7 +1408,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != "2.97.0" {
 		t.Fatalf("original Delivery Worker runtime = %#v, want Candidate runtime", runtime.specs)
 	}
-	assertDeliveryOriginMount(t, runtime.specs[0], source)
+	assertDeliveryOriginMount(t, runtime, runtime.specs[0], source)
 	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
 	if err != nil || candidateTools["github-cli"] != "" {
 		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
@@ -1614,14 +1630,17 @@ func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryC
 	}
 }
 
-func assertDeliveryOriginMount(t *testing.T, spec worker.Spec, source string) {
+func assertDeliveryOriginMount(t *testing.T, runtime *fakeRuntime, spec worker.Spec, source string) {
 	t.Helper()
 	if _, exists := spec.Environment["GIT_CONFIG_COUNT"]; exists {
 		t.Fatalf("Delivery Controller retained additive Git origin override = %#v", spec.Environment)
 	}
+	if runtime.deliveryOrigin != "/source-repository" {
+		t.Fatalf("Delivery Controller workspace origin = %q", runtime.deliveryOrigin)
+	}
 	workspaceOrigin := exec.Command("git", "-C", spec.WorkspacePath, "remote", "get-url", "--all", "origin")
-	if output, err := workspaceOrigin.Output(); err != nil || strings.TrimSpace(string(output)) != "/source-repository" {
-		t.Fatalf("Delivery Controller workspace origin = %q, %v", output, err)
+	if output, err := workspaceOrigin.Output(); err != nil || !strings.EqualFold(filepath.Clean(strings.TrimSpace(string(output))), filepath.Clean(source)) {
+		t.Fatalf("restored Ticket Workspace origin = %q, %v", output, err)
 	}
 	for _, mount := range spec.Mounts {
 		if mount.Target == "/source-repository" {

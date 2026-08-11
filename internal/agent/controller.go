@@ -239,11 +239,14 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
-	var deliverySource string
+	var deliverySource, sourceRepository string
 	if strings.TrimSpace(c.SourceRepository) != "" {
-		sourceRepository, err := localSourceRepository(c.SourceRepository)
+		sourceRepository, err = localSourceRepository(c.SourceRepository)
 		if err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err))
 		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, session.WorkspacePath, sourceRepository)
 		if err != nil {
@@ -258,7 +261,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 			return c.failDeliveryController(finalizationCtx, claim, err)
 		}
 	}
-	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, Branch: session.Branch}
+	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
@@ -302,9 +305,6 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
 	}
 	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, err)
-	}
-	if err := prepareDeliveryWorkspace(ctx, ws.Path); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	deliveryEnvironment := map[string]string{
@@ -363,7 +363,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
-	deliveryResult, deliveryErr := c.Runtime.Run(deliveryCtx, deliverySpec)
+	deliveryResult, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
+	if deliveryErr != nil && deliveryResult.ContainerID == "" {
+		return c.failDeliveryController(ctx, deliveryClaim, deliveryErr)
+	}
 	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
@@ -395,21 +398,41 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	return nil
 }
 
-func prepareDeliveryWorkspace(ctx context.Context, workspacePath string) error {
-	if strings.TrimSpace(workspacePath) == "" {
-		return errors.New("Ticket Workspace path is required")
-	}
-	if err := runGit(ctx, workspacePath, "config", "--local", "--replace-all", "remote.origin.url", "/source-repository"); err != nil {
-		return fmt.Errorf("configure Delivery Worker origin: %w", err)
-	}
-	urls, err := gitOutput(ctx, workspacePath, "remote", "get-url", "--all", "origin")
+func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, resultErr error) {
+	restore, err := prepareDeliveryWorkspace(ctx, spec.WorkspacePath, sourceRepository)
 	if err != nil {
-		return fmt.Errorf("validate Delivery Worker origin: %w", err)
+		return worker.Result{}, err
 	}
-	if strings.TrimSpace(urls) != "/source-repository" {
-		return errors.New("Delivery Worker origin does not select the mounted Delivery Source")
+	defer func() {
+		restoreCtx, cancel := context.WithTimeout(context.Background(), workerAuditTimeout)
+		defer cancel()
+		resultErr = errors.Join(resultErr, restore(restoreCtx))
+	}()
+	return runtime.Run(ctx, spec)
+}
+
+func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceRepository string) (func(context.Context) error, error) {
+	if strings.TrimSpace(workspacePath) == "" {
+		return nil, errors.New("Ticket Workspace path is required")
 	}
-	return nil
+	original, err := gitOutput(ctx, workspacePath, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		return nil, fmt.Errorf("read Ticket Workspace origin: %w", err)
+	}
+	restoreURLs := strings.Split(strings.TrimSpace(original), "\n")
+	if strings.TrimSpace(sourceRepository) != "" {
+		restoreURLs = []string{sourceRepository}
+	}
+	if err := replaceWorkspaceOriginURLs(ctx, workspacePath, []string{"/source-repository"}); err != nil {
+		return nil, fmt.Errorf("configure Delivery Worker origin: %w", err)
+	}
+	restore := func(restoreCtx context.Context) error {
+		if err := replaceWorkspaceOriginURLs(restoreCtx, workspacePath, restoreURLs); err != nil {
+			return fmt.Errorf("restore Ticket Workspace origin: %w", err)
+		}
+		return nil
+	}
+	return restore, nil
 }
 
 func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string, error) {
