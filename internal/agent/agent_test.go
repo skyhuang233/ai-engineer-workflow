@@ -1513,11 +1513,11 @@ func TestControllerRetryDeliveryRejectsRepinnedModernSource(t *testing.T) {
 	}
 }
 
-func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfterRestart(t *testing.T) {
+func TestControllerRetryDeliveryRevalidatesLegacyCandidateWithoutSourceDigest(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
-	db, _, claim := createClaim(t, ctx, root)
+	db, version, claim := createClaim(t, ctx, root)
 	t.Cleanup(func() { _ = db.Close() })
 	workspacePath := filepath.Join(root, "workspace")
 	for _, command := range [][]string{
@@ -1553,7 +1553,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	oldTools := map[string]string{"codex": "1.0.0", "go": "1.25.12", "no-mistakes": "v1.0.0"}
 	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{
 		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: strings.TrimSpace(string(head)),
-		StructuredOutput: []byte(`{"summary":"accepted","checks":[{"command":"go test","outcome":"passed"}]}`), ImageDigest: oldImage, ToolVersions: oldTools, Now: time.Now().UTC(),
+		StructuredOutput: []byte(`{"summary":"accepted","checks":[{"command":"go test","outcome":"passed"}]}`), ImageDigest: oldImage, ToolVersions: oldTools, DeliverySourceDigest: strings.Repeat("a", 64), Now: time.Now().UTC(),
 		Publication: store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"},
 	}, time.Minute)
 	if err != nil {
@@ -1570,6 +1570,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		"DELETE FROM schema_migrations WHERE version >= 48",
 		"ALTER TABLE worker_runs DROP COLUMN delivery_runtime_candidate_run_id",
 		"ALTER TABLE worker_audits DROP COLUMN lease_generation",
+		"ALTER TABLE candidate_revisions DROP COLUMN delivery_source_digest",
 		"DROP TABLE worker_container_results",
 	} {
 		if _, err := raw.ExecContext(ctx, statement); err != nil {
@@ -1594,19 +1595,25 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test", SourceRepository: source}
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
-		t.Fatalf("resume original ready Delivery Worker Run: %v", err)
+		t.Fatalf("revalidate legacy delivery: %v", err)
 	}
-	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != "2.97.0" {
-		t.Fatalf("original Delivery Worker runtime = %#v, want Candidate runtime", runtime.specs)
+	if len(runtime.specs) != 0 {
+		t.Fatalf("Delivery Controller launched without pinned source provenance: %#v", runtime.specs)
 	}
-	assertDeliveryOriginMount(t, runtime, runtime.specs[0], source)
 	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
 	if err != nil || candidateTools["github-cli"] != "" {
 		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
 	}
-	audit, err := db.WorkerAudit(ctx, deliveryClaim.RunID)
-	if err != nil || audit.ImageDigest != oldImage || audit.LeaseGeneration != deliveryClaim.LeaseGeneration || audit.ContainerID != "delivery-container" {
-		t.Fatalf("original Delivery Worker audit = %#v, %v", audit, err)
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatalf("claim Delivery Source revalidation: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "lacks verifiable Delivery Source provenance") {
+		t.Fatalf("Delivery Source revalidation = %#v, prompt %q", revision, prompt)
+	}
+	deliverySource := filepath.Join(root, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	if _, err := os.Stat(deliverySource); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy Delivery Source was reconstructed: %v", err)
 	}
 }
 

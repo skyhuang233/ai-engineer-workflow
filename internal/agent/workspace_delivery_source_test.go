@@ -12,7 +12,14 @@ import (
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/worker"
 )
+
+type deliveryWorkspaceRuntimeFunc func(context.Context, worker.Spec) (worker.Result, error)
+
+func (run deliveryWorkspaceRuntimeFunc) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
+	return run(ctx, spec)
+}
 
 func TestDeliverySourceAuthenticationFailure(t *testing.T) {
 	tests := []struct {
@@ -347,6 +354,47 @@ func TestPrepareDeliveryWorkspaceScopesOriginReplacement(t *testing.T) {
 	if strings.TrimSpace(urls) != `C:\source\repository` {
 		t.Fatalf("restored Ticket Workspace origins = %q", urls)
 	}
+}
+
+func TestRunInDeliveryWorkspaceClassifiesHostFailuresAsInfrastructure(t *testing.T) {
+	ctx := context.Background()
+	repository := filepath.Join(t.TempDir(), "workspace")
+	if err := runGit(ctx, "", "init", "-b", "main", repository); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, repository, "config", "--local", "remote.origin.url", repository); err != nil {
+		t.Fatal(err)
+	}
+	configLock := filepath.Join(repository, ".git", "config.lock")
+	spec := worker.Spec{WorkspacePath: repository}
+
+	t.Run("prepare", func(t *testing.T) {
+		if err := os.WriteFile(configLock, []byte("locked"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(configLock)
+		invoked := false
+		_, err := runInDeliveryWorkspace(ctx, deliveryWorkspaceRuntimeFunc(func(context.Context, worker.Spec) (worker.Result, error) {
+			invoked = true
+			return worker.Result{}, nil
+		}), spec, "")
+		if err == nil || !worker.IsInfrastructureFailure(err) || invoked {
+			t.Fatalf("preparation result: invoked=%t err=%v", invoked, err)
+		}
+	})
+
+	t.Run("restore", func(t *testing.T) {
+		result, err := runInDeliveryWorkspace(ctx, deliveryWorkspaceRuntimeFunc(func(context.Context, worker.Spec) (worker.Result, error) {
+			if err := os.WriteFile(configLock, []byte("locked"), 0o600); err != nil {
+				return worker.Result{}, err
+			}
+			return worker.Result{ContainerID: "container"}, nil
+		}), spec, "")
+		defer os.Remove(configLock)
+		if result.ContainerID != "container" || err == nil || !worker.IsInfrastructureFailure(err) {
+			t.Fatalf("restoration result: result=%#v err=%v", result, err)
+		}
+	})
 }
 
 func writeDeliverySourceCommit(t *testing.T, ctx context.Context, source, content string) {

@@ -248,6 +248,9 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
+	if strings.TrimSpace(expectedSourceDigest) == "" {
+		return c.Store.RevalidateDeliverySource(finalizationCtx, claim, "The accepted Candidate Revision lacks verifiable Delivery Source provenance. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain.", c.now())
+	}
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
@@ -387,12 +390,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
-	deliveryResult, runtimeInvoked, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
+	deliveryResult, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
-		if runtimeInvoked {
-			return c.failDeliveryControllerWithClass(ctx, deliveryClaim, deliveryErr, failureClass(deliveryErr))
-		}
-		return c.failDeliveryController(ctx, deliveryClaim, deliveryErr)
+		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, deliveryErr, failureClass(deliveryErr))
 	}
 	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
@@ -425,18 +425,20 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	return nil
 }
 
-func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, runtimeInvoked bool, resultErr error) {
+func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, resultErr error) {
 	restore, err := prepareDeliveryWorkspace(ctx, spec.WorkspacePath, sourceRepository)
 	if err != nil {
-		return worker.Result{}, false, err
+		return worker.Result{}, worker.InfrastructureError{Err: err}
 	}
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), workerAuditTimeout)
 		defer cancel()
-		resultErr = errors.Join(resultErr, restore(restoreCtx))
+		if err := restore(restoreCtx); err != nil {
+			resultErr = errors.Join(resultErr, worker.InfrastructureError{Err: err})
+		}
 	}()
 	result, resultErr = runtime.Run(ctx, spec)
-	return result, true, resultErr
+	return result, resultErr
 }
 
 func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceRepository string) (func(context.Context) error, error) {
@@ -470,7 +472,7 @@ func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string,
 
 func verifyDeliverySourceDigest(ctx context.Context, sourcePath, expected string) error {
 	if expected == "" {
-		return nil
+		return errors.New("Delivery Source provenance is unavailable")
 	}
 	actual, err := digestDeliverySource(ctx, sourcePath)
 	if err != nil {
