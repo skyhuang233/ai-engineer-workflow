@@ -344,7 +344,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 		return workspace{}, err
 	}
 	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
-		if err := runGit(ctx, "", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--local", "--no-hardlinks", sourceRepository, path); err != nil {
+		if err := runGit(ctx, "", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--local", "--no-hardlinks", deliverySource, path); err != nil {
 			return workspace{}, fmt.Errorf("clone ticket workspace: %w", err)
 		}
 		if err := runGit(ctx, path, "checkout", "-b", branch); err != nil {
@@ -361,7 +361,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 			return workspace{}, fmt.Errorf("workspace branch is %q, want %q", strings.TrimSpace(current), branch)
 		}
 	}
-	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", deliverySource, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return workspace{}, fmt.Errorf("refresh ticket workspace source: %w", err)
 	}
 	if err := configureTicketWorkspaceLineEndings(ctx, path); err != nil {

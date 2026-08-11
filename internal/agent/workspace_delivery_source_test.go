@@ -21,6 +21,15 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	}
 	writeDeliverySourceCommit(t, ctx, source, "first")
 	manager := WorkspaceManager{RootDir: filepath.Join(t.TempDir(), "workspaces"), CodexStateRoot: filepath.Join(t.TempDir(), "codex")}
+	workspacePath, _, err := manager.sessionPaths("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedFirst, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", workspacePath, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDeliverySourceCommit(t, ctx, source, "second")
 	first, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +38,17 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeDeliverySourceCommit(t, ctx, source, "second")
+	firstWorkspaceMain, err := gitOutput(ctx, first.Path, "rev-parse", "refs/remotes/origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceMain, err := gitOutput(ctx, source, "rev-parse", "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.DeliverySource != pinnedFirst || strings.TrimSpace(firstWorkspaceMain) != strings.TrimSpace(firstMain) || strings.TrimSpace(firstWorkspaceMain) == strings.TrimSpace(sourceMain) {
+		t.Fatalf("workspace did not use pinned revision source: snapshot=%q workspace=%q source=%q", firstMain, firstWorkspaceMain, sourceMain)
+	}
 	second, err := manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +64,8 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	if first.DeliverySource == second.DeliverySource || strings.TrimSpace(firstMain) == strings.TrimSpace(secondMain) || strings.TrimSpace(workspaceMain) != strings.TrimSpace(secondMain) {
 		t.Fatalf("revision sources were not independently refreshed: first=%q second=%q workspace=%q", firstMain, secondMain, workspaceMain)
 	}
-	retry, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
+	writeDeliverySourceCommit(t, ctx, source, "third")
+	retry, err := manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +73,31 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retry.DeliverySource != first.DeliverySource || strings.TrimSpace(retryMain) != strings.TrimSpace(firstMain) {
+	if retry.DeliverySource != second.DeliverySource || strings.TrimSpace(retryMain) != strings.TrimSpace(secondMain) {
 		t.Fatalf("revision retry source changed: path=%q main=%q", retry.DeliverySource, retryMain)
+	}
+}
+
+func TestPrepareDeliveryWorkspaceReplacesAllOriginURLs(t *testing.T) {
+	ctx := context.Background()
+	repository := filepath.Join(t.TempDir(), "workspace")
+	if err := runGit(ctx, "", "init", "-b", "main", repository); err != nil {
+		t.Fatal(err)
+	}
+	for _, remoteURL := range []string{`C:\source\repository`, `D:\other\repository`} {
+		if err := runGit(ctx, repository, "config", "--local", "--add", "remote.origin.url", remoteURL); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := prepareDeliveryWorkspace(ctx, repository); err != nil {
+		t.Fatal(err)
+	}
+	urls, err := gitOutput(ctx, repository, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(urls) != "/source-repository" {
+		t.Fatalf("prepared Delivery Worker origins = %q", urls)
 	}
 }
 

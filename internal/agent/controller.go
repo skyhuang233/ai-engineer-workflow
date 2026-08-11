@@ -304,6 +304,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
+	if err := prepareDeliveryWorkspace(ctx, ws.Path); err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, err)
+	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
 		"NM_HOME":                          "/codex-state/no-mistakes",
@@ -322,9 +325,6 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		"NO_MISTAKES_EXPECT_REMOTE_ABSENT": fmt.Sprint(publication.ExpectRemoteAbsent),
 		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
 		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
-		"GIT_CONFIG_COUNT":                 "1",
-		"GIT_CONFIG_KEY_0":                 "remote.origin.url",
-		"GIT_CONFIG_VALUE_0":               "/source-repository",
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	if gate, answer, err := c.Store.DeliveryQualityGateAnswer(ctx, session.SessionID); err == nil {
@@ -391,6 +391,23 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	if err := c.Store.CompleteDeliveryController(finalizationCtx, deliveryClaim, c.now()); err != nil {
 		return err
+	}
+	return nil
+}
+
+func prepareDeliveryWorkspace(ctx context.Context, workspacePath string) error {
+	if strings.TrimSpace(workspacePath) == "" {
+		return errors.New("Ticket Workspace path is required")
+	}
+	if err := runGit(ctx, workspacePath, "config", "--local", "--replace-all", "remote.origin.url", "/source-repository"); err != nil {
+		return fmt.Errorf("configure Delivery Worker origin: %w", err)
+	}
+	urls, err := gitOutput(ctx, workspacePath, "remote", "get-url", "--all", "origin")
+	if err != nil {
+		return fmt.Errorf("validate Delivery Worker origin: %w", err)
+	}
+	if strings.TrimSpace(urls) != "/source-repository" {
+		return errors.New("Delivery Worker origin does not select the mounted Delivery Source")
 	}
 	return nil
 }

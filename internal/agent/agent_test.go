@@ -1360,7 +1360,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		t.Fatal(err)
 	}
 	for _, statement := range []string{
-		"DELETE FROM schema_migrations WHERE version IN (48, 49)",
+		"DELETE FROM schema_migrations WHERE version >= 48",
 		"ALTER TABLE worker_runs DROP COLUMN delivery_runtime_candidate_run_id",
 		"ALTER TABLE worker_audits DROP COLUMN lease_generation",
 		"DROP TABLE worker_container_results",
@@ -1616,8 +1616,12 @@ func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryC
 
 func assertDeliveryOriginMount(t *testing.T, spec worker.Spec, source string) {
 	t.Helper()
-	if spec.Environment["GIT_CONFIG_COUNT"] != "1" || spec.Environment["GIT_CONFIG_KEY_0"] != "remote.origin.url" || spec.Environment["GIT_CONFIG_VALUE_0"] != "/source-repository" {
-		t.Fatalf("Delivery Controller Git origin override = %#v", spec.Environment)
+	if _, exists := spec.Environment["GIT_CONFIG_COUNT"]; exists {
+		t.Fatalf("Delivery Controller retained additive Git origin override = %#v", spec.Environment)
+	}
+	workspaceOrigin := exec.Command("git", "-C", spec.WorkspacePath, "remote", "get-url", "--all", "origin")
+	if output, err := workspaceOrigin.Output(); err != nil || strings.TrimSpace(string(output)) != "/source-repository" {
+		t.Fatalf("Delivery Controller workspace origin = %q, %v", output, err)
 	}
 	for _, mount := range spec.Mounts {
 		if mount.Target == "/source-repository" {

@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 49
+	latestSchemaVersion = 50
 )
 
 var (
@@ -1357,6 +1357,49 @@ AND NOT EXISTS (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (49, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 50 {
+		now := time.Now().UTC()
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT question.repository
+FROM workflow_questions question
+JOIN ticket_runtime runtime ON runtime.version_id = question.version_id AND runtime.issue_id = question.issue_id
+WHERE runtime.delivered = 1 AND question.kind IN ('needs_attention', 'quality_gate') AND question.state = 'open'`)
+		if err != nil {
+			return fmt.Errorf("migration 50: %w", err)
+		}
+		var repositories []string
+		for rows.Next() {
+			var repository string
+			if err := rows.Scan(&repository); err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 50: %w", err)
+			}
+			repositories = append(repositories, repository)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 50: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("migration 50: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions
+SET state = 'answered', answer = 'resolved by delivery', answered_at = ?
+WHERE kind IN ('needs_attention', 'quality_gate') AND state = 'open'
+AND EXISTS (
+    SELECT 1 FROM ticket_runtime runtime
+    WHERE runtime.version_id = workflow_questions.version_id AND runtime.issue_id = workflow_questions.issue_id AND runtime.delivered = 1
+)`, formatTimestamp(now)); err != nil {
+			return fmt.Errorf("migration 50: %w", err)
+		}
+		for _, repository := range repositories {
+			if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
+				return fmt.Errorf("migration 50: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (50, ?)", formatTimestamp(now)); err != nil {
 			return err
 		}
 	}

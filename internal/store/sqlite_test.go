@@ -193,6 +193,80 @@ func TestMigrationFromV42AddsMergeReadyObservationColumns(t *testing.T) {
 	}
 }
 
+func TestMigrationFromV49RepairsDeliveredQuestions(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "workflow.db")
+	snapshot := testSnapshot()
+	db, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.QueueWorkflowInboxProjection(ctx, snapshot.Repository, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"needs_attention", "quality_gate"} {
+		if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, kind, "stale delivery recovery", now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.QueueWorkflowInboxProjection(ctx, snapshot.Repository, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var beforeGeneration int64
+	if err := db.db.QueryRowContext(ctx, `SELECT generation FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&beforeGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= 50"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var repairedQuestions int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_questions
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate')
+AND state = 'answered' AND answer = 'resolved by delivery' AND answered_at != ''`, version.ID, 1).Scan(&repairedQuestions); err != nil {
+		t.Fatal(err)
+	}
+	if repairedQuestions != 2 {
+		t.Fatalf("repaired delivered questions after migration = %d", repairedQuestions)
+	}
+	var afterGeneration int64
+	if err := migrated.db.QueryRowContext(ctx, `SELECT generation FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&afterGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration+1 {
+		t.Fatalf("Inbox projection generation after migration = %d, want %d", afterGeneration, beforeGeneration+1)
+	}
+}
+
 func TestReopenWithoutMigrationPreservesVerifiedBackup(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
