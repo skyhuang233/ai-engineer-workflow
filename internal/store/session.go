@@ -746,18 +746,22 @@ WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.
 }
 
 func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, now)
+	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, false, now)
 }
 
 func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, now)
+	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, false, now)
 }
 
 // FailDeliveryControllerWithClass releases the failed Delivery Controller and
 // schedules a fenced retry of its accepted Candidate Revision. The bounded
 // retry count is per recovery epoch; escalation remains the explicit fallback.
 func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, now)
+	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now)
+}
+
+func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now)
 }
 
 func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
@@ -858,7 +862,7 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 	return sessionID, candidateRunID.String, nil
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry bool, now time.Time) error {
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -895,7 +899,22 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	if err != nil {
 		return err
 	}
-	if !expiresAt.After(now) {
+	if allowExpiredUnstarted {
+		var unstarted bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM worker_audits audit
+JOIN worker_runs run ON run.run_id = audit.run_id AND run.lease_generation = audit.lease_generation
+WHERE audit.run_id = ? AND audit.lease_generation = ? AND run.launch_state = 'launched'
+AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_id = audit.run_id AND result.lease_generation = audit.lease_generation)
+)`, claim.RunID, claim.LeaseGeneration).Scan(&unstarted); err != nil {
+			return err
+		}
+		if !unstarted {
+			return ErrWorkerLaunched
+		}
+	}
+	expired := !expiresAt.After(now)
+	if expired && !allowExpiredUnstarted {
 		nowText := formatTimestamp(now)
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
 			return err
@@ -918,7 +937,11 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, state, formatTimestamp(now), claim.RunID, RunRunning); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
+	leaseState := "revoked"
+	if expired {
+		leaseState = "expired"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND lease_token = ? AND state = ?`, leaseState, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
 		return err
 	}
 	if reason == "" {

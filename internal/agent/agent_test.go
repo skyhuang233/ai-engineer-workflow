@@ -40,8 +40,10 @@ type fakeRuntime struct {
 	refreshedAuth                 []byte
 	deleteCodexAuthDuringDelivery bool
 	beforeDeliveryReturn          func(time.Time) error
+	beforeDelivery                func(worker.Spec) error
 	afterCandidate                func() error
 	deliveryErr                   error
+	waitForDeliveryDeadline       bool
 	deliveryOrigin                string
 }
 
@@ -63,12 +65,21 @@ func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Re
 func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
 	r.specs = append(r.specs, spec)
 	if spec.Command[0] == "no-mistakes" {
+		if r.beforeDelivery != nil {
+			if err := r.beforeDelivery(spec); err != nil {
+				return worker.Result{}, err
+			}
+		}
 		origin := exec.Command("git", "-C", spec.WorkspacePath, "config", "--local", "--get-all", "remote.origin.url")
 		originOutput, err := origin.Output()
 		if err != nil {
 			return worker.Result{}, err
 		}
 		r.deliveryOrigin = strings.TrimSpace(string(originOutput))
+		if r.waitForDeliveryDeadline {
+			<-ctx.Done()
+			return worker.Result{}, worker.InfrastructureError{Err: ctx.Err()}
+		}
 		if r.deliveryErr != nil {
 			return worker.Result{}, r.deliveryErr
 		}
@@ -710,6 +721,27 @@ func TestControllerBacksOffInitialDeliverySourceHostFailure(t *testing.T) {
 		LeaseTTL: time.Minute, Now: failureNow.Add(30 * time.Second),
 	}); !errors.Is(err, store.ErrNotReady) {
 		t.Fatalf("initial Delivery Source host retry = %v, want ErrNotReady", err)
+	}
+}
+
+func TestControllerTerminalizesInitialDeliverySourceIntegrityFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		},
+		Runtime: &fakeRuntime{},
+	}
+	request := candidateRequest(claim, "relative-source", "ticket-1", "implement")
+	if _, err := controller.Run(ctx, request); err == nil || !strings.Contains(err.Error(), "absolute local path") {
+		t.Fatalf("initial Delivery Source integrity failure = %v", err)
+	}
+	if _, err := db.CurrentClaim(ctx, version.ID, claim.TicketID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("initial Delivery Source claim remained active: %v", err)
 	}
 }
 
@@ -1541,6 +1573,107 @@ func TestControllerRevalidatesDeliverySourceDigestBeforeInitialLaunch(t *testing
 	}
 	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "no longer available at its pinned revision") {
 		t.Fatalf("Delivery Source revalidation = %#v, prompt %q", revision, prompt)
+	}
+}
+
+func TestControllerSealsDeliverySourceAcrossRuntimeLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	retainedSource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	runtime := &fakeRuntime{
+		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		beforeDelivery: func(spec worker.Spec) error {
+			sealedSource := spec.Mounts[2].Source
+			if filepath.Clean(sealedSource) == filepath.Clean(retainedSource) {
+				return errors.New("Delivery Worker mounted the retained mutable source")
+			}
+			command := exec.Command("git", "--git-dir", retainedSource, "update-ref", "refs/tags/tampered", "refs/heads/main")
+			if output, err := command.CombinedOutput(); err != nil {
+				return fmt.Errorf("tamper retained Delivery Source: %w (%s)", err, output)
+			}
+			if err := exec.Command("git", "--git-dir", sealedSource, "rev-parse", "--verify", "refs/tags/tampered").Run(); err == nil {
+				return errors.New("sealed Delivery Source changed with retained source")
+			}
+			return nil
+		},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: manager, Runtime: runtime,
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("sealed Delivery Source launch: %v", err)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("worker launches = %d, want Ticket Agent and Delivery Controller", len(runtime.specs))
+	}
+}
+
+func TestControllerRejectsDeliverySourceURLRewrite(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
+	runtime := &fakeRuntime{
+		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		afterCandidate: func() error {
+			command := exec.Command("git", "config", "--local", "url.file:///fake.insteadOf", "/source-repository")
+			command.Dir = workspacePath
+			if output, err := command.CombinedOutput(); err != nil {
+				return fmt.Errorf("configure URL rewrite: %w (%s)", err, output)
+			}
+			return nil
+		},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: manager, Runtime: runtime,
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("reject Delivery Source URL rewrite: %v", err)
+	}
+	if len(runtime.specs) != 1 {
+		t.Fatalf("Delivery Controller launched with URL rewrite: %#v", runtime.specs)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatalf("claim transport revalidation: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || !strings.Contains(prompt, "freshly pinned Delivery Source") {
+		t.Fatalf("transport revalidation = %#v, prompt %q", revision, prompt)
+	}
+}
+
+func TestControllerRetriesPrecontainerDeliveryTimeout(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		results:                 []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		waitForDeliveryDeadline: true,
+	}
+	controller := agent.Controller{
+		Store:     db,
+		Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime:   runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		DeliveryLeaseTTL: 5 * time.Second,
+	}
+	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
+	if runErr == nil {
+		t.Fatal("pre-container delivery timeout returned nil error")
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC().Add(2*time.Minute))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pre-container timeout retry = %#v, %v; run error: %v", pending, err, runErr)
 	}
 }
 

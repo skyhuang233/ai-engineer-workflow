@@ -580,6 +580,91 @@ func (m WorkspaceManager) reclaimSupersededDeliverySources(ctx context.Context, 
 	return nil
 }
 
+func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, revisionRoundID, launchID, sourcePath, expectedDigest string) (string, func() error, error) {
+	current, err := m.deliverySourcePath(sessionID, revisionRoundID)
+	if err != nil {
+		return "", nil, err
+	}
+	if filepath.Clean(sourcePath) != current {
+		return "", nil, deliverySourceIntegrityError(errors.New("Delivery Source path does not match the accepted Revision Round"))
+	}
+	if launchID == "" || filepath.Base(launchID) != launchID {
+		return "", nil, deliverySourceIntegrityError(errors.New("Delivery Controller launch ID is invalid"))
+	}
+	root := filepath.Dir(current)
+	launchPath, err := canonicalPath(filepath.Join(root, ".launch-"+launchID+".git"))
+	if err != nil {
+		return "", nil, deliverySourceInfrastructureError(fmt.Errorf("resolve sealed Delivery Source path: %w", err))
+	}
+	if _, err := managedPath(root, launchPath); err != nil {
+		return "", nil, deliverySourceIntegrityError(err)
+	}
+	temporaryPath := launchPath + ".tmp"
+	for _, path := range []string{launchPath, temporaryPath} {
+		if err := makeDeliverySourceWritable(path); err != nil {
+			return "", nil, deliverySourceInfrastructureError(fmt.Errorf("unlock stale sealed Delivery Source: %w", err))
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return "", nil, deliverySourceInfrastructureError(fmt.Errorf("remove stale sealed Delivery Source: %w", err))
+		}
+	}
+	cleanup := func() error {
+		return errors.Join(makeDeliverySourceWritable(launchPath), os.RemoveAll(launchPath), makeDeliverySourceWritable(temporaryPath), os.RemoveAll(temporaryPath))
+	}
+	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
+	if err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source identity: %w", err))
+	}
+	if err := runGit(ctx, "", "clone", "--bare", "--no-hardlinks", sourcePath, temporaryPath); err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("seal Delivery Source: %w", err))
+	}
+	if err := runGit(ctx, temporaryPath, "remote", "remove", "origin"); err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("detach sealed Delivery Source: %w", err))
+	}
+	if err := runGit(ctx, temporaryPath, "config", "--local", "workflow.sourceIdentity", strings.TrimSpace(identity)); err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("record sealed Delivery Source identity: %w", err))
+	}
+	if err := verifyDeliverySourceDigest(ctx, temporaryPath, expectedDigest); err != nil {
+		return "", cleanup, err
+	}
+	if err := os.Rename(temporaryPath, launchPath); err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("persist sealed Delivery Source: %w", err))
+	}
+	if err := makeDeliverySourceReadOnly(launchPath); err != nil {
+		return "", cleanup, deliverySourceInfrastructureError(fmt.Errorf("seal Delivery Source permissions: %w", err))
+	}
+	return launchPath, cleanup, nil
+}
+
+func makeDeliverySourceReadOnly(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o555)
+		}
+		return os.Chmod(path, 0o444)
+	})
+}
+
+func makeDeliverySourceWritable(root string) error {
+	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o755)
+		}
+		return os.Chmod(path, 0o644)
+	})
+}
+
 func validateDeliverySource(ctx context.Context, path string) error {
 	bare, err := gitOutput(ctx, path, "rev-parse", "--is-bare-repository")
 	if err != nil {
@@ -921,6 +1006,23 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git %v: %w", args, err)
+	}
+	return string(output), nil
+}
+
+func trustedGitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	for _, variable := range os.Environ() {
+		name, _, _ := strings.Cut(variable, "=")
+		if !strings.HasPrefix(strings.ToUpper(name), "GIT_CONFIG_") {
+			cmd.Env = append(cmd.Env, variable)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=0", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("git %v: %w", args, err)

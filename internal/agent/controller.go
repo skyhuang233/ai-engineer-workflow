@@ -79,14 +79,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	ws, err := c.Workspace.ensure(ctx, session.SessionID, request.Claim.RunID, request.SourceRepository, request.Branch)
 	if err != nil {
-		if isDeliverySourceAuthenticationFailure(err) {
-			return Candidate{}, err
-		}
-		var sourceFailure *deliverySourceInfrastructureFailure
-		if errors.As(err, &sourceFailure) {
-			return c.failInitialSourceRefresh(context.WithoutCancel(ctx), request, err)
-		}
-		return Candidate{}, err
+		return c.failInitialSource(context.WithoutCancel(ctx), request, err)
 	}
 	identity := session.AgentIdentity
 	if identity == "" {
@@ -308,7 +301,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	return c.runDeliveryController(finalizationCtx, claim, session, ws, publication, intent)
 }
 
-func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) error {
+func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim store.TicketClaim, session store.TicketSession, ws workspace, publication store.CandidatePublication, intent string) (resultErr error) {
 	gatewayURL := strings.TrimSpace(c.GatewayURL)
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
@@ -320,7 +313,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
-	defaultBranch, err := c.validateDeliverySourceForLaunch(ctx, session, ws.DeliverySource)
+	defaultBranch, expectedSourceDigest, err := c.validateDeliverySourceForLaunch(ctx, session, ws.DeliverySource)
 	if err != nil {
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
 	}
@@ -330,6 +323,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
+		"GIT_CONFIG_COUNT":                 "0",
+		"GIT_CONFIG_GLOBAL":                "/dev/null",
+		"GIT_CONFIG_NOSYSTEM":              "1",
 		"NM_HOME":                          "/codex-state/no-mistakes",
 		"NO_MISTAKES_WORKFLOW_MODE":        "true",
 		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
@@ -357,6 +353,23 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("load quality gate answer: %w", err))
 	}
 	deliveryEnvironment["NO_MISTAKES_GATE_ENFORCED"] = "true"
+	preDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
+	}
+	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
+		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
+	}
+	sealedSource, cleanupSealedSource, err := c.Workspace.sealDeliverySource(ctx, session.SessionID, session.AcceptedCandidateRunID, deliveryClaim.RunID, ws.DeliverySource, expectedSourceDigest)
+	if err != nil {
+		if cleanupSealedSource != nil {
+			err = errors.Join(err, cleanupSealedSource())
+		}
+		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, cleanupSealedSource())
+	}()
 	deliverySpec := worker.Spec{
 		RunID:   deliveryClaim.RunID,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
@@ -365,16 +378,12 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		Mounts: []worker.Mount{
 			{Source: ws.Path, Target: "/workspace"},
 			{Source: ws.CodexState, Target: "/codex-state"},
-			{Source: ws.DeliverySource, Target: "/source-repository", ReadOnly: true},
+			{Source: sealedSource, Target: "/source-repository", ReadOnly: true},
 		},
 		ExtraHosts: []string{worker.GatewayHostMapping},
 	}
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
-	}
-	preDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
-	if err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
 	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now()); err != nil {
 		if errors.Is(err, store.ErrWorkerLaunched) {
@@ -382,14 +391,15 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		}
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
-		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
-	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
-	deliveryResult, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
+	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
-		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		var integrityFailure *deliverySourceIntegrityFailure
+		if errors.As(deliveryErr, &integrityFailure) {
+			return c.failDeliverySourcePreflight(context.WithoutCancel(ctx), deliveryClaim, deliveryErr)
+		}
+		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
 	}
 	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
@@ -422,9 +432,18 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	return nil
 }
 
-func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, resultErr error) {
+func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (worker.Result, error) {
+	return runInValidatedDeliveryWorkspace(ctx, runtime, spec, sourceRepository, "", "")
+}
+
+func runInValidatedDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository, sealedSource, expectedSourceDigest string) (result worker.Result, resultErr error) {
 	restore, err := prepareDeliveryWorkspace(ctx, spec.WorkspacePath, sourceRepository)
 	if err != nil {
+		var integrityFailure *deliverySourceIntegrityFailure
+		var infrastructureFailure *deliverySourceInfrastructureFailure
+		if errors.As(err, &integrityFailure) || errors.As(err, &infrastructureFailure) {
+			return worker.Result{}, err
+		}
 		return worker.Result{}, worker.InfrastructureError{Err: err}
 	}
 	defer func() {
@@ -434,6 +453,11 @@ func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec wo
 			resultErr = errors.Join(resultErr, worker.InfrastructureError{Err: err})
 		}
 	}()
+	if sealedSource != "" || expectedSourceDigest != "" {
+		if err := verifyDeliverySourceDigest(ctx, sealedSource, expectedSourceDigest); err != nil {
+			return worker.Result{}, err
+		}
+	}
 	result, resultErr = runtime.Run(ctx, spec)
 	return result, resultErr
 }
@@ -441,6 +465,9 @@ func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec wo
 func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceRepository string) (func(context.Context) error, error) {
 	if strings.TrimSpace(workspacePath) == "" {
 		return nil, errors.New("Ticket Workspace path is required")
+	}
+	if err := validateDeliveryWorkspaceTransport(ctx, workspacePath); err != nil {
+		return nil, err
 	}
 	original, err := gitOutput(ctx, workspacePath, "config", "--local", "--get-all", "remote.origin.url")
 	if err != nil {
@@ -459,7 +486,34 @@ func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceReposito
 		}
 		return nil
 	}
+	effective, err := trustedGitOutput(ctx, workspacePath, "remote", "get-url", "--all", "origin")
+	if err != nil {
+		return nil, errors.Join(deliverySourceInfrastructureError(fmt.Errorf("resolve effective Delivery Worker origin: %w", err)), restore(context.WithoutCancel(ctx)))
+	}
+	if strings.TrimSpace(effective) != "/source-repository" {
+		return nil, errors.Join(deliverySourceIntegrityError(errors.New("Ticket Workspace transport configuration rewrites the pinned Delivery Source")), restore(context.WithoutCancel(ctx)))
+	}
 	return restore, nil
+}
+
+func validateDeliveryWorkspaceTransport(ctx context.Context, workspacePath string) error {
+	output, err := gitOutput(ctx, workspacePath, "config", "--local", "--includes", "--name-only", "--list", "-z")
+	if err != nil {
+		return deliverySourceInfrastructureError(fmt.Errorf("inspect Ticket Workspace transport configuration: %w", err))
+	}
+	for _, key := range strings.Split(output, "\x00") {
+		key = strings.ToLower(strings.TrimSpace(key))
+		parts := strings.Split(key, ".")
+		unsafeRemote := len(parts) >= 3 && parts[0] == "remote" && (parts[len(parts)-1] == "uploadpack" || parts[len(parts)-1] == "receivepack" || parts[len(parts)-1] == "proxy" || parts[len(parts)-1] == "vcs")
+		unsafeRewrite := strings.HasPrefix(key, "url.") && (strings.HasSuffix(key, ".insteadof") || strings.HasSuffix(key, ".pushinsteadof"))
+		unsafeInclude := strings.HasPrefix(key, "include.") || strings.HasPrefix(key, "includeif.")
+		unsafeCore := key == "core.sshcommand" || key == "core.gitproxy"
+		unsafeProtocol := strings.HasPrefix(key, "protocol.") && strings.HasSuffix(key, ".allow")
+		if unsafeRemote || unsafeRewrite || unsafeInclude || unsafeCore || unsafeProtocol {
+			return deliverySourceIntegrityError(fmt.Errorf("Ticket Workspace contains unsafe Git transport configuration %q", key))
+		}
+	}
+	return nil
 }
 
 func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string, error) {
@@ -483,22 +537,22 @@ func (c Controller) candidateDeliverySourceDigest(ctx context.Context, candidate
 	return strings.TrimSpace(expected), nil
 }
 
-func (c Controller) validateDeliverySourceForLaunch(ctx context.Context, session store.TicketSession, sourcePath string) (string, error) {
+func (c Controller) validateDeliverySourceForLaunch(ctx context.Context, session store.TicketSession, sourcePath string) (string, string, error) {
 	expected, err := c.candidateDeliverySourceDigest(ctx, session.AcceptedCandidateRunID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := validateDeliverySource(ctx, sourcePath); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := verifyDeliverySourceDigest(ctx, sourcePath, expected); err != nil {
-		return "", err
+		return "", "", err
 	}
 	branch, err := trustedSourceDefaultBranch(ctx, sourcePath)
 	if err != nil {
-		return "", fmt.Errorf("resolve trusted default branch: %w", err)
+		return "", "", fmt.Errorf("resolve trusted default branch: %w", err)
 	}
-	return branch, nil
+	return branch, expected, nil
 }
 
 func verifyDeliverySourceDigest(ctx context.Context, sourcePath, expected string) error {
@@ -565,6 +619,10 @@ func (c Controller) failDeliveryController(ctx context.Context, claim store.Tick
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	return errors.Join(cause, c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now()))
+}
+
+func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
+	return errors.Join(cause, c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now()))
 }
 
 func runtimeStdout(result worker.Result) []byte {
@@ -657,12 +715,17 @@ func (c Controller) failRun(ctx context.Context, request RunRequest, ws workspac
 	return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, reason, output, &redactor)
 }
 
-func (c Controller) failInitialSourceRefresh(ctx context.Context, request RunRequest, refreshErr error) (Candidate, error) {
+func (c Controller) failInitialSource(ctx context.Context, request RunRequest, sourceErr error) (Candidate, error) {
+	class := store.FailureCodeQuality
+	var infrastructureFailure *deliverySourceInfrastructureFailure
+	if errors.As(sourceErr, &infrastructureFailure) || isDeliverySourceAuthenticationFailure(sourceErr) {
+		class = store.FailureInfrastructure
+	}
 	recordErr := c.Store.RecordRunFailure(ctx, store.RunFailure{
 		RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken,
-		Error: refreshErr.Error(), Class: store.FailureInfrastructure, Now: c.now(),
+		Error: sourceErr.Error(), Class: class, Now: c.now(),
 	})
-	return Candidate{}, errors.Join(refreshErr, recordErr)
+	return Candidate{}, errors.Join(sourceErr, recordErr)
 }
 
 func (c Controller) failRunWithRedactor(ctx context.Context, request RunRequest, ws workspace, session store.TicketSession, baseCommit, reason, output string, redactor *codexauth.Redactor) (Candidate, error) {
