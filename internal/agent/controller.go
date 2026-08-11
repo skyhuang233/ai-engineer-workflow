@@ -82,8 +82,8 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		if isDeliverySourceAuthenticationFailure(err) {
 			return Candidate{}, err
 		}
-		var refreshFailure *deliverySourceRefreshFailure
-		if errors.As(err, &refreshFailure) {
+		var sourceFailure *deliverySourceInfrastructureFailure
+		if errors.As(err, &sourceFailure) {
 			return c.failInitialSourceRefresh(context.WithoutCancel(ctx), request, err)
 		}
 		return Candidate{}, err
@@ -277,6 +277,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		err = validateDeliverySource(finalizationCtx, deliverySource)
 	}
 	if err != nil {
+		if isDeliverySourceAuthenticationFailure(err) {
+			deferErr := c.Store.DeferDeliveryControllerForCredentialPause(finalizationCtx, claim, c.now())
+			return errors.Join(err, deferErr)
+		}
 		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 	}
 	if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {

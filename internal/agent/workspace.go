@@ -34,12 +34,19 @@ type workspace struct {
 	BaseCommit           string
 }
 
-type deliverySourceRefreshFailure struct {
+type deliverySourceInfrastructureFailure struct {
 	err error
 }
 
-func (e *deliverySourceRefreshFailure) Error() string { return e.err.Error() }
-func (e *deliverySourceRefreshFailure) Unwrap() error { return e.err }
+func (e *deliverySourceInfrastructureFailure) Error() string { return e.err.Error() }
+func (e *deliverySourceInfrastructureFailure) Unwrap() error { return e.err }
+
+func deliverySourceInfrastructureError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &deliverySourceInfrastructureFailure{err: err}
+}
 
 type RecoveryInspector struct {
 	Containers worker.ContainerInspector
@@ -459,64 +466,64 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceRepository)))
 	if info, statErr := os.Stat(path); statErr == nil {
 		if !info.IsDir() {
-			return "", errors.New("persisted Delivery Source is not a directory")
+			return "", deliverySourceInfrastructureError(errors.New("persisted Delivery Source is not a directory"))
 		}
 		storedIdentity, err := gitOutput(ctx, path, "config", "--local", "--get", "workflow.sourceIdentity")
 		if err != nil || strings.TrimSpace(storedIdentity) != identity {
-			return "", errors.New("persisted Delivery Source identity does not match the admitted source repository")
+			return "", deliverySourceInfrastructureError(errors.New("persisted Delivery Source identity does not match the admitted source repository"))
 		}
 		if err := validateDeliverySource(ctx, path); err != nil {
-			return "", err
+			return "", deliverySourceInfrastructureError(err)
 		}
 		return path, nil
 	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return "", statErr
+		return "", deliverySourceInfrastructureError(statErr)
 	}
 	root := filepath.Dir(path)
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(err)
 	}
 	temporaryPath, err := os.MkdirTemp(root, ".delivery-")
 	if err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(err)
 	}
 	defer os.RemoveAll(temporaryPath)
 	if err := runGit(ctx, "", "-c", "core.longpaths=true", "init", "--bare", "--template=", temporaryPath); err != nil {
-		return "", fmt.Errorf("initialize Delivery Source: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("initialize Delivery Source: %w", err))
 	}
 	if err := runGit(ctx, temporaryPath, "config", "--local", "core.longpaths", "true"); err != nil {
-		return "", fmt.Errorf("configure Delivery Source long paths: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("configure Delivery Source long paths: %w", err))
 	}
 	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); err != nil {
-		return "", fmt.Errorf("copy admitted Delivery Source: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("copy admitted Delivery Source: %w", err))
 	}
 	var head string
 	if m.RefreshDeliverySource != nil {
 		head, err = m.RefreshDeliverySource(ctx, temporaryPath)
 		if err != nil {
-			return "", &deliverySourceRefreshFailure{err: fmt.Errorf("refresh Delivery Source from admitted remote: %w", err)}
+			return "", deliverySourceInfrastructureError(fmt.Errorf("refresh Delivery Source from admitted remote: %w", err))
 		}
 	} else {
 		head, err = gitOutput(ctx, sourceRepository, "symbolic-ref", "--quiet", "HEAD")
 		if err != nil {
-			return "", fmt.Errorf("resolve Delivery Source HEAD: %w", err)
+			return "", deliverySourceInfrastructureError(fmt.Errorf("resolve Delivery Source HEAD: %w", err))
 		}
 	}
 	head = strings.TrimSpace(head)
 	if _, err := validateDeliverySourceDefaultBranchRef(ctx, temporaryPath, head); err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(err)
 	}
 	if err := runGit(ctx, temporaryPath, "symbolic-ref", "HEAD", head); err != nil {
-		return "", fmt.Errorf("record Delivery Source HEAD: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("record Delivery Source HEAD: %w", err))
 	}
 	if err := runGit(ctx, temporaryPath, "config", "--local", "workflow.sourceIdentity", identity); err != nil {
-		return "", fmt.Errorf("record Delivery Source identity: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("record Delivery Source identity: %w", err))
 	}
 	if err := validateDeliverySource(ctx, temporaryPath); err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(err)
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		return "", fmt.Errorf("persist Delivery Source: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("persist Delivery Source: %w", err))
 	}
 	return path, nil
 }

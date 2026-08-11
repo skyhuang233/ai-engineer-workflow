@@ -670,6 +670,43 @@ func TestControllerBacksOffInitialDeliverySourceRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestControllerBacksOffInitialDeliverySourceHostFailure(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	failureNow := claim.LeaseExpiresAt.Add(-30 * time.Second)
+	workspaceRoot := filepath.Join(root, "workspaces")
+	if err := os.MkdirAll(workspaceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceRoot, ".delivery-sources"), []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{}
+	controller := agent.Controller{
+		Store: db,
+		Workspace: agent.WorkspaceManager{
+			RootDir: workspaceRoot, CodexStateRoot: filepath.Join(root, "codex"),
+		},
+		Runtime: runtime,
+		Now:     func() time.Time { return failureNow },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("initial Delivery Source host failure returned nil error")
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatal("worker started after initial Delivery Source host failure")
+	}
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{
+		VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1,
+		LeaseTTL: time.Minute, Now: failureNow.Add(30 * time.Second),
+	}); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("initial Delivery Source host retry = %v, want ErrNotReady", err)
+	}
+}
+
 func TestControllerAcceptsCredentialBearingCandidateInTrustedWorkflow(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -1381,6 +1418,15 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
 	}
 	now = now.Add(2 * time.Minute)
+	controller.SourceRepository = source
+	if err := controller.RetryDelivery(ctx, pending[0]); err == nil {
+		t.Fatal("second delivery infrastructure failure returned nil error")
+	}
+	now = now.Add(3 * time.Minute)
+	pending, err = db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("claim credential-blocked delivery = %#v, %v", pending, err)
+	}
 	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
 	if err := os.RemoveAll(deliverySource); err != nil {
 		t.Fatal(err)
@@ -1394,7 +1440,6 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 	retryRuntime := &fakeRuntime{}
 	controller.Workspace = manager
 	controller.Runtime = retryRuntime
-	controller.SourceRepository = source
 	if err := controller.RetryDelivery(ctx, pending[0]); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 		t.Fatalf("credential-rejected Delivery Source refresh = %v", err)
 	}

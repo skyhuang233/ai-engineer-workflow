@@ -760,6 +760,53 @@ func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim Ticke
 	return s.finishDeliveryController(ctx, claim, reason, class, true, now)
 }
 
+func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var sessionID string
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_runtime runtime ON runtime.version_id = s.version_id AND runtime.issue_id = s.issue_id
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ?
+AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? AND runtime.delivered = 0`,
+		claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidClaim
+	}
+	if err != nil {
+		return err
+	}
+	nowText := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, nowText, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, nowText, claim.VersionID, claim.TicketID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -902,7 +949,7 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 			return err
 		}
 		var attempts int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND recovery_epoch = ? AND run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
 			return err
 		}
 		if attempts < DefaultMaxWorkerAttempts {
