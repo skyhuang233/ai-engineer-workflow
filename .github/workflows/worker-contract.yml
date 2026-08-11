@@ -74,6 +74,7 @@ jobs:
           fi
           no_mistakes_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" no-mistakes --version)"
           go_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" go version)"
+          docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu 'command -v delivery-source-digest >/dev/null'
           test "$go_output" = "go version go${{ steps.pins.outputs.go_version }} linux/amd64"
           if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.no_mistakes_version }}"

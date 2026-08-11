@@ -983,11 +983,11 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fenced, err = db.AcknowledgeDeliveryIsolation(context.Background(), fenced)
+		proofs, err := db.AcknowledgeDeliveryIsolation(context.Background(), fenced)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second), store.DefaultMaxWorkerAttempts, fenced...); err != nil {
+		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second), store.DefaultMaxWorkerAttempts, proofs...); err != nil {
 			return err
 		}
 		return nil

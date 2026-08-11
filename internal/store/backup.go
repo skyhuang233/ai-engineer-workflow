@@ -634,7 +634,7 @@ func (s *Store) ReconcilePreview(ctx context.Context) (ReconcilePreview, error) 
 // turns unknown outbox writes into reconcile-only work, releases Worker Runs
 // with a fresh lease boundary, preserves Inbox questions, and makes pollers
 // eligible to re-observe GitHub without issuing a write itself.
-func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time, isolated ...TicketClaim) error {
+func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time, isolated ...DeliveryIsolationProof) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -672,7 +672,7 @@ func (s *Store) ReconcileRestoredControlPlaneDryRun(ctx context.Context, now tim
 	return reconcileRestoredControlPlaneTx(ctx, tx, now, nil, true)
 }
 
-func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []TicketClaim, modelIsolation bool) error {
+func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []DeliveryIsolationProof, modelIsolation bool) error {
 	stamp := formatTimestamp(now)
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM worker_runs r
 JOIN ticket_sessions s ON s.current_run_id = r.run_id
@@ -704,7 +704,9 @@ WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticke
 			if err != nil {
 				return err
 			}
-			isolated = append(isolated, targets...)
+			for _, target := range targets {
+				isolated = append(isolated, DeliveryIsolationProof{target: target})
+			}
 		}
 	}
 	for _, versionID := range deliveryVersions {
@@ -718,7 +720,7 @@ WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticke
 	if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET last_success_at = '', last_full_reconcile_at = '', next_attempt_at = ?, updated_at = ?`, stamp, stamp); err != nil {
 		return err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
+	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, s.session_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
 FROM worker_runs r JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
@@ -726,14 +728,14 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 		return err
 	}
 	type activeRun struct {
-		runID, kind, versionID, lease, expiresAt string
-		issueID                                  int64
-		leaseGeneration, isolationGeneration     int64
+		runID, kind, versionID, sessionID, lease, expiresAt string
+		issueID                                             int64
+		leaseGeneration, isolationGeneration                int64
 	}
 	var active []activeRun
 	for rows.Next() {
 		var run activeRun
-		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.leaseGeneration, &run.isolationGeneration, &run.lease, &run.expiresAt); err != nil {
+		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.sessionID, &run.leaseGeneration, &run.isolationGeneration, &run.lease, &run.expiresAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -750,7 +752,7 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 				if err != nil {
 					return err
 				}
-				proofs = append(proofs, TicketClaim{VersionID: run.versionID, TicketID: run.issueID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt})
+				proofs = append(proofs, DeliveryIsolationProof{target: TicketClaim{VersionID: run.versionID, TicketID: run.issueID, SessionID: run.sessionID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt}})
 			}
 			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, proofs...); err != nil {
 				return err

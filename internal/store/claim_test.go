@@ -394,7 +394,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := <-frozen; !errors.As(err, &fencedIsolation) || len(fencedIsolation.Targets) != 1 || fencedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("post-create terminalization isolation requirement = %#v, %v", fencedIsolation, err)
 	}
-	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), fencedIsolation.Targets...); !errors.As(err, &fencedIsolation) {
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), DeliveryIsolationProof{}); !errors.As(err, &fencedIsolation) {
 		t.Fatalf("unfenced point-in-time isolation proof = %v, want DeliveryIsolationRequired", err)
 	}
 	tx, err := db.db.BeginTx(ctx, nil)
@@ -500,11 +500,11 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	fenced, err = db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, fenced...); err != nil {
+	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, proofs...); err != nil {
 		t.Fatal(err)
 	}
 	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))
@@ -582,7 +582,7 @@ func TestDeliveryCreateAndIsolationFencesCoordinateAcrossStores(t *testing.T) {
 		t.Fatal(err)
 	}
 	var isolation *DeliveryIsolationRequired
-	if _, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), fenced...); !errors.As(err, &isolation) {
+	if _, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), DeliveryIsolationProof{}); !errors.As(err, &isolation) {
 		t.Fatalf("unacknowledged create containment = %v, want DeliveryIsolationRequired", err)
 	}
 	acknowledged, err := isolator.AcknowledgeDeliveryIsolation(ctx, fenced)
@@ -2084,11 +2084,11 @@ func TestClosedPullRequestFreezesPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fenced, err = db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozen, err = db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second), fenced...)
+	frozen, err = db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second), proofs...)
 	if err != nil {
 		t.Fatal(err)
 	}

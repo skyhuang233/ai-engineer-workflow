@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
+	"github.com/skyhuang233/workflow/internal/deliverysource"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -735,23 +736,21 @@ func deliverySourceDefaultBranch(ctx context.Context, sourcePath string) (string
 }
 
 func digestDeliverySource(ctx context.Context, sourcePath string) (string, error) {
-	head, _, err := deliverySourceDefaultBranch(ctx, sourcePath)
+	_, _, err := deliverySourceDefaultBranch(ctx, sourcePath)
 	if err != nil {
 		return "", err
 	}
-	identity, err := deliverySourceIdentity(ctx, sourcePath, "read Delivery Source identity")
-	if err != nil {
+	if _, err := deliverySourceIdentity(ctx, sourcePath, "read Delivery Source identity"); err != nil {
 		return "", err
 	}
 	if err := validateDeliverySourceConnectivity(ctx, sourcePath); err != nil {
 		return "", err
 	}
-	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
+	digest, err := deliverysource.Digest(ctx, sourcePath)
 	if err != nil {
-		return "", deliverySourceProbeError(ctx, "read Delivery Source refs", err)
+		return "", deliverySourceProbeError(ctx, "compute Delivery Source digest", err)
 	}
-	digest := sha256.Sum256([]byte(head + "\n" + strings.TrimSpace(identity) + "\n" + strings.TrimSpace(refs)))
-	return fmt.Sprintf("%x", digest), nil
+	return digest, nil
 }
 
 func deliverySourceProbeError(ctx context.Context, operation string, err error) error {

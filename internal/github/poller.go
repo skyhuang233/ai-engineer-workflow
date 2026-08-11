@@ -740,7 +740,7 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	resolve := func(isolated ...store.TicketClaim) (store.GitHubPollTerminalFailureDisposition, error) {
+	resolve := func(isolated ...store.DeliveryIsolationProof) (store.GitHubPollTerminalFailureDisposition, error) {
 		if retryUnowned {
 			return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
 		}

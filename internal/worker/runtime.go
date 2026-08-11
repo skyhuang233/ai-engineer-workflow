@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -450,10 +451,36 @@ func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context
 	if name == "" {
 		name = "docker"
 	}
-	return isolateContainersByLabels(ctx, name,
-		"label=workflow.control_plane="+r.ControlPlaneID,
-		"label=workflow.run_kind=delivery_controller",
-	)
+	output, err := exec.CommandContext(ctx, name, "container", "ls", "--all", "--quiet", "--filter", "label=workflow.run_id").Output()
+	if err != nil {
+		return fmt.Errorf("inspect Control Plane worker containers: %w", err)
+	}
+	var deliveries []string
+	var ambiguous []string
+	for _, containerID := range strings.Fields(string(output)) {
+		labelsOutput, err := exec.CommandContext(ctx, name, "container", "inspect", "--format", "{{json .Config.Labels}}", containerID).Output()
+		if err != nil {
+			return fmt.Errorf("inspect workflow container %s labels: %w", containerID, err)
+		}
+		labels := make(map[string]string)
+		if err := json.Unmarshal(bytes.TrimSpace(labelsOutput), &labels); err != nil {
+			return fmt.Errorf("decode workflow container %s labels: %w", containerID, err)
+		}
+		controlPlaneID := strings.TrimSpace(labels["workflow.control_plane"])
+		runKind := strings.TrimSpace(labels["workflow.run_kind"])
+		if controlPlaneID == "" || runKind == "" {
+			ambiguous = append(ambiguous, containerID)
+			continue
+		}
+		if controlPlaneID == r.ControlPlaneID && runKind == "delivery_controller" {
+			deliveries = append(deliveries, containerID)
+		}
+	}
+	if len(ambiguous) > 0 {
+		sort.Strings(ambiguous)
+		return fmt.Errorf("ambiguous legacy workflow containers require manual isolation: %s", strings.Join(ambiguous, ", "))
+	}
+	return removeContainers(ctx, name, deliveries)
 }
 
 func isolateContainersByRunID(ctx context.Context, name, runID string) error {
@@ -469,7 +496,11 @@ func isolateContainersByLabels(ctx context.Context, name string, filters ...stri
 	if err != nil {
 		return fmt.Errorf("inspect expired worker container: %w", err)
 	}
-	for _, containerID := range strings.Fields(string(output)) {
+	return removeContainers(ctx, name, strings.Fields(string(output)))
+}
+
+func removeContainers(ctx context.Context, name string, containerIDs []string) error {
+	for _, containerID := range containerIDs {
 		if err := exec.CommandContext(ctx, name, "container", "rm", "--force", containerID).Run(); err != nil {
 			return fmt.Errorf("isolate expired worker container %s: %w", containerID, err)
 		}

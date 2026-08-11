@@ -4,13 +4,31 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/startup"
 )
+
+func TestOpenFileURIHoldsCanonicalRestoreBarrier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	fileURI := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(path), "/")}).String()
+	db, err := Open(context.Background(), fileURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	blocked, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := startup.AcquireRestoreBarrier(blocked, path); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("restore bypassed Store opened by file URI: %v", err)
+	}
+}
 
 func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")

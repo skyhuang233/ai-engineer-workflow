@@ -17,12 +17,12 @@ func (s *coordinatorStore) FenceDeliveryIsolation(_ context.Context, targets []s
 	return targets, nil
 }
 
-func (s *coordinatorStore) AcknowledgeDeliveryIsolation(ctx context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+func (s *coordinatorStore) AcknowledgeDeliveryIsolation(ctx context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	s.acknowledged = true
-	return targets, nil
+	return make([]store.DeliveryIsolationProof, len(targets)), nil
 }
 
 type coordinatorIsolator struct {

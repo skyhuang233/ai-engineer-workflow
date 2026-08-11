@@ -58,6 +58,14 @@ RUN curl --fail --show-error --location \
     && rm /tmp/go.tar.gz \
     && go version
 
+COPY go.mod go.sum /tmp/workflow/
+COPY internal/deliverysource /tmp/workflow/internal/deliverysource
+COPY cmd/delivery-source-digest /tmp/workflow/cmd/delivery-source-digest
+RUN cd /tmp/workflow \
+    && go build -trimpath -o /usr/local/bin/delivery-source-digest ./cmd/delivery-source-digest \
+    && rm --recursive --force /tmp/workflow \
+    && delivery-source-digest 2>&1 | grep --fixed-strings "usage: delivery-source-digest"
+
 RUN curl --fail --show-error --location \
       "https://github.com/${NO_MISTAKES_FORK_REPOSITORY}/releases/download/${NO_MISTAKES_FORK_RELEASE}/no-mistakes-${NO_MISTAKES_VERSION}-linux-amd64.tar.gz" \
       --output /tmp/no-mistakes.tar.gz \

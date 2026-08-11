@@ -102,6 +102,10 @@ type TicketClaim struct {
 	LeaseExpiresAt      time.Time
 }
 
+type DeliveryIsolationProof struct {
+	target TicketClaim
+}
+
 // TicketBody returns the immutable specification persisted when the Delivery
 // Plan version was activated. Workers do not need GitHub credentials to read it.
 func (s *Store) TicketBody(ctx context.Context, versionID string, issueID int64) (string, error) {
@@ -1091,14 +1095,14 @@ AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_re
 	return claim, nil
 }
 
-func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated TicketClaim) (bool, error) {
-	if mergeCommit == "" || isolated.VersionID != versionID || isolated.TicketID != issueID || isolated.RunID == "" || isolated.LeaseGeneration <= 0 {
+func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated DeliveryIsolationProof) (bool, error) {
+	if mergeCommit == "" {
 		return false, ErrInvalidClaim
 	}
-	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, []TicketClaim{isolated})
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, []DeliveryIsolationProof{isolated})
 }
 
-func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated []TicketClaim) (bool, error) {
+func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated []DeliveryIsolationProof) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -1058,7 +1058,7 @@ func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request Del
 	return nil
 }
 
-func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, key string, uncertain bool, reason string, now time.Time, isolated ...TicketClaim) error {
+func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, key string, uncertain bool, reason string, now time.Time, isolated ...DeliveryIsolationProof) error {
 	if request.RunID == "" {
 		switch request.Operation {
 		case DeliveryProjectPlan:

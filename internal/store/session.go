@@ -220,7 +220,7 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 	return targets, pending, nil
 }
 
-func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []TicketClaim) error {
+func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []DeliveryIsolationProof) error {
 	targets, pending, err := deliveryIsolationTargetsTx(ctx, tx, versionID, issueIDs)
 	if err != nil {
 		return err
@@ -228,7 +228,7 @@ func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID strin
 	for _, target := range targets {
 		verified := false
 		for _, proof := range isolated {
-			if pending[target.RunID] && proof.VersionID == target.VersionID && proof.TicketID == target.TicketID && proof.RunID == target.RunID && proof.LeaseGeneration == target.LeaseGeneration && proof.IsolationGeneration == target.IsolationGeneration && proof.LeaseToken == target.LeaseToken {
+			if pending[target.RunID] && sameDeliveryIsolationTarget(proof.target, target) {
 				verified = true
 				break
 			}
@@ -332,7 +332,7 @@ AND EXISTS (SELECT 1 FROM run_leases l WHERE l.run_id = worker_runs.run_id AND l
 	return targets, nil
 }
 
-func (s *Store) AcknowledgeDeliveryIsolation(ctx context.Context, fenced []TicketClaim) ([]TicketClaim, error) {
+func (s *Store) AcknowledgeDeliveryIsolation(ctx context.Context, fenced []TicketClaim) ([]DeliveryIsolationProof, error) {
 	if len(fenced) == 0 {
 		return nil, ErrInvalidClaim
 	}
@@ -343,7 +343,7 @@ func (s *Store) AcknowledgeDeliveryIsolation(ctx context.Context, fenced []Ticke
 		return nil, err
 	}
 	defer tx.Rollback()
-	acknowledged := make([]TicketClaim, 0, len(fenced))
+	acknowledged := make([]DeliveryIsolationProof, 0, len(fenced))
 	for _, proof := range fenced {
 		current, _, err := deliveryIsolationTargetsTx(ctx, tx, proof.VersionID, map[int64]bool{proof.TicketID: true})
 		if err != nil {
@@ -368,12 +368,16 @@ WHERE run_id = ? AND lease_generation = ? AND container_create_generation = ? AN
 		if count != 1 {
 			return nil, ErrFencingConflict
 		}
-		acknowledged = append(acknowledged, target)
+		acknowledged = append(acknowledged, DeliveryIsolationProof{target: target})
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return acknowledged, nil
+}
+
+func sameDeliveryIsolationTarget(left, right TicketClaim) bool {
+	return left.VersionID == right.VersionID && left.TicketID == right.TicketID && left.SessionID == right.SessionID && left.RunID == right.RunID && left.LeaseGeneration == right.LeaseGeneration && left.IsolationGeneration == right.IsolationGeneration && left.LeaseToken == right.LeaseToken
 }
 
 // ExpiredLaunchedRecoveryRuns lists current Agent and Delivery Controller Runs
@@ -489,7 +493,7 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 	return runs, nil
 }
 
-func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, maxAttempts int, now time.Time, isolated []TicketClaim) error {
+func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, maxAttempts int, now time.Time, isolated []DeliveryIsolationProof) error {
 	if err := requireDeliveryIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
 		return err
 	}
@@ -548,7 +552,7 @@ func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
 	return runs, rows.Err()
 }
 
-func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
+func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if run.Claim.RunID == "" || run.Claim.LeaseToken == "" || run.Claim.LeaseGeneration <= 0 || strings.TrimSpace(reason) == "" {
@@ -1019,7 +1023,7 @@ func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClai
 	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, nil)
 }
 
-func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time, isolated ...TicketClaim) error {
+func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time, isolated ...DeliveryIsolationProof) error {
 	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, isolated)
 }
 
@@ -1034,7 +1038,7 @@ func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim Ticke
 	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, limit, nil)
 }
 
-func (s *Store) FailDeliveryControllerWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
+func (s *Store) FailDeliveryControllerWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
 	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, maxWorkerAttempts(maxAttempts), isolated)
 }
 
@@ -1046,7 +1050,7 @@ func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim
 	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, limit, nil)
 }
 
-func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
+func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
 	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, maxWorkerAttempts(maxAttempts), isolated)
 }
 
@@ -1148,7 +1152,7 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 	return sessionID, candidateRunID.String, nil
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, limit int, isolated []TicketClaim) error {
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, limit int, isolated []DeliveryIsolationProof) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {

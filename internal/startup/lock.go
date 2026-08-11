@@ -6,19 +6,25 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 )
 
 var ErrAlreadyRunning = errors.New("Control Plane is already running")
 
-type Lock struct{ file *os.File }
+type Lock struct {
+	file *os.File
+	held []*os.File
+}
 
 func AcquireLock(databasePath string) (*Lock, error) {
-	if databasePath == "" || databasePath == ":memory:" {
+	identity, err := DatabaseIdentity(databasePath)
+	if err != nil {
+		return nil, err
+	}
+	if identity == "" {
 		return nil, errors.New("Control Plane lock requires a database path")
 	}
-	file, err := openLockFile(filepath.Clean(databasePath) + ".lock")
+	file, err := openLockFile(identity + ".lock")
 	if err != nil {
 		return nil, err
 	}
@@ -41,26 +47,57 @@ func AcquireRestoreBarrier(ctx context.Context, databasePath string) (*Lock, err
 }
 
 func acquireDatabaseBarrier(ctx context.Context, databasePath string, exclusive bool) (*Lock, error) {
-	if databasePath == "" || databasePath == ":memory:" {
-		return nil, errors.New("database restore barrier requires a database path")
-	}
-	file, err := openLockFile(filepath.Clean(databasePath) + ".restore.lock")
+	identity, err := DatabaseIdentity(databasePath)
 	if err != nil {
 		return nil, err
 	}
+	if identity == "" {
+		return nil, errors.New("database restore barrier requires a database path")
+	}
+	turnstile, err := openLockFile(identity + ".restore.intent.lock")
+	if err != nil {
+		return nil, err
+	}
+	if err := acquireFileLock(ctx, turnstile, exclusive, "database restore turnstile"); err != nil {
+		_ = turnstile.Close()
+		return nil, err
+	}
+	file, err := openLockFile(identity + ".restore.lock")
+	if err != nil {
+		_ = unlockFile(turnstile)
+		_ = turnstile.Close()
+		return nil, err
+	}
+	if err := acquireFileLock(ctx, file, exclusive, "database restore barrier"); err != nil {
+		_ = file.Close()
+		_ = unlockFile(turnstile)
+		_ = turnstile.Close()
+		return nil, err
+	}
+	if exclusive {
+		return &Lock{file: file, held: []*os.File{turnstile}}, nil
+	}
+	turnstileErr := errors.Join(unlockFile(turnstile), turnstile.Close())
+	if turnstileErr != nil {
+		_ = unlockFile(file)
+		_ = file.Close()
+		return nil, turnstileErr
+	}
+	return &Lock{file: file}, nil
+}
+
+func acquireFileLock(ctx context.Context, file *os.File, exclusive bool, description string) error {
 	for {
 		if err := tryLockFile(file, exclusive); err == nil {
-			return &Lock{file: file}, nil
+			return nil
 		} else if !isLockConflict(err) {
-			_ = file.Close()
-			return nil, fmt.Errorf("lock database restore barrier: %w", err)
+			return fmt.Errorf("lock %s: %w", description, err)
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			_ = file.Close()
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -79,6 +116,10 @@ func (l *Lock) Close() error {
 		return nil
 	}
 	err := errors.Join(unlockFile(l.file), l.file.Close())
+	for i := len(l.held) - 1; i >= 0; i-- {
+		err = errors.Join(err, unlockFile(l.held[i]), l.held[i].Close())
+	}
 	l.file = nil
+	l.held = nil
 	return err
 }

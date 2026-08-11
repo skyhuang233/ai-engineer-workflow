@@ -13,14 +13,14 @@ const defaultTimeout = 30 * time.Second
 
 type Store interface {
 	FenceDeliveryIsolation(context.Context, []store.TicketClaim) ([]store.TicketClaim, error)
-	AcknowledgeDeliveryIsolation(context.Context, []store.TicketClaim) ([]store.TicketClaim, error)
+	AcknowledgeDeliveryIsolation(context.Context, []store.TicketClaim) ([]store.DeliveryIsolationProof, error)
 }
 
 type ContainerIsolator interface {
 	IsolateContainer(context.Context, string) error
 }
 
-func DeliveryControllers(ctx context.Context, database Store, isolator ContainerIsolator, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+func DeliveryControllers(ctx context.Context, database Store, isolator ContainerIsolator, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
 	if database == nil || isolator == nil {
 		return nil, errors.New("Delivery Controller isolation dependencies are incomplete")
 	}

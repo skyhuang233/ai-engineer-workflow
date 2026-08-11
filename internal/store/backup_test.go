@@ -255,11 +255,11 @@ func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	fenced, err = restored.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := restored.AcknowledgeDeliveryIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute), fenced...); err != nil {
+	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute), proofs...); err != nil {
 		t.Fatal(err)
 	}
 	projection, err := restored.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Minute))

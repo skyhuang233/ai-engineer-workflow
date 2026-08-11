@@ -85,10 +85,8 @@ infrastructure_failure() {
   exit 79
 }
 git --git-dir=/source-seed fsck --connectivity-only --no-dangling >/dev/null 2>&1 || integrity_failure
+actual=$(delivery-source-digest /source-seed) || integrity_failure
 identity=$(git --git-dir=/source-seed config --local --get workflow.sourceIdentity) || integrity_failure
-head=$(git --git-dir=/source-seed symbolic-ref HEAD) || integrity_failure
-refs=$(git --git-dir=/source-seed for-each-ref --sort=refname '--format=%(refname) %(objectname)' refs/heads refs/tags) || integrity_failure
-actual=$(printf '%s\n%s\n%s' "$head" "$identity" "$refs" | sha256sum | awk '{print $1}') || infrastructure_failure
 [ "$actual" = "$NO_MISTAKES_DELIVERY_SOURCE_DIGEST" ] || integrity_failure
 rm -rf /source-repository || infrastructure_failure
 git clone --bare --no-local /source-seed /source-repository >/dev/null 2>&1 || infrastructure_failure
@@ -713,7 +711,7 @@ func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.Pl
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
 	storeErr := c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
 		return c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
@@ -721,7 +719,7 @@ func (c Controller) failDeliveryController(ctx context.Context, claim store.Tick
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	storeErr := c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
 		return c.Store.FailDeliveryControllerWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
@@ -729,13 +727,13 @@ func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim s
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	storeErr := c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
 		return c.Store.FailDeliveryControllerLaunchWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
 }
 
-func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, retry func([]store.TicketClaim) error) error {
+func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, retry func([]store.DeliveryIsolationProof) error) error {
 	var isolation *store.DeliveryIsolationRequired
 	if !errors.As(err, &isolation) {
 		return err
@@ -747,7 +745,7 @@ func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, 
 	return retry(isolated)
 }
 
-func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
 	isolator, ok := c.Runtime.(worker.ContainerIsolator)
 	if !ok {
 		return nil, errors.New("agent controller cannot isolate an active Delivery Controller")

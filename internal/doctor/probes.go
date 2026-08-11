@@ -253,6 +253,7 @@ codex --version
 gh --version
 go version
 no-mistakes --version
+command -v delivery-source-digest
 no-mistakes daemon start
 daemon_status="$(no-mistakes daemon status)"
 printf "%s\n" "$daemon_status"

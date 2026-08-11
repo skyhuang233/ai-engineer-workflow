@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "deploy/worker/**"
+      - "cmd/delivery-source-digest/**"
+      - "internal/deliverysource/**"
+      - "go.mod"
+      - "go.sum"
       - "config/toolchain.json"
       - ".github/workflows/publish-worker.yml"
 
@@ -102,11 +106,19 @@ jobs:
         shell: bash
         run: |
           deploy_worker_tree="$(git rev-parse "${GITHUB_SHA}:deploy/worker")"
+          delivery_source_digest_command_tree="$(git rev-parse "${GITHUB_SHA}:cmd/delivery-source-digest")"
+          delivery_source_digest_package_tree="$(git rev-parse "${GITHUB_SHA}:internal/deliverysource")"
+          go_mod_blob="$(git rev-parse "${GITHUB_SHA}:go.mod")"
+          go_sum_blob="$(git rev-parse "${GITHUB_SHA}:go.sum")"
           publish_worker_workflow_blob="$(git rev-parse "${GITHUB_SHA}:.github/workflows/publish-worker.yml")"
           identity_json="$(jq --compact-output \
             --arg deploy_worker_tree "$deploy_worker_tree" \
+            --arg delivery_source_digest_command_tree "$delivery_source_digest_command_tree" \
+            --arg delivery_source_digest_package_tree "$delivery_source_digest_package_tree" \
+            --arg go_mod_blob "$go_mod_blob" \
+            --arg go_sum_blob "$go_sum_blob" \
             --arg publish_worker_workflow_blob "$publish_worker_workflow_blob" \
-            '{schema_version:5,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
+            '{schema_version:6,deploy_worker_tree:($deploy_worker_tree | @base64),delivery_source_digest_command_tree:($delivery_source_digest_command_tree | @base64),delivery_source_digest_package_tree:($delivery_source_digest_package_tree | @base64),go_mod_blob:($go_mod_blob | @base64),go_sum_blob:($go_sum_blob | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}' \
             config/toolchain.json)"
           identity="$(printf '%s' "$identity_json" | sha256sum | awk '{print $1}')"
           [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || {
@@ -129,7 +141,7 @@ jobs:
               jq --sort-keys '{codex,github_cli,go,no_mistakes,worker}' > /tmp/worker-inputs-before.json
             jq --sort-keys '{codex,github_cli,go,no_mistakes,worker}' config/toolchain.json > /tmp/worker-inputs-now.json
             if ! cmp --silent /tmp/worker-inputs-before.json /tmp/worker-inputs-now.json ||
-               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker .github/workflows/publish-worker.yml; then
+               ! git diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- deploy/worker cmd/delivery-source-digest internal/deliverysource go.mod go.sum .github/workflows/publish-worker.yml; then
               required=true
             fi
           fi

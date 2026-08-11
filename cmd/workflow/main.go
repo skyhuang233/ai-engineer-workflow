@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -51,18 +50,9 @@ func defaultCodexAuthFile() string {
 }
 
 func controlPlaneContainerID(databasePath string) string {
-	absolute, err := filepath.Abs(databasePath)
-	if err != nil {
-		absolute = filepath.Clean(databasePath)
-	}
-	canonical := filepath.Clean(absolute)
-	if resolved, resolveErr := filepath.EvalSymlinks(canonical); resolveErr == nil {
-		canonical = resolved
-	} else if resolvedParent, parentErr := filepath.EvalSymlinks(filepath.Dir(canonical)); parentErr == nil {
-		canonical = filepath.Join(resolvedParent, filepath.Base(canonical))
-	}
-	if goruntime.GOOS == "windows" {
-		canonical = strings.ToLower(canonical)
+	canonical, err := startup.DatabaseIdentity(databasePath)
+	if err != nil || canonical == "" {
+		canonical = filepath.Clean(databasePath)
 	}
 	digest := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(digest[:])
@@ -251,7 +241,7 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 	return isolateControlPlaneDeliveryContainers(ctx, isolator)
 }
 
-func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
 	if isolator == nil {
 		return nil, errors.New("restore cannot isolate an active Delivery Controller")
 	}
@@ -271,7 +261,7 @@ func isolateControlPlaneDeliveryContainers(ctx context.Context, isolator restore
 }
 
 func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator restoreContainerIsolator, now time.Time) error {
-	var isolated []store.TicketClaim
+	var isolated []store.DeliveryIsolationProof
 	for {
 		err := db.ReconcileRestoredControlPlane(ctx, now, isolated...)
 		var isolation *store.DeliveryIsolationRequired

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -101,15 +100,14 @@ func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func openForStartup(ctx context.Context, dsn string, useRestoreBarrier bool) (*Store, error) {
-	databasePath := ""
-	if dsn != ":memory:" && !strings.HasPrefix(dsn, "file:") {
-		databasePath = dsn
+	databasePath, err := startup.DatabaseIdentity(dsn)
+	if err != nil {
+		return nil, err
 	}
 	if dsn == ":memory:" {
 		dsn = "file:workflow?mode=memory&cache=shared"
 	}
 	var barrier *startup.Lock
-	var err error
 	if useRestoreBarrier && databasePath != "" {
 		barrier, err = startup.AcquireDatabaseAccess(ctx, databasePath)
 		if err != nil {
