@@ -367,7 +367,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 			return workspace{}, fmt.Errorf("workspace branch is %q, want %q", strings.TrimSpace(current), branch)
 		}
 	}
-	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", deliverySource, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", deliverySource, "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"); err != nil {
 		return workspace{}, fmt.Errorf("refresh ticket workspace source: %w", err)
 	}
 	if err := replaceWorkspaceOriginURLs(ctx, path, []string{sourceRepository}); err != nil {
@@ -486,7 +486,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if err := runGit(ctx, temporaryPath, "config", "--local", "core.longpaths", "true"); err != nil {
 		return "", fmt.Errorf("configure Delivery Source long paths: %w", err)
 	}
-	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*"); err != nil {
+	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); err != nil {
 		return "", fmt.Errorf("copy admitted Delivery Source: %w", err)
 	}
 	if _, err := gitOutput(ctx, temporaryPath, "rev-parse", "--verify", head+"^{commit}"); err != nil {
