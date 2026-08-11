@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 )
 
 var ErrGitHubCredential = errors.New("worker spec contains a GitHub write credential")
@@ -39,7 +40,10 @@ func IsCertifiedNoLaunchFailure(err error) bool {
 	return errors.As(err, &failure) && failure.NoContainerStarted()
 }
 
-const GatewayHostMapping = "host.docker.internal:host-gateway"
+const (
+	GatewayHostMapping              = "host.docker.internal:host-gateway"
+	preparedContainerCleanupTimeout = 10 * time.Second
+)
 
 // CodexSandboxDockerArgs returns the Docker permissions required by Codex's
 // nested bubblewrap sandbox. Both SYS_ADMIN and an unconfined seccomp profile
@@ -269,7 +273,9 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		return Result{}, CertifiedNoLaunchError{Err: errors.New("Docker did not report the prepared worker container ID")}
 	}
 	removePrepared := func() error {
-		output, err := exec.CommandContext(context.WithoutCancel(ctx), name, "container", "rm", "--force", containerID).CombinedOutput()
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+		defer cancelCleanup()
+		output, err := exec.CommandContext(cleanupCtx, name, "container", "rm", "--force", containerID).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("remove prepared worker container %s: %w (%s)", containerID, err, strings.TrimSpace(string(output)))
 		}

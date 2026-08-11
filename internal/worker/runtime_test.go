@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func init() {
@@ -139,6 +140,42 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	}
 	if result.ContainerID != "prepared-container" || strings.TrimSpace(string(result.Stdout)) != "started" || !strings.Contains(string(commands), "container start --attach prepared-container") {
 		t.Fatalf("admitted Docker start = result %#v, commands %q", result, commands)
+	}
+}
+
+func TestDockerRuntimeRemovesPreparedContainerAfterRejectedAdmission(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	spec := Spec{
+		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+		StartAdmission: func(context.Context) error {
+			cancel()
+			return errors.New("lease expired")
+		},
+	}
+	_, err = (DockerRuntime{Binary: binary}).Run(ctx, spec)
+	if !IsCertifiedNoLaunchFailure(err) {
+		t.Fatalf("rejected admission = %T %v", err, err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(commands), "container rm --force prepared-container") {
+		t.Fatalf("prepared container cleanup commands = %q", commands)
+	}
+}
+
+func TestPreparedContainerCleanupTimeoutIsBounded(t *testing.T) {
+	if preparedContainerCleanupTimeout <= 0 || preparedContainerCleanupTimeout > 30*time.Second {
+		t.Fatalf("prepared container cleanup timeout = %s", preparedContainerCleanupTimeout)
 	}
 }
 
