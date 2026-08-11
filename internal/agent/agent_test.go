@@ -1222,6 +1222,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[1].Environment["NO_MISTAKES_GATEWAY_URL"] != "http://gateway.test" {
 		t.Fatalf("Delivery Controller Gateway URL = %#v", first.specs[1].Environment)
 	}
+	assertDeliveryOriginMount(t, first.specs[1], source)
 	if !first.deliveryDeadline.After(claim.LeaseExpiresAt) {
 		t.Fatalf("Delivery Controller deadline = %s, want after Agent deadline %s", first.deliveryDeadline, claim.LeaseExpiresAt)
 	}
@@ -1516,7 +1517,7 @@ func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) 
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  source: no-mistakes\n  finding_id: finding-42\n  action: ask-user\n  reason: choose the migration strategy\n  allowed_answers[2]: proceed, decline\n")
+	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  source: no-mistakes\n  finding_id: finding-42\n  action: ask_user\n  reason: choose the migration strategy\n  allowed_answers[2]: proceed, decline\n")
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
 	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
@@ -1554,7 +1555,7 @@ func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) 
 	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
 		t.Fatalf("retry answered gate: %v", err)
 	}
-	if len(retryRuntime.specs) != 1 || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ID"] != "gate-17" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_FINDING_ID"] != "finding-42" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ANSWER"] != "proceed" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ENFORCED"] != "true" {
+	if len(retryRuntime.specs) != 1 || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ID"] != "gate-17" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_FINDING_ID"] != "finding-42" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ANSWER"] != "proceed" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ACTION"] != "ask-user" || retryRuntime.specs[0].Environment["NO_MISTAKES_GATE_ENFORCED"] != "true" {
 		t.Fatalf("quality gate retry environment = %#v", retryRuntime.specs)
 	}
 	if strings.Contains(strings.Join(retryRuntime.specs[0].Command, " "), "--yes") {
@@ -1597,6 +1598,22 @@ func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryC
 	if spec.Environment["NO_MISTAKES_DEFAULT_BRANCH"] != "main" {
 		t.Fatalf("Delivery Controller default branch = %q, want trusted source default", spec.Environment["NO_MISTAKES_DEFAULT_BRANCH"])
 	}
+}
+
+func assertDeliveryOriginMount(t *testing.T, spec worker.Spec, source string) {
+	t.Helper()
+	if spec.Environment["GIT_CONFIG_COUNT"] != "1" || spec.Environment["GIT_CONFIG_KEY_0"] != "remote.origin.url" || spec.Environment["GIT_CONFIG_VALUE_0"] != "/source-repository" {
+		t.Fatalf("Delivery Controller Git origin override = %#v", spec.Environment)
+	}
+	for _, mount := range spec.Mounts {
+		if mount.Target == "/source-repository" {
+			if mount.Source != source || !mount.ReadOnly {
+				t.Fatalf("Delivery Controller source mount = %#v, want read-only %q", mount, source)
+			}
+			return
+		}
+	}
+	t.Fatalf("Delivery Controller source mount missing: %#v", spec.Mounts)
 }
 
 func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T) {

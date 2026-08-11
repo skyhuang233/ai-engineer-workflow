@@ -967,6 +967,11 @@ WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, n
 			return false, ErrNotFound
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions
+SET state = 'answered', answer = ?, answered_at = ?
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID); err != nil {
+		return false, err
+	}
 	var sessionID, runID string
 	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
 		if err := s.markPlanCompletedTx(ctx, tx, versionID, now); err != nil {

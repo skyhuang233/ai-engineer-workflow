@@ -2090,8 +2090,27 @@ func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 2, LeaseTTL: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now().UTC()
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, "needs_attention", "stale delivery recovery", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 {
+		t.Fatalf("open questions before delivery = %#v, %v", questions, err)
+	}
 	if err := db.MarkTicketDelivered(ctx, version.ID, 1); err != nil {
 		t.Fatal(err)
+	}
+	resolved, err := db.WorkflowQuestion(ctx, snapshot.Repository, questions[0].ID)
+	if err != nil || resolved.State != "answered" || resolved.Answer != "resolved by delivery" {
+		t.Fatalf("question after delivery = %#v, %v", resolved, err)
 	}
 	frontier, err := db.ReadyFrontier(ctx, version.ID, 2, time.Now().UTC())
 	if err != nil {

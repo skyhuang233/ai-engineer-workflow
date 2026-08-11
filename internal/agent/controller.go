@@ -281,6 +281,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
 	}
+	trustedOrigin, err := trustedWorkspaceOrigin(ctx, ws.Path)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted workspace origin: %w", err))
+	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
 		"NM_HOME":                          "/codex-state/no-mistakes",
@@ -299,6 +303,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		"NO_MISTAKES_EXPECT_REMOTE_ABSENT": fmt.Sprint(publication.ExpectRemoteAbsent),
 		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
 		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
+		"GIT_CONFIG_COUNT":                 "1",
+		"GIT_CONFIG_KEY_0":                 "remote.origin.url",
+		"GIT_CONFIG_VALUE_0":               "/source-repository",
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	if gate, answer, err := c.Store.DeliveryQualityGateAnswer(ctx, session.SessionID); err == nil {
@@ -315,8 +322,12 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: deliveryEnvironment,
-		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
-		ExtraHosts:  []string{worker.GatewayHostMapping},
+		Mounts: []worker.Mount{
+			{Source: ws.Path, Target: "/workspace"},
+			{Source: ws.CodexState, Target: "/codex-state"},
+			{Source: trustedOrigin, Target: "/source-repository", ReadOnly: true},
+		},
+		ExtraHosts: []string{worker.GatewayHostMapping},
 	}
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
@@ -387,6 +398,17 @@ func trustedWorkspaceDefaultBranch(ctx context.Context, workspacePath string) (s
 		}
 	}
 	return "", errors.New("source repository did not advertise a default branch")
+}
+
+func trustedWorkspaceOrigin(ctx context.Context, workspacePath string) (string, error) {
+	if strings.TrimSpace(workspacePath) == "" {
+		return "", errors.New("Ticket Workspace path is required")
+	}
+	origin, err := gitOutput(ctx, workspacePath, "remote", "get-url", "origin")
+	if err != nil {
+		return "", err
+	}
+	return localSourceRepository(strings.TrimSpace(origin))
 }
 
 func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {
@@ -507,6 +529,9 @@ func parseQualityGate(document map[string]any) (*store.QualityGate, error) {
 	}
 	if err := json.Unmarshal(encoded, &gate); err != nil {
 		return nil, fmt.Errorf("Delivery Controller gate is invalid: %w", err)
+	}
+	if gate.Action == "ask_user" {
+		gate.Action = store.QualityGateAskUser
 	}
 	if gate.Action != store.QualityGateAskUser && gate.Action != store.QualityGateSkip {
 		if gate.Action == "auto-fix" && strings.TrimSpace(gate.FindingID) == "" {
