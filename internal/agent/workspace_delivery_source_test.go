@@ -21,11 +21,7 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	}
 	writeDeliverySourceCommit(t, ctx, source, "first")
 	manager := WorkspaceManager{RootDir: filepath.Join(t.TempDir(), "workspaces"), CodexStateRoot: filepath.Join(t.TempDir(), "codex")}
-	workspacePath, _, err := manager.sessionPaths("session-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pinnedFirst, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", workspacePath, source)
+	pinnedFirst, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
 	if err != nil {
 		t.Fatal(err)
 	}

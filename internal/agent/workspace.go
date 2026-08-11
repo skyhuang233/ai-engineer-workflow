@@ -217,11 +217,16 @@ func (m WorkspaceManager) ReclaimClosed(ctx context.Context, db *store.Store, re
 	reclaimed := 0
 	var cleanupErr error
 	for _, session := range sessions {
-		workspacePath, err := managedPath(m.RootDir, session.WorkspacePath)
-		if err == nil {
-			err = os.RemoveAll(workspacePath)
+		var err error
+		if strings.TrimSpace(session.WorkspacePath) != "" {
+			workspacePath, workspaceErr := managedPath(m.RootDir, session.WorkspacePath)
+			if workspaceErr != nil {
+				err = workspaceErr
+			} else {
+				err = os.RemoveAll(workspacePath)
+			}
 		}
-		if err == nil {
+		if err == nil && strings.TrimSpace(session.CodexStatePath) != "" {
 			statePath, stateErr := managedPath(m.CodexStateRoot, session.CodexStatePath)
 			if stateErr != nil {
 				err = stateErr
@@ -230,7 +235,7 @@ func (m WorkspaceManager) ReclaimClosed(ctx context.Context, db *store.Store, re
 			}
 		}
 		if err == nil {
-			deliverySource, sourceErr := m.deliverySourceSessionPath(session.SessionID, session.WorkspacePath)
+			deliverySource, sourceErr := m.deliverySourceSessionPath(session.SessionID)
 			if sourceErr != nil {
 				err = sourceErr
 			} else {
@@ -340,7 +345,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	if err := os.MkdirAll(m.CodexStateRoot, 0o755); err != nil {
 		return workspace{}, err
 	}
-	deliverySource, err := m.ensureDeliverySource(ctx, sessionID, revisionRoundID, path, sourceRepository)
+	deliverySource, err := m.ensureDeliverySource(ctx, sessionID, revisionRoundID, sourceRepository)
 	if err != nil {
 		return workspace{}, err
 	}
@@ -387,16 +392,22 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
 }
 
-func (m WorkspaceManager) deliverySourceSessionPath(sessionID, workspacePath string) (string, error) {
+func (m WorkspaceManager) deliverySourceSessionPath(sessionID string) (string, error) {
+	if strings.TrimSpace(m.RootDir) == "" {
+		return "", errors.New("workspace configuration is incomplete")
+	}
 	if sessionID == "" || filepath.Base(sessionID) != sessionID {
 		return "", errors.New("Ticket Session ID is invalid")
 	}
-	managedWorkspace, err := managedPath(m.RootDir, workspacePath)
+	workspaceRoot, err := canonicalPath(m.RootDir)
 	if err != nil {
 		return "", err
 	}
-	root, err := canonicalPath(filepath.Join(filepath.Dir(managedWorkspace), ".delivery-sources"))
+	root, err := canonicalPath(filepath.Join(workspaceRoot, ".delivery-sources"))
 	if err != nil {
+		return "", err
+	}
+	if _, err := managedPath(workspaceRoot, root); err != nil {
 		return "", err
 	}
 	path, err := canonicalPath(filepath.Join(root, sessionID))
@@ -409,11 +420,11 @@ func (m WorkspaceManager) deliverySourceSessionPath(sessionID, workspacePath str
 	return path, nil
 }
 
-func (m WorkspaceManager) deliverySourcePath(sessionID, revisionRoundID, workspacePath string) (string, error) {
+func (m WorkspaceManager) deliverySourcePath(sessionID, revisionRoundID string) (string, error) {
 	if revisionRoundID == "" || filepath.Base(revisionRoundID) != revisionRoundID {
 		return "", errors.New("Revision Round ID is invalid")
 	}
-	root, err := m.deliverySourceSessionPath(sessionID, workspacePath)
+	root, err := m.deliverySourceSessionPath(sessionID)
 	if err != nil {
 		return "", err
 	}
@@ -427,8 +438,8 @@ func (m WorkspaceManager) deliverySourcePath(sessionID, revisionRoundID, workspa
 	return path, nil
 }
 
-func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, revisionRoundID, workspacePath, sourceRepository string) (string, error) {
-	path, err := m.deliverySourcePath(sessionID, revisionRoundID, workspacePath)
+func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, revisionRoundID, sourceRepository string) (string, error) {
+	path, err := m.deliverySourcePath(sessionID, revisionRoundID)
 	if err != nil {
 		return "", err
 	}

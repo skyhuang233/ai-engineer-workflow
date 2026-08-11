@@ -983,26 +983,12 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 	if err != nil {
 		return false, err
 	}
-	var completionQueued bool
 	var sessionID, runID string
-	if err := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID); errors.Is(err, sql.ErrNoRows) {
-		completionQueued, err = s.markPlanCompletedTx(ctx, tx, versionID, now)
-		if err != nil {
-			return false, err
-		}
-		if resolvedQuestions > 0 && !completionQueued {
-			if err := s.queueDeliveredQuestionRepairTx(ctx, tx, versionID, now); err != nil {
-				return false, err
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return false, err
-		}
-		return true, nil
-	} else if err != nil {
-		return false, err
+	sessionErr := tx.QueryRowContext(ctx, `SELECT session_id, COALESCE(current_run_id, '') FROM ticket_sessions WHERE version_id = ? AND issue_id = ?`, versionID, issueID).Scan(&sessionID, &runID)
+	if sessionErr != nil && !errors.Is(sessionErr, sql.ErrNoRows) {
+		return false, sessionErr
 	}
-	if runID != "" {
+	if sessionErr == nil && runID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "succeeded", nowText, runID, RunRunning); err != nil {
 			return false, err
 		}
@@ -1010,10 +996,12 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 			return false, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
-		return false, err
+	if sessionErr == nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET state = ?, owner = '', updated_at = ? WHERE session_id = ?`, SessionClosed, nowText, sessionID); err != nil {
+			return false, err
+		}
 	}
-	completionQueued, err = s.markPlanCompletedTx(ctx, tx, versionID, now)
+	completionQueued, err := s.markPlanCompletedTx(ctx, tx, versionID, now)
 	if err != nil {
 		return false, err
 	}

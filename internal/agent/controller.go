@@ -248,12 +248,12 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err))
 		}
-		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, session.WorkspacePath, sourceRepository)
+		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
 		if err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, err)
 		}
 	} else {
-		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID, session.WorkspacePath)
+		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
 		if err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, err)
 		}
@@ -363,8 +363,11 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
-	deliveryResult, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
+	deliveryResult, runtimeInvoked, deliveryErr := runInDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository)
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
+		if runtimeInvoked {
+			return c.failDeliveryControllerWithClass(ctx, deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		}
 		return c.failDeliveryController(ctx, deliveryClaim, deliveryErr)
 	}
 	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
@@ -398,17 +401,18 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	return nil
 }
 
-func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, resultErr error) {
+func runInDeliveryWorkspace(ctx context.Context, runtime worker.Runtime, spec worker.Spec, sourceRepository string) (result worker.Result, runtimeInvoked bool, resultErr error) {
 	restore, err := prepareDeliveryWorkspace(ctx, spec.WorkspacePath, sourceRepository)
 	if err != nil {
-		return worker.Result{}, err
+		return worker.Result{}, false, err
 	}
 	defer func() {
 		restoreCtx, cancel := context.WithTimeout(context.Background(), workerAuditTimeout)
 		defer cancel()
 		resultErr = errors.Join(resultErr, restore(restoreCtx))
 	}()
-	return runtime.Run(ctx, spec)
+	result, resultErr = runtime.Run(ctx, spec)
+	return result, true, resultErr
 }
 
 func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceRepository string) (func(context.Context) error, error) {

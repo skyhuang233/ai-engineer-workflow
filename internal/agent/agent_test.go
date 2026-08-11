@@ -39,6 +39,7 @@ type fakeRuntime struct {
 	refreshedAuth                 []byte
 	deleteCodexAuthDuringDelivery bool
 	beforeDeliveryReturn          func(time.Time) error
+	deliveryErr                   error
 	deliveryOrigin                string
 }
 
@@ -66,6 +67,9 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 			return worker.Result{}, err
 		}
 		r.deliveryOrigin = strings.TrimSpace(string(originOutput))
+		if r.deliveryErr != nil {
+			return worker.Result{}, r.deliveryErr
+		}
 		if r.deleteCodexAuthDuringDelivery {
 			if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
 				return worker.Result{}, err
@@ -1513,6 +1517,37 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	}
 }
 
+func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "Docker daemon unavailable") {
+		t.Fatalf("pre-container infrastructure error = %v", err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 0 {
+		t.Fatalf("pre-container infrastructure failure escalated: questions=%#v, err=%v", questions, err)
+	}
+	earlyRetries, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC())
+	if err != nil || len(earlyRetries) != 0 {
+		t.Fatalf("pre-container infrastructure failure skipped backoff: retries=%#v, err=%v", earlyRetries, err)
+	}
+	retries, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC().Add(2*time.Minute))
+	if err != nil || len(retries) != 1 || retries[0].SessionID != claim.SessionID {
+		t.Fatalf("pre-container delivery retry = %#v, err=%v", retries, err)
+	}
+}
+
 func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -1853,6 +1888,27 @@ func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
 	}
 	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(3*time.Hour)); err != nil || reclaimed != 0 {
 		t.Fatalf("idempotent reclaim = %d, %v", reclaimed, err)
+	}
+}
+
+func TestWorkspaceManagerReclaimsPreBindDeliverySnapshot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	deliverySourcePath := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, ".delivery-orphan")
+	if err := os.MkdirAll(deliverySourcePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := manager.ReclaimClosed(ctx, db, time.Hour, time.Now().UTC().Add(2*time.Hour)); err != nil || reclaimed != 1 {
+		t.Fatalf("pre-bind reclaim = %d, %v", reclaimed, err)
+	}
+	if _, err := os.Stat(filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-bind Delivery Source still exists: %v", err)
 	}
 }
 
