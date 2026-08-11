@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/startup"
 	"modernc.org/sqlite"
 )
 
@@ -54,9 +55,10 @@ const (
 )
 
 type Store struct {
-	db           *sql.DB
-	databasePath string
-	leaseMu      sync.Mutex
+	db             *sql.DB
+	databasePath   string
+	restoreBarrier *startup.Lock
+	leaseMu        sync.Mutex
 }
 
 type PlanVersion = plan.Version
@@ -69,7 +71,15 @@ func formatTimestamp(value time.Time) string {
 
 // Open configures SQLite, checks its integrity, and runs all pending migrations.
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	store, err := OpenForStartup(ctx, dsn)
+	return open(ctx, dsn, true)
+}
+
+func OpenForRestore(ctx context.Context, dsn string) (*Store, error) {
+	return open(ctx, dsn, false)
+}
+
+func open(ctx context.Context, dsn string, restoreBarrier bool) (*Store, error) {
+	store, err := openForStartup(ctx, dsn, restoreBarrier)
 	if err != nil {
 		return nil, err
 	}
@@ -87,6 +97,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // OpenForStartup configures SQLite without migrations so startup can make the
 // integrity-check then migration boundary explicit.
 func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
+	return openForStartup(ctx, dsn, true)
+}
+
+func openForStartup(ctx context.Context, dsn string, useRestoreBarrier bool) (*Store, error) {
 	databasePath := ""
 	if dsn != ":memory:" && !strings.HasPrefix(dsn, "file:") {
 		databasePath = dsn
@@ -94,14 +108,23 @@ func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
 	if dsn == ":memory:" {
 		dsn = "file:workflow?mode=memory&cache=shared"
 	}
+	var barrier *startup.Lock
+	var err error
+	if useRestoreBarrier && databasePath != "" {
+		barrier, err = startup.AcquireDatabaseAccess(ctx, databasePath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		_ = barrier.Close()
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db, databasePath: databasePath}
+	store := &Store{db: db, databasePath: databasePath, restoreBarrier: barrier}
 	if err := store.configure(ctx); err != nil {
-		db.Close()
+		_ = store.Close()
 		return nil, err
 	}
 	return store, nil
@@ -1591,7 +1614,12 @@ func (s *Store) backupDatabase(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	return errors.Join(s.db.Close(), s.restoreBarrier.Close())
+}
 
 // BeginActivation writes a complete immutable version in one transaction.
 // The returned version remains in projecting until MarkActive is called after

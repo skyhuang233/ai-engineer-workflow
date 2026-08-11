@@ -524,7 +524,7 @@ func TestPrepareDeliveryWorkspaceScopesOriginReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(urls) != "/source-repository" {
-		t.Fatalf("prepared Delivery Worker origins = %q", urls)
+		t.Fatalf("prepared Delivery Controller origins = %q", urls)
 	}
 	if err := restore(ctx); err != nil {
 		t.Fatal(err)

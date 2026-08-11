@@ -54,6 +54,10 @@ type HTTPOptions struct {
 	ControlPlaneToken string
 }
 
+type HTTPGateway interface {
+	Deliver(context.Context, store.DeliveryRequest) (store.DeliveryOutbox, error)
+}
+
 type HTTPProjector struct {
 	URL               string
 	ControlPlaneToken string
@@ -108,7 +112,7 @@ func (p HTTPProjector) deliver(ctx context.Context, command store.DeliveryReques
 	return nil
 }
 
-func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
+func HTTPHandler(gateway HTTPGateway, options ...HTTPOptions) http.Handler {
 	option := HTTPOptions{}
 	if len(options) > 0 {
 		option = options[0]
@@ -139,10 +143,7 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 			http.Error(writer, "invalid delivery command", http.StatusBadRequest)
 			return
 		}
-		outbox, err := gateway.Submit(request.Context(), command)
-		if err == nil {
-			err = gateway.Dispatch(request.Context(), outbox.IdempotencyKey)
-		}
+		outbox, err := gateway.Deliver(request.Context(), command)
 		if err != nil {
 			status := http.StatusInternalServerError
 			if retryAt := retryAt(err); !retryAt.IsZero() {
@@ -160,12 +161,6 @@ func HTTPHandler(gateway Gateway, options ...HTTPOptions) http.Handler {
 				writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
 			}
 			http.Error(writer, err.Error(), status)
-			return
-		}
-		outbox, err = gateway.Store.DeliveryOutbox(request.Context(), outbox.IdempotencyKey)
-		if err != nil {
-			writer.Header().Set(errorCodeHeader, ErrorCodeRetryableStore)
-			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")

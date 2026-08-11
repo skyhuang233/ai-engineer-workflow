@@ -90,6 +90,21 @@ func NewGateway(store *store.Store, remote Remote) (Gateway, error) {
 	return Gateway{Store: store, Remote: remote, DispatcherToken: "gateway-dispatcher-" + hex.EncodeToString(bytes)}, nil
 }
 
+func (g Gateway) Deliver(ctx context.Context, request store.DeliveryRequest) (store.DeliveryOutbox, error) {
+	outbox, err := g.Submit(ctx, request)
+	if err == nil {
+		err = g.Dispatch(ctx, outbox.IdempotencyKey)
+	}
+	if err != nil {
+		return outbox, err
+	}
+	outbox, err = g.Store.DeliveryOutbox(ctx, outbox.IdempotencyKey)
+	if err != nil {
+		return outbox, errors.Join(ErrGatewayStore, err)
+	}
+	return outbox, nil
+}
+
 type uncertainWriteError struct {
 	applyErr   error
 	observeErr error

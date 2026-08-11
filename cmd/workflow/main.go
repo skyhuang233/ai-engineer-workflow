@@ -208,6 +208,12 @@ func restoreControlPlane(ctx context.Context, backupPath, databasePath string, i
 		db.Close()
 		return err
 	}
+	restoreBarrier, err := startup.AcquireRestoreBarrier(ctx, databasePath)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	defer restoreBarrier.Close()
 	if err := isolateCurrentControlPlane(ctx, databasePath, isolator); err != nil {
 		db.Close()
 		return err
@@ -228,7 +234,7 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 	} else if err != nil {
 		return err
 	}
-	db, err := store.Open(ctx, databasePath)
+	db, err := store.OpenForRestore(ctx, databasePath)
 	if err != nil {
 		if store.IsDatabaseError(err) || errors.Is(err, store.ErrDatabaseIntegrity) {
 			return isolateControlPlaneDeliveryContainers(ctx, isolator)
@@ -1223,6 +1229,86 @@ func deliverySourceRefresher(database *store.Store, provider githubTokenProvider
 	}
 }
 
+type restoreFencedGateway struct {
+	databasePath    string
+	config          doctor.Config
+	githubURL       string
+	pushURL         string
+	dispatcherToken string
+	provider        *verifiedGitHubAppTokenSource
+	mu              sync.Mutex
+}
+
+func newRestoreFencedGateway(databasePath string, config doctor.Config, githubURL, pushURL string) (*restoreFencedGateway, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return nil, err
+	}
+	return &restoreFencedGateway{
+		databasePath:    databasePath,
+		config:          config,
+		githubURL:       githubURL,
+		pushURL:         pushURL,
+		dispatcherToken: "gateway-dispatcher-" + hex.EncodeToString(bytes),
+		provider:        &verifiedGitHubAppTokenSource{Config: config, APIBase: githubURL},
+	}, nil
+}
+
+func (g *restoreFencedGateway) withGateway(ctx context.Context, action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	db, err := store.Open(ctx, g.databasePath)
+	if err != nil {
+		return err
+	}
+	g.provider.Database = db
+	defer func() {
+		g.provider.Database = nil
+		resultErr = errors.Join(resultErr, db.Close())
+	}()
+	credentialSource := func(ctx context.Context) (string, error) {
+		return admitControlPlaneGitHubApp(ctx, db, g.provider, nil)
+	}
+	remote := &github.DeliveryRemote{
+		Client: github.NewClient(g.githubURL, "", nil).WithRepositoryOwner(g.config.GitHub.Credential.Owner),
+		Store:  db, PushURL: g.pushURL, CredentialSource: credentialSource,
+	}
+	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: g.dispatcherToken}
+	return action(db, gateway, credentialSource)
+}
+
+func (g *restoreFencedGateway) Deliver(ctx context.Context, request store.DeliveryRequest) (outbox store.DeliveryOutbox, resultErr error) {
+	resultErr = g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
+		var err error
+		outbox, err = gateway.Deliver(ctx, request)
+		return err
+	})
+	return outbox, resultErr
+}
+
+func (g *restoreFencedGateway) Initialize(ctx context.Context) error {
+	return g.withGateway(ctx, func(db *store.Store, gateway delivery.Gateway, credentialSource func(context.Context) (string, error)) error {
+		if _, err := credentialSource(ctx); shouldPauseGatewayForCredential(err) {
+			if pauseErr := db.PauseGatewayWrites(ctx, store.ControlPlaneGitHubAppRecoveryRemediation, time.Now().UTC()); pauseErr != nil {
+				return pauseErr
+			}
+		}
+		return gateway.QueueGatewayCredentialInboxProjections(ctx)
+	})
+}
+
+func (g *restoreFencedGateway) QueueGatewayCredentialInboxProjections(ctx context.Context) error {
+	return g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
+		return gateway.QueueGatewayCredentialInboxProjections(ctx)
+	})
+}
+
+func (g *restoreFencedGateway) DispatchPending(ctx context.Context, limit int) error {
+	return g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
+		return gateway.DispatchPending(ctx, limit)
+	})
+}
+
 func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
@@ -1237,33 +1323,15 @@ func runGateway(args []string) {
 		fmt.Fprintln(os.Stderr, "gateway requires listen address and control-plane credential")
 		os.Exit(2)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
-	if err != nil {
-		fail(err)
-	}
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
-		_ = db.Close()
 		fail(err)
 	}
-	provider := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: *githubURL}
-	credentialSource := func(ctx context.Context) (string, error) {
-		return admitControlPlaneGitHubApp(ctx, db, provider, nil)
-	}
-	remote := &github.DeliveryRemote{Client: github.NewClient(*githubURL, "", nil).WithRepositoryOwner(config.GitHub.Credential.Owner), Store: db, PushURL: *pushURL, CredentialSource: credentialSource}
-	gateway, err := delivery.NewGateway(db, remote)
+	gateway, err := newRestoreFencedGateway(*databasePath, config, *githubURL, *pushURL)
 	if err != nil {
-		_ = db.Close()
 		fail(err)
 	}
-	if _, err := credentialSource(context.Background()); shouldPauseGatewayForCredential(err) {
-		if pauseErr := db.PauseGatewayWrites(context.Background(), store.ControlPlaneGitHubAppRecoveryRemediation, time.Now().UTC()); pauseErr != nil {
-			_ = db.Close()
-			fail(pauseErr)
-		}
-	}
-	if err := gateway.QueueGatewayCredentialInboxProjections(context.Background()); err != nil {
-		_ = db.Close()
+	if err := gateway.Initialize(context.Background()); err != nil {
 		fail(err)
 	}
 	go func() {
@@ -1279,10 +1347,8 @@ func runGateway(args []string) {
 	}()
 	server := &http.Server{Addr: *listen, Handler: delivery.HTTPHandler(gateway, delivery.HTTPOptions{ControlPlaneToken: *controlToken})}
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		_ = db.Close()
 		fail(err)
 	}
-	_ = db.Close()
 }
 
 type verifiedGitHubAppTokenSource struct {

@@ -585,8 +585,8 @@ func (m WorkspaceManager) reclaimSupersededDeliverySources(ctx context.Context, 
 	return nil
 }
 
-func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, revisionRoundID, launchID, sourcePath, expectedDigest string) (string, func() error, error) {
-	launchPath, err := m.sealedDeliverySourcePath(sessionID, revisionRoundID, launchID, sourcePath)
+func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, revisionRoundID, workerRunID, sourcePath, expectedDigest string) (string, func() error, error) {
+	launchPath, err := m.sealedDeliverySourcePath(sessionID, revisionRoundID, workerRunID, sourcePath)
 	if err != nil {
 		return "", nil, err
 	}
@@ -627,7 +627,7 @@ func (m WorkspaceManager) sealDeliverySource(ctx context.Context, sessionID, rev
 	return launchPath, cleanup, nil
 }
 
-func (m WorkspaceManager) sealedDeliverySourcePath(sessionID, revisionRoundID, launchID, sourcePath string) (string, error) {
+func (m WorkspaceManager) sealedDeliverySourcePath(sessionID, revisionRoundID, workerRunID, sourcePath string) (string, error) {
 	current, err := m.deliverySourcePath(sessionID, revisionRoundID)
 	if err != nil {
 		return "", err
@@ -635,11 +635,11 @@ func (m WorkspaceManager) sealedDeliverySourcePath(sessionID, revisionRoundID, l
 	if filepath.Clean(sourcePath) != current {
 		return "", deliverySourceIntegrityError(errors.New("Delivery Source path does not match the accepted Revision Round"))
 	}
-	if launchID == "" || filepath.Base(launchID) != launchID {
-		return "", deliverySourceIntegrityError(errors.New("Delivery Controller launch ID is invalid"))
+	if workerRunID == "" || filepath.Base(workerRunID) != workerRunID {
+		return "", deliverySourceIntegrityError(errors.New("Worker Run ID is invalid"))
 	}
 	root := filepath.Dir(current)
-	launchPath, err := canonicalPath(filepath.Join(root, ".launch-"+launchID+".git"))
+	launchPath, err := canonicalPath(filepath.Join(root, ".launch-"+workerRunID+".git"))
 	if err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve sealed Delivery Source path: %w", err))
 	}

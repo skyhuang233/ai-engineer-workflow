@@ -24,6 +24,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -196,6 +197,100 @@ func TestRestoreReplacesCorruptCurrentDatabase(t *testing.T) {
 	defer restored.Close()
 	if _, err := restored.ReconcilePreview(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRestoreFencedGatewayDrainsAndReopensPublishedDatabase(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "workflow.db")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := plan.Snapshot{
+		Repository: "owner/repository",
+		Root:       plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replacementPath := filepath.Join(directory, "replacement.db")
+	replacement, err := store.Open(ctx, replacementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := newRestoreFencedGateway(databasePath, doctor.Config{}, "https://api.github.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	gatewayDone := make(chan error, 1)
+	go func() {
+		gatewayDone <- gateway.withGateway(ctx, func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	type barrierResult struct {
+		lock *startup.Lock
+		err  error
+	}
+	barrierDone := make(chan barrierResult, 1)
+	go func() {
+		lock, err := startup.AcquireRestoreBarrier(ctx, databasePath)
+		barrierDone <- barrierResult{lock: lock, err: err}
+	}()
+	select {
+	case result := <-barrierDone:
+		if result.lock != nil {
+			result.lock.Close()
+		}
+		t.Fatalf("restore crossed active Gateway database access: %v", result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-gatewayDone; err != nil {
+		t.Fatal(err)
+	}
+	result := <-barrierDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if err := store.PublishRestoredBackup(ctx, replacementPath, databasePath); err != nil {
+		result.lock.Close()
+		t.Fatal(err)
+	}
+	if err := result.lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = gateway.withGateway(ctx, func(db *store.Store, _ delivery.Gateway, _ func(context.Context) (string, error)) error {
+		_, err := db.PlanProjectionAt(ctx, version.ID, time.Now().UTC())
+		return err
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Gateway retained pre-restore database = %v", err)
 	}
 }
 

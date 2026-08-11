@@ -370,7 +370,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
 	}
-	imageDigest, toolVersions, err := c.deliveryWorkerRuntime(ctx, deliveryClaim)
+	imageDigest, toolVersions, err := c.deliveryControllerRuntime(ctx, deliveryClaim)
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
@@ -563,7 +563,7 @@ func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceReposito
 		restoreURLs = []string{sourceRepository}
 	}
 	if err := replaceWorkspaceOriginURLs(ctx, workspacePath, []string{"/source-repository"}); err != nil {
-		return nil, fmt.Errorf("configure Delivery Worker origin: %w", err)
+		return nil, fmt.Errorf("configure Delivery Controller origin: %w", err)
 	}
 	restore := func(restoreCtx context.Context) error {
 		if err := replaceWorkspaceOriginURLs(restoreCtx, workspacePath, restoreURLs); err != nil {
@@ -573,7 +573,7 @@ func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceReposito
 	}
 	effective, err := trustedGitOutput(ctx, workspacePath, "remote", "get-url", "--all", "origin")
 	if err != nil {
-		return nil, errors.Join(deliverySourceInfrastructureError(fmt.Errorf("resolve effective Delivery Worker origin: %w", err)), restore(context.WithoutCancel(ctx)))
+		return nil, errors.Join(deliverySourceInfrastructureError(fmt.Errorf("resolve effective Delivery Controller origin: %w", err)), restore(context.WithoutCancel(ctx)))
 	}
 	if strings.TrimSpace(effective) != "/source-repository" {
 		return nil, errors.Join(deliverySourceIntegrityError(errors.New("Ticket Workspace transport configuration rewrites the pinned Delivery Source")), restore(context.WithoutCancel(ctx)))
@@ -667,10 +667,10 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	return activeRelease.ImageReference, toolVersions, nil
 }
 
-func (c Controller) deliveryWorkerRuntime(ctx context.Context, claim store.TicketClaim) (string, map[string]string, error) {
+func (c Controller) deliveryControllerRuntime(ctx context.Context, claim store.TicketClaim) (string, map[string]string, error) {
 	imageDigest, toolVersions, pinned, err := c.Store.DeliveryWorkerRuntime(ctx, claim)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve Delivery Worker runtime: %w", err)
+		return "", nil, fmt.Errorf("resolve Delivery Controller runtime: %w", err)
 	}
 	if pinned {
 		return imageDigest, toolVersions, nil

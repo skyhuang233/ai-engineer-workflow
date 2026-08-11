@@ -1661,10 +1661,10 @@ func TestControllerSealsDeliverySourceAcrossRuntimeLaunch(t *testing.T) {
 		beforeDelivery: func(spec worker.Spec) error {
 			sealedSource := spec.Mounts[2].Source
 			if spec.Mounts[2].Target != "/source-seed" || spec.ContainerPreflight == "" {
-				return errors.New("Delivery Worker omitted isolated source materialization")
+				return errors.New("Delivery Controller omitted isolated source materialization")
 			}
 			if filepath.Clean(sealedSource) == filepath.Clean(retainedSource) {
-				return errors.New("Delivery Worker mounted the retained mutable source")
+				return errors.New("Delivery Controller mounted the retained mutable source")
 			}
 			command := exec.Command("git", "--git-dir", retainedSource, "update-ref", "refs/tags/tampered", "refs/heads/main")
 			if output, err := command.CombinedOutput(); err != nil {
@@ -2029,7 +2029,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	}
 	retryRunID := pending[0].RunID
 	if _, _, pinned, err := db.DeliveryWorkerRuntime(ctx, pending[0]); err != nil || pinned {
-		t.Fatalf("recovery Delivery Worker runtime pin = %v, %v; want Active selection", pinned, err)
+		t.Fatalf("recovery Delivery Controller runtime pin = %v, %v; want Active selection", pinned, err)
 	}
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
@@ -2084,7 +2084,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 		t.Fatalf("accepted Candidate identity changed during recovery: session=%#v candidate=%#v", session, candidate)
 	}
 	t.Logf("accepted Candidate preserved: run=%s commit=%s image=%s tools=%v", claim.RunID, candidate.CommitSHA, candidateImage, candidateTools)
-	t.Logf("recovery Delivery Worker launched: run=%s image=%s tools=%v mounts=%s extra_hosts=%s github_write_credentials=%t container=%s", retryRunID, audit.ImageDigest, auditedTools, audit.MountsJSON, audit.ExtraHostsJSON, audit.GitHubWriteCredentials, audit.ContainerID)
+	t.Logf("recovery Delivery Controller launched: run=%s image=%s tools=%v mounts=%s extra_hosts=%s github_write_credentials=%t container=%s", retryRunID, audit.ImageDigest, auditedTools, audit.MountsJSON, audit.ExtraHostsJSON, audit.GitHubWriteCredentials, audit.ContainerID)
 	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, revisionRoundIDForRun(t, ctx, db, claim.RunID), pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
