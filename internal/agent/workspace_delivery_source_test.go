@@ -110,6 +110,84 @@ func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	assertGitRefMissing(t, ctx, retry.Path, "refs/tags/v3")
 }
 
+func TestDeliverySourceRefreshesAdvancedRemoteBaseAndPinsRevision(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	if err := runGit(ctx, "", "init", "--bare", remote); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "source")
+	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, source)
+	writeDeliverySourceCommit(t, ctx, source, "first")
+	if err := runGit(ctx, source, "remote", "add", "origin", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, source, "push", "-u", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	manager := WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		RefreshDeliverySource: func(ctx context.Context, snapshotPath, headRef string) error {
+			return runGit(ctx, snapshotPath, "fetch", "--force", "--no-tags", remote, "+"+headRef+":"+headRef)
+		},
+	}
+	first, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMain, err := gitOutput(ctx, first.DeliverySource, "rev-parse", "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := filepath.Join(root, "publisher")
+	if err := runGit(ctx, "", "clone", "-b", "main", remote, publisher); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, publisher)
+	writeDeliverySourceCommit(t, ctx, publisher, "second")
+	if err := runGit(ctx, publisher, "push", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	sourceMain, err := gitOutput(ctx, source, "rev-parse", "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondMain, err := gitOutput(ctx, second.DeliverySource, "rev-parse", "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceMain, err := gitOutput(ctx, second.Path, "rev-parse", "refs/remotes/origin/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(sourceMain) != strings.TrimSpace(firstMain) || strings.TrimSpace(secondMain) == strings.TrimSpace(firstMain) || strings.TrimSpace(workspaceMain) != strings.TrimSpace(secondMain) {
+		t.Fatalf("advanced base was not refreshed through the pinned snapshot: source=%q first=%q second=%q workspace=%q", sourceMain, firstMain, secondMain, workspaceMain)
+	}
+	writeDeliverySourceCommit(t, ctx, publisher, "third")
+	if err := runGit(ctx, publisher, "push", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryMain, err := gitOutput(ctx, retry.DeliverySource, "rev-parse", "refs/heads/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(retryMain) != strings.TrimSpace(secondMain) {
+		t.Fatalf("revision retry refreshed pinned base: retry=%q second=%q", retryMain, secondMain)
+	}
+}
+
 func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("requires a Windows host")
@@ -211,6 +289,15 @@ func writeDeliverySourceCommit(t *testing.T, ctx context.Context, source, conten
 	}
 	if err := runGit(ctx, source, "commit", "-m", content); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func configureDeliverySourceTestIdentity(t *testing.T, ctx context.Context, repository string) {
+	t.Helper()
+	for key, value := range map[string]string{"user.name": "Test", "user.email": "test@example.com"} {
+		if err := runGit(ctx, repository, "config", key, value); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -492,10 +492,13 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
-	client, err := admittedControlPlaneGitHubClient(ctx, db, config, *githubURL, *repository)
+	client, provider, err := admittedControlPlaneGitHubClientAndProvider(ctx, db, config, *githubURL, *repository)
 	if err != nil {
 		fail(err)
+	}
+	workspaceManager := agent.WorkspaceManager{
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RefreshDeliverySource: deliverySourceRefresher(db, provider, *repository),
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
 	if err != nil {
@@ -686,7 +689,10 @@ func runPollGitHub(args []string) {
 		fail(err)
 	}
 	provider := &verifiedGitHubAppTokenSource{Database: db, Config: config, APIBase: *githubURL}
-	workspaceManager := agent.WorkspaceManager{RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile}
+	workspaceManager := agent.WorkspaceManager{
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RefreshDeliverySource: deliverySourceRefresher(db, provider, *repository),
+	}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
 	if reason, err := runtime.Inspect(context.Background()); err != nil {
 		fail(err)
@@ -1053,16 +1059,29 @@ func requireOwnerGuardedControlPlaneRepository(ctx context.Context, client *gith
 }
 
 func admittedControlPlaneGitHubClient(ctx context.Context, database *store.Store, config doctor.Config, apiBase, repository string) (*github.Client, error) {
-	provider, _, _, err := loadVerifiedGitHubAppProvider(ctx, database, config, apiBase, nil)
-	if err != nil {
-		return nil, persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
-	}
+	client, _, err := admittedControlPlaneGitHubClientAndProvider(ctx, database, config, apiBase, repository)
+	return client, err
+}
+
+func admittedControlPlaneGitHubClientAndProvider(ctx context.Context, database *store.Store, config doctor.Config, apiBase, repository string) (*github.Client, githubTokenProvider, error) {
+	provider := &verifiedGitHubAppTokenSource{Database: database, Config: config, APIBase: apiBase}
 	var client *github.Client
-	_, err = admitControlPlaneGitHubApp(ctx, database, provider, func(token string) error {
+	_, err := admitControlPlaneGitHubApp(ctx, database, provider, func(token string) error {
 		client = github.NewClient(apiBase, token, nil).WithRepositoryOwner(config.GitHub.Credential.Owner)
 		return requireOwnerGuardedControlPlaneRepository(ctx, client, repository)
 	})
-	return client, err
+	return client, provider, err
+}
+
+func deliverySourceRefresher(database *store.Store, provider githubTokenProvider, repository string) func(context.Context, string, string) error {
+	return func(ctx context.Context, snapshotPath, headRef string) error {
+		token, err := provider.Token(ctx)
+		if err != nil {
+			return persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+		}
+		err = (github.DeliverySourceFetcher{Repository: repository, Token: token}).Fetch(ctx, snapshotPath, headRef)
+		return persistGitHubAppAdmissionError(ctx, database, err, time.Now().UTC())
+	}
 }
 
 func runGateway(args []string) {

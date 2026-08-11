@@ -18,9 +18,10 @@ import (
 )
 
 type WorkspaceManager struct {
-	RootDir        string
-	CodexStateRoot string
-	CodexAuthFile  string
+	RootDir               string
+	CodexStateRoot        string
+	CodexAuthFile         string
+	RefreshDeliverySource func(context.Context, string, string) error
 }
 
 type workspace struct {
@@ -488,6 +489,11 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	}
 	if err := runGit(ctx, temporaryPath, "fetch", "--force", "--prune", "--no-tags", sourceRepository, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); err != nil {
 		return "", fmt.Errorf("copy admitted Delivery Source: %w", err)
+	}
+	if m.RefreshDeliverySource != nil {
+		if err := m.RefreshDeliverySource(ctx, temporaryPath, head); err != nil {
+			return "", fmt.Errorf("refresh Delivery Source from admitted remote: %w", err)
+		}
 	}
 	if _, err := gitOutput(ctx, temporaryPath, "rev-parse", "--verify", head+"^{commit}"); err != nil {
 		return "", fmt.Errorf("verify Delivery Source HEAD: %w", err)
