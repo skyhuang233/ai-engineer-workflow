@@ -171,12 +171,12 @@ type RecoveryRun struct {
 	Session TicketSession
 }
 
-// ExpiredAgentRecoveryRuns lists the current Agent Runs whose Run Leases have
-// elapsed. Callers must isolate the corresponding container before using
+// ExpiredLaunchedRecoveryRuns lists current Agent Runs and launched Delivery
+// Controller Runs whose Run Leases have elapsed. Callers must isolate the corresponding container before using
 // ReconcileMissingRecoveryRun to release the ticket for a replacement Run.
 // The latter method repeats the current-run and Lease checks atomically, so a
 // stale recovery observation can never supersede a newer generation.
-func (s *Store) ExpiredAgentRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
+func (s *Store) ExpiredLaunchedRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
 	if versionID == "" {
 		return nil, ErrInvalidClaim
 	}
@@ -192,8 +192,10 @@ FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at <= ?
-ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunRunning, LeaseActive, formatTimestamp(now))
+WHERE s.version_id = ? AND s.current_run_id = r.run_id
+AND (r.run_kind = ? OR (r.run_kind = ? AND r.launch_state = 'launched'))
+AND r.state = ? AND l.state = ? AND l.expires_at <= ?
+ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +223,7 @@ func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now ti
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at <= ?`, versionID, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
+WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.launch_state = 'ready' AND r.state = ? AND l.state = ? AND l.expires_at <= ?`, versionID, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
 	if err != nil {
 		return nil, err
 	}
@@ -350,11 +352,12 @@ func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun
 		return err
 	}
 	defer tx.Rollback()
-	var kind string
-	err = tx.QueryRowContext(ctx, `SELECT r.run_kind FROM worker_runs r
+	var kind, sessionID, launchState string
+	var recoveryEpoch int64
+	err = tx.QueryRowContext(ctx, `SELECT r.run_kind, r.session_id, r.recovery_epoch, r.launch_state FROM worker_runs r
 JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AND l.state = ?`, run.Claim.RunID, run.Claim.LeaseToken, run.Claim.LeaseGeneration, RunRunning, LeaseActive).Scan(&kind)
+WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AND l.state = ? AND l.expires_at <= ?`, run.Claim.RunID, run.Claim.LeaseToken, run.Claim.LeaseGeneration, RunRunning, LeaseActive, formatTimestamp(now)).Scan(&kind, &sessionID, &recoveryEpoch, &launchState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -362,7 +365,10 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 		return err
 	}
 	if kind == RunDelivery {
-		if err := markTicketNeedsAttentionTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, "Delivery Controller was not recoverable after restart: "+reason, now); err != nil {
+		if launchState != "launched" {
+			return ErrInvalidClaim
+		}
+		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, now); err != nil {
 			return err
 		}
 		return tx.Commit()

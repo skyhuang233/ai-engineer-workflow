@@ -214,10 +214,11 @@ JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 	}
 	sessionProvisioned := false
 	if currentRunID != "" {
-		var runKind, runState, leaseState, expiresText string
-		err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, l.expires_at
+		var runKind, runState, launchState, leaseToken, leaseState, expiresText string
+		var runRecoveryEpoch int64
+		err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, r.launch_state, r.recovery_epoch, l.lease_token, l.state, l.expires_at
 FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expiresText)
+WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &launchState, &runRecoveryEpoch, &leaseToken, &leaseState, &expiresText)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return TicketClaim{}, "", err
 		}
@@ -230,19 +231,16 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expir
 				return TicketClaim{}, "", ErrNotReady
 			}
 			if runKind == RunDelivery {
-				if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), currentRunID, RunRunning); err != nil {
-					return TicketClaim{}, "", err
+				if launchState != "ready" {
+					return TicketClaim{}, "", ErrNotReady
 				}
-				if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND state = ?`, currentRunID, LeaseActive); err != nil {
-					return TicketClaim{}, "", err
-				}
-				if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "Delivery Controller lease expired before completion", now); err != nil {
+				if err := recoverExpiredDeliveryTx(ctx, tx, versionID, issueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, now); err != nil {
 					return TicketClaim{}, "", err
 				}
 				if err := tx.Commit(); err != nil {
 					return TicketClaim{}, "", err
 				}
-				return TicketClaim{}, "", ErrNeedsAttention
+				return TicketClaim{}, "", ErrNotReady
 			}
 			if len(provisionSession) > 0 && provisionSession[0] != nil {
 				_, provisionErr := provisionSession[0](ctx, SessionProvisioning{SessionID: sessionID, Existing: true, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, CurrentRunID: currentRunID})

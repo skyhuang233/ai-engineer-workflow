@@ -362,6 +362,60 @@ func TestRecoverIsolatesExpiredContainerBeforeReplacementRun(t *testing.T) {
 	}
 }
 
+func TestRecoverIsolatesExpiredDeliveryBeforeTerminalization(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := time.Date(2099, 8, 9, 12, 0, 0, 0, time.UTC)
+	now := claimedAt.Add(2 * time.Minute)
+	agentClaim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claimedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: claimedAt, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, store.WorkerAudit{RunID: deliveryClaim.RunID, LeaseGeneration: deliveryClaim.LeaseGeneration, ImageDigest: "sha256:delivery", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, claimedAt); err != nil {
+		t.Fatal(err)
+	}
+	activeAtIsolation := false
+	var isolated []string
+	dispatcher := scheduler.Dispatcher{Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{}, Recovery: recoveryInspector{containerRunning: true, workspaceReady: true, isolate: func(runID string) {
+		isolated = append(isolated, runID)
+		runs, queryErr := db.ExpiredLaunchedRecoveryRuns(ctx, version.ID, now)
+		activeAtIsolation = queryErr == nil && len(runs) == 1 && runs[0].Claim.RunID == deliveryClaim.RunID
+	}}, Now: func() time.Time { return now }}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 1 || isolated[0] != deliveryClaim.RunID || !activeAtIsolation {
+		t.Fatalf("delivery isolation = runs %#v active=%t", isolated, activeAtIsolation)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("post-isolation projection = %#v", projection)
+	}
+}
+
 func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}

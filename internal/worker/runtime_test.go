@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -62,6 +63,16 @@ func TestCertifiedNoLaunchFailureIsInfrastructure(t *testing.T) {
 	err := CertifiedNoLaunchError{Err: errors.New("launch preparation failed")}
 	if !IsCertifiedNoLaunchFailure(err) || !IsInfrastructureFailure(err) {
 		t.Fatalf("certified no-launch classification = %v", err)
+	}
+}
+
+func TestDockerRuntimeCertifiesPreRuntimeContextExpiry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	spec := Spec{Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1", AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping}}
+	_, err := (DockerRuntime{}).Run(ctx, spec)
+	if !IsCertifiedNoLaunchFailure(err) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-runtime context expiry = %T %v", err, err)
 	}
 }
 

@@ -491,11 +491,14 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceRepository)))
 	if info, statErr := os.Stat(path); statErr == nil {
 		if !info.IsDir() {
-			return "", deliverySourceInfrastructureError(errors.New("persisted Delivery Source is not a directory"))
+			return "", deliverySourceIntegrityError(errors.New("persisted Delivery Source is not a directory"))
 		}
 		storedIdentity, err := gitOutput(ctx, path, "config", "--local", "--get", "workflow.sourceIdentity")
-		if err != nil || strings.TrimSpace(storedIdentity) != identity {
-			return "", deliverySourceInfrastructureError(errors.New("persisted Delivery Source identity does not match the admitted source repository"))
+		if err != nil {
+			return "", deliverySourceProbeError(ctx, "read persisted Delivery Source identity", err)
+		}
+		if strings.TrimSpace(storedIdentity) != identity {
+			return "", deliverySourceIntegrityError(errors.New("persisted Delivery Source identity does not match the admitted source repository"))
 		}
 		if err := validateDeliverySource(ctx, path); err != nil {
 			return "", err
@@ -670,14 +673,14 @@ func makeDeliverySourceWritable(root string) error {
 func validateDeliverySource(ctx context.Context, path string) error {
 	bare, err := gitOutput(ctx, path, "rev-parse", "--is-bare-repository")
 	if err != nil {
-		return deliverySourceInfrastructureError(fmt.Errorf("inspect persisted Delivery Source: %w", err))
+		return deliverySourceProbeError(ctx, "inspect persisted Delivery Source", err)
 	}
 	if strings.TrimSpace(bare) != "true" {
 		return deliverySourceIntegrityError(errors.New("persisted Delivery Source is not a bare Git repository"))
 	}
 	remotes, err := gitOutput(ctx, path, "remote")
 	if err != nil {
-		return deliverySourceInfrastructureError(fmt.Errorf("inspect persisted Delivery Source remotes: %w", err))
+		return deliverySourceProbeError(ctx, "inspect persisted Delivery Source remotes", err)
 	}
 	if strings.TrimSpace(remotes) != "" {
 		return deliverySourceIntegrityError(errors.New("persisted Delivery Source contains a remote configuration"))
@@ -692,10 +695,10 @@ func validateDeliverySourceDefaultBranchRef(ctx context.Context, sourcePath, ref
 	}
 	branch := strings.TrimPrefix(ref, "refs/heads/")
 	if _, err := gitOutput(ctx, sourcePath, "check-ref-format", "--branch", branch); err != nil {
-		return "", deliverySourceIntegrityError(fmt.Errorf("invalid Delivery Source default branch %q: %w", branch, err))
+		return "", deliverySourceProbeError(ctx, fmt.Sprintf("validate Delivery Source default branch %q", branch), err)
 	}
 	if _, err := gitOutput(ctx, sourcePath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
-		return "", deliverySourceIntegrityError(fmt.Errorf("resolve Delivery Source default branch %q: %w", branch, err))
+		return "", deliverySourceProbeError(ctx, fmt.Sprintf("resolve Delivery Source default branch %q", branch), err)
 	}
 	return branch, nil
 }
@@ -706,7 +709,7 @@ func deliverySourceDefaultBranch(ctx context.Context, sourcePath string) (string
 	}
 	output, err := gitOutput(ctx, sourcePath, "symbolic-ref", "HEAD")
 	if err != nil {
-		return "", "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source HEAD: %w", err))
+		return "", "", deliverySourceProbeError(ctx, "read Delivery Source HEAD", err)
 	}
 	ref := strings.TrimSpace(output)
 	branch, err := validateDeliverySourceDefaultBranchRef(ctx, sourcePath, ref)
@@ -723,7 +726,7 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	}
 	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
 	if err != nil {
-		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source identity: %w", err))
+		return "", deliverySourceProbeError(ctx, "read Delivery Source identity", err)
 	}
 	if err := runGit(ctx, sourcePath, "fsck", "--connectivity-only", "--no-dangling"); err != nil {
 		if ctx.Err() != nil {
@@ -733,10 +736,22 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	}
 	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
 	if err != nil {
-		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source refs: %w", err))
+		return "", deliverySourceProbeError(ctx, "read Delivery Source refs", err)
 	}
 	digest := sha256.Sum256([]byte(head + "\n" + strings.TrimSpace(identity) + "\n" + strings.TrimSpace(refs)))
 	return fmt.Sprintf("%x", digest), nil
+}
+
+func deliverySourceProbeError(ctx context.Context, operation string, err error) error {
+	wrapped := fmt.Errorf("%s: %w", operation, err)
+	if ctx.Err() != nil {
+		return deliverySourceInfrastructureError(wrapped)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return deliverySourceIntegrityError(wrapped)
+	}
+	return deliverySourceInfrastructureError(wrapped)
 }
 
 func validateLocalRemotes(ctx context.Context, path string) error {

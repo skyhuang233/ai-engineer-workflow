@@ -198,6 +198,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err := spec.Validate(); err != nil {
 		return Result{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, CertifiedNoLaunchError{Err: err}
+	}
 	name := r.Binary
 	if name == "" {
 		name = "docker"
@@ -217,6 +220,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	defer os.Remove(cidfilePath)
 	args := dockerArgs(spec)
 	args = append(args[:2], append([]string{"--cidfile", cidfilePath}, args[2:]...)...)
+	if err := ctx.Err(); err != nil {
+		return Result{}, CertifiedNoLaunchError{Err: err}
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -234,7 +240,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 			if result.ExitCode == 125 {
-				return result, InfrastructureError{Err: err}
+				return result, CertifiedNoLaunchError{Err: err}
 			}
 		} else {
 			return result, InfrastructureError{Err: err}

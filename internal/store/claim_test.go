@@ -299,7 +299,7 @@ WHERE rt.version_id = ? AND rt.issue_id = ?`, version.ID, claim.TicketID).Scan(&
 	}
 }
 
-func TestRecoveryExpiresDeliveryControllersBeforeReturningLiveRuns(t *testing.T) {
+func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -330,12 +330,29 @@ func TestRecoveryExpiresDeliveryControllersBeforeReturningLiveRuns(t *testing.T)
 	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
 		t.Fatal(err)
 	}
+	expired, err := db.ExpiredLaunchedRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 || expired[0].Claim.RunID != delivery.RunID {
+		t.Fatalf("expired launched runs = %#v", expired)
+	}
 	runs, err := db.ActiveRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(runs) != 0 {
 		t.Fatalf("recovery runs = %#v", runs)
+	}
+	var runState, leaseState string
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&runState, &leaseState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != RunRunning || leaseState != LeaseActive {
+		t.Fatalf("pre-isolation delivery state = run %q lease %q", runState, leaseState)
+	}
+	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
 	}
 	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))
 	if err != nil {
@@ -389,7 +406,7 @@ func TestDeliveryClaimsCannotBeReadOrAcceptedAsAgentClaims(t *testing.T) {
 	}
 }
 
-func TestExpiredDeliveryFeedbackNeedsAttentionWithoutAgentRevision(t *testing.T) {
+func TestExpiredReadyDeliveryFeedbackSchedulesDeliveryRetry(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -419,8 +436,8 @@ func TestExpiredDeliveryFeedbackNeedsAttentionWithoutAgentRevision(t *testing.T)
 	if _, err := db.RecordReviewFeedback(ctx, version.ID, claim.TicketID, []ReviewFeedback{{Source: "review", EventID: "1", Body: "Please revise."}}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNeedsAttention) {
-		t.Fatalf("expired delivery feedback recovery = %v, want ErrNeedsAttention", err)
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Hour, now.Add(2*time.Hour), 1, DefaultMaxWorkerAttempts); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("expired delivery feedback recovery = %v, want ErrNotReady", err)
 	}
 	var runtimeState string
 	var agentRuns int
@@ -430,8 +447,12 @@ func TestExpiredDeliveryFeedbackNeedsAttentionWithoutAgentRevision(t *testing.T)
 	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs WHERE session_id = ? AND run_kind = ? AND state = ?`, claim.SessionID, RunAgent, RunRunning).Scan(&agentRuns); err != nil {
 		t.Fatal(err)
 	}
-	if runtimeState != plan.StateNeedsAttention || agentRuns != 0 {
+	if runtimeState != plan.StateWaitingReview || agentRuns != 0 {
 		t.Fatalf("expired delivery feedback state = %q, running agent revisions = %d", runtimeState, agentRuns)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 1 || pending[0].SessionID != claim.SessionID {
+		t.Fatalf("feedback-path delivery retry = %#v, %v", pending, err)
 	}
 }
 

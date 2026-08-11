@@ -192,7 +192,7 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 	if d.Recovery == nil {
 		return nil
 	}
-	expired, err := d.Store.ExpiredAgentRecoveryRuns(ctx, versionID, now)
+	expired, err := d.Store.ExpiredLaunchedRecoveryRuns(ctx, versionID, now)
 	if err != nil {
 		return err
 	}

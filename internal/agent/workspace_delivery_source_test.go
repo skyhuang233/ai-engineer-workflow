@@ -56,6 +56,70 @@ func TestDeliverySourcePathClassifiesOperationalAndIntegrityFailures(t *testing.
 	}
 }
 
+func TestRetainedDeliverySourceStructuralCorruptionIsIntegrity(t *testing.T) {
+	ctx := context.Background()
+	newManager := func(t *testing.T) (WorkspaceManager, string) {
+		t.Helper()
+		root := t.TempDir()
+		source := filepath.Join(root, "source")
+		if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+			t.Fatal(err)
+		}
+		configureDeliverySourceTestIdentity(t, ctx, source)
+		writeDeliverySourceCommit(t, ctx, source, "first")
+		return WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, source
+	}
+
+	t.Run("non-directory", func(t *testing.T) {
+		manager, source := newManager(t)
+		path, err := manager.deliverySourcePath("session-1", "revision-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("not a repository"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err = manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		var integrityFailure *deliverySourceIntegrityFailure
+		if !errors.As(err, &integrityFailure) {
+			t.Fatalf("retained non-directory classification = %T %v", err, err)
+		}
+	})
+
+	t.Run("missing identity", func(t *testing.T) {
+		manager, source := newManager(t)
+		path, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runGit(ctx, path, "config", "--local", "--unset-all", "workflow.sourceIdentity"); err != nil {
+			t.Fatal(err)
+		}
+		_, err = manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+		var integrityFailure *deliverySourceIntegrityFailure
+		if !errors.As(err, &integrityFailure) {
+			t.Fatalf("missing retained identity classification = %T %v", err, err)
+		}
+	})
+
+	t.Run("context expiry", func(t *testing.T) {
+		manager, source := newManager(t)
+		if _, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source); err != nil {
+			t.Fatal(err)
+		}
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := manager.ensureDeliverySource(cancelled, "session-1", "revision-1", source)
+		var infrastructureFailure *deliverySourceInfrastructureFailure
+		if !errors.As(err, &infrastructureFailure) {
+			t.Fatalf("retained source context classification = %T %v", err, err)
+		}
+	})
+}
+
 func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	ctx := context.Background()
 	source := filepath.Join(t.TempDir(), "source")
