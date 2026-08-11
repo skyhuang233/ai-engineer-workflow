@@ -392,6 +392,9 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := <-frozen; !errors.As(err, &fencedIsolation) || len(fencedIsolation.Targets) != 1 || fencedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("post-create terminalization isolation requirement = %#v, %v", fencedIsolation, err)
 	}
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), fencedIsolation.Targets...); !errors.As(err, &fencedIsolation) {
+		t.Fatalf("unfenced point-in-time isolation proof = %v, want DeliveryIsolationRequired", err)
+	}
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -491,7 +494,11 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if runState != RunRunning || leaseState != LeaseActive {
 		t.Fatalf("unisolated recovery mutated delivery state = run %q lease %q", runState, leaseState)
 	}
-	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, expired[0].Claim); err != nil {
+	fenced, err := db.FenceDeliveryIsolation(ctx, sharedIsolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, fenced...); err != nil {
 		t.Fatal(err)
 	}
 	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))
@@ -1992,7 +1999,11 @@ func TestClosedPullRequestFreezesPlan(t *testing.T) {
 	if frozen || !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("closed pull request isolation requirement = frozen %t, %#v, %v", frozen, isolation, err)
 	}
-	frozen, err = db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second), isolation.Targets...)
+	fenced, err := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, err = db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second), fenced...)
 	if err != nil {
 		t.Fatal(err)
 	}

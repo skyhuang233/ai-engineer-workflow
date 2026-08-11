@@ -187,6 +187,27 @@ func TestDeliverySourceProbeDistinguishesStructuralAndOperationalFailures(t *tes
 	}
 }
 
+func TestDeliverySourceProbePreservesPackedRefsIntegrityAfterCancellation(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "source.git")
+	if output, err := exec.Command("git", "init", "--bare", repository).CombinedOutput(); err != nil {
+		t.Fatalf("init bare repository: %v (%s)", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "packed-refs"), []byte("invalid packed ref"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, probeErr := exec.Command("git", "-C", repository, "for-each-ref").Output()
+	if probeErr == nil {
+		t.Fatal("malformed packed-refs probe succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	classified := deliverySourceProbeError(ctx, "read Delivery Source refs", probeErr)
+	var integrity *deliverySourceIntegrityFailure
+	if !errors.As(classified, &integrity) {
+		t.Fatalf("canceled malformed packed-refs classification = %T %v", classified, classified)
+	}
+}
+
 func TestPreRuntimeContextExpiryIsCertifiedNoLaunch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

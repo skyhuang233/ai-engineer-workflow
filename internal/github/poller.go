@@ -751,12 +751,16 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 		if p.ContainerIsolator == nil {
 			return errors.Join(result, attentionErr, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
 		}
-		for _, target := range isolation.Targets {
+		fenced, fenceErr := p.Store.FenceDeliveryIsolation(persistenceCtx, isolation.Targets)
+		if fenceErr != nil {
+			return errors.Join(result, attentionErr, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
+		}
+		for _, target := range fenced {
 			if isolateErr := p.ContainerIsolator.IsolateContainer(persistenceCtx, target.RunID); isolateErr != nil {
 				return errors.Join(result, attentionErr, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 			}
 		}
-		disposition, attentionErr = resolve(isolation.Targets...)
+		disposition, attentionErr = resolve(fenced...)
 	}
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
@@ -956,12 +960,16 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 					if p.ContainerIsolator == nil {
 						return errors.Join(err, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
 					}
-					for _, target := range isolation.Targets {
+					fenced, fenceErr := p.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
+					if fenceErr != nil {
+						return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
+					}
+					for _, target := range fenced {
 						if isolateErr := p.ContainerIsolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
 							return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 						}
 					}
-					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), isolation.Targets...)
+					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), fenced...)
 				}
 			}
 			if err != nil && !errors.Is(err, store.ErrNotFound) {

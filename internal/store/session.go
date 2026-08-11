@@ -181,8 +181,8 @@ func (e *DeliveryIsolationRequired) Error() string {
 
 func (e *DeliveryIsolationRequired) Unwrap() error { return ErrWorkerLaunched }
 
-func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []TicketClaim) error {
-	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.lease_generation, l.lease_token, l.expires_at
+func deliveryIsolationTargetsTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool) ([]TicketClaim, map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.lease_generation, r.container_create_generation, r.isolation_pending, l.lease_token, l.expires_at
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
@@ -191,15 +191,17 @@ AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_re
 AND l.state = ?
 ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	var targets []TicketClaim
+	pending := make(map[string]bool)
 	for rows.Next() {
 		var target TicketClaim
 		var expiresAt string
-		if err := rows.Scan(&target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.LeaseToken, &expiresAt); err != nil {
-			return err
+		var isolationPending int
+		if err := rows.Scan(&target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.IsolationGeneration, &isolationPending, &target.LeaseToken, &expiresAt); err != nil {
+			return nil, nil, err
 		}
 		if len(issueIDs) > 0 && !issueIDs[target.TicketID] {
 			continue
@@ -207,17 +209,26 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 		target.VersionID = versionID
 		target.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, expiresAt)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		targets = append(targets, target)
+		pending[target.RunID] = isolationPending != 0
 	}
 	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return targets, pending, nil
+}
+
+func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []TicketClaim) error {
+	targets, pending, err := deliveryIsolationTargetsTx(ctx, tx, versionID, issueIDs)
+	if err != nil {
 		return err
 	}
 	for _, target := range targets {
 		verified := false
 		for _, proof := range isolated {
-			if proof.VersionID == target.VersionID && proof.TicketID == target.TicketID && proof.RunID == target.RunID && proof.LeaseGeneration == target.LeaseGeneration && proof.LeaseToken == target.LeaseToken {
+			if pending[target.RunID] && proof.VersionID == target.VersionID && proof.TicketID == target.TicketID && proof.RunID == target.RunID && proof.LeaseGeneration == target.LeaseGeneration && proof.IsolationGeneration == target.IsolationGeneration && proof.LeaseToken == target.LeaseToken {
 				verified = true
 				break
 			}
@@ -227,6 +238,86 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 		}
 	}
 	return nil
+}
+
+func (s *Store) DeliveryIsolationTargets(ctx context.Context) ([]TicketClaim, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_kind = ? AND r.state = ? AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
+ORDER BY s.version_id`, RunDelivery, RunRunning, LeaseActive)
+	if err != nil {
+		return nil, err
+	}
+	var versionIDs []string
+	for rows.Next() {
+		var versionID string
+		if err := rows.Scan(&versionID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		versionIDs = append(versionIDs, versionID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	var targets []TicketClaim
+	for _, versionID := range versionIDs {
+		versionTargets, _, err := deliveryIsolationTargetsTx(ctx, tx, versionID, nil)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, versionTargets...)
+	}
+	return targets, nil
+}
+
+func (s *Store) FenceDeliveryIsolation(ctx context.Context, requested []TicketClaim) ([]TicketClaim, error) {
+	if len(requested) == 0 {
+		return nil, ErrInvalidClaim
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	seen := make(map[string]bool)
+	targets := make([]TicketClaim, 0, len(requested))
+	for _, proof := range requested {
+		if proof.VersionID == "" || proof.TicketID == 0 {
+			return nil, ErrInvalidClaim
+		}
+		current, _, err := deliveryIsolationTargetsTx(ctx, tx, proof.VersionID, map[int64]bool{proof.TicketID: true})
+		if err != nil {
+			return nil, err
+		}
+		if len(current) != 1 {
+			return nil, ErrInvalidClaim
+		}
+		target := current[0]
+		if seen[target.RunID] {
+			continue
+		}
+		seen[target.RunID] = true
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1
+WHERE run_id = ? AND lease_generation = ? AND state = ?`, target.RunID, target.LeaseGeneration, RunRunning); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return targets, nil
 }
 
 // ExpiredLaunchedRecoveryRuns lists current Agent and Delivery Controller Runs
@@ -899,6 +990,10 @@ func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim
 	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, limit, nil)
 }
 
+func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, maxWorkerAttempts(maxAttempts), isolated)
+}
+
 func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -1020,10 +1115,11 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 	}
 	defer tx.Rollback()
 	var sessionID, launchState, expiresText string
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, r.launch_state, l.expires_at
+	var createGeneration int64
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, r.launch_state, r.container_create_generation, l.expires_at
 FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID, &launchState, &expiresText)
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive).Scan(&sessionID, &launchState, &createGeneration, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidClaim
 	}
@@ -1036,7 +1132,7 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	}
 	certifiedUnstarted := false
 	if allowExpiredUnstarted {
-		certifiedUnstarted = launchState == "ready"
+		certifiedUnstarted = launchState == "ready" && createGeneration == 0
 		if launchState == "launched" {
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM worker_audits audit
@@ -1048,7 +1144,9 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 			}
 		}
 		if !certifiedUnstarted {
-			return ErrWorkerLaunched
+			if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+				return err
+			}
 		}
 	}
 	expired := !expiresAt.After(now)

@@ -378,6 +378,27 @@ func RestoreBackup(ctx context.Context, backupPath, destination string) error {
 	return replaceDatabaseFile(temporaryPath, destination)
 }
 
+func PublishRestoredBackup(ctx context.Context, stagedPath, destination string) error {
+	if strings.TrimSpace(stagedPath) == "" || strings.TrimSpace(destination) == "" || stagedPath == destination {
+		return ErrInvalidClaim
+	}
+	db, err := sql.Open("sqlite", stagedPath)
+	if err != nil {
+		return fmt.Errorf("open staged restored SQLite database: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		db.Close()
+		return fmt.Errorf("checkpoint staged restored SQLite database: %w", err)
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("close staged restored SQLite database: %w", err)
+	}
+	if err := verifySQLite(ctx, stagedPath); err != nil {
+		return fmt.Errorf("verify staged restored SQLite database: %w", err)
+	}
+	return replaceDatabaseFile(stagedPath, destination)
+}
+
 // DrillBackup proves a backup can be restored and migrated in a disposable
 // location. Its reconcile preview never calls a GitHub client or dispatcher.
 func DrillBackup(ctx context.Context, backupPath string, now time.Time) (BackupDrill, error) {
@@ -653,13 +674,51 @@ func (s *Store) ReconcileRestoredControlPlaneDryRun(ctx context.Context, now tim
 
 func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []TicketClaim, modelIsolation bool) error {
 	stamp := formatTimestamp(now)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM worker_runs r
+JOIN ticket_sessions s ON s.current_run_id = r.run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_kind = ? AND r.state = ? AND l.state = ?
+ORDER BY s.version_id`, RunDelivery, RunRunning, LeaseActive)
+	if err != nil {
+		return err
+	}
+	var deliveryVersions []string
+	for rows.Next() {
+		var versionID string
+		if err := rows.Scan(&versionID); err != nil {
+			rows.Close()
+			return err
+		}
+		deliveryVersions = append(deliveryVersions, versionID)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if modelIsolation {
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1
+WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticket_sessions)`, RunDelivery, RunRunning); err != nil {
+			return err
+		}
+		for _, versionID := range deliveryVersions {
+			targets, _, err := deliveryIsolationTargetsTx(ctx, tx, versionID, nil)
+			if err != nil {
+				return err
+			}
+			isolated = append(isolated, targets...)
+		}
+	}
+	for _, versionID := range deliveryVersions {
+		if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', dispatcher_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE state = ?`, OutboxPending, "delivery state was interrupted by Control Plane restore", stamp, stamp, OutboxProcessing); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET last_success_at = '', last_full_reconcile_at = '', next_attempt_at = ?, updated_at = ?`, stamp, stamp); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, r.lease_generation, l.lease_token, l.expires_at
+	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
 FROM worker_runs r JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
@@ -669,12 +728,12 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 	type activeRun struct {
 		runID, kind, versionID, lease, expiresAt string
 		issueID                                  int64
-		leaseGeneration                          int64
+		leaseGeneration, isolationGeneration     int64
 	}
 	var active []activeRun
 	for rows.Next() {
 		var run activeRun
-		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.leaseGeneration, &run.lease, &run.expiresAt); err != nil {
+		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.leaseGeneration, &run.isolationGeneration, &run.lease, &run.expiresAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -691,7 +750,7 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 				if err != nil {
 					return err
 				}
-				proofs = append(proofs, TicketClaim{VersionID: run.versionID, TicketID: run.issueID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt})
+				proofs = append(proofs, TicketClaim{VersionID: run.versionID, TicketID: run.issueID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt})
 			}
 			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, proofs...); err != nil {
 				return err

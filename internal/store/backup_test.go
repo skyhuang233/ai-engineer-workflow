@@ -251,7 +251,11 @@ func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *test
 	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("restore isolation requirement = %#v, %v", isolation, err)
 	}
-	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute), isolation.Targets...); err != nil {
+	fenced, err := restored.FenceDeliveryIsolation(ctx, isolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute), fenced...); err != nil {
 		t.Fatal(err)
 	}
 	projection, err := restored.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Minute))

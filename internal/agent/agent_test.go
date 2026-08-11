@@ -979,7 +979,11 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		if len(runs) != 1 {
 			return fmt.Errorf("expired launched recovery runs = %#v", runs)
 		}
-		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second), store.DefaultMaxWorkerAttempts, runs[0].Claim); err != nil {
+		fenced, err := db.FenceDeliveryIsolation(context.Background(), []store.TicketClaim{runs[0].Claim})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second), store.DefaultMaxWorkerAttempts, fenced...); err != nil {
 			return err
 		}
 		return nil

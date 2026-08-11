@@ -453,16 +453,15 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
 	if deliveryErr != nil && worker.IsPreparedContainerCleanupFailure(deliveryErr) {
-		isolator, ok := c.Runtime.(worker.ContainerIsolator)
-		if !ok {
-			return errors.Join(deliveryErr, errors.New("agent controller cannot isolate a prepared Delivery Controller"))
+		target, targetErr := c.Store.DeliveryContainerIsolationTarget(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
+		if targetErr != nil {
+			return errors.Join(deliveryErr, targetErr)
 		}
-		isolationCtx, cancelIsolation := context.WithTimeout(context.Background(), workerAuditTimeout)
-		defer cancelIsolation()
-		if isolateErr := isolator.IsolateContainer(isolationCtx, deliveryClaim.RunID); isolateErr != nil {
-			return errors.Join(deliveryErr, fmt.Errorf("isolate prepared Delivery Controller %s: %w", deliveryClaim.RunID, isolateErr))
+		isolated, isolateErr := c.isolateDeliveryTargets(ctx, []store.TicketClaim{target})
+		if isolateErr != nil {
+			return errors.Join(deliveryErr, isolateErr)
 		}
-		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		return errors.Join(deliveryErr, c.Store.FailDeliveryControllerLaunchWithClassAfterIsolation(context.WithoutCancel(ctx), deliveryClaim, deliveryErr.Error(), failureClass(deliveryErr), c.now(), c.maxWorkerAttempts(), isolated...))
 	}
 	if deliveryErr != nil && worker.IsCertifiedNoLaunchFailure(deliveryErr) {
 		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
@@ -704,16 +703,11 @@ func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.Pl
 	if !errors.As(err, &isolation) {
 		return proposal, err
 	}
-	isolator, ok := c.Runtime.(worker.ContainerIsolator)
-	if !ok {
-		return store.PlanAmendmentProposal{}, errors.Join(err, errors.New("agent controller cannot isolate an active Delivery Controller"))
+	isolated, isolateErr := c.isolateDeliveryTargets(ctx, isolation.Targets)
+	if isolateErr != nil {
+		return store.PlanAmendmentProposal{}, errors.Join(err, isolateErr)
 	}
-	for _, target := range isolation.Targets {
-		if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-			return store.PlanAmendmentProposal{}, errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
-		}
-	}
-	return c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolation.Targets...)
+	return c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolated...)
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
@@ -733,7 +727,11 @@ func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim s
 }
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	return errors.Join(cause, c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts()))
+	storeErr := c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+		return c.Store.FailDeliveryControllerLaunchWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
+	})
+	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, retry func([]store.TicketClaim) error) error {
@@ -741,16 +739,28 @@ func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, 
 	if !errors.As(err, &isolation) {
 		return err
 	}
+	isolated, isolateErr := c.isolateDeliveryTargets(ctx, isolation.Targets)
+	if isolateErr != nil {
+		return errors.Join(err, isolateErr)
+	}
+	return retry(isolated)
+}
+
+func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
 	isolator, ok := c.Runtime.(worker.ContainerIsolator)
 	if !ok {
-		return errors.Join(err, errors.New("agent controller cannot isolate an active Delivery Controller"))
+		return nil, errors.New("agent controller cannot isolate an active Delivery Controller")
 	}
-	for _, target := range isolation.Targets {
+	fenced, err := c.Store.FenceDeliveryIsolation(ctx, targets)
+	if err != nil {
+		return nil, fmt.Errorf("fence Delivery Controller isolation: %w", err)
+	}
+	for _, target := range fenced {
 		if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
 		}
 	}
-	return retry(isolation.Targets)
+	return fenced, nil
 }
 
 func runtimeStdout(result worker.Result) []byte {

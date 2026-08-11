@@ -84,34 +84,38 @@ func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delive
 	if r.Isolator == nil {
 		return errors.Join(err, errors.New("delivered reconciler cannot isolate an active Delivery Controller"))
 	}
-	for _, target := range isolation.Targets {
+	fenced, fenceErr := r.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
+	if fenceErr != nil {
+		return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
+	}
+	for _, target := range fenced {
 		if isolateErr := r.Isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
 			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 		}
 	}
-	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, isolation.Targets...)
+	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, fenced...)
 	return err
 }
 
 func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {
-	if _, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit); !errors.Is(err, store.ErrWorkerLaunched) {
+	_, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
+	var isolation *store.DeliveryIsolationRequired
+	if !errors.As(err, &isolation) {
 		return err
 	}
 	if r.Isolator == nil {
 		return errors.New("delivered reconciler cannot isolate an active Delivery Controller")
 	}
-	target, err := r.Store.DeliveryContainerIsolationTarget(ctx, delivery.VersionID, delivery.IssueID)
-	if errors.Is(err, store.ErrNotFound) {
-		_, err = r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
-		return err
-	}
+	fenced, err := r.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
 	if err != nil {
-		return err
+		return fmt.Errorf("fence delivered Delivery Controller isolation: %w", err)
 	}
-	if err := r.Isolator.IsolateContainer(ctx, target.RunID); err != nil {
-		return fmt.Errorf("isolate delivered Delivery Controller %s: %w", target.RunID, err)
+	for _, target := range fenced {
+		if err := r.Isolator.IsolateContainer(ctx, target.RunID); err != nil {
+			return fmt.Errorf("isolate delivered Delivery Controller %s: %w", target.RunID, err)
+		}
 	}
-	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, target)
+	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, fenced[0])
 	return err
 }
 

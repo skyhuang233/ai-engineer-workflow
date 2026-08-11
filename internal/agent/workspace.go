@@ -756,12 +756,12 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 
 func deliverySourceProbeError(ctx context.Context, operation string, err error) error {
 	wrapped := fmt.Errorf("%s: %w", operation, err)
-	if ctx.Err() != nil {
-		return deliverySourceInfrastructureError(wrapped)
-	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && (isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), string(exitErr.Stderr)) || isDeliverySourceStructuralGitFailure(exitErr.ExitCode(), err.Error()+"\n"+string(exitErr.Stderr))) {
 		return deliverySourceIntegrityError(wrapped)
+	}
+	if ctx.Err() != nil {
+		return deliverySourceInfrastructureError(wrapped)
 	}
 	return deliverySourceInfrastructureError(wrapped)
 }

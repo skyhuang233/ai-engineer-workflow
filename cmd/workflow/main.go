@@ -34,6 +34,7 @@ import (
 const (
 	defaultControlPlaneDatabase = "workflow.db"
 	doctorVerificationTimeout   = 10 * time.Minute
+	restoreIsolationTimeout     = 30 * time.Second
 )
 
 func defaultCodexAuthFile() string {
@@ -148,18 +149,79 @@ func runRestore(args []string) {
 		fail(err)
 	}
 	defer lock.Close()
-	if err := store.RestoreBackup(context.Background(), *backupPath, *databasePath); err != nil {
+	ctx := context.Background()
+	isolator := worker.DockerRuntime{}
+	if err := isolateCurrentControlPlane(ctx, *databasePath, isolator); err != nil {
 		fail(err)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	if err := os.MkdirAll(filepath.Dir(*databasePath), 0o700); err != nil {
+		fail(err)
+	}
+	staged, err := os.CreateTemp(filepath.Dir(*databasePath), filepath.Base(*databasePath)+".restore-staged-*.db")
 	if err != nil {
 		fail(err)
 	}
-	defer db.Close()
-	if err := reconcileRestoredControlPlane(context.Background(), db, worker.DockerRuntime{}, time.Now().UTC()); err != nil {
+	stagedPath := staged.Name()
+	if err := staged.Close(); err != nil {
+		fail(err)
+	}
+	defer os.Remove(stagedPath)
+	defer os.Remove(stagedPath + "-wal")
+	defer os.Remove(stagedPath + "-shm")
+	if err := store.RestoreBackup(ctx, *backupPath, stagedPath); err != nil {
+		fail(err)
+	}
+	db, err := store.Open(ctx, stagedPath)
+	if err != nil {
+		fail(err)
+	}
+	if err := reconcileRestoredControlPlane(ctx, db, isolator, time.Now().UTC()); err != nil {
+		db.Close()
+		fail(err)
+	}
+	if err := db.Close(); err != nil {
+		fail(err)
+	}
+	if err := store.PublishRestoredBackup(ctx, stagedPath, *databasePath); err != nil {
 		fail(err)
 	}
 	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+}
+
+func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolator worker.ContainerIsolator) error {
+	if _, err := os.Stat(databasePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		return fmt.Errorf("open current Control Plane before restore: %w", err)
+	}
+	targets, targetErr := db.DeliveryIsolationTargets(ctx)
+	if targetErr == nil && len(targets) > 0 {
+		_, targetErr = isolateDeliveryTargets(ctx, db, isolator, targets)
+	}
+	return errors.Join(targetErr, db.Close())
+}
+
+func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+	if isolator == nil {
+		return nil, errors.New("restore cannot isolate an active Delivery Controller")
+	}
+	fenced, err := db.FenceDeliveryIsolation(ctx, targets)
+	if err != nil {
+		return nil, fmt.Errorf("fence Delivery Controller isolation: %w", err)
+	}
+	for _, target := range fenced {
+		isolationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreIsolationTimeout)
+		isolateErr := isolator.IsolateContainer(isolationCtx, target.RunID)
+		cancel()
+		if isolateErr != nil {
+			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
+		}
+	}
+	return fenced, nil
 }
 
 func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, now time.Time) error {
@@ -173,12 +235,11 @@ func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolato
 		if isolator == nil {
 			return errors.Join(err, errors.New("restore cannot isolate an active Delivery Controller"))
 		}
-		for _, target := range isolation.Targets {
-			if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-				return errors.Join(err, fmt.Errorf("isolate restored Delivery Controller %s: %w", target.RunID, isolateErr))
-			}
-			isolated = append(isolated, target)
+		fenced, isolateErr := isolateDeliveryTargets(ctx, db, isolator, isolation.Targets)
+		if isolateErr != nil {
+			return errors.Join(err, isolateErr)
 		}
+		isolated = append(isolated, fenced...)
 	}
 }
 
@@ -812,12 +873,16 @@ func runPollGitHub(args []string) {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			var isolation *store.DeliveryIsolationRequired
 			if errors.As(err, &isolation) {
-				for _, target := range isolation.Targets {
+				fenced, fenceErr := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+				if fenceErr != nil {
+					return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
+				}
+				for _, target := range fenced {
 					if isolateErr := runtime.IsolateContainer(ctx, target.RunID); isolateErr != nil {
 						return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 					}
 				}
-				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), isolation.Targets...)
+				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), fenced...)
 			}
 			if err != nil {
 				return err
