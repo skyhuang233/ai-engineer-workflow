@@ -299,6 +299,46 @@ WHERE rt.version_id = ? AND rt.issue_id = ?`, version.ID, claim.TicketID).Scan(&
 	}
 }
 
+func TestActiveRecoveryRunsHonorsConfiguredDeliveryAttemptLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if runs, err := db.ActiveRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour), 1); err != nil || len(runs) != 0 {
+		t.Fatalf("active recovery runs = %#v, %v", runs, err)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("configured-limit restart retry = %#v, %v", pending, err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
+	if err != nil || len(questions) != 1 || questions[0].Kind != "needs_attention" {
+		t.Fatalf("configured-limit restart questions = %#v, %v", questions, err)
+	}
+}
+
 func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -338,6 +378,18 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatalf("prelaunch-reserved delivery remained dispatchable = %#v, %v", pending, err)
 	}
 	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.cancelPlanTx(ctx, tx, version.ID, now.Add(time.Minute))
+	var isolation *DeliveryIsolationRequired
+	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("cancellation isolation requirement = %#v, %v", isolation, err)
+	}
+	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Hour)}); !errors.Is(err, ErrNotReady) {

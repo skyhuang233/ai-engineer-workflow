@@ -1112,7 +1112,7 @@ WHERE q.question_id = ? AND q.repository = ?`, questionID, repository).
 	return question, err
 }
 
-func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time) error {
+func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...TicketClaim) error {
 	if repository == "" || questionID == "" || answer == "" {
 		return ErrInvalidClaim
 	}
@@ -1123,16 +1123,16 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 	if err != nil {
 		return err
 	}
-	answerErr := s.AnswerWorkflowQuestionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
+	answerErr := s.AnswerWorkflowQuestionLeased(ctx, repository, questionID, answer, now, token, leaseNow, isolated...)
 	return errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, leaseToken, leaseNow)
+func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) error {
+	_, err := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, leaseToken, leaseNow, isolated...)
 	return err
 }
 
-func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) (DeliveryOutbox, error) {
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) (DeliveryOutbox, error) {
 	if repository == "" || questionID == "" || answer == "" {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
@@ -1157,7 +1157,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.
 		return DeliveryOutbox{}, err
 	}
 	defer tx.Rollback()
-	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow, isolated); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	outbox, err := s.queueWorkflowInboxProjectionTx(ctx, tx, repository, now)
@@ -1170,7 +1170,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.
 	return outbox, nil
 }
 
-func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time) (DeliveryOutbox, error) {
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...TicketClaim) (DeliveryOutbox, error) {
 	if repository == "" || questionID == "" || answer == "" {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
@@ -1183,7 +1183,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Contex
 	if err != nil {
 		return DeliveryOutbox{}, err
 	}
-	outbox, answerErr := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, token, leaseNow)
+	outbox, answerErr := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, token, leaseNow, isolated...)
 	return outbox, errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
@@ -1324,7 +1324,7 @@ func WorkflowQuestionProjections(questions []WorkflowQuestion) []plan.WorkflowQu
 	return projected
 }
 
-func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time) error {
+func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated []TicketClaim) error {
 	var kind, versionID, state, priorAnswer string
 	var issueID int64
 	err := tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
@@ -1382,7 +1382,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 			if decision.Replacement != nil {
 				return ErrInvalidClaim
 			}
-			if err := s.cancelPlanTx(ctx, tx, versionID, now); err != nil {
+			if err := s.cancelPlanTx(ctx, tx, versionID, now, isolated...); err != nil {
 				return err
 			}
 		case "replace":
@@ -1404,7 +1404,7 @@ func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, reposi
 		if err := json.Unmarshal([]byte(answer), &decision); err != nil {
 			return ErrInvalidClaim
 		}
-		if err := s.resolvePlanAmendmentTx(ctx, tx, questionID, versionID, decision.Action, now); err != nil {
+		if err := s.resolvePlanAmendmentTx(ctx, tx, questionID, versionID, decision.Action, now, isolated); err != nil {
 			return err
 		}
 	}
@@ -1554,7 +1554,10 @@ WHERE repository = ?`, failureKind, recoveryState, recoveryPlanVersionID, string
 	return err
 }
 
-func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time) error {
+func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time, isolated ...TicketClaim) error {
+	if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+		return err
+	}
 	stamp := formatTimestamp(now)
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND delivered = 0`, plan.StateCancelled, stamp, versionID); err != nil {
 		return err
@@ -1653,7 +1656,7 @@ VALUES (?, ?, ?, ?, ?, ?, 'approved', ?)`, questionID, versionID, frozenIssueID,
 	return nil
 }
 
-func (s *Store) SchedulerRoot(ctx context.Context, repository string, configuredRoot int64, now time.Time) (int64, error) {
+func (s *Store) SchedulerRoot(ctx context.Context, repository string, configuredRoot int64, now time.Time, isolated ...TicketClaim) (int64, error) {
 	if repository == "" || configuredRoot <= 0 {
 		return 0, ErrInvalidClaim
 	}
@@ -1717,7 +1720,7 @@ WHERE v.version_id = ? AND p.repository = ? AND p.current_version_id = v.version
 		return 0, ErrNotReady
 	}
 	if handoffState == "approved" {
-		if err := s.cancelPlanTx(ctx, tx, sourceVersionID, now); err != nil {
+		if err := s.cancelPlanTx(ctx, tx, sourceVersionID, now, isolated...); err != nil {
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE replacement_tickets SET state = 'active' WHERE version_id = ? AND state = 'approved'`, sourceVersionID); err != nil {

@@ -868,7 +868,7 @@ WHERE recovery.idempotency_key = ? AND recovery.question_id = ? AND question.rep
 	if state == "answered" && priorAnswer != answer {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
-	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow); err != nil {
+	if err := s.answerWorkflowQuestionTx(ctx, tx, repository, questionID, answer, now, leaseToken, leaseNow, nil); err != nil {
 		return DeliveryOutbox{}, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE delivery_outbox

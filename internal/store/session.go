@@ -171,6 +171,62 @@ type RecoveryRun struct {
 	Session TicketSession
 }
 
+type DeliveryIsolationRequired struct {
+	Targets []TicketClaim
+}
+
+func (e *DeliveryIsolationRequired) Error() string {
+	return "active Delivery Controller must be isolated before terminalization"
+}
+
+func (e *DeliveryIsolationRequired) Unwrap() error { return ErrWorkerLaunched }
+
+func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []TicketClaim) error {
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.lease_generation, l.lease_token, l.expires_at
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'launched' AND l.state = ?
+ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var targets []TicketClaim
+	for rows.Next() {
+		var target TicketClaim
+		var expiresAt string
+		if err := rows.Scan(&target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.LeaseToken, &expiresAt); err != nil {
+			return err
+		}
+		if len(issueIDs) > 0 && !issueIDs[target.TicketID] {
+			continue
+		}
+		target.VersionID = versionID
+		target.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, expiresAt)
+		if err != nil {
+			return err
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, target := range targets {
+		verified := false
+		for _, proof := range isolated {
+			if proof.VersionID == target.VersionID && proof.TicketID == target.TicketID && proof.RunID == target.RunID && proof.LeaseGeneration == target.LeaseGeneration && proof.LeaseToken == target.LeaseToken {
+				verified = true
+				break
+			}
+		}
+		if !verified {
+			return &DeliveryIsolationRequired{Targets: targets}
+		}
+	}
+	return nil
+}
+
 // ExpiredLaunchedRecoveryRuns lists current Agent Runs and launched Delivery
 // Controller Runs whose Run Leases have elapsed. Callers must isolate the corresponding container before using
 // ReconcileMissingRecoveryRun to release the ticket for a replacement Run.
@@ -203,7 +259,7 @@ ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunDelivery, RunRunning, 
 	return scanRecoveryRuns(rows)
 }
 
-func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now time.Time) ([]RecoveryRun, error) {
+func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now time.Time, maxAttempts ...int) ([]RecoveryRun, error) {
 	if versionID == "" {
 		return nil, ErrInvalidClaim
 	}
@@ -249,8 +305,12 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	limit := DefaultMaxWorkerAttempts
+	if len(maxAttempts) > 0 {
+		limit = maxWorkerAttempts(maxAttempts[0])
+	}
 	for _, delivery := range expired {
-		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, DefaultMaxWorkerAttempts, now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, limit, now); err != nil {
 			return nil, err
 		}
 	}
@@ -336,7 +396,7 @@ func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
 	return runs, rows.Err()
 }
 
-func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time) error {
+func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time, maxAttempts ...int) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if run.Claim.RunID == "" || run.Claim.LeaseToken == "" || run.Claim.LeaseGeneration <= 0 || strings.TrimSpace(reason) == "" {
@@ -368,7 +428,11 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 		if launchState != "launched" {
 			return ErrInvalidClaim
 		}
-		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, DefaultMaxWorkerAttempts, now); err != nil {
+		limit := DefaultMaxWorkerAttempts
+		if len(maxAttempts) > 0 {
+			limit = maxWorkerAttempts(maxAttempts[0])
+		}
+		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, limit, now); err != nil {
 			return err
 		}
 		return tx.Commit()

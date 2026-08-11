@@ -43,6 +43,7 @@ type fakeRuntime struct {
 	beforeDelivery                func(worker.Spec) error
 	afterCandidate                func() error
 	deliveryErr                   error
+	deliveryErrorResult           worker.Result
 	waitForDeliveryDeadline       bool
 	deliveryOrigin                string
 }
@@ -81,7 +82,7 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 			return worker.Result{}, worker.CertifiedNoLaunchError{Err: ctx.Err()}
 		}
 		if r.deliveryErr != nil {
-			return worker.Result{}, r.deliveryErr
+			return r.deliveryErrorResult, r.deliveryErr
 		}
 		if r.deleteCodexAuthDuringDelivery {
 			if err := os.Remove(filepath.Join(spec.CodexStatePath, "auth.json")); err != nil {
@@ -2038,8 +2039,9 @@ func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	runtime := &fakeRuntime{
-		results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-		deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
+		results:             []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr:         worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
+		deliveryErrorResult: worker.Result{ContainerID: "cidfile-written-before-certified-failure"},
 	}
 	controller := agent.Controller{
 		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},

@@ -939,6 +939,18 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 				_, err = p.Store.RecoverUncertainInboxDeliveryQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
 			} else {
 				_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
+				var isolation *store.DeliveryIsolationRequired
+				if errors.As(err, &isolation) {
+					if p.ContainerIsolator == nil {
+						return errors.Join(err, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
+					}
+					for _, target := range isolation.Targets {
+						if isolateErr := p.ContainerIsolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+							return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+						}
+					}
+					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), isolation.Targets...)
+				}
 			}
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return wrapPollStoreError(err)

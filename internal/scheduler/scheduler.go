@@ -11,15 +11,16 @@ import (
 )
 
 type Dispatcher struct {
-	Store            *store.Store
-	Reader           plan.SnapshotReader
-	Projector        plan.RootProjector
-	MaxParallelRuns  int
-	LeaseTTL         time.Duration
-	Now              func() time.Time
-	Recovery         RecoveryInspector
-	HostPressure     HostPressureInspector
-	ProvisionSession store.SessionProvisioner
+	Store             *store.Store
+	Reader            plan.SnapshotReader
+	Projector         plan.RootProjector
+	MaxParallelRuns   int
+	MaxWorkerAttempts int
+	LeaseTTL          time.Duration
+	Now               func() time.Time
+	Recovery          RecoveryInspector
+	HostPressure      HostPressureInspector
+	ProvisionSession  store.SessionProvisioner
 }
 
 type RecoveryInspector interface {
@@ -200,11 +201,11 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		if err := d.Recovery.IsolateContainer(ctx, run.Claim.RunID); err != nil {
 			return fmt.Errorf("isolate expired worker container %s: %w", run.Claim.RunID, err)
 		}
-		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
+		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
 			return err
 		}
 	}
-	runs, err := d.Store.ActiveRecoveryRuns(ctx, versionID, now)
+	runs, err := d.Store.ActiveRecoveryRuns(ctx, versionID, now, d.MaxWorkerAttempts)
 	if err != nil {
 		return err
 	}
@@ -237,7 +238,7 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		if !workspaceAvailable {
 			reason = "ticket workspace is unavailable"
 		}
-		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now); err != nil {
+		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now, d.MaxWorkerAttempts); err != nil {
 			return err
 		}
 	}

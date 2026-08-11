@@ -790,6 +790,15 @@ func runPollGitHub(args []string) {
 		attemptedPlanAlreadyComplete := false
 		bootstrap := func(ctx context.Context) error {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
+			var isolation *store.DeliveryIsolationRequired
+			if errors.As(err, &isolation) {
+				for _, target := range isolation.Targets {
+					if isolateErr := runtime.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+						return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+					}
+				}
+				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), isolation.Targets...)
+			}
 			if err != nil {
 				return err
 			}
@@ -815,7 +824,7 @@ func runPollGitHub(args []string) {
 			if bootstrapErr != nil {
 				return controlResult, bootstrapErr
 			}
-			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime, ProvisionSession: workspaceManager.ProvisionCodexSession}
+			dispatcher := scheduler.Dispatcher{Store: db, Reader: client, Projector: projector, MaxParallelRuns: *maxParallelRuns, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts, LeaseTTL: 30 * time.Minute, Recovery: agent.RecoveryInspector{Containers: runtime, Workspace: workspaceManager}, HostPressure: runtime, ProvisionSession: workspaceManager.ProvisionCodexSession}
 			paused, err := dispatcher.DispatchPaused(ctx, *repository)
 			if err != nil {
 				return controlResult, err

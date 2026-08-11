@@ -70,25 +70,37 @@ type Candidate struct {
 }
 
 const (
-	codexAuthenticationFailure       = "Ticket Session Codex authentication cache is unavailable"
-	workerAuditTimeout               = 10 * time.Second
-	deliverySourcePreflightExitCode  = 78
-	deliverySourceContainerPreflight = `
-source_failure() {
+	codexAuthenticationFailure           = "Ticket Session Codex authentication cache is unavailable"
+	workerAuditTimeout                   = 10 * time.Second
+	deliverySourceIntegrityExitCode      = 78
+	deliverySourceInfrastructureExitCode = 79
+	deliverySourceContainerPreflight     = `
+integrity_failure() {
   echo "Delivery Source failed isolated launch revalidation" >&2
   exit 78
 }
-rm -rf /source-repository || source_failure
-git clone --bare --no-local /source-seed /source-repository >/dev/null 2>&1 || source_failure
-git --git-dir=/source-repository remote remove origin || source_failure
-identity=$(git --git-dir=/source-seed config --local --get workflow.sourceIdentity) || source_failure
-git --git-dir=/source-repository config --local workflow.sourceIdentity "$identity" || source_failure
-git --git-dir=/source-repository fsck --connectivity-only --no-dangling >/dev/null 2>&1 || source_failure
-head=$(git --git-dir=/source-repository symbolic-ref HEAD) || source_failure
-refs=$(git --git-dir=/source-repository for-each-ref --sort=refname '--format=%(refname) %(objectname)' refs/heads refs/tags) || source_failure
-actual=$(printf '%s\n%s\n%s' "$head" "$identity" "$refs" | sha256sum | awk '{print $1}') || source_failure
-[ "$actual" = "$NO_MISTAKES_DELIVERY_SOURCE_DIGEST" ] || source_failure
-exec "$@"
+infrastructure_failure() {
+  echo "Delivery Source isolated launch preparation failed" >&2
+  exit 79
+}
+git --git-dir=/source-seed fsck --connectivity-only --no-dangling >/dev/null 2>&1 || integrity_failure
+identity=$(git --git-dir=/source-seed config --local --get workflow.sourceIdentity) || integrity_failure
+head=$(git --git-dir=/source-seed symbolic-ref HEAD) || integrity_failure
+refs=$(git --git-dir=/source-seed for-each-ref --sort=refname '--format=%(refname) %(objectname)' refs/heads refs/tags) || integrity_failure
+actual=$(printf '%s\n%s\n%s' "$head" "$identity" "$refs" | sha256sum | awk '{print $1}') || infrastructure_failure
+[ "$actual" = "$NO_MISTAKES_DELIVERY_SOURCE_DIGEST" ] || integrity_failure
+rm -rf /source-repository || infrastructure_failure
+git clone --bare --no-local /source-seed /source-repository >/dev/null 2>&1 || infrastructure_failure
+git --git-dir=/source-repository remote remove origin || infrastructure_failure
+git --git-dir=/source-repository config --local workflow.sourceIdentity "$identity" || infrastructure_failure
+if "$@"; then
+  exit 0
+else
+  status=$?
+  [ "$status" -eq 78 ] && exit 80
+  [ "$status" -eq 79 ] && exit 81
+  exit "$status"
+fi
 `
 )
 
@@ -218,7 +230,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		}
 		candidateOutput.PlanAmendment.VersionID = request.Claim.VersionID
 		candidateOutput.PlanAmendment.TicketID = request.Claim.TicketID
-		if _, err := c.Store.ProposePlanAmendment(handoffCtx, *candidateOutput.PlanAmendment, c.now()); err != nil {
+		if _, err := c.proposePlanAmendment(handoffCtx, *candidateOutput.PlanAmendment); err != nil {
 			return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 		}
 		return Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, StructuredOutput: structured}, nil
@@ -244,6 +256,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	session.AcceptedCommit = commit
 	session.AcceptedCandidateRunID = request.Claim.RunID
 	candidate := Candidate{RunID: request.Claim.RunID, SessionID: session.SessionID, CodexSessionID: codexSessionID, Commit: commit, StructuredOutput: structured}
+	if err := c.Store.ReserveDeliveryControllerPrelaunch(handoffCtx, deliveryClaim, c.now()); err != nil {
+		return candidate, err
+	}
 	if err := c.runDeliveryController(handoffCtx, deliveryClaim, session, ws, publication, request.Prompt); err != nil {
 		return candidate, err
 	}
@@ -255,6 +270,9 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		return errors.New("agent controller dependencies are incomplete")
 	}
 	if err := c.Store.RequireCurrentDeliveryLease(ctx, claim, c.now()); err != nil {
+		return err
+	}
+	if err := c.Store.ReserveDeliveryControllerPrelaunch(ctx, claim, c.now()); err != nil {
 		return err
 	}
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), claim.LeaseExpiresAt.Add(10*time.Second))
@@ -347,9 +365,6 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if noMistakes == "" {
 		noMistakes = "no-mistakes"
 	}
-	if err := c.Store.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, c.now()); err != nil {
-		return err
-	}
 	defaultBranch, expectedSourceDigest, err := c.validateDeliverySourceForLaunch(ctx, session, ws.DeliverySource)
 	if err != nil {
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
@@ -437,10 +452,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
+	if deliveryErr != nil && worker.IsCertifiedNoLaunchFailure(deliveryErr) {
+		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+	}
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
-		if worker.IsCertifiedNoLaunchFailure(deliveryErr) {
-			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
-		}
 		var integrityFailure *deliverySourceIntegrityFailure
 		var infrastructureFailure *deliverySourceInfrastructureFailure
 		if errors.As(deliveryErr, &integrityFailure) || errors.As(deliveryErr, &infrastructureFailure) {
@@ -454,8 +469,11 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if auditErr != nil {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(auditErr.Error())))
 	}
-	if deliveryResult.ExitCode == deliverySourcePreflightExitCode {
+	if deliveryResult.ExitCode == deliverySourceIntegrityExitCode {
 		return c.failDeliverySourcePreflight(finalizationCtx, deliveryClaim, deliverySourceIntegrityError(errors.New("mounted Delivery Source failed isolated launch revalidation")))
+	}
+	if deliveryResult.ExitCode == deliverySourceInfrastructureExitCode {
+		return c.failDeliverySourcePreflight(finalizationCtx, deliveryClaim, deliverySourceInfrastructureError(errors.New("mounted Delivery Source could not be prepared for isolated launch")))
 	}
 	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {
@@ -666,6 +684,24 @@ func (c Controller) recordWorkerContainer(claim store.TicketClaim, result worker
 	auditCtx, cancelAudit := context.WithTimeout(context.Background(), workerAuditTimeout)
 	defer cancelAudit()
 	return c.Store.RecordWorkerContainer(auditCtx, claim.RunID, claim.LeaseGeneration, result.ContainerID)
+}
+
+func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.PlanAmendment) (store.PlanAmendmentProposal, error) {
+	proposal, err := c.Store.ProposePlanAmendment(ctx, amendment, c.now())
+	var isolation *store.DeliveryIsolationRequired
+	if !errors.As(err, &isolation) {
+		return proposal, err
+	}
+	isolator, ok := c.Runtime.(worker.ContainerIsolator)
+	if !ok {
+		return store.PlanAmendmentProposal{}, errors.Join(err, errors.New("agent controller cannot isolate an active Delivery Controller"))
+	}
+	for _, target := range isolation.Targets {
+		if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+			return store.PlanAmendmentProposal{}, errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+		}
+	}
+	return c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolation.Targets...)
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
