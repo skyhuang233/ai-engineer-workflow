@@ -1418,6 +1418,63 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 	}
 }
 
+func TestControllerRetryDeliveryRejectsRepinnedModernSource(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	controller := agent.Controller{
+		Store: db, Workspace: manager,
+		Runtime: &fakeRuntime{
+			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+		},
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("initial delivery infrastructure failure returned nil error")
+	}
+	digest, err := db.CandidateDeliverySourceDigest(ctx, claim.RunID)
+	if err != nil || len(digest) != 64 {
+		t.Fatalf("pinned Delivery Source digest = %q, %v", digest, err)
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
+	}
+	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	if err := os.RemoveAll(deliverySource); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "advanced.txt"), []byte("advanced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "advanced.txt"}, {"commit", "-m", "advance source"}} {
+		command := exec.Command("git", args...)
+		command.Dir = source
+		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	controller.SourceRepository = source
+	if err := controller.RetryDelivery(ctx, pending[0]); err == nil || !strings.Contains(err.Error(), "does not match its pinned Candidate Revision") {
+		t.Fatalf("repinned Delivery Source error = %v", err)
+	}
+	if len(retryRuntime.specs) != 0 {
+		t.Fatal("Delivery Controller launched with a repinned source")
+	}
+	if _, err := os.Stat(deliverySource); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mismatched reconstructed Delivery Source was retained: %v", err)
+	}
+}
+
 func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

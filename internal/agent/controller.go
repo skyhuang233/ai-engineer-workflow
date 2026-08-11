@@ -214,7 +214,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if publication.Body == "" {
 		publication.Body = candidateSummary(structured)
 	}
-	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, ImageDigest: imageDigest, ToolVersions: toolVersions, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
+	deliveryClaim, err := c.Store.AcceptCandidateForDelivery(handoffCtx, store.CandidateRevision{RunID: request.Claim.RunID, LeaseToken: request.Claim.LeaseToken, CodexSessionID: codexSessionID, CommitSHA: commit, StructuredOutput: structured, ImageDigest: imageDigest, ToolVersions: toolVersions, DeliverySourceDigest: ws.DeliverySourceDigest, Now: c.now(), Publication: publication}, c.deliveryLeaseTTL())
 	if err != nil {
 		return c.failRunWithRedactor(handoffCtx, request, ws, session, baseCommit, err.Error(), string(output), &runRedactor)
 	}
@@ -244,6 +244,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
+	expectedSourceDigest, err := c.Store.CandidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, err)
+	}
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
@@ -256,8 +260,23 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err))
 		}
+		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
+		if err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+		_, statErr := os.Stat(deliverySource)
+		sourceWasMissing := errors.Is(statErr, os.ErrNotExist)
+		if statErr != nil && !sourceWasMissing {
+			return c.failDeliveryControllerWithClass(finalizationCtx, claim, statErr, store.FailureInfrastructure)
+		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
 		if err != nil {
+			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
+		}
+		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
+			if sourceWasMissing {
+				err = errors.Join(err, os.RemoveAll(deliverySource))
+			}
 			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 		}
 	} else {
@@ -266,6 +285,9 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 			return c.failDeliveryController(finalizationCtx, claim, err)
 		}
 		if err := validateDeliverySource(finalizationCtx, deliverySource); err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
 			return c.failDeliveryController(finalizationCtx, claim, err)
 		}
 	}
@@ -451,25 +473,22 @@ func prepareDeliveryWorkspace(ctx context.Context, workspacePath, sourceReposito
 }
 
 func trustedSourceDefaultBranch(ctx context.Context, sourcePath string) (string, error) {
-	if strings.TrimSpace(sourcePath) == "" {
-		return "", errors.New("Delivery Source path is required")
+	_, branch, err := deliverySourceDefaultBranch(ctx, sourcePath)
+	return branch, err
+}
+
+func verifyDeliverySourceDigest(ctx context.Context, sourcePath, expected string) error {
+	if expected == "" {
+		return nil
 	}
-	output, err := gitOutput(ctx, sourcePath, "symbolic-ref", "HEAD")
+	actual, err := digestDeliverySource(ctx, sourcePath)
 	if err != nil {
-		return "", err
+		return err
 	}
-	ref := strings.TrimSpace(output)
-	if !strings.HasPrefix(ref, "refs/heads/") {
-		return "", errors.New("Delivery Source did not identify a default branch")
+	if actual != expected {
+		return errors.New("Delivery Source does not match its pinned Candidate Revision")
 	}
-	branch := strings.TrimPrefix(ref, "refs/heads/")
-	if _, err := gitOutput(ctx, sourcePath, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("invalid source default branch %q: %w", branch, err)
-	}
-	if _, err := gitOutput(ctx, sourcePath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
-		return "", fmt.Errorf("resolve source default branch %q: %w", branch, err)
-	}
-	return branch, nil
+	return nil
 }
 
 func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string]string, error) {

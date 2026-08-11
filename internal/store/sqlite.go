@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 50
+	latestSchemaVersion = 51
 )
 
 var (
@@ -1413,6 +1413,20 @@ WHERE runtime.delivered = 1 AND (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (50, ?)", formatTimestamp(now)); err != nil {
+			return err
+		}
+	}
+	if applied < 51 {
+		exists, err := tableHasColumnTx(ctx, tx, "candidate_revisions", "delivery_source_digest")
+		if err != nil {
+			return fmt.Errorf("migration 51: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE candidate_revisions ADD COLUMN delivery_source_digest TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("migration 51: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (51, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

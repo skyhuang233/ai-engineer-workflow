@@ -36,6 +36,10 @@ _Avoid_: Worker Run, container, controller-managed context packet
 The isolated, persistent version-control workspace owned by one Ticket Session and used by its successive Worker Runs.
 _Avoid_: Container filesystem, shared checkout, dependency cache
 
+**Delivery Source（交付源）**:
+The credential-free, read-only Git snapshot pinned when a Revision Round begins and retained through that round's Candidate delivery; it is refreshed from the host-side admitted repository only for a new Revision Round, distinguished from both the mutable host source checkout and the Ticket Workspace, and reclaimed after a later accepted round or the Ticket Session is closed.
+_Avoid_: Host source checkout, Ticket Workspace, live remote clone
+
 **Ticket Agent（票据 Agent）**:
 The sole agent identity currently accountable for a Ticket Session and responsible for initial implementation and every subsequent review revision; responsibility may transfer only after the prior session is confirmed permanently unrecoverable.
 _Avoid_: Worker Run, replacement worker, coordinating agent

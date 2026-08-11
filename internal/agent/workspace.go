@@ -25,12 +25,13 @@ type WorkspaceManager struct {
 }
 
 type workspace struct {
-	Path             string
-	CodexState       string
-	DeliverySource   string
-	SourceRepository string
-	Branch           string
-	BaseCommit       string
+	Path                 string
+	CodexState           string
+	DeliverySource       string
+	DeliverySourceDigest string
+	SourceRepository     string
+	Branch               string
+	BaseCommit           string
 }
 
 type deliverySourceRefreshFailure struct {
@@ -397,7 +398,11 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	if err != nil {
 		return workspace{}, err
 	}
-	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
+	deliverySourceDigest, err := digestDeliverySource(ctx, deliverySource)
+	if err != nil {
+		return workspace{}, err
+	}
+	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, DeliverySourceDigest: deliverySourceDigest, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
 }
 
 func (m WorkspaceManager) deliverySourceSessionPath(sessionID string) (string, error) {
@@ -498,15 +503,8 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 		}
 	}
 	head = strings.TrimSpace(head)
-	if !strings.HasPrefix(head, "refs/heads/") {
-		return "", errors.New("Delivery Source HEAD is not a branch")
-	}
-	branch := strings.TrimPrefix(head, "refs/heads/")
-	if _, err := gitOutput(ctx, temporaryPath, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("invalid Delivery Source branch %q: %w", branch, err)
-	}
-	if _, err := gitOutput(ctx, temporaryPath, "rev-parse", "--verify", head+"^{commit}"); err != nil {
-		return "", fmt.Errorf("verify Delivery Source HEAD: %w", err)
+	if _, err := validateDeliverySourceDefaultBranchRef(ctx, temporaryPath, head); err != nil {
+		return "", err
 	}
 	if err := runGit(ctx, temporaryPath, "symbolic-ref", "HEAD", head); err != nil {
 		return "", fmt.Errorf("record Delivery Source HEAD: %w", err)
@@ -565,6 +563,54 @@ func validateDeliverySource(ctx context.Context, path string) error {
 		return errors.New("persisted Delivery Source contains a remote configuration")
 	}
 	return nil
+}
+
+func validateDeliverySourceDefaultBranchRef(ctx context.Context, sourcePath, ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return "", errors.New("Delivery Source did not identify a default branch")
+	}
+	branch := strings.TrimPrefix(ref, "refs/heads/")
+	if _, err := gitOutput(ctx, sourcePath, "check-ref-format", "--branch", branch); err != nil {
+		return "", fmt.Errorf("invalid Delivery Source default branch %q: %w", branch, err)
+	}
+	if _, err := gitOutput(ctx, sourcePath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
+		return "", fmt.Errorf("resolve Delivery Source default branch %q: %w", branch, err)
+	}
+	return branch, nil
+}
+
+func deliverySourceDefaultBranch(ctx context.Context, sourcePath string) (string, string, error) {
+	if strings.TrimSpace(sourcePath) == "" {
+		return "", "", errors.New("Delivery Source path is required")
+	}
+	output, err := gitOutput(ctx, sourcePath, "symbolic-ref", "HEAD")
+	if err != nil {
+		return "", "", err
+	}
+	ref := strings.TrimSpace(output)
+	branch, err := validateDeliverySourceDefaultBranchRef(ctx, sourcePath, ref)
+	if err != nil {
+		return "", "", err
+	}
+	return ref, branch, nil
+}
+
+func digestDeliverySource(ctx context.Context, sourcePath string) (string, error) {
+	head, _, err := deliverySourceDefaultBranch(ctx, sourcePath)
+	if err != nil {
+		return "", err
+	}
+	identity, err := gitOutput(ctx, sourcePath, "config", "--local", "--get", "workflow.sourceIdentity")
+	if err != nil {
+		return "", fmt.Errorf("read Delivery Source identity: %w", err)
+	}
+	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags")
+	if err != nil {
+		return "", fmt.Errorf("read Delivery Source refs: %w", err)
+	}
+	digest := sha256.Sum256([]byte(head + "\n" + strings.TrimSpace(identity) + "\n" + strings.TrimSpace(refs)))
+	return fmt.Sprintf("%x", digest), nil
 }
 
 func validateLocalRemotes(ctx context.Context, path string) error {

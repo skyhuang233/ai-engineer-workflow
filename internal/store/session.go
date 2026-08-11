@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -101,15 +103,16 @@ type WorkerAudit struct {
 }
 
 type CandidateRevision struct {
-	RunID            string
-	LeaseToken       string
-	CodexSessionID   string
-	CommitSHA        string
-	StructuredOutput []byte
-	ImageDigest      string
-	ToolVersions     map[string]string
-	Now              time.Time
-	Publication      CandidatePublication
+	RunID                string
+	LeaseToken           string
+	CodexSessionID       string
+	CommitSHA            string
+	StructuredOutput     []byte
+	ImageDigest          string
+	ToolVersions         map[string]string
+	DeliverySourceDigest string
+	Now                  time.Time
+	Publication          CandidatePublication
 }
 
 const defaultDeliveryLeaseTTL = 30 * time.Minute
@@ -538,6 +541,18 @@ WHERE s.version_id = ? AND s.issue_id = ?`, versionID, issueID).
 	return imageDigest, toolVersions, nil
 }
 
+func (s *Store) CandidateDeliverySourceDigest(ctx context.Context, runID string) (string, error) {
+	if runID == "" {
+		return "", ErrInvalidClaim
+	}
+	var digest string
+	err := s.db.QueryRowContext(ctx, `SELECT delivery_source_digest FROM candidate_revisions WHERE run_id = ?`, runID).Scan(&digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return digest, err
+}
+
 func (s *Store) DeliveryWorkerRuntime(ctx context.Context, claim TicketClaim) (string, map[string]string, bool, error) {
 	if claim.RunID == "" || claim.LeaseGeneration <= 0 {
 		return "", nil, false, ErrInvalidClaim
@@ -606,6 +621,12 @@ func (s *Store) acceptCandidate(ctx context.Context, candidate CandidateRevision
 	if candidateoutput.Validate(candidate.StructuredOutput) != nil {
 		return TicketClaim{}, ErrInvalidClaim
 	}
+	if candidate.DeliverySourceDigest != "" {
+		decoded, err := hex.DecodeString(candidate.DeliverySourceDigest)
+		if err != nil || len(decoded) != sha256.Size || strings.ToLower(candidate.DeliverySourceDigest) != candidate.DeliverySourceDigest {
+			return TicketClaim{}, ErrInvalidClaim
+		}
+	}
 	toolVersions, err := json.Marshal(candidate.ToolVersions)
 	if err != nil {
 		return TicketClaim{}, err
@@ -641,7 +662,7 @@ SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = 
 	WHERE json_extract(request_json, '$.run_id') = ? AND state IN (?, ?)`, OutboxRejected, "candidate accepted before delivery controller admission", now, now, candidate.RunID, OutboxPending, OutboxProcessing); err != nil {
 		return TicketClaim{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, image_digest, tool_versions_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), candidate.ImageDigest, string(toolVersions), now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_revisions(run_id, session_id, codex_session_id, commit_sha, structured_output, image_digest, tool_versions_json, delivery_source_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, candidate.RunID, sessionID, candidate.CodexSessionID, candidate.CommitSHA, string(candidate.StructuredOutput), candidate.ImageDigest, string(toolVersions), candidate.DeliverySourceDigest, now); err != nil {
 		return TicketClaim{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'succeeded', finished_at = ? WHERE run_id = ? AND state = ?`, now, candidate.RunID, RunRunning); err != nil {
