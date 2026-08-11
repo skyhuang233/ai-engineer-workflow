@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	ErrGatewayCredentialRejected = errors.New("Gateway Credential was rejected")
+	ErrGatewayCredentialRejected = errors.New("Control Plane GitHub App Credential was rejected")
 	ErrGatewayWritesPaused       = errors.New("Gateway writes are paused")
 	ErrGatewayStore              = errors.New("Gateway persistence is temporarily unavailable")
 )
@@ -506,7 +506,7 @@ func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
-	reason := "Gateway Credential was rejected; replace and verify it to resume writes"
+	reason := store.ControlPlaneGitHubAppRecoveryRemediation
 	if err := g.Store.PauseGatewayWrites(ctx, reason, g.now()); err != nil {
 		return errors.Join(fmt.Errorf("%v; persist Gateway pause: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}

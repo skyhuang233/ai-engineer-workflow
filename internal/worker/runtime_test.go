@@ -16,6 +16,7 @@ func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
 	if spec.Validate() == nil {
 		t.Fatal("Validate accepted a spec without tool versions")
 	}
+	t.Log("Worker spec validation rejected a GitHub credential before launch")
 }
 
 func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
@@ -73,6 +74,7 @@ func TestGitHubCredentialClassifierCoversTokenAliases(t *testing.T) {
 	if IsGitHubCredentialName("WORKFLOW_GATEWAY_PROBE_TOKEN") {
 		t.Fatal("Gateway probe token was misclassified as a GitHub credential")
 	}
+	t.Log("Worker credential isolation recognizes GH/GitHub token, PAT, OAuth, and enterprise-token aliases while retaining the non-GitHub Gateway probe token")
 }
 
 func TestContainerPathMapsHostMounts(t *testing.T) {

@@ -20,6 +20,8 @@ import (
 
 const Redacted = "[REDACTED]"
 
+const GitHubAppPrivateKeyFile = `C:\ProgramData\workflow\github-app.pem`
+
 type Status string
 
 const (
@@ -73,6 +75,7 @@ type GitHubCredentialPin struct {
 	Kind            string            `json:"kind"`
 	Owner           string            `json:"owner"`
 	AllRepositories bool              `json:"all_repositories"`
+	PrivateKeyFile  string            `json:"private_key_file"`
 	Permissions     map[string]string `json:"permissions"`
 }
 
@@ -164,18 +167,20 @@ func (c Config) Validate() error {
 		return errors.New("GitHub required check is required")
 	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
 		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
-	case c.GitHub.Credential.Kind != "fine-grained-pat":
-		return errors.New("Gateway Credential must be a fine-grained PAT")
+	case c.GitHub.Credential.Kind != "github-app":
+		return errors.New("Control Plane GitHub credential must be a GitHub App")
 	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
-		return errors.New("Gateway Credential owner is required")
+		return errors.New("Control Plane GitHub App owner is required")
+	case !strings.EqualFold(strings.TrimSpace(c.GitHub.Credential.PrivateKeyFile), GitHubAppPrivateKeyFile):
+		return fmt.Errorf("Control Plane GitHub App private key file must be %s", GitHubAppPrivateKeyFile)
 	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
-		return errors.New("worker release repository owner must match the Gateway Credential owner")
+		return errors.New("worker release repository owner must match the Control Plane GitHub App owner")
 	case !repositoryOwnedBy(c.GitHub.TestRepository, c.GitHub.Credential.Owner):
-		return errors.New("GitHub test repository owner must match the Gateway Credential owner")
+		return errors.New("GitHub test repository owner must match the Control Plane GitHub App owner")
 	case !c.GitHub.Credential.AllRepositories:
-		return errors.New("Gateway Credential must cover all repositories")
-	case !validGatewayPermissions(c.GitHub.Credential.Permissions):
-		return errors.New("Gateway Credential permissions must match the Gateway contract")
+		return errors.New("Control Plane GitHub App must cover all repositories")
+	case !validGitHubAppPermissions(c.GitHub.Credential.Permissions):
+		return errors.New("Control Plane GitHub App permissions do not satisfy the GitHub contract")
 	case strings.TrimSpace(c.Upgrade.Rule) == "":
 		return errors.New("toolchain upgrade rule is required")
 	default:
@@ -187,16 +192,14 @@ func repositoryOwnedBy(repository, owner string) bool {
 	return githubapi.ValidateOwnerGuardedRepositoryName(repository, owner) == nil
 }
 
-func validGatewayPermissions(actual map[string]string) bool {
+func validGitHubAppPermissions(actual map[string]string) bool {
 	expected := map[string]string{
 		"actions": "read", "checks": "read", "contents": "write", "issues": "write",
 		"metadata": "read", "pull_requests": "write",
 	}
-	if len(actual) != len(expected) {
-		return false
-	}
 	for name, access := range expected {
-		if actual[name] != access {
+		got := actual[name]
+		if got != access && !(access == "read" && got == "write") {
 			return false
 		}
 	}

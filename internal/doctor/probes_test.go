@@ -2,9 +2,14 @@ package doctor
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +19,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/credential"
+	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
@@ -194,6 +200,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 456, "repository_selection": "all", "account": map[string]string{"login": "SKYHUANG233"}})
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
@@ -232,14 +240,17 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}))
 	defer server.Close()
 	credentials := memoryCredential{secret: token}
-	verification := store.GatewayCredentialVerification{
-		FingerprintSHA256:     credential.Fingerprint(token),
-		Owner:                 config.GitHub.Credential.Owner,
-		IntegrationRepository: config.GitHub.TestRepository,
+	privateKeyPEM := doctorTestPrivateKeyPEM(t)
+	verification := store.GitHubAppVerification{
+		FingerprintSHA256:     doctorTestPrivateKeyFingerprint(privateKeyPEM),
+		AppID:                 123,
+		InstallationID:        456,
+		Owner:                 strings.ToUpper(config.GitHub.Credential.Owner),
+		IntegrationRepository: strings.ToUpper(config.GitHub.TestRepository),
 	}
 	if result := (GitHubCredentialCheck{
-		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, Credentials: credentials,
-		Verification: verification, APIBase: server.URL,
+		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository, PrivateKeyPEM: privateKeyPEM,
+		Verification: verification, APIBase: server.URL, Client: server.Client(),
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("credential check = %#v", result)
 	}
@@ -273,6 +284,57 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
 		}
 	}
+}
+
+func TestGitHubCredentialCheckRejectsLiveInstallationDrift(t *testing.T) {
+	config := validConfig()
+	privateKeyPEM := doctorTestPrivateKeyPEM(t)
+	verification := store.GitHubAppVerification{
+		FingerprintSHA256: doctorTestPrivateKeyFingerprint(privateKeyPEM), AppID: 123, InstallationID: 456,
+		Owner: config.GitHub.Credential.Owner, IntegrationRepository: config.GitHub.TestRepository,
+	}
+	tests := []struct {
+		name                string
+		installationID      int64
+		owner               string
+		repositorySelection string
+	}{
+		{name: "installation ID", installationID: 999, owner: config.GitHub.Credential.Owner, repositorySelection: "all"},
+		{name: "owner", installationID: 456, owner: "different-owner", repositorySelection: "all"},
+		{name: "repository selection", installationID: 456, owner: config.GitHub.Credential.Owner, repositorySelection: "selected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": tt.installationID, "repository_selection": tt.repositorySelection,
+					"account": map[string]string{"login": tt.owner},
+				})
+			}))
+			defer server.Close()
+			result := (GitHubCredentialCheck{
+				Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
+				PrivateKeyPEM: privateKeyPEM, Verification: verification, APIBase: server.URL, Client: server.Client(),
+			}).Run(context.Background())
+			if result.Status != Fail || !errors.Is(result.Err, githubapp.ErrCredentialUnavailable) || (Report{Results: []Result{result}}).AuthenticationFailure() == nil {
+				t.Fatalf("credential check accepted live %s drift: %#v", tt.name, result)
+			}
+		})
+	}
+}
+
+func doctorTestPrivateKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
+
+func doctorTestPrivateKeyFingerprint(privateKeyPEM []byte) string {
+	digest := sha256.Sum256(privateKeyPEM)
+	return hex.EncodeToString(digest[:])
 }
 
 func TestGitHubCheckRejectsCanonicalIntegrationRepositoryOwnedByAnotherAccount(t *testing.T) {
@@ -325,23 +387,14 @@ func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
 
 func TestGitHubCredentialCheckRejectsDifferentIntegrationRepository(t *testing.T) {
 	config := validConfig()
-	token := "github_pat_test"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/user" {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
-	}))
-	defer server.Close()
+	privateKeyPEM := []byte("test-private-key")
 	result := (GitHubCredentialCheck{
 		Pin: config.GitHub.Credential, IntegrationRepository: config.GitHub.TestRepository,
-		Credentials: memoryCredential{secret: token},
-		Verification: store.GatewayCredentialVerification{
-			FingerprintSHA256: credential.Fingerprint(token), Owner: config.GitHub.Credential.Owner,
+		PrivateKeyPEM: privateKeyPEM,
+		Verification: store.GitHubAppVerification{
+			FingerprintSHA256: credential.Fingerprint(string(privateKeyPEM)), AppID: 123, InstallationID: 456, Owner: config.GitHub.Credential.Owner,
 			IntegrationRepository: "skyhuang233/different-integration",
 		},
-		APIBase: server.URL,
 	}).Run(context.Background())
 	if result.Status != Fail || !strings.Contains(result.Summary, "integration repository") {
 		t.Fatalf("credential check = %#v", result)

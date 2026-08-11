@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 48
+	latestSchemaVersion = 49
 )
 
 var (
@@ -1334,6 +1334,29 @@ AND NOT EXISTS (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (48, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 49 {
+		columns := []struct {
+			name       string
+			definition string
+		}{
+			{name: "app_id", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "installation_id", definition: "INTEGER NOT NULL DEFAULT 0"},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "gateway_credential_verifications", column.name)
+			if err != nil {
+				return fmt.Errorf("migration 49: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE gateway_credential_verifications ADD COLUMN %s %s", column.name, column.definition)); err != nil {
+					return fmt.Errorf("migration 49: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (49, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

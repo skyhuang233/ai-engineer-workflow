@@ -56,9 +56,9 @@ _Avoid_: Ticket Agent, GitHub Actions, workflow scheduler
 The narrow boundary that validates a current Run Lease, ticket ownership, and expected remote revision before executing an external repository mutation.
 _Avoid_: General GitHub proxy, agent credential, merge authority
 
-**Gateway Credential（网关凭据）**:
-The owner-wide fine-grained GitHub credential held only by the trusted GitHub Write Gateway to perform ticket-scoped branch, pull-request, issue, and CI operations across repositories admitted by the Control Plane.
-_Avoid_: Worker token, package publisher token, general GitHub credential
+**Control Plane GitHub App Credential（控制平面 GitHub App 凭据）**:
+The owner-wide GitHub App installation credential used by trusted host-side GitHub readers and the GitHub Write Gateway across repositories admitted by the Control Plane. The App private key remains on the host and Workers never receive GitHub credentials.
+_Avoid_: Gateway-only credential, fine-grained PAT, Worker token, package publisher token
 
 **Delivery Cycle（交付周期）**:
 The single long-lived validation and review lifecycle bound to an Executable Ticket until its delivery succeeds or is cancelled.

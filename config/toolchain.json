@@ -34,9 +34,10 @@
     "required_check": "workflow-contract",
     "workflow_path": ".github/workflows/workflow-contract.yml",
     "credential": {
-      "kind": "fine-grained-pat",
+      "kind": "github-app",
       "owner": "skyhuang233",
       "all_repositories": true,
+      "private_key_file": "C:\\ProgramData\\workflow\\github-app.pem",
       "permissions": {
         "actions": "read",
         "checks": "read",
