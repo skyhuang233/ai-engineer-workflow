@@ -1418,6 +1418,44 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 	}
 }
 
+func TestControllerRetryDeliveryUsesRetainedSourceWhenCheckoutIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	controller := agent.Controller{
+		Store: db, Workspace: manager,
+		Runtime: &fakeRuntime{
+			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+		},
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("initial delivery infrastructure failure returned nil error")
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
+	}
+	if err := os.Rename(source, source+"-unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Runtime = retryRuntime
+	controller.SourceRepository = source
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("retry with retained Delivery Source = %v", err)
+	}
+	if len(retryRuntime.specs) != 1 || retryRuntime.deliveryOrigin != "/source-repository" {
+		t.Fatalf("Delivery Controller launch = %#v, origin %q", retryRuntime.specs, retryRuntime.deliveryOrigin)
+	}
+}
+
 func TestControllerRetryDeliveryRejectsRepinnedModernSource(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

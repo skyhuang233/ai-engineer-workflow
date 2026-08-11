@@ -251,45 +251,36 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
-	var deliverySource, sourceRepository string
-	if strings.TrimSpace(c.SourceRepository) != "" {
+	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
+	if err != nil {
+		return c.failDeliveryController(finalizationCtx, claim, err)
+	}
+	_, statErr := os.Stat(deliverySource)
+	sourceWasMissing := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !sourceWasMissing {
+		return c.failDeliveryControllerWithClass(finalizationCtx, claim, statErr, store.FailureInfrastructure)
+	}
+	var sourceRepository string
+	if sourceWasMissing {
 		sourceRepository, err = localSourceRepository(c.SourceRepository)
 		if err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
+			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 		}
 		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err))
-		}
-		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
-		if err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
-		}
-		_, statErr := os.Stat(deliverySource)
-		sourceWasMissing := errors.Is(statErr, os.ErrNotExist)
-		if statErr != nil && !sourceWasMissing {
-			return c.failDeliveryControllerWithClass(finalizationCtx, claim, statErr, store.FailureInfrastructure)
+			return c.failDeliveryControllerWithClass(finalizationCtx, claim, fmt.Errorf("restore ticket workspace origin: %w", err), store.FailureInfrastructure)
 		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
-		if err != nil {
-			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
-		}
-		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
-			if sourceWasMissing {
-				err = errors.Join(err, os.RemoveAll(deliverySource))
-			}
-			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
-		}
 	} else {
-		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
-		if err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
+		err = validateDeliverySource(finalizationCtx, deliverySource)
+	}
+	if err != nil {
+		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
+	}
+	if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
+		if sourceWasMissing {
+			err = errors.Join(err, os.RemoveAll(deliverySource))
 		}
-		if err := validateDeliverySource(finalizationCtx, deliverySource); err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
-		}
-		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
-			return c.failDeliveryController(finalizationCtx, claim, err)
-		}
+		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 	}
 	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
