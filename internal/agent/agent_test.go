@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/agent"
+	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
@@ -1352,6 +1353,68 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	}
 	if len(controller.Runtime.(*fakeRuntime).specs) != 0 {
 		t.Fatal("Delivery Controller launched for an Agent lease")
+	}
+}
+
+func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	controller := agent.Controller{
+		Store: db, Workspace: manager,
+		Runtime: &fakeRuntime{
+			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+		},
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
+		t.Fatal("initial delivery infrastructure failure returned nil error")
+	}
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
+	}
+	now = now.Add(2 * time.Minute)
+	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	if err := os.RemoveAll(deliverySource); err != nil {
+		t.Fatal(err)
+	}
+	manager.RefreshDeliverySource = func(refreshCtx context.Context, _ string) (string, error) {
+		if err := db.PauseGatewayWrites(refreshCtx, store.ControlPlaneGitHubAppRecoveryRemediation, now); err != nil {
+			return "", err
+		}
+		return "", delivery.ErrGatewayCredentialRejected
+	}
+	retryRuntime := &fakeRuntime{}
+	controller.Workspace = manager
+	controller.Runtime = retryRuntime
+	controller.SourceRepository = source
+	if err := controller.RetryDelivery(ctx, pending[0]); !errors.Is(err, delivery.ErrGatewayCredentialRejected) {
+		t.Fatalf("credential-rejected Delivery Source refresh = %v", err)
+	}
+	if len(retryRuntime.specs) != 0 {
+		t.Fatal("Delivery Controller launched after credential rejection")
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 || questions[0].Kind != "gateway_credential" {
+		t.Fatalf("credential rejection questions = %#v, %v", questions, err)
+	}
+	rotation, err := db.BeginGatewayCredentialRotation(ctx, "test", "credential restored", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResumeGatewayWrites(ctx, rotation, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, now.Add(2*time.Minute))
+	if err != nil || len(resumed) != 1 || resumed[0].SessionID != claim.SessionID {
+		t.Fatalf("delivery recovery after credential restoration = %#v, %v", resumed, err)
 	}
 }
 

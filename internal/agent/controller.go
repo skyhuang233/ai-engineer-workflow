@@ -258,9 +258,6 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		}
 		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
 		if err != nil {
-			if isDeliverySourceAuthenticationFailure(err) {
-				return c.failDeliveryController(finalizationCtx, claim, err)
-			}
 			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 		}
 	} else {
