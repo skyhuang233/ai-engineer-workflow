@@ -45,8 +45,28 @@ func deliverySourceInfrastructureError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var infrastructureFailure *deliverySourceInfrastructureFailure
+	if errors.As(err, &infrastructureFailure) {
+		return err
+	}
 	return &deliverySourceInfrastructureFailure{err: err}
 }
+
+type deliverySourceIntegrityFailure struct {
+	err error
+}
+
+func (e *deliverySourceIntegrityFailure) Error() string { return e.err.Error() }
+func (e *deliverySourceIntegrityFailure) Unwrap() error { return e.err }
+
+func deliverySourceIntegrityError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &deliverySourceIntegrityFailure{err: err}
+}
+
+const admittedSourceRepositoryConfig = "workflow.sourceRepository"
 
 type RecoveryInspector struct {
 	Containers worker.ContainerInspector
@@ -349,17 +369,17 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	}
 	sourceRepository, err := localSourceRepository(sourceRepository)
 	if err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	path, state, err := m.sessionPaths(sessionID)
 	if err != nil {
 		return workspace{}, err
 	}
 	if err := os.MkdirAll(m.RootDir, 0o755); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	if err := os.MkdirAll(m.CodexStateRoot, 0o755); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	deliverySource, err := m.ensureDeliverySource(ctx, sessionID, revisionRoundID, sourceRepository)
 	if err != nil {
@@ -367,47 +387,50 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	}
 	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
 		if err := runGit(ctx, "", "-c", "core.longpaths=true", "clone", "--config", "core.autocrlf=false", "--config", "core.eol=lf", "--config", "core.longpaths=true", "--local", "--no-hardlinks", deliverySource, path); err != nil {
-			return workspace{}, fmt.Errorf("clone ticket workspace: %w", err)
+			return workspace{}, deliverySourceInfrastructureError(fmt.Errorf("clone ticket workspace: %w", err))
 		}
 		if err := runGit(ctx, path, "checkout", "-b", branch); err != nil {
-			return workspace{}, fmt.Errorf("create ticket branch: %w", err)
+			return workspace{}, deliverySourceInfrastructureError(fmt.Errorf("create ticket branch: %w", err))
 		}
 	} else if err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	} else {
 		current, err := gitOutput(ctx, path, "branch", "--show-current")
 		if err != nil {
-			return workspace{}, err
+			return workspace{}, deliverySourceInfrastructureError(err)
 		}
 		if strings.TrimSpace(current) != branch {
 			return workspace{}, fmt.Errorf("workspace branch is %q, want %q", strings.TrimSpace(current), branch)
 		}
 	}
+	if err := recordAdmittedSourceRepository(ctx, path, sourceRepository); err != nil {
+		return workspace{}, deliverySourceInfrastructureError(err)
+	}
 	if err := runGit(ctx, path, "fetch", "--force", "--prune", "--no-tags", deliverySource, "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"); err != nil {
-		return workspace{}, fmt.Errorf("refresh ticket workspace source: %w", err)
+		return workspace{}, deliverySourceInfrastructureError(fmt.Errorf("refresh ticket workspace source: %w", err))
 	}
 	if err := replaceWorkspaceOriginURLs(ctx, path, []string{sourceRepository}); err != nil {
-		return workspace{}, fmt.Errorf("restore ticket workspace origin: %w", err)
+		return workspace{}, deliverySourceInfrastructureError(fmt.Errorf("restore ticket workspace origin: %w", err))
 	}
 	if err := configureTicketWorkspaceLineEndings(ctx, path); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	if err := configureTicketWorkspaceGitIdentity(ctx, path); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	if err := validateLocalRemotes(ctx, path); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	if err := os.MkdirAll(state, 0o755); err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	base, err := gitOutput(ctx, path, "rev-parse", "HEAD")
 	if err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	deliverySourceDigest, err := digestDeliverySource(ctx, deliverySource)
 	if err != nil {
-		return workspace{}, err
+		return workspace{}, deliverySourceInfrastructureError(err)
 	}
 	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, DeliverySourceDigest: deliverySourceDigest, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
 }
@@ -559,15 +582,18 @@ func (m WorkspaceManager) reclaimSupersededDeliverySources(ctx context.Context, 
 
 func validateDeliverySource(ctx context.Context, path string) error {
 	bare, err := gitOutput(ctx, path, "rev-parse", "--is-bare-repository")
-	if err != nil || strings.TrimSpace(bare) != "true" {
-		return errors.New("persisted Delivery Source is not a bare Git repository")
+	if err != nil {
+		return deliverySourceInfrastructureError(fmt.Errorf("inspect persisted Delivery Source: %w", err))
+	}
+	if strings.TrimSpace(bare) != "true" {
+		return deliverySourceIntegrityError(errors.New("persisted Delivery Source is not a bare Git repository"))
 	}
 	remotes, err := gitOutput(ctx, path, "remote")
 	if err != nil {
-		return err
+		return deliverySourceInfrastructureError(fmt.Errorf("inspect persisted Delivery Source remotes: %w", err))
 	}
 	if strings.TrimSpace(remotes) != "" {
-		return errors.New("persisted Delivery Source contains a remote configuration")
+		return deliverySourceIntegrityError(errors.New("persisted Delivery Source contains a remote configuration"))
 	}
 	return nil
 }
@@ -575,25 +601,25 @@ func validateDeliverySource(ctx context.Context, path string) error {
 func validateDeliverySourceDefaultBranchRef(ctx context.Context, sourcePath, ref string) (string, error) {
 	ref = strings.TrimSpace(ref)
 	if !strings.HasPrefix(ref, "refs/heads/") {
-		return "", errors.New("Delivery Source did not identify a default branch")
+		return "", deliverySourceIntegrityError(errors.New("Delivery Source did not identify a default branch"))
 	}
 	branch := strings.TrimPrefix(ref, "refs/heads/")
 	if _, err := gitOutput(ctx, sourcePath, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("invalid Delivery Source default branch %q: %w", branch, err)
+		return "", deliverySourceIntegrityError(fmt.Errorf("invalid Delivery Source default branch %q: %w", branch, err))
 	}
 	if _, err := gitOutput(ctx, sourcePath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
-		return "", fmt.Errorf("resolve Delivery Source default branch %q: %w", branch, err)
+		return "", deliverySourceIntegrityError(fmt.Errorf("resolve Delivery Source default branch %q: %w", branch, err))
 	}
 	return branch, nil
 }
 
 func deliverySourceDefaultBranch(ctx context.Context, sourcePath string) (string, string, error) {
 	if strings.TrimSpace(sourcePath) == "" {
-		return "", "", errors.New("Delivery Source path is required")
+		return "", "", deliverySourceIntegrityError(errors.New("Delivery Source path is required"))
 	}
 	output, err := gitOutput(ctx, sourcePath, "symbolic-ref", "HEAD")
 	if err != nil {
-		return "", "", err
+		return "", "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source HEAD: %w", err))
 	}
 	ref := strings.TrimSpace(output)
 	branch, err := validateDeliverySourceDefaultBranchRef(ctx, sourcePath, ref)
@@ -673,6 +699,43 @@ func replaceWorkspaceOriginURLs(ctx context.Context, workspacePath string, urls 
 		return errors.New("Ticket Workspace origin URLs were not configured exactly")
 	}
 	return nil
+}
+
+func recordAdmittedSourceRepository(ctx context.Context, workspacePath, sourceRepository string) error {
+	if err := runGit(ctx, workspacePath, "config", "--local", admittedSourceRepositoryConfig, sourceRepository); err != nil {
+		return fmt.Errorf("record admitted source repository: %w", err)
+	}
+	recorded, err := gitOutput(ctx, workspacePath, "config", "--local", "--get", admittedSourceRepositoryConfig)
+	if err != nil {
+		return fmt.Errorf("verify admitted source repository: %w", err)
+	}
+	if strings.TrimSpace(recorded) != sourceRepository {
+		return errors.New("admitted source repository was not recorded exactly")
+	}
+	return nil
+}
+
+func admittedSourceRepository(ctx context.Context, workspacePath, configured string) (string, error) {
+	recorded, err := gitOutput(ctx, workspacePath, "config", "--local", "--get", admittedSourceRepositoryConfig)
+	if err == nil && strings.TrimSpace(recorded) != "" {
+		return validateAdmittedSourceRepository(strings.TrimSpace(recorded))
+	}
+	var exitErr *exec.ExitError
+	if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 1) {
+		return "", deliverySourceInfrastructureError(fmt.Errorf("read admitted source repository: %w", err))
+	}
+	if strings.TrimSpace(configured) != "" {
+		return validateAdmittedSourceRepository(configured)
+	}
+	return "", deliverySourceIntegrityError(errors.New("Ticket Workspace admitted source repository is unavailable"))
+}
+
+func validateAdmittedSourceRepository(sourceRepository string) (string, error) {
+	sourceRepository = filepath.Clean(strings.TrimSpace(sourceRepository))
+	if !filepath.IsAbs(sourceRepository) {
+		return "", deliverySourceIntegrityError(errors.New("Ticket Workspace admitted source repository must be an absolute local path"))
+	}
+	return sourceRepository, nil
 }
 
 func localSourceRepository(source string) (string, error) {

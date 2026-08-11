@@ -397,6 +397,110 @@ func TestRunInDeliveryWorkspaceClassifiesHostFailuresAsInfrastructure(t *testing
 	})
 }
 
+func TestRevisionSourceApplicationClassifiesGitFailuresAsInfrastructure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, source)
+	writeDeliverySourceCommit(t, ctx, source, "first")
+	manager := WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	first, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configLock := filepath.Join(first.Path, ".git", "config.lock")
+	if err := os.WriteFile(configLock, []byte("locked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configLock)
+	_, err = manager.ensure(ctx, "session-1", "revision-2", source, "ticket-1")
+	var infrastructureFailure *deliverySourceInfrastructureFailure
+	if err == nil || !errors.As(err, &infrastructureFailure) {
+		t.Fatalf("revision source application error = %v", err)
+	}
+}
+
+func TestDeliverySourcePreflightDistinguishesInfrastructureFromIntegrity(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "missing.git")
+	if _, err := trustedSourceDefaultBranch(ctx, missing); err == nil {
+		t.Fatal("missing Delivery Source returned nil error")
+	} else {
+		var infrastructureFailure *deliverySourceInfrastructureFailure
+		if !errors.As(err, &infrastructureFailure) {
+			t.Fatalf("missing Delivery Source error = %v", err)
+		}
+	}
+
+	source := filepath.Join(t.TempDir(), "source.git")
+	if err := runGit(ctx, "", "init", "--bare", "--initial-branch", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, source, "symbolic-ref", "HEAD", "refs/heads/missing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trustedSourceDefaultBranch(ctx, source); err == nil {
+		t.Fatal("invalid Delivery Source returned nil error")
+	} else {
+		var infrastructureFailure *deliverySourceInfrastructureFailure
+		var integrityFailure *deliverySourceIntegrityFailure
+		if errors.As(err, &infrastructureFailure) || !errors.As(err, &integrityFailure) {
+			t.Fatalf("invalid Delivery Source error = %v", err)
+		}
+	}
+}
+
+func TestDeliveryWorkspaceRestoresDurableAdmittedOriginAfterRetry(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, source)
+	writeDeliverySourceCommit(t, ctx, source, "first")
+	manager := WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	workspace, err := manager.ensure(ctx, "session-1", "revision-1", source, "ticket-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, err := prepareDeliveryWorkspace(ctx, workspace.Path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configLock := filepath.Join(workspace.Path, ".git", "config.lock")
+	if err := os.WriteFile(configLock, []byte("locked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(ctx); err == nil {
+		t.Fatal("locked origin restoration returned nil error")
+	}
+	if err := os.Remove(configLock); err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := admittedSourceRepository(ctx, workspace.Path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore, err = prepareDeliveryWorkspace(ctx, workspace.Path, admitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := gitOutput(ctx, workspace.Path, "config", "--local", "--get-all", "remote.origin.url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(origin) != source {
+		t.Fatalf("restored Ticket Workspace origin = %q, want %q", origin, source)
+	}
+}
+
 func writeDeliverySourceCommit(t *testing.T, ctx context.Context, source, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(source, "source.txt"), []byte(content+"\n"), 0o644); err != nil {

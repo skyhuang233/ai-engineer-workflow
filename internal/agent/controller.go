@@ -263,9 +263,12 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if statErr != nil && !sourceWasMissing {
 		return c.failDeliveryControllerWithClass(finalizationCtx, claim, statErr, store.FailureInfrastructure)
 	}
-	var sourceRepository string
+	sourceRepository, err := admittedSourceRepository(finalizationCtx, session.WorkspacePath, c.SourceRepository)
+	if err != nil {
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
+	}
 	if sourceWasMissing {
-		sourceRepository, err = localSourceRepository(c.SourceRepository)
+		sourceRepository, err = localSourceRepository(sourceRepository)
 		if err != nil {
 			return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 		}
@@ -330,10 +333,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	}
 	defaultBranch, err := trustedSourceDefaultBranch(ctx, ws.DeliverySource)
 	if err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
+		return c.failDeliverySourcePreflight(ctx, deliveryClaim, fmt.Errorf("resolve trusted default branch: %w", err))
 	}
 	if err := validateDeliverySource(ctx, ws.DeliverySource); err != nil {
-		return c.failDeliveryController(ctx, deliveryClaim, err)
+		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
 	}
 	deliveryEnvironment := map[string]string{
 		"CODEX_HOME":                       ws.CodexState,
@@ -677,6 +680,14 @@ func isDeliverySourceAuthenticationFailure(err error) bool {
 	}
 	var authenticationFailure interface{ AuthenticationFailure() bool }
 	return errors.As(err, &authenticationFailure) && authenticationFailure.AuthenticationFailure()
+}
+
+func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store.TicketClaim, err error) error {
+	var infrastructureFailure *deliverySourceInfrastructureFailure
+	if errors.As(err, &infrastructureFailure) {
+		return c.failDeliveryControllerWithClass(ctx, claim, err, store.FailureInfrastructure)
+	}
+	return c.failDeliveryController(ctx, claim, err)
 }
 
 func redactFailureError(err error, redactor *codexauth.Redactor) error {
