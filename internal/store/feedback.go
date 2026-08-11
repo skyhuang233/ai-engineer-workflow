@@ -419,7 +419,7 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' A
 	return TicketClaim{VersionID: versionID, TicketID: issueID, TicketNumber: ticketNumber, TicketTitle: ticketTitle, Owner: owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: generation, LeaseExpiresAt: expiresAt}, prompt.String(), nil
 }
 
-func (s *Store) FreezePlanForClosedPullRequest(ctx context.Context, versionID string, issueID int64, now time.Time) (bool, error) {
+func (s *Store) FreezePlanForClosedPullRequest(ctx context.Context, versionID string, issueID int64, now time.Time, isolated ...TicketClaim) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if now.IsZero() {
@@ -465,7 +465,7 @@ ON CONFLICT(version_id) DO NOTHING`, versionID, issueID, "pull request closed wi
 	if err := recordClosedUnmergedQuestionContextTx(ctx, tx, repository, versionID, issueID); err != nil {
 		return false, err
 	}
-	if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "pull request closed without merge", now); err != nil {
+	if err := markPlanNeedsAttentionTx(ctx, tx, versionID, "pull request closed without merge", now, isolated...); err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = 'running' AND session_id IN (SELECT session_id FROM ticket_sessions WHERE version_id = ?)`, formatTimestamp(now), versionID); err != nil {

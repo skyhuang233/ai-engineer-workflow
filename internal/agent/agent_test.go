@@ -46,6 +46,8 @@ type fakeRuntime struct {
 	deliveryErrorResult           worker.Result
 	waitForDeliveryDeadline       bool
 	deliveryOrigin                string
+	isolatedRuns                  []string
+	isolationErr                  error
 }
 
 type blockingFailureRuntime struct {
@@ -186,6 +188,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 		}
 	}
 	return result, nil
+}
+
+func (r *fakeRuntime) IsolateContainer(_ context.Context, runID string) error {
+	r.isolatedRuns = append(r.isolatedRuns, runID)
+	return r.isolationErr
 }
 
 func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
@@ -1720,6 +1727,9 @@ func TestControllerDoesNotRetryUncertainEmptyContainerLaunch(t *testing.T) {
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
 	if err != nil || len(questions) != 1 || questions[0].Kind != "needs_attention" {
 		t.Fatalf("uncertain launch questions = %#v, %v", questions, err)
+	}
+	if len(runtime.isolatedRuns) != 1 || runtime.isolatedRuns[0] == "" {
+		t.Fatalf("uncertain launch isolated runs = %#v", runtime.isolatedRuns)
 	}
 }
 

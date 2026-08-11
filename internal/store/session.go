@@ -857,22 +857,34 @@ WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.
 }
 
 func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, false, now)
+	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, nil)
 }
 
-func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, false, now)
+func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time, isolated ...TicketClaim) error {
+	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, isolated)
 }
 
 // FailDeliveryControllerWithClass releases the failed Delivery Controller and
 // schedules a fenced retry of its accepted Candidate Revision. The bounded
 // retry count is per recovery epoch; escalation remains the explicit fallback.
 func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts ...int) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, maxAttempts...)
+	limit := DefaultMaxWorkerAttempts
+	if len(maxAttempts) > 0 {
+		limit = maxWorkerAttempts(maxAttempts[0])
+	}
+	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, limit, nil)
+}
+
+func (s *Store) FailDeliveryControllerWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
+	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, maxWorkerAttempts(maxAttempts), isolated)
 }
 
 func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts ...int) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, maxAttempts...)
+	limit := DefaultMaxWorkerAttempts
+	if len(maxAttempts) > 0 {
+		limit = maxWorkerAttempts(maxAttempts[0])
+	}
+	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, limit, nil)
 }
 
 func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
@@ -973,7 +985,7 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 	return sessionID, candidateRunID.String, nil
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, maxAttempts ...int) error {
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, limit int, isolated []TicketClaim) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -1010,19 +1022,20 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	if err != nil {
 		return err
 	}
+	certifiedUnstarted := false
 	if allowExpiredUnstarted {
-		unstarted := launchState == "ready"
+		certifiedUnstarted = launchState == "ready"
 		if launchState == "launched" {
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM worker_audits audit
 JOIN worker_runs run ON run.run_id = audit.run_id AND run.lease_generation = audit.lease_generation
 WHERE audit.run_id = ? AND audit.lease_generation = ? AND run.launch_state = 'launched'
 AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_id = audit.run_id AND result.lease_generation = audit.lease_generation)
-)`, claim.RunID, claim.LeaseGeneration).Scan(&unstarted); err != nil {
+)`, claim.RunID, claim.LeaseGeneration).Scan(&certifiedUnstarted); err != nil {
 				return err
 			}
 		}
-		if !unstarted {
+		if !certifiedUnstarted {
 			return ErrWorkerLaunched
 		}
 	}
@@ -1045,6 +1058,23 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 			return err
 		}
 		return ErrNeedsAttention
+	}
+	willNeedAttention := reason != "" && !retry
+	if reason != "" && retry {
+		var recoveryEpoch int64
+		if err := tx.QueryRowContext(ctx, `SELECT recovery_epoch FROM ticket_sessions WHERE session_id = ?`, sessionID).Scan(&recoveryEpoch); err != nil {
+			return err
+		}
+		var priorAttempts int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&priorAttempts); err != nil {
+			return err
+		}
+		willNeedAttention = priorAttempts+1 >= limit
+	}
+	if willNeedAttention && launchState == "launched" && !certifiedUnstarted {
+		if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+			return err
+		}
 	}
 	state := "succeeded"
 	if reason != "" {
@@ -1083,10 +1113,6 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 		var attempts int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
 			return err
-		}
-		limit := DefaultMaxWorkerAttempts
-		if len(maxAttempts) > 0 {
-			limit = maxWorkerAttempts(maxAttempts[0])
 		}
 		if attempts < limit {
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {

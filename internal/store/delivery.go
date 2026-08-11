@@ -1058,14 +1058,14 @@ func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request Del
 	return nil
 }
 
-func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, key string, uncertain bool, reason string, now time.Time) error {
+func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, key string, uncertain bool, reason string, now time.Time, isolated ...TicketClaim) error {
 	if request.RunID == "" {
 		switch request.Operation {
 		case DeliveryProjectPlan:
 			if request.PlanProjection == nil || request.PlanProjection.VersionID == "" {
 				return ErrInvalidClaim
 			}
-			if err := markPlanNeedsAttentionTx(ctx, tx, request.PlanProjection.VersionID, reason, now); err != nil {
+			if err := markPlanNeedsAttentionTx(ctx, tx, request.PlanProjection.VersionID, reason, now, isolated...); err != nil {
 				return err
 			}
 			if _, err := s.queueWorkflowInboxProjectionTx(ctx, tx, request.Repository, now); err != nil {
@@ -1077,7 +1077,7 @@ func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, re
 				return err
 			}
 			for _, versionID := range versionIDs {
-				if err := markPlanNeedsAttentionTx(ctx, tx, versionID, reason, now); err != nil {
+				if err := markPlanNeedsAttentionTx(ctx, tx, versionID, reason, now, isolated...); err != nil {
 					return err
 				}
 			}
@@ -1116,7 +1116,7 @@ WHERE rt.version_id = s.version_id AND rt.issue_id = s.issue_id`, request.RunID)
 		}
 		return err
 	}
-	if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
+	if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now, isolated...); err != nil {
 		return err
 	}
 	return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)

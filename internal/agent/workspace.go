@@ -783,6 +783,9 @@ func isDeliverySourceStructuralGitFailure(exitCode int, stderr string) bool {
 	if exitCode == 1 && detail == "" {
 		return true
 	}
+	if strings.Contains(detail, "packed-refs") && (strings.Contains(detail, "unterminated line in") || strings.Contains(detail, "unexpected line in")) {
+		return true
+	}
 	for _, marker := range []string{
 		"not a git repository",
 		"bad config line",

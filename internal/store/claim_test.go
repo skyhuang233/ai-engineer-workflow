@@ -384,6 +384,18 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	err = markTicketNeedsAttentionTx(ctx, tx, version.ID, delivery.TicketID, "manual recovery required", now.Add(time.Minute))
+	var sharedIsolation *DeliveryIsolationRequired
+	if !errors.As(err, &sharedIsolation) || len(sharedIsolation.Targets) != 1 || sharedIsolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("Needs Attention isolation requirement = %#v, %v", sharedIsolation, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = db.cancelPlanTx(ctx, tx, version.ID, now.Add(time.Minute))
 	var isolation *DeliveryIsolationRequired
 	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
@@ -598,7 +610,14 @@ func TestCertifiedNoLaunchRetriesExpiredReadyDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.FailDeliveryControllerLaunchWithClass(ctx, delivery, context.DeadlineExceeded.Error(), FailureInfrastructure, now.Add(2*time.Hour)); err != nil {
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	audit := WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, audit, now.Add(2*time.Hour)); !errors.Is(err, ErrDeliveryLaunchLeaseExpired) {
+		t.Fatalf("expired launch reservation = %v, want ErrDeliveryLaunchLeaseExpired", err)
+	}
+	if err := db.FailDeliveryControllerLaunchWithClass(ctx, delivery, ErrDeliveryLaunchLeaseExpired.Error(), FailureInfrastructure, now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
@@ -1893,10 +1912,27 @@ func TestClosedPullRequestFreezesPlan(t *testing.T) {
 	if err := db.MarkActive(ctx, version.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour}); err != nil {
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
 		t.Fatal(err)
 	}
-	frozen, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, time.Now().UTC())
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second))
+	var isolation *DeliveryIsolationRequired
+	if frozen || !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("closed pull request isolation requirement = frozen %t, %#v, %v", frozen, isolation, err)
+	}
+	frozen, err = db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second), isolation.Targets...)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -173,6 +173,8 @@ func TestDeliverySourceProbeDistinguishesStructuralAndOperationalFailures(t *tes
 	}{
 		{name: "missing config value", exitCode: 1, structural: true},
 		{name: "not a repository", exitCode: 128, stderr: "fatal: not a git repository", structural: true},
+		{name: "unterminated packed refs", exitCode: 128, stderr: "fatal: unterminated line in ./packed-refs: 012345", structural: true},
+		{name: "unexpected packed refs line", exitCode: 128, stderr: "fatal: unexpected line in ./packed-refs: invalid", structural: true},
 		{name: "permission failure", exitCode: 128, stderr: "fatal: cannot open config file: Permission denied"},
 		{name: "device IO failure", exitCode: 128, stderr: "fatal: failed to read object: Input/output error"},
 	}

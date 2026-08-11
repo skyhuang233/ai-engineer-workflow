@@ -739,12 +739,24 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	var disposition store.GitHubPollTerminalFailureDisposition
-	var attentionErr error
-	if retryUnowned {
-		disposition, attentionErr = p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now())
-	} else {
-		disposition, attentionErr = p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now())
+	resolve := func(isolated ...store.TicketClaim) (store.GitHubPollTerminalFailureDisposition, error) {
+		if retryUnowned {
+			return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
+		}
+		return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
+	}
+	disposition, attentionErr := resolve()
+	var isolation *store.DeliveryIsolationRequired
+	if errors.As(attentionErr, &isolation) {
+		if p.ContainerIsolator == nil {
+			return errors.Join(result, attentionErr, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
+		}
+		for _, target := range isolation.Targets {
+			if isolateErr := p.ContainerIsolator.IsolateContainer(persistenceCtx, target.RunID); isolateErr != nil {
+				return errors.Join(result, attentionErr, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+			}
+		}
+		disposition, attentionErr = resolve(isolation.Targets...)
 	}
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)

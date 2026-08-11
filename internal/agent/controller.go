@@ -444,6 +444,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		resultErr = errors.Join(resultErr, cleanupSealedSource())
 	}()
 	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now()); err != nil {
+		if errors.Is(err, store.ErrDeliveryLaunchLeaseExpired) {
+			cause := worker.CertifiedNoLaunchError{Err: err}
+			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, cause, store.FailureInfrastructure)
+		}
 		if errors.Is(err, store.ErrWorkerLaunched) {
 			return err
 		}
@@ -705,15 +709,40 @@ func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.Pl
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
-	return errors.Join(cause, c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now()))
+	storeErr := c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now())
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+		return c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now(), isolated...)
+	})
+	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	return errors.Join(cause, c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts()))
+	storeErr := c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
+	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.TicketClaim) error {
+		return c.Store.FailDeliveryControllerWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
+	})
+	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	return errors.Join(cause, c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts()))
+}
+
+func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, retry func([]store.TicketClaim) error) error {
+	var isolation *store.DeliveryIsolationRequired
+	if !errors.As(err, &isolation) {
+		return err
+	}
+	isolator, ok := c.Runtime.(worker.ContainerIsolator)
+	if !ok {
+		return errors.Join(err, errors.New("agent controller cannot isolate an active Delivery Controller"))
+	}
+	for _, target := range isolation.Targets {
+		if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+		}
+	}
+	return retry(isolation.Targets)
 }
 
 func runtimeStdout(result worker.Result) []byte {

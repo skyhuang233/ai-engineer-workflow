@@ -67,11 +67,30 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 			return pullRequestPending, wrapPollStoreError(err)
 		}
 	case pullRequestClosedUnmerged:
-		if _, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, time.Now().UTC()); err != nil {
+		if err := r.freezeClosedPullRequest(ctx, delivery); err != nil {
 			return pullRequestPending, wrapPollStoreError(err)
 		}
 	}
 	return deliveryState.State, nil
+}
+
+func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delivery store.TicketDelivery) error {
+	now := time.Now().UTC()
+	_, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now)
+	var isolation *store.DeliveryIsolationRequired
+	if !errors.As(err, &isolation) {
+		return err
+	}
+	if r.Isolator == nil {
+		return errors.Join(err, errors.New("delivered reconciler cannot isolate an active Delivery Controller"))
+	}
+	for _, target := range isolation.Targets {
+		if isolateErr := r.Isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
+		}
+	}
+	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, isolation.Targets...)
+	return err
 }
 
 func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {

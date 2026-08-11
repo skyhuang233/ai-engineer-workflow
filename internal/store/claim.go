@@ -686,6 +686,22 @@ AND EXISTS (
 		return err
 	}
 	if count != 1 {
+		if runKind == RunDelivery {
+			var expiredReady int
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+SELECT 1 FROM worker_runs r
+JOIN ticket_sessions s ON s.current_run_id = r.run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ? AND r.state = ?
+AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1
+AND l.lease_token = ? AND l.state = ? AND l.expires_at <= ?
+)`, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now)).Scan(&expiredReady); err != nil {
+				return err
+			}
+			if expiredReady != 0 {
+				return ErrDeliveryLaunchLeaseExpired
+			}
+		}
 		return ErrWorkerLaunched
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_audits(run_id, lease_generation, container_id, image_digest, mounts_json, extra_hosts_json, tool_versions_json, github_write_credentials, created_at)

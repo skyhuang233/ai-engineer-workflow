@@ -821,16 +821,16 @@ func (s *Store) DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(ctx contex
 	return s.advanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, recoveryPlanVersionID, attemptedPlanVersionIDs, retryAt, leaseToken, leaseNow)
 }
 
-func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
+func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...TicketClaim) error {
 	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
 	if err != nil {
 		return err
 	}
-	markErr := s.MarkRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow)
+	markErr := s.MarkRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow, isolated...)
 	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
+func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -844,44 +844,44 @@ func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, reposito
 	if err := requireGitHubPollLeaseTx(ctx, tx, repository, leaseToken, leaseNow); err != nil {
 		return err
 	}
-	if _, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, "", now); err != nil {
+	if _, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, "", now, isolated...); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time) error {
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...TicketClaim) error {
 	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
 	if err != nil {
 		return err
 	}
-	markErr := s.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow)
+	markErr := s.MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx, repository, now, token, leaseNow, isolated...)
 	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow, false)
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) error {
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow, false, isolated)
 	return err
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) error {
-	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, false)
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) error {
+	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, false, isolated)
 	return err
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, true)
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) (GitHubPollTerminalFailureDisposition, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, true, isolated)
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, true)
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) (GitHubPollTerminalFailureDisposition, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, true, isolated)
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time) (GitHubPollTerminalFailureDisposition, error) {
-	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, false)
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...TicketClaim) (GitHubPollTerminalFailureDisposition, error) {
+	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, false, isolated)
 }
 
-func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, retryUnowned bool) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, retryUnowned bool, isolated []TicketClaim) (GitHubPollTerminalFailureDisposition, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -926,7 +926,7 @@ FROM github_poll_cursors WHERE repository = ?`, repository).Scan(&persistedRecov
 		}
 		return GitHubPollTerminalFailureResolved, nil
 	}
-	owned, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now)
+	owned, err := markRepositoryNeedsAttentionTx(ctx, tx, repository, recoveryPlanVersionID, now, isolated...)
 	if err != nil {
 		return "", err
 	}
@@ -1018,7 +1018,7 @@ func markFrozenAttemptedPlansPollRecoveryTx(ctx context.Context, tx *sql.Tx, rep
 	return owned, nil
 }
 
-func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time) (bool, error) {
+func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time, isolated ...TicketClaim) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
 WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
     v.version_id = ? AND ((
@@ -1045,6 +1045,21 @@ WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
 	}
 	if err := rows.Close(); err != nil {
 		return false, err
+	}
+	var isolationTargets []TicketClaim
+	for _, versionID := range versionIDs {
+		err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated)
+		var isolation *DeliveryIsolationRequired
+		if errors.As(err, &isolation) {
+			isolationTargets = append(isolationTargets, isolation.Targets...)
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	if len(isolationTargets) > 0 {
+		return false, &DeliveryIsolationRequired{Targets: isolationTargets}
 	}
 	for _, versionID := range versionIDs {
 		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
@@ -1075,7 +1090,7 @@ WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
 			return false, err
 		}
 		for _, issueID := range issueIDs {
-			if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "GitHub polling exhausted its retry budget", now); err != nil {
+			if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "GitHub polling exhausted its retry budget", now, isolated...); err != nil {
 				return false, err
 			}
 			var ticketQuestionID string
@@ -1778,7 +1793,10 @@ ON CONFLICT(repository, version_id, issue_id, kind, generation) DO NOTHING`, que
 	return err
 }
 
-func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time) error {
+func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time, isolated ...TicketClaim) error {
+	if err := requireDeliveryIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
+		return err
+	}
 	var repository string
 	var number int64
 	var acceptedCommit string
@@ -1877,7 +1895,10 @@ VALUES (?, ?, ?, ?, 'needs_attention', ?, ?, 'open', ?)`, questionID, repository
 	return err
 }
 
-func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time) error {
+func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time, isolated ...TicketClaim) error {
+	if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT issue_id FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID)
 	if err != nil {
 		return err
@@ -1899,7 +1920,7 @@ func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason
 		return err
 	}
 	for _, issueID := range issueIDs {
-		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now); err != nil {
+		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now, isolated...); err != nil {
 			return err
 		}
 	}
