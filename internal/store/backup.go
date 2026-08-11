@@ -613,7 +613,7 @@ func (s *Store) ReconcilePreview(ctx context.Context) (ReconcilePreview, error) 
 // turns unknown outbox writes into reconcile-only work, releases Worker Runs
 // with a fresh lease boundary, preserves Inbox questions, and makes pollers
 // eligible to re-observe GitHub without issuing a write itself.
-func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time) error {
+func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time, isolated ...TicketClaim) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -626,7 +626,7 @@ func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time
 		return err
 	}
 	defer tx.Rollback()
-	if err := reconcileRestoredControlPlaneTx(ctx, tx, now); err != nil {
+	if err := reconcileRestoredControlPlaneTx(ctx, tx, now, isolated, false); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -648,10 +648,10 @@ func (s *Store) ReconcileRestoredControlPlaneDryRun(ctx context.Context, now tim
 		return err
 	}
 	defer tx.Rollback()
-	return reconcileRestoredControlPlaneTx(ctx, tx, now)
+	return reconcileRestoredControlPlaneTx(ctx, tx, now, nil, true)
 }
 
-func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
+func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []TicketClaim, modelIsolation bool) error {
 	stamp := formatTimestamp(now)
 	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', dispatcher_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE state = ?`, OutboxPending, "delivery state was interrupted by Control Plane restore", stamp, stamp, OutboxProcessing); err != nil {
 		return err
@@ -659,7 +659,7 @@ func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.T
 	if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET last_success_at = '', last_full_reconcile_at = '', next_attempt_at = ?, updated_at = ?`, stamp, stamp); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, l.lease_token
+	rows, err := tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, r.lease_generation, l.lease_token, l.expires_at
 FROM worker_runs r JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
@@ -667,13 +667,14 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 		return err
 	}
 	type activeRun struct {
-		runID, kind, versionID, lease string
-		issueID                       int64
+		runID, kind, versionID, lease, expiresAt string
+		issueID                                  int64
+		leaseGeneration                          int64
 	}
 	var active []activeRun
 	for rows.Next() {
 		var run activeRun
-		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.lease); err != nil {
+		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.leaseGeneration, &run.lease, &run.expiresAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -684,7 +685,15 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 	}
 	for _, run := range active {
 		if run.kind == RunDelivery {
-			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now); err != nil {
+			proofs := isolated
+			if modelIsolation {
+				expiresAt, err := time.Parse(time.RFC3339Nano, run.expiresAt)
+				if err != nil {
+					return err
+				}
+				proofs = append(proofs, TicketClaim{VersionID: run.versionID, TicketID: run.issueID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt})
+			}
+			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, proofs...); err != nil {
 				return err
 			}
 			continue

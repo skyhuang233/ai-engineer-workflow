@@ -23,6 +23,9 @@ func init() {
 	_ = logFile.Close()
 	if len(os.Args) > 1 && os.Args[1] == "create" {
 		_, _ = fmt.Fprintln(os.Stdout, "prepared-container")
+		if os.Getenv("WORKFLOW_DOCKER_RUNTIME_CREATE_FAIL") == "1" {
+			os.Exit(3)
+		}
 		os.Exit(0)
 	}
 	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "start" {
@@ -123,7 +126,19 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
 		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
 	}
+	fenced := false
+	released := false
+	spec.ContainerCreateFence = func(context.Context) (func(), error) {
+		if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("Docker create ran before create fence: %v", err)
+		}
+		fenced = true
+		return func() { released = true }, nil
+	}
 	spec.StartAdmission = func(context.Context) error {
+		if !fenced || !released {
+			return errors.New("container create fence was not held and released around Docker create")
+		}
 		commands, err := os.ReadFile(logPath)
 		if err != nil {
 			return err
@@ -143,6 +158,34 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	}
 	if result.ContainerID != "prepared-container" || strings.TrimSpace(string(result.Stdout)) != "started" || !strings.Contains(string(commands), "container start --attach prepared-container") {
 		t.Fatalf("admitted Docker start = result %#v, commands %q", result, commands)
+	}
+}
+
+func TestDockerRuntimeSweepsUncertainCreateBeforeCertification(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_CREATE_FAIL", "1")
+	spec := Spec{
+		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+		StartAdmission: func(context.Context) error { return nil },
+	}
+	_, err = (DockerRuntime{Binary: binary}).Run(context.Background(), spec)
+	if !IsCertifiedNoLaunchFailure(err) {
+		t.Fatalf("uncertain Docker create = %T %v", err, err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(commands)
+	if !strings.Contains(log, "container ls --all --quiet --filter label=workflow.run_id=run-1") || !strings.Contains(log, "container rm --force prepared-container") {
+		t.Fatalf("uncertain create cleanup commands = %q", log)
 	}
 }
 

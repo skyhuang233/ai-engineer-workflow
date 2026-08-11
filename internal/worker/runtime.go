@@ -70,19 +70,20 @@ type Mount struct {
 }
 
 type Spec struct {
-	RunID              string
-	Command            []string
-	WorkspacePath      string
-	CodexStatePath     string
-	Branch             string
-	AgentIdentity      string
-	ImageDigest        string
-	ToolVersions       map[string]string
-	Environment        map[string]string
-	Mounts             []Mount
-	ExtraHosts         []string
-	ContainerPreflight string
-	StartAdmission     func(context.Context) error
+	RunID                string
+	Command              []string
+	WorkspacePath        string
+	CodexStatePath       string
+	Branch               string
+	AgentIdentity        string
+	ImageDigest          string
+	ToolVersions         map[string]string
+	Environment          map[string]string
+	Mounts               []Mount
+	ExtraHosts           []string
+	ContainerPreflight   string
+	ContainerCreateFence func(context.Context) (func(), error)
+	StartAdmission       func(context.Context) error
 }
 
 type Result struct {
@@ -271,17 +272,42 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, spec Spec) (Result, error) {
 	args := dockerArgs(spec)
 	args[0] = "create"
+	releaseCreate := func() {}
+	if spec.ContainerCreateFence != nil {
+		var err error
+		releaseCreate, err = spec.ContainerCreateFence(ctx)
+		if err != nil {
+			return Result{}, CertifiedNoLaunchError{Err: err}
+		}
+		if releaseCreate == nil {
+			return Result{}, CertifiedNoLaunchError{Err: errors.New("worker container create fence did not provide a release function")}
+		}
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	var createStdout, createStderr bytes.Buffer
 	cmd.Stdout = &createStdout
 	cmd.Stderr = &createStderr
-	if err := cmd.Run(); err != nil {
+	createErr := cmd.Run()
+	releaseCreate()
+	if createErr != nil {
 		output := append(append([]byte(nil), createStdout.Bytes()...), createStderr.Bytes()...)
-		return Result{Output: output, Stdout: createStdout.Bytes(), Stderr: createStderr.Bytes(), ExitCode: 1}, CertifiedNoLaunchError{Err: err}
+		result := Result{Output: output, Stdout: createStdout.Bytes(), Stderr: createStderr.Bytes(), ContainerID: strings.TrimSpace(createStdout.String()), ExitCode: 1}
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+		defer cancelCleanup()
+		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
+			return result, PreparedContainerCleanupError{Err: errors.Join(createErr, cleanupErr)}
+		}
+		return Result{}, CertifiedNoLaunchError{Err: createErr}
 	}
 	containerID := strings.TrimSpace(createStdout.String())
 	if containerID == "" {
-		return Result{}, InfrastructureError{Err: errors.New("Docker did not report the prepared worker container ID")}
+		cause := InfrastructureError{Err: errors.New("Docker did not report the prepared worker container ID")}
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+		defer cancelCleanup()
+		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
+			return Result{}, PreparedContainerCleanupError{Err: errors.Join(cause, cleanupErr)}
+		}
+		return Result{}, CertifiedNoLaunchError{Err: cause}
 	}
 	removePrepared := func() error {
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
@@ -388,6 +414,10 @@ func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error
 	if name == "" {
 		name = "docker"
 	}
+	return isolateContainersByRunID(ctx, name, runID)
+}
+
+func isolateContainersByRunID(ctx context.Context, name, runID string) error {
 	output, err := exec.CommandContext(ctx, name, "container", "ls", "--all", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
 	if err != nil {
 		return fmt.Errorf("inspect expired worker container: %w", err)

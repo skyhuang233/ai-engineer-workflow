@@ -31,6 +31,67 @@ type githubTokenProviderFunc func(context.Context) (string, error)
 
 func (f githubTokenProviderFunc) Token(ctx context.Context) (string, error) { return f(ctx) }
 
+type restoreContainerIsolatorFunc func(context.Context, string) error
+
+func (f restoreContainerIsolatorFunc) IsolateContainer(ctx context.Context, runID string) error {
+	return f(ctx, runID)
+}
+
+func TestReconcileRestoredControlPlaneIsolatesPreparedDeliveryBeforeApplying(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repository",
+		Root:       plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}},
+		Children:   []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	err = reconcileRestoredControlPlane(ctx, db, restoreContainerIsolatorFunc(func(_ context.Context, runID string) error {
+		isolated = append(isolated, runID)
+		return nil
+	}), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 1 || isolated[0] != delivery.RunID {
+		t.Fatalf("restored Delivery Controller isolation = %#v", isolated)
+	}
+	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("restored Delivery Controller state = %q", projection.Tickets[0].State)
+	}
+}
+
 func TestProvisionGitHubAppDiscoversInstallationVerifiesContractAndStoresOnlyIdentity(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

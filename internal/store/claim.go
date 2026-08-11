@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/plan"
@@ -635,6 +636,46 @@ AND EXISTS (
 		return ErrWorkerLaunched
 	}
 	return nil
+}
+
+func (s *Store) AcquireDeliveryControllerCreateFence(ctx context.Context, claim TicketClaim, now time.Time) (func(), error) {
+	s.leaseMu.Lock()
+	release := sync.OnceFunc(s.leaseMu.Unlock)
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		release()
+		return nil, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	var expiresText string
+	err := s.db.QueryRowContext(ctx, `SELECT l.expires_at
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.lease_generation = ?
+AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1
+AND l.lease_token = ? AND l.state = ?`, claim.VersionID, claim.TicketID, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.LeaseToken, LeaseActive).Scan(&expiresText)
+	if errors.Is(err, sql.ErrNoRows) {
+		release()
+		return nil, ErrWorkerLaunched
+	}
+	if err != nil {
+		release()
+		return nil, err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	if !expiresAt.After(now) {
+		release()
+		return nil, ErrDeliveryLaunchLeaseExpired
+	}
+	return release, nil
 }
 
 func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time) error {

@@ -156,10 +156,30 @@ func runRestore(args []string) {
 		fail(err)
 	}
 	defer db.Close()
-	if err := db.ReconcileRestoredControlPlane(context.Background(), time.Now().UTC()); err != nil {
+	if err := reconcileRestoredControlPlane(context.Background(), db, worker.DockerRuntime{}, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+}
+
+func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, now time.Time) error {
+	var isolated []store.TicketClaim
+	for {
+		err := db.ReconcileRestoredControlPlane(ctx, now, isolated...)
+		var isolation *store.DeliveryIsolationRequired
+		if !errors.As(err, &isolation) {
+			return err
+		}
+		if isolator == nil {
+			return errors.Join(err, errors.New("restore cannot isolate an active Delivery Controller"))
+		}
+		for _, target := range isolation.Targets {
+			if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
+				return errors.Join(err, fmt.Errorf("isolate restored Delivery Controller %s: %w", target.RunID, isolateErr))
+			}
+			isolated = append(isolated, target)
+		}
+	}
 }
 
 func runBackupDrill(args []string) {

@@ -427,6 +427,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		ExtraHosts:         []string{worker.GatewayHostMapping},
 		ContainerPreflight: deliverySourceContainerPreflight,
 	}
+	deliverySpec.ContainerCreateFence = func(createCtx context.Context) (func(), error) {
+		return c.Store.AcquireDeliveryControllerCreateFence(createCtx, deliveryClaim, c.now())
+	}
 	deliverySpec.StartAdmission = func(startCtx context.Context) error {
 		return c.Store.ReserveDeliveryControllerLaunch(startCtx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now())
 	}

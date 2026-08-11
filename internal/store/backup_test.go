@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -195,4 +196,69 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	}
 
 	_ = processing
+}
+
+func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(t.TempDir(), "workflow.backup.db")
+	metadata, err := db.CreateOnlineBackup(ctx, backupPath, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !metadata.LastDrill.Succeeded {
+		t.Fatalf("prepared-delivery restore drill = %#v", metadata.LastDrill)
+	}
+	restoredPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := RestoreBackup(ctx, backupPath, restoredPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(ctx, restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	err = restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute))
+	var isolation *DeliveryIsolationRequired
+	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("restore isolation requirement = %#v, %v", isolation, err)
+	}
+	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute), isolation.Targets...); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := restored.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("restored prepared delivery state = %q", projection.Tickets[0].State)
+	}
 }

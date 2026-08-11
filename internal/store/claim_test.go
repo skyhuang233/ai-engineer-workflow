@@ -370,6 +370,28 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
 		t.Fatal(err)
 	}
+	releaseCreate, err := db.AcquireDeliveryControllerCreateFence(ctx, delivery, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	frozen := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute))
+		frozen <- err
+	}()
+	<-started
+	select {
+	case err := <-frozen:
+		t.Fatalf("terminalization crossed active container create fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseCreate()
+	var fencedIsolation *DeliveryIsolationRequired
+	if err := <-frozen; !errors.As(err, &fencedIsolation) || len(fencedIsolation.Targets) != 1 || fencedIsolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("post-create terminalization isolation requirement = %#v, %v", fencedIsolation, err)
+	}
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
