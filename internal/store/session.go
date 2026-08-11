@@ -182,7 +182,7 @@ func (e *DeliveryIsolationRequired) Error() string {
 func (e *DeliveryIsolationRequired) Unwrap() error { return ErrWorkerLaunched }
 
 func deliveryIsolationTargetsTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool) ([]TicketClaim, map[string]bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.lease_generation, r.container_create_generation, r.isolation_pending, l.lease_token, l.expires_at
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.lease_generation, r.container_create_generation, r.container_create_pending, r.isolation_pending, l.lease_token, l.expires_at
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
@@ -199,8 +199,8 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 	for rows.Next() {
 		var target TicketClaim
 		var expiresAt string
-		var isolationPending int
-		if err := rows.Scan(&target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.IsolationGeneration, &isolationPending, &target.LeaseToken, &expiresAt); err != nil {
+		var createPending, isolationPending int
+		if err := rows.Scan(&target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.IsolationGeneration, &createPending, &isolationPending, &target.LeaseToken, &expiresAt); err != nil {
 			return nil, nil, err
 		}
 		if len(issueIDs) > 0 && !issueIDs[target.TicketID] {
@@ -212,7 +212,7 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 			return nil, nil, err
 		}
 		targets = append(targets, target)
-		pending[target.RunID] = isolationPending != 0
+		pending[target.RunID] = isolationPending != 0 && createPending == 0
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
@@ -293,7 +293,7 @@ func (s *Store) FenceDeliveryIsolation(ctx context.Context, requested []TicketCl
 	seen := make(map[string]bool)
 	targets := make([]TicketClaim, 0, len(requested))
 	for _, proof := range requested {
-		if proof.VersionID == "" || proof.TicketID == 0 {
+		if proof.VersionID == "" || proof.TicketID == 0 || proof.SessionID == "" || proof.RunID == "" || proof.LeaseGeneration <= 0 || proof.IsolationGeneration < 0 || proof.LeaseToken == "" {
 			return nil, ErrInvalidClaim
 		}
 		current, _, err := deliveryIsolationTargetsTx(ctx, tx, proof.VersionID, map[int64]bool{proof.TicketID: true})
@@ -301,16 +301,28 @@ func (s *Store) FenceDeliveryIsolation(ctx context.Context, requested []TicketCl
 			return nil, err
 		}
 		if len(current) != 1 {
-			return nil, ErrInvalidClaim
+			return nil, ErrFencingConflict
 		}
 		target := current[0]
+		if proof.VersionID != target.VersionID || proof.TicketID != target.TicketID || proof.SessionID != target.SessionID || proof.RunID != target.RunID || proof.LeaseGeneration != target.LeaseGeneration || proof.IsolationGeneration != target.IsolationGeneration || proof.LeaseToken != target.LeaseToken {
+			return nil, ErrFencingConflict
+		}
 		if seen[target.RunID] {
 			continue
 		}
 		seen[target.RunID] = true
-		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1
-WHERE run_id = ? AND lease_generation = ? AND state = ?`, target.RunID, target.LeaseGeneration, RunRunning); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1
+WHERE run_id = ? AND lease_generation = ? AND container_create_generation = ? AND state = ?
+AND EXISTS (SELECT 1 FROM run_leases l WHERE l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation AND l.lease_token = ? AND l.state = ?)`, target.RunID, target.LeaseGeneration, target.IsolationGeneration, RunRunning, target.LeaseToken, LeaseActive)
+		if err != nil {
 			return nil, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if count != 1 {
+			return nil, ErrFencingConflict
 		}
 		targets = append(targets, target)
 	}
@@ -318,6 +330,50 @@ WHERE run_id = ? AND lease_generation = ? AND state = ?`, target.RunID, target.L
 		return nil, err
 	}
 	return targets, nil
+}
+
+func (s *Store) AcknowledgeDeliveryIsolation(ctx context.Context, fenced []TicketClaim) ([]TicketClaim, error) {
+	if len(fenced) == 0 {
+		return nil, ErrInvalidClaim
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	acknowledged := make([]TicketClaim, 0, len(fenced))
+	for _, proof := range fenced {
+		current, _, err := deliveryIsolationTargetsTx(ctx, tx, proof.VersionID, map[int64]bool{proof.TicketID: true})
+		if err != nil {
+			return nil, err
+		}
+		if len(current) != 1 {
+			return nil, ErrFencingConflict
+		}
+		target := current[0]
+		if proof.VersionID != target.VersionID || proof.TicketID != target.TicketID || proof.SessionID != target.SessionID || proof.RunID != target.RunID || proof.LeaseGeneration != target.LeaseGeneration || proof.IsolationGeneration != target.IsolationGeneration || proof.LeaseToken != target.LeaseToken {
+			return nil, ErrFencingConflict
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE worker_runs SET container_create_pending = 0
+WHERE run_id = ? AND lease_generation = ? AND container_create_generation = ? AND isolation_pending = 1 AND state = ?`, target.RunID, target.LeaseGeneration, target.IsolationGeneration, RunRunning)
+		if err != nil {
+			return nil, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if count != 1 {
+			return nil, ErrFencingConflict
+		}
+		acknowledged = append(acknowledged, target)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return acknowledged, nil
 }
 
 // ExpiredLaunchedRecoveryRuns lists current Agent and Delivery Controller Runs
@@ -336,13 +392,13 @@ func (s *Store) ExpiredLaunchedRecoveryRuns(ctx context.Context, versionID strin
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
 s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit, s.accepted_candidate_run_id,
-l.lease_token, l.generation, l.expires_at
+	r.container_create_generation, l.lease_token, l.generation, l.expires_at
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE s.version_id = ? AND s.current_run_id = r.run_id
-AND (r.run_kind = ? OR (r.run_kind = ? AND r.launch_state IN ('ready', 'launched')))
+	AND (r.run_kind = ? OR (r.run_kind = ? AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))))
 AND r.state = ? AND l.state = ? AND l.expires_at <= ?
 ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunDelivery, RunRunning, LeaseActive, formatTimestamp(now))
 	if err != nil {
@@ -409,7 +465,7 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 	}
 	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, t.issue_number, t.title, s.owner, s.session_id,
 s.agent_identity, s.codex_session_id, s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit, s.accepted_candidate_run_id,
-l.lease_token, l.generation, l.expires_at
+	r.container_create_generation, l.lease_token, l.generation, l.expires_at
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
@@ -475,7 +531,7 @@ func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
 		var expiresAt string
 		if err := rows.Scan(&run.Claim.RunID, &run.Kind, &run.Claim.VersionID, &run.Claim.TicketID, &run.Claim.TicketNumber, &run.Claim.TicketTitle, &run.Claim.Owner, &run.Claim.SessionID,
 			&run.Session.AgentIdentity, &run.Session.CodexSessionID, &run.Session.WorkspacePath, &run.Session.CodexStatePath, &run.Session.Branch, &run.Session.AcceptedCommit,
-			&run.Session.AcceptedCandidateRunID,
+			&run.Session.AcceptedCandidateRunID, &run.Claim.IsolationGeneration,
 			&run.Claim.LeaseToken, &run.Claim.LeaseGeneration, &expiresAt); err != nil {
 			return nil, err
 		}

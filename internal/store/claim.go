@@ -639,11 +639,11 @@ AND EXISTS (
 	return nil
 }
 
-func (s *Store) AcquireDeliveryControllerCreateFence(ctx context.Context, claim TicketClaim, now time.Time) (func(), error) {
+func (s *Store) AcquireDeliveryControllerCreateFence(ctx context.Context, claim TicketClaim, now time.Time) (func(context.Context) error, error) {
 	s.leaseMu.Lock()
-	release := sync.OnceFunc(s.leaseMu.Unlock)
+	unlock := sync.OnceFunc(s.leaseMu.Unlock)
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
-		release()
+		unlock()
 		return nil, ErrInvalidClaim
 	}
 	if now.IsZero() {
@@ -653,27 +653,27 @@ func (s *Store) AcquireDeliveryControllerCreateFence(ctx context.Context, claim 
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		release()
+		unlock()
 		return nil, err
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE worker_runs
-SET container_create_generation = container_create_generation + 1
+SET container_create_generation = container_create_generation + 1, container_create_pending = 1
 WHERE run_id = ? AND lease_generation = ? AND run_kind = ? AND state = ?
-AND launch_state = 'ready' AND prelaunch_reserved = 1 AND isolation_pending = 0
+AND launch_state = 'ready' AND prelaunch_reserved = 1 AND isolation_pending = 0 AND container_create_pending = 0
 AND EXISTS (
     SELECT 1 FROM ticket_sessions s
     JOIN run_leases l ON l.run_id = worker_runs.run_id AND l.generation = worker_runs.lease_generation
     WHERE s.version_id = ? AND s.issue_id = ? AND s.current_run_id = worker_runs.run_id
       AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?
-)`, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.VersionID, claim.TicketID, claim.LeaseToken, LeaseActive, formatTimestamp(now))
+	)`, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.VersionID, claim.TicketID, claim.LeaseToken, LeaseActive, formatTimestamp(now))
 	if err != nil {
-		release()
+		unlock()
 		return nil, err
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		release()
+		unlock()
 		return nil, err
 	}
 	if count != 1 {
@@ -684,20 +684,42 @@ JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.lease_generation = ?
 AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1
-AND r.isolation_pending = 0 AND l.lease_token = ? AND l.state = ? AND l.expires_at <= ?
+	AND r.isolation_pending = 0 AND l.lease_token = ? AND l.state = ? AND l.expires_at <= ?
 )`, claim.VersionID, claim.TicketID, claim.RunID, claim.LeaseGeneration, RunDelivery, RunRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now)).Scan(&expiredReady); err != nil {
-			release()
+			unlock()
 			return nil, err
 		}
-		release()
+		unlock()
 		if expiredReady != 0 {
 			return nil, ErrDeliveryLaunchLeaseExpired
 		}
 		return nil, ErrWorkerLaunched
 	}
 	if err := tx.Commit(); err != nil {
-		release()
+		unlock()
 		return nil, err
+	}
+	var once sync.Once
+	var releaseErr error
+	release := func(releaseCtx context.Context) error {
+		once.Do(func() {
+			defer unlock()
+			result, err := s.db.ExecContext(releaseCtx, `UPDATE worker_runs SET container_create_pending = 0
+WHERE run_id = ? AND lease_generation = ? AND container_create_pending = 1 AND isolation_pending = 0`, claim.RunID, claim.LeaseGeneration)
+			if err != nil {
+				releaseErr = err
+				return
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				releaseErr = err
+				return
+			}
+			if count != 1 {
+				releaseErr = ErrFencingConflict
+			}
+		})
+		return releaseErr
 	}
 	return release, nil
 }

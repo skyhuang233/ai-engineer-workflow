@@ -93,6 +93,10 @@ func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delive
 			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 		}
 	}
+	fenced, fenceErr = r.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if fenceErr != nil {
+		return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+	}
 	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, fenced...)
 	return err
 }
@@ -114,6 +118,10 @@ func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.T
 		if err := r.Isolator.IsolateContainer(ctx, target.RunID); err != nil {
 			return fmt.Errorf("isolate delivered Delivery Controller %s: %w", target.RunID, err)
 		}
+	}
+	fenced, err = r.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		return fmt.Errorf("acknowledge delivered Delivery Controller isolation: %w", err)
 	}
 	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, fenced[0])
 	return err

@@ -82,7 +82,7 @@ type Spec struct {
 	Mounts               []Mount
 	ExtraHosts           []string
 	ContainerPreflight   string
-	ContainerCreateFence func(context.Context) (func(), error)
+	ContainerCreateFence func(context.Context) (func(context.Context) error, error)
 	StartAdmission       func(context.Context) error
 }
 
@@ -272,7 +272,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, spec Spec) (Result, error) {
 	args := dockerArgs(spec)
 	args[0] = "create"
-	releaseCreate := func() {}
+	releaseCreate := func(context.Context) error { return nil }
 	if spec.ContainerCreateFence != nil {
 		var err error
 		releaseCreate, err = spec.ContainerCreateFence(ctx)
@@ -288,7 +288,17 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 	cmd.Stdout = &createStdout
 	cmd.Stderr = &createStderr
 	createErr := cmd.Run()
-	releaseCreate()
+	releaseCtx, cancelRelease := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+	releaseErr := releaseCreate(releaseCtx)
+	cancelRelease()
+	if releaseErr != nil {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+		defer cancelCleanup()
+		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
+			return Result{ContainerID: strings.TrimSpace(createStdout.String())}, PreparedContainerCleanupError{Err: errors.Join(createErr, releaseErr, cleanupErr)}
+		}
+		return Result{}, CertifiedNoLaunchError{Err: errors.Join(createErr, releaseErr)}
+	}
 	if createErr != nil {
 		output := append(append([]byte(nil), createStdout.Bytes()...), createStderr.Bytes()...)
 		result := Result{Output: output, Stdout: createStdout.Bytes(), Stderr: createStderr.Bytes(), ContainerID: strings.TrimSpace(createStdout.String()), ExitCode: 1}

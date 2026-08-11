@@ -760,6 +760,10 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 				return errors.Join(result, attentionErr, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 			}
 		}
+		fenced, fenceErr = p.Store.AcknowledgeDeliveryIsolation(persistenceCtx, fenced)
+		if fenceErr != nil {
+			return errors.Join(result, attentionErr, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+		}
 		disposition, attentionErr = resolve(fenced...)
 	}
 	if attentionErr != nil {
@@ -968,6 +972,10 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 						if isolateErr := p.ContainerIsolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
 							return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 						}
+					}
+					fenced, fenceErr = p.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
+					if fenceErr != nil {
+						return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
 					}
 					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), fenced...)
 				}

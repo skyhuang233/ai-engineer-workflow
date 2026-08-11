@@ -128,12 +128,15 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	}
 	fenced := false
 	released := false
-	spec.ContainerCreateFence = func(context.Context) (func(), error) {
+	spec.ContainerCreateFence = func(context.Context) (func(context.Context) error, error) {
 		if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("Docker create ran before create fence: %v", err)
 		}
 		fenced = true
-		return func() { released = true }, nil
+		return func(context.Context) error {
+			released = true
+			return nil
+		}, nil
 	}
 	spec.StartAdmission = func(context.Context) error {
 		if !fenced || !released {

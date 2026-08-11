@@ -387,7 +387,9 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatalf("terminalization crossed active container create fence: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	releaseCreate()
+	if err := releaseCreate(ctx); err != nil {
+		t.Fatal(err)
+	}
 	var fencedIsolation *DeliveryIsolationRequired
 	if err := <-frozen; !errors.As(err, &fencedIsolation) || len(fencedIsolation.Targets) != 1 || fencedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("post-create terminalization isolation requirement = %#v, %v", fencedIsolation, err)
@@ -498,6 +500,10 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	fenced, err = db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, fenced...); err != nil {
 		t.Fatal(err)
 	}
@@ -514,6 +520,81 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	questions, err := db.OpenWorkflowQuestions(ctx, snapshot.Repository, snapshot.Root.Number)
 	if err != nil || len(questions) != 1 {
 		t.Fatalf("recovery questions = %#v, %v", questions, err)
+	}
+}
+
+func TestDeliveryCreateAndIsolationFencesCoordinateAcrossStores(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	creator, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer creator.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := creator.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := creator.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	claim, err := creator.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := creator.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := creator.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	releaseCreate, err := creator.AcquireDeliveryControllerCreateFence(ctx, delivery, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isolator, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer isolator.Close()
+	targets, err := isolator.DeliveryIsolationTargets(ctx)
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("isolation targets = %#v, %v", targets, err)
+	}
+	stale := targets[0]
+	stale.RunID = "stale-run"
+	if _, err := isolator.FenceDeliveryIsolation(ctx, []TicketClaim{stale}); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("stale isolation target = %v, want ErrFencingConflict", err)
+	}
+	var isolationPending int
+	if err := isolator.db.QueryRowContext(ctx, `SELECT isolation_pending FROM worker_runs WHERE run_id = ?`, delivery.RunID).Scan(&isolationPending); err != nil || isolationPending != 0 {
+		t.Fatalf("stale target fenced current run = %d, %v", isolationPending, err)
+	}
+	fenced, err := isolator.FenceDeliveryIsolation(ctx, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var isolation *DeliveryIsolationRequired
+	if _, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), fenced...); !errors.As(err, &isolation) {
+		t.Fatalf("unacknowledged create containment = %v, want DeliveryIsolationRequired", err)
+	}
+	acknowledged, err := isolator.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseCreate(ctx); !errors.Is(err, ErrFencingConflict) {
+		t.Fatalf("create completion crossed isolation fence: %v", err)
+	}
+	frozen, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), acknowledged...)
+	if err != nil || !frozen {
+		t.Fatalf("acknowledged isolation did not terminalize: frozen=%t err=%v", frozen, err)
 	}
 }
 
@@ -2000,6 +2081,10 @@ func TestClosedPullRequestFreezesPlan(t *testing.T) {
 		t.Fatalf("closed pull request isolation requirement = frozen %t, %#v, %v", frozen, isolation, err)
 	}
 	fenced, err := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenced, err = db.AcknowledgeDeliveryIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}

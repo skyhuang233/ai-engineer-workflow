@@ -20,7 +20,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 53
+	latestSchemaVersion = 54
 )
 
 var (
@@ -35,6 +35,7 @@ var (
 	ErrGatewayWritesPaused        = errors.New("gateway writes are paused")
 	ErrWorkerLaunched             = errors.New("worker run has already been launched")
 	ErrDeliveryLaunchLeaseExpired = errors.New("delivery controller lease expired before launch")
+	ErrDatabaseIntegrity          = errors.New("database integrity check failed")
 	ErrNeedsAttention             = errors.New("workflow needs attention")
 )
 
@@ -112,7 +113,7 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 		return fmt.Errorf("check sqlite integrity: %w", err)
 	}
 	if result != "ok" {
-		return fmt.Errorf("check sqlite integrity: %s", result)
+		return fmt.Errorf("%w: %s", ErrDatabaseIntegrity, result)
 	}
 	return nil
 }
@@ -1465,6 +1466,20 @@ WHERE runtime.delivered = 1 AND (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (53, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 54 {
+		exists, err := tableHasColumnTx(ctx, tx, "worker_runs", "container_create_pending")
+		if err != nil {
+			return fmt.Errorf("migration 54: %w", err)
+		}
+		if !exists {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE worker_runs ADD COLUMN container_create_pending INTEGER NOT NULL DEFAULT 0 CHECK (container_create_pending IN (0, 1))"); err != nil {
+				return fmt.Errorf("migration 54: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (54, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

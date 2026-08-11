@@ -427,7 +427,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		ExtraHosts:         []string{worker.GatewayHostMapping},
 		ContainerPreflight: deliverySourceContainerPreflight,
 	}
-	deliverySpec.ContainerCreateFence = func(createCtx context.Context) (func(), error) {
+	deliverySpec.ContainerCreateFence = func(createCtx context.Context) (func(context.Context) error, error) {
 		return c.Store.AcquireDeliveryControllerCreateFence(createCtx, deliveryClaim, c.now())
 	}
 	deliverySpec.StartAdmission = func(startCtx context.Context) error {
@@ -760,7 +760,11 @@ func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.
 			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
 		}
 	}
-	return fenced, nil
+	acknowledged, err := c.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		return nil, fmt.Errorf("acknowledge Delivery Controller isolation: %w", err)
+	}
+	return acknowledged, nil
 }
 
 func runtimeStdout(result worker.Result) []byte {

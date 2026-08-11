@@ -151,41 +151,50 @@ func runRestore(args []string) {
 	defer lock.Close()
 	ctx := context.Background()
 	isolator := worker.DockerRuntime{}
-	if err := isolateCurrentControlPlane(ctx, *databasePath, isolator); err != nil {
+	if err := restoreControlPlane(ctx, *backupPath, *databasePath, isolator, time.Now().UTC()); err != nil {
 		fail(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(*databasePath), 0o700); err != nil {
-		fail(err)
+	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+}
+
+func restoreControlPlane(ctx context.Context, backupPath, databasePath string, isolator worker.ContainerIsolator, now time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
+		return err
 	}
-	staged, err := os.CreateTemp(filepath.Dir(*databasePath), filepath.Base(*databasePath)+".restore-staged-*.db")
+	staged, err := os.CreateTemp(filepath.Dir(databasePath), filepath.Base(databasePath)+".restore-staged-*.db")
 	if err != nil {
-		fail(err)
+		return err
 	}
 	stagedPath := staged.Name()
 	if err := staged.Close(); err != nil {
-		fail(err)
+		return err
 	}
 	defer os.Remove(stagedPath)
 	defer os.Remove(stagedPath + "-wal")
 	defer os.Remove(stagedPath + "-shm")
-	if err := store.RestoreBackup(ctx, *backupPath, stagedPath); err != nil {
-		fail(err)
+	if err := store.RestoreBackup(ctx, backupPath, stagedPath); err != nil {
+		return err
 	}
 	db, err := store.Open(ctx, stagedPath)
 	if err != nil {
-		fail(err)
+		return err
 	}
-	if err := reconcileRestoredControlPlane(ctx, db, isolator, time.Now().UTC()); err != nil {
+	if err := db.ReconcileRestoredControlPlaneDryRun(ctx, now); err != nil {
 		db.Close()
-		fail(err)
+		return err
+	}
+	if err := isolateCurrentControlPlane(ctx, databasePath, isolator); err != nil {
+		db.Close()
+		return err
+	}
+	if err := reconcileRestoredControlPlane(ctx, db, isolator, now); err != nil {
+		db.Close()
+		return err
 	}
 	if err := db.Close(); err != nil {
-		fail(err)
+		return err
 	}
-	if err := store.PublishRestoredBackup(ctx, stagedPath, *databasePath); err != nil {
-		fail(err)
-	}
-	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
+	return store.PublishRestoredBackup(ctx, stagedPath, databasePath)
 }
 
 func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolator worker.ContainerIsolator) error {
@@ -196,6 +205,9 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 	}
 	db, err := store.Open(ctx, databasePath)
 	if err != nil {
+		if store.IsDatabaseError(err) || errors.Is(err, store.ErrDatabaseIntegrity) {
+			return nil
+		}
 		return fmt.Errorf("open current Control Plane before restore: %w", err)
 	}
 	targets, targetErr := db.DeliveryIsolationTargets(ctx)
@@ -221,7 +233,11 @@ func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worke
 			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
 		}
 	}
-	return fenced, nil
+	acknowledged, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		return nil, fmt.Errorf("acknowledge Delivery Controller isolation: %w", err)
+	}
+	return acknowledged, nil
 }
 
 func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, now time.Time) error {
@@ -881,6 +897,10 @@ func runPollGitHub(args []string) {
 					if isolateErr := runtime.IsolateContainer(ctx, target.RunID); isolateErr != nil {
 						return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
 					}
+				}
+				fenced, fenceErr = db.AcknowledgeDeliveryIsolation(ctx, fenced)
+				if fenceErr != nil {
+					return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
 				}
 				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), fenced...)
 			}

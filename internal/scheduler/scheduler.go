@@ -209,6 +209,13 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		if err := d.Recovery.IsolateContainer(ctx, proof.RunID); err != nil {
 			return fmt.Errorf("isolate expired worker container %s: %w", proof.RunID, err)
 		}
+		if run.Kind == store.RunDelivery {
+			acknowledged, err := d.Store.AcknowledgeDeliveryIsolation(ctx, []store.TicketClaim{proof})
+			if err != nil {
+				return fmt.Errorf("acknowledge expired Delivery Controller isolation: %w", err)
+			}
+			proof = acknowledged[0]
+		}
 		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts, proof); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
 			return err
 		}

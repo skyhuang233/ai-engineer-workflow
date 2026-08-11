@@ -92,6 +92,85 @@ func TestReconcileRestoredControlPlaneIsolatesPreparedDeliveryBeforeApplying(t *
 	}
 }
 
+func TestRestoreValidatesStagedBackupBeforeCurrentIsolation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{Repository: "owner/repository", Root: plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	err = restoreControlPlane(ctx, filepath.Join(t.TempDir(), "missing.backup"), databasePath, restoreContainerIsolatorFunc(func(_ context.Context, runID string) error {
+		isolated = append(isolated, runID)
+		return nil
+	}), now)
+	if err == nil {
+		t.Fatal("invalid backup passed staged validation")
+	}
+	if len(isolated) != 0 {
+		t.Fatalf("current control plane isolated before staged validation: %#v", isolated)
+	}
+}
+
+func TestRestoreReplacesCorruptCurrentDatabase(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	source, err := store.Open(ctx, sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(directory, "workflow.backup")
+	if _, err := source.CreateOnlineBackup(ctx, backupPath, now); err != nil {
+		source.Close()
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(directory, "workflow.db")
+	if err := os.WriteFile(databasePath, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreControlPlane(ctx, backupPath, databasePath, restoreContainerIsolatorFunc(func(context.Context, string) error { return nil }), now); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatalf("open restored database: %v", err)
+	}
+	defer restored.Close()
+	if _, err := restored.ReconcilePreview(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProvisionGitHubAppDiscoversInstallationVerifiesContractAndStoresOnlyIdentity(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

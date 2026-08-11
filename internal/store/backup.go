@@ -695,7 +695,7 @@ ORDER BY s.version_id`, RunDelivery, RunRunning, LeaseActive)
 		return err
 	}
 	if modelIsolation {
-		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1, container_create_pending = 0
 WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticket_sessions)`, RunDelivery, RunRunning); err != nil {
 			return err
 		}
