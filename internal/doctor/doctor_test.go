@@ -44,6 +44,7 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"integration repository owner", func(c *Config) { c.GitHub.TestRepository = "collaborator/integration" }},
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
 		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
+		{"GitHub credential kind", func(c *Config) { c.GitHub.Credential.Kind = "fine-grained-pat" }},
 		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
 		{"checks read permission", func(c *Config) { delete(c.GitHub.Credential.Permissions, "checks") }},
 		{"GitHub App private key file", func(c *Config) { c.GitHub.Credential.PrivateKeyFile = "" }},

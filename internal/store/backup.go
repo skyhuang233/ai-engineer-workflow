@@ -232,6 +232,8 @@ func checksumReference(path string) (string, bool, error) {
 		if info.IsDir() {
 			return nil
 		}
+		// Active Ticket Session directories can contain transient sockets and
+		// other non-transportable entries; provenance covers regular file bytes.
 		if !info.Mode().IsRegular() {
 			return nil
 		}

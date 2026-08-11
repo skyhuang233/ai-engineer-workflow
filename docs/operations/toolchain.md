@@ -191,9 +191,13 @@ The command fails closed if any check fails. In particular, a locally built
 image is not evidence of publication: the pinned digest must resolve from the
 registry. The Release Manifest's exact digest must resolve from GHCR and pass
 the Docker contract. Doctor may activate the latest owner-accepted manifest
-even after unrelated `main` commits, but only while every pinned toolchain
-input remains current and the deterministic build-input identity still matches
-both its source commit and current `main`. That identity covers the
+even after unrelated `main` commits. It validates the current toolchain
+configuration completely, including the required GitHub App contract, but
+reconstructs a historical release using only the Worker-consumed build inputs;
+superseded historical `github.credential` values such as
+`kind: fine-grained-pat` do not invalidate that release. Every pinned Worker
+input must remain current, and the deterministic build-input identity must
+still match both its source commit and current `main`. That identity covers the
 `deploy/worker` Git tree, the pinned `publish-worker` workflow blob, and the
 Worker toolchain inputs consumed by the build. The Worker tree includes an
 immutable Debian snapshot and exact direct APT package versions, which are also

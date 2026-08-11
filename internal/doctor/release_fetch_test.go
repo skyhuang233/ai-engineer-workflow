@@ -32,6 +32,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	sourceWorkflowsTree := strings.Repeat("8", 40)
 	mainWorkflowsTree := strings.Repeat("9", 40)
 	publisherWorkflowBlob := strings.Repeat("b", 40)
+	currentPublisherWorkflowBlob := publisherWorkflowBlob
 	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob)
 	manifestData, err := json.Marshal(WorkerReleaseManifest{
 		ToolProvenance: workerrelease.ToolProvenance{
@@ -116,8 +117,10 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 			_, _ = w.Write([]byte(`{"tree":[{"path":"workflows","type":"tree","sha":"` + sourceWorkflowsTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainGitHubTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"workflows","type":"tree","sha":"` + mainWorkflowsTree + `"}]}`))
-		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceWorkflowsTree, "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainWorkflowsTree:
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceWorkflowsTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"publish-worker.yml","type":"blob","sha":"` + publisherWorkflowBlob + `"}]}`))
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainWorkflowsTree:
+			_, _ = w.Write([]byte(`{"tree":[{"path":"publish-worker.yml","type":"blob","sha":"` + currentPublisherWorkflowBlob + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/actions/runs/123":
 			_, _ = w.Write([]byte(`{"head_sha":"` + sourceSHA + `","head_branch":"main","event":"push","status":"completed","conclusion":"success","workflow_id":` + fmt.Sprint(workflowID) + `}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/actions/workflows/publish-worker.yml":
@@ -143,6 +146,7 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	if !fullPullRequested {
 		t.Fatal("fetch did not load the full merged pull request")
 	}
+	t.Logf("accepted immutable historical Worker release with matching build inputs: source=%s worker_tree=%s publisher_workflow=%s identity=%s source_credential=%s current_credential=%s", got.SourceCommit, sourceWorkerTree, publisherWorkflowBlob, got.BuildInputIdentity, sourceConfig.GitHub.Credential.Kind, config.GitHub.Credential.Kind)
 	immutableRelease = false
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil || !strings.Contains(err.Error(), "immutable") {
 		t.Fatalf("accepted a mutable authoritative Worker Release: %v", err)
@@ -184,6 +188,11 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	currentWorkerTree = strings.Repeat("d", 40)
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest after the current Worker build context changed")
+	}
+	currentWorkerTree = sourceWorkerTree
+	currentPublisherWorkflowBlob = strings.Repeat("d", 40)
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
+		t.Fatal("accepted a manifest after the current Worker publisher workflow changed")
 	}
 }
 
