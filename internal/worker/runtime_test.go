@@ -34,6 +34,9 @@ func init() {
 		os.Exit(0)
 	}
 	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "rm" {
+		if os.Getenv("WORKFLOW_DOCKER_RUNTIME_RM_FAIL") == "1" {
+			os.Exit(3)
+		}
 		os.Exit(0)
 	}
 	os.Exit(2)
@@ -170,6 +173,27 @@ func TestDockerRuntimeRemovesPreparedContainerAfterRejectedAdmission(t *testing.
 	}
 	if !strings.Contains(string(commands), "container rm --force prepared-container") {
 		t.Fatalf("prepared container cleanup commands = %q", commands)
+	}
+}
+
+func TestDockerRuntimePreservesPreparedContainerAfterCleanupFailure(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_RM_FAIL", "1")
+	admissionErr := errors.New("lease expired")
+	spec := Spec{
+		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+		StartAdmission: func(context.Context) error { return admissionErr },
+	}
+	result, err := (DockerRuntime{Binary: binary}).Run(context.Background(), spec)
+	if result.ContainerID != "prepared-container" || !IsPreparedContainerCleanupFailure(err) || IsCertifiedNoLaunchFailure(err) || !IsInfrastructureFailure(err) || !errors.Is(err, admissionErr) {
+		t.Fatalf("failed prepared cleanup = result %#v, error %T %v", result, err, err)
 	}
 }
 

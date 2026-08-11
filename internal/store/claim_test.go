@@ -370,6 +370,35 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
 		t.Fatal(err)
 	}
+	tx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = markTicketNeedsAttentionTx(ctx, tx, version.ID, delivery.TicketID, "manual recovery required", now.Add(time.Minute))
+	var preparedIsolation *DeliveryIsolationRequired
+	if !errors.As(err, &preparedIsolation) || len(preparedIsolation.Targets) != 1 || preparedIsolation.Targets[0].RunID != delivery.RunID {
+		t.Fatalf("prepared Needs Attention isolation requirement = %#v, %v", preparedIsolation, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	preparedExpired, err := db.ExpiredLaunchedRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preparedExpired) != 1 || preparedExpired[0].Claim.RunID != delivery.RunID {
+		t.Fatalf("expired prepared runs = %#v", preparedExpired)
+	}
+	if err := db.ReconcileMissingRecoveryRun(ctx, preparedExpired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts); !errors.As(err, &preparedIsolation) {
+		t.Fatalf("prepared recovery without isolation = %v, want DeliveryIsolationRequired", err)
+	}
+	var preparedLaunchState, preparedRunState, preparedLeaseState string
+	if err := db.db.QueryRowContext(ctx, `SELECT r.launch_state, r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&preparedLaunchState, &preparedRunState, &preparedLeaseState); err != nil {
+		t.Fatal(err)
+	}
+	if preparedLaunchState != "ready" || preparedRunState != RunRunning || preparedLeaseState != LeaseActive {
+		t.Fatalf("unisolated prepared recovery mutated state = launch %q run %q lease %q", preparedLaunchState, preparedRunState, preparedLeaseState)
+	}
 	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); !errors.Is(err, ErrWorkerLaunched) {
 		t.Fatalf("duplicate prelaunch reservation = %v, want ErrWorkerLaunched", err)
 	}
@@ -380,7 +409,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := db.db.BeginTx(ctx, nil)
+	tx, err = db.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

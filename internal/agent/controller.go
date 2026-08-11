@@ -449,6 +449,18 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
+	if deliveryErr != nil && worker.IsPreparedContainerCleanupFailure(deliveryErr) {
+		isolator, ok := c.Runtime.(worker.ContainerIsolator)
+		if !ok {
+			return errors.Join(deliveryErr, errors.New("agent controller cannot isolate a prepared Delivery Controller"))
+		}
+		isolationCtx, cancelIsolation := context.WithTimeout(context.Background(), workerAuditTimeout)
+		defer cancelIsolation()
+		if isolateErr := isolator.IsolateContainer(isolationCtx, deliveryClaim.RunID); isolateErr != nil {
+			return errors.Join(deliveryErr, fmt.Errorf("isolate prepared Delivery Controller %s: %w", deliveryClaim.RunID, isolateErr))
+		}
+		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+	}
 	if deliveryErr != nil && worker.IsCertifiedNoLaunchFailure(deliveryErr) {
 		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
 	}

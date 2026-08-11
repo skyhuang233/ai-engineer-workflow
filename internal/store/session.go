@@ -186,7 +186,9 @@ func requireDeliveryIsolationTx(ctx context.Context, tx *sql.Tx, versionID strin
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND r.run_kind = ? AND r.state = ? AND r.launch_state = 'launched' AND l.state = ?
+WHERE s.version_id = ? AND r.run_kind = ? AND r.state = ?
+AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))
+AND l.state = ?
 ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
 	if err != nil {
 		return err
@@ -310,7 +312,7 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
 	for _, delivery := range expired {
-		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, limit, now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, limit, now, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -340,7 +342,10 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 	return runs, nil
 }
 
-func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, maxAttempts int, now time.Time) error {
+func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, maxAttempts int, now time.Time, isolated []TicketClaim) error {
+	if err := requireDeliveryIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), runID, RunRunning); err != nil {
 		return err
 	}
@@ -439,7 +444,7 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 			return err
 		}
 		limit := maxWorkerAttempts(maxAttempts)
-		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, limit, now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, limit, now, isolated); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -1048,8 +1053,8 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 	}
 	expired := !expiresAt.After(now)
 	if expired && !allowExpiredUnstarted {
-		if launchState == "launched" {
-			return ErrWorkerLaunched
+		if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+			return err
 		}
 		nowText := formatTimestamp(now)
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
@@ -1058,7 +1063,7 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
 			return err
 		}
-		if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller lease expired before completion", now); err != nil {
+		if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller lease expired before completion", now, isolated...); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
@@ -1078,7 +1083,7 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 		}
 		willNeedAttention = priorAttempts+1 >= limit
 	}
-	if willNeedAttention && launchState == "launched" && !certifiedUnstarted {
+	if willNeedAttention && !certifiedUnstarted {
 		if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
 			return err
 		}
@@ -1128,10 +1133,10 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), claim.VersionID, claim.TicketID); err != nil {
 				return err
 			}
-		} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, fmt.Sprintf("Delivery Controller retry budget exhausted after %d attempts: %s", attempts, reason), now); err != nil {
+		} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, fmt.Sprintf("Delivery Controller retry budget exhausted after %d attempts: %s", attempts, reason), now, isolated...); err != nil {
 			return err
 		}
-	} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller failed: "+reason, now); err != nil {
+	} else if err := markTicketNeedsAttentionTx(ctx, tx, claim.VersionID, claim.TicketID, "Delivery Controller failed: "+reason, now, isolated...); err != nil {
 		return err
 	}
 	return tx.Commit()

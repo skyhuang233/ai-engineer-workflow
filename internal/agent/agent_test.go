@@ -2116,6 +2116,33 @@ func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T
 	}
 }
 
+func TestControllerIsolatesPreparedContainerAfterCleanupFailure(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		results:             []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr:         worker.PreparedContainerCleanupError{Err: errors.New("prepared container cleanup failed")},
+		deliveryErrorResult: worker.Result{ContainerID: "prepared-container"},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "prepared container cleanup failed") {
+		t.Fatalf("prepared cleanup failure = %v", err)
+	}
+	if len(runtime.isolatedRuns) != 1 || runtime.isolatedRuns[0] == "" {
+		t.Fatalf("prepared cleanup isolation = %#v", runtime.isolatedRuns)
+	}
+	retries, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC().Add(2*time.Minute))
+	if err != nil || len(retries) != 1 || retries[0].SessionID != claim.SessionID {
+		t.Fatalf("prepared cleanup retry = %#v, %v", retries, err)
+	}
+}
+
 func TestControllerCertifiedNoLaunchHonorsConfiguredAttemptLimit(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

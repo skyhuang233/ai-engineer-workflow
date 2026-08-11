@@ -247,7 +247,7 @@ WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &launchState, &runR
 					if launchState != "ready" {
 						return TicketClaim{}, ErrNotReady
 					}
-					if err := recoverExpiredDeliveryTx(ctx, tx, request.VersionID, selected.IssueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, request.MaxAttempts, request.Now); err != nil {
+					if err := recoverExpiredDeliveryTx(ctx, tx, request.VersionID, selected.IssueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, request.MaxAttempts, request.Now, nil); err != nil {
 						return TicketClaim{}, err
 					}
 					if err := tx.Commit(); err != nil {

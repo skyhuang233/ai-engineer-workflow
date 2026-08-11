@@ -40,6 +40,17 @@ func IsCertifiedNoLaunchFailure(err error) bool {
 	return errors.As(err, &failure) && failure.NoContainerStarted()
 }
 
+type PreparedContainerCleanupError struct{ Err error }
+
+func (e PreparedContainerCleanupError) Error() string               { return e.Err.Error() }
+func (e PreparedContainerCleanupError) Unwrap() error               { return e.Err }
+func (e PreparedContainerCleanupError) InfrastructureFailure() bool { return true }
+
+func IsPreparedContainerCleanupFailure(err error) bool {
+	var failure PreparedContainerCleanupError
+	return errors.As(err, &failure)
+}
+
 const (
 	GatewayHostMapping              = "host.docker.internal:host-gateway"
 	preparedContainerCleanupTimeout = 10 * time.Second
@@ -270,7 +281,7 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 	}
 	containerID := strings.TrimSpace(createStdout.String())
 	if containerID == "" {
-		return Result{}, CertifiedNoLaunchError{Err: errors.New("Docker did not report the prepared worker container ID")}
+		return Result{}, InfrastructureError{Err: errors.New("Docker did not report the prepared worker container ID")}
 	}
 	removePrepared := func() error {
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
@@ -281,11 +292,17 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		}
 		return nil
 	}
+	rejectPrepared := func(cause error) (Result, error) {
+		if cleanupErr := removePrepared(); cleanupErr != nil {
+			return Result{ContainerID: containerID}, PreparedContainerCleanupError{Err: errors.Join(cause, cleanupErr)}
+		}
+		return Result{}, CertifiedNoLaunchError{Err: cause}
+	}
 	if err := ctx.Err(); err != nil {
-		return Result{}, CertifiedNoLaunchError{Err: errors.Join(err, removePrepared())}
+		return rejectPrepared(err)
 	}
 	if err := spec.StartAdmission(ctx); err != nil {
-		return Result{}, CertifiedNoLaunchError{Err: errors.Join(err, removePrepared())}
+		return rejectPrepared(err)
 	}
 	cmd = exec.CommandContext(ctx, name, "container", "start", "--attach", containerID)
 	var stdout, stderr bytes.Buffer
