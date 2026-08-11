@@ -1362,21 +1362,36 @@ AND NOT EXISTS (
 	}
 	if applied < 50 {
 		now := time.Now().UTC()
-		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT question.repository
-FROM workflow_questions question
-JOIN ticket_runtime runtime ON runtime.version_id = question.version_id AND runtime.issue_id = question.issue_id
-WHERE runtime.delivered = 1 AND question.kind IN ('needs_attention', 'quality_gate') AND question.state = 'open'`)
+		rows, err := tx.QueryContext(ctx, `SELECT runtime.version_id, runtime.issue_id, plan.repository
+FROM ticket_runtime runtime
+JOIN plan_versions version ON version.version_id = runtime.version_id
+JOIN plans plan ON plan.id = version.plan_id
+WHERE runtime.delivered = 1 AND (
+    EXISTS (
+        SELECT 1 FROM workflow_questions question
+        WHERE question.version_id = runtime.version_id AND question.issue_id = runtime.issue_id
+        AND question.kind IN ('needs_attention', 'quality_gate', 'closed_unmerged_impact') AND question.state = 'open'
+    ) OR EXISTS (
+        SELECT 1 FROM plan_freezes freeze
+        WHERE freeze.version_id = runtime.version_id AND freeze.issue_id = runtime.issue_id
+    )
+)`)
 		if err != nil {
 			return fmt.Errorf("migration 50: %w", err)
 		}
-		var repositories []string
+		type deliveredRepair struct {
+			versionID  string
+			issueID    int64
+			repository string
+		}
+		var repairs []deliveredRepair
 		for rows.Next() {
-			var repository string
-			if err := rows.Scan(&repository); err != nil {
+			var repair deliveredRepair
+			if err := rows.Scan(&repair.versionID, &repair.issueID, &repair.repository); err != nil {
 				rows.Close()
 				return fmt.Errorf("migration 50: %w", err)
 			}
-			repositories = append(repositories, repository)
+			repairs = append(repairs, repair)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -1385,16 +1400,14 @@ WHERE runtime.delivered = 1 AND question.kind IN ('needs_attention', 'quality_ga
 		if err := rows.Close(); err != nil {
 			return fmt.Errorf("migration 50: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE workflow_questions
-SET state = 'answered', answer = 'resolved by delivery', answered_at = ?
-WHERE kind IN ('needs_attention', 'quality_gate') AND state = 'open'
-AND EXISTS (
-    SELECT 1 FROM ticket_runtime runtime
-    WHERE runtime.version_id = workflow_questions.version_id AND runtime.issue_id = workflow_questions.issue_id AND runtime.delivered = 1
-)`, formatTimestamp(now)); err != nil {
-			return fmt.Errorf("migration 50: %w", err)
+		repositories := make(map[string]struct{})
+		for _, repair := range repairs {
+			if _, err := resolveDeliveredAttentionTx(ctx, tx, repair.versionID, repair.issueID, formatTimestamp(now)); err != nil {
+				return fmt.Errorf("migration 50: %w", err)
+			}
+			repositories[repair.repository] = struct{}{}
 		}
-		for _, repository := range repositories {
+		for repository := range repositories {
 			if _, err := s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now); err != nil {
 				return fmt.Errorf("migration 50: %w", err)
 			}

@@ -223,10 +223,13 @@ func TestMigrationFromV49RepairsDeliveredQuestions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"needs_attention", "quality_gate"} {
+	for _, kind := range []string{"needs_attention", "quality_gate", "closed_unmerged_impact"} {
 		if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, kind, "stale delivery recovery", now.Add(time.Second)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plan_freezes(version_id, issue_id, reason, frozen_at) VALUES (?, ?, ?, ?)`, version.ID, int64(1), "pull request closed without merge", formatTimestamp(now)); err != nil {
+		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -251,12 +254,19 @@ func TestMigrationFromV49RepairsDeliveredQuestions(t *testing.T) {
 	defer migrated.Close()
 	var repairedQuestions int
 	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_questions
-WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate')
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate', 'closed_unmerged_impact')
 AND state = 'answered' AND answer = 'resolved by delivery' AND answered_at != ''`, version.ID, 1).Scan(&repairedQuestions); err != nil {
 		t.Fatal(err)
 	}
-	if repairedQuestions != 2 {
+	if repairedQuestions != 3 {
 		t.Fatalf("repaired delivered questions after migration = %d", repairedQuestions)
+	}
+	var remainingFreezes int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, version.ID, 1).Scan(&remainingFreezes); err != nil {
+		t.Fatal(err)
+	}
+	if remainingFreezes != 0 {
+		t.Fatalf("delivered ticket freezes after migration = %d", remainingFreezes)
 	}
 	var afterGeneration int64
 	if err := migrated.db.QueryRowContext(ctx, `SELECT generation FROM workflow_inbox_projections WHERE repository = ?`, snapshot.Repository).Scan(&afterGeneration); err != nil {
