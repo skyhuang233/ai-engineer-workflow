@@ -3,9 +3,40 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func init() {
+	if os.Getenv("WORKFLOW_DOCKER_RUNTIME_HELPER") != "1" {
+		return
+	}
+	logFile, err := os.OpenFile(os.Getenv("WORKFLOW_DOCKER_RUNTIME_LOG"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		os.Exit(2)
+	}
+	_, _ = fmt.Fprintln(logFile, strings.Join(os.Args[1:], " "))
+	_ = logFile.Close()
+	if len(os.Args) > 1 && os.Args[1] == "create" {
+		_, _ = fmt.Fprintln(os.Stdout, "prepared-container")
+		os.Exit(0)
+	}
+	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "start" {
+		_, _ = fmt.Fprintln(os.Stdout, "started")
+		os.Exit(0)
+	}
+	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "ls" {
+		_, _ = fmt.Fprintln(os.Stdout, "prepared-container")
+		os.Exit(0)
+	}
+	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "rm" {
+		os.Exit(0)
+	}
+	os.Exit(2)
+}
 
 func TestSpecRejectsGitHubWriteCredentialsAndRequiresAuditInputs(t *testing.T) {
 	spec := Spec{Command: []string{"codex", "exec"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1", AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, Environment: map[string]string{"GITHUB_TOKEN": "secret"}, ExtraHosts: []string{GatewayHostMapping}}
@@ -73,6 +104,62 @@ func TestDockerRuntimeCertifiesPreRuntimeContextExpiry(t *testing.T) {
 	_, err := (DockerRuntime{}).Run(ctx, spec)
 	if !IsCertifiedNoLaunchFailure(err) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-runtime context expiry = %T %v", err, err)
+	}
+}
+
+func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	spec := Spec{
+		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+	}
+	spec.StartAdmission = func(context.Context) error {
+		commands, err := os.ReadFile(logPath)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(string(commands), "create ") || strings.Contains(string(commands), "container start") {
+			return fmt.Errorf("start admission command order = %q", commands)
+		}
+		return nil
+	}
+	result, err := (DockerRuntime{Binary: binary}).Run(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ContainerID != "prepared-container" || strings.TrimSpace(string(result.Stdout)) != "started" || !strings.Contains(string(commands), "container start --attach prepared-container") {
+		t.Fatalf("admitted Docker start = result %#v, commands %q", result, commands)
+	}
+}
+
+func TestDockerRuntimeIsolationIncludesPreparedContainers(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	if err := (DockerRuntime{Binary: binary}).IsolateContainer(context.Background(), "run-1"); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(commands)
+	if !strings.Contains(log, "container ls --all --quiet --filter label=workflow.run_id=run-1") || !strings.Contains(log, "container rm --force prepared-container") {
+		t.Fatalf("prepared container isolation commands = %q", log)
 	}
 }
 

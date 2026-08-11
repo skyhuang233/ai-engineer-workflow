@@ -73,6 +73,11 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 				return worker.Result{}, err
 			}
 		}
+		if spec.StartAdmission != nil {
+			if err := spec.StartAdmission(ctx); err != nil {
+				return worker.Result{}, worker.CertifiedNoLaunchError{Err: err}
+			}
+		}
 		origin := exec.Command("git", "-C", spec.WorkspacePath, "config", "--local", "--get-all", "remote.origin.url")
 		originOutput, err := origin.Output()
 		if err != nil {
@@ -919,6 +924,43 @@ func TestControllerAuditsDeliveryBeforePostRunAuthenticationInspection(t *testin
 	}
 }
 
+func TestControllerFencesDeliveryStartAfterConcurrentTerminalization(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	started := false
+	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
+	runtime.beforeDelivery = func(spec worker.Spec) error {
+		if _, err := db.WorkerAudit(context.Background(), spec.RunID); !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("delivery launch was admitted before the runtime boundary: %v", err)
+		}
+		frozen, err := db.FreezePlanForClosedPullRequest(context.Background(), version.ID, claim.TicketID, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if !frozen {
+			return errors.New("concurrent terminalization did not freeze the plan")
+		}
+		return nil
+	}
+	runtime.beforeDeliveryReturn = func(time.Time) error {
+		started = true
+		return nil
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); !errors.Is(err, store.ErrWorkerLaunched) {
+		t.Fatalf("concurrently terminalized Delivery Controller = %v, want launch rejection", err)
+	}
+	if started {
+		t.Fatal("Delivery Controller started after terminalization")
+	}
+}
+
 func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -937,7 +979,7 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		if len(runs) != 1 {
 			return fmt.Errorf("expired launched recovery runs = %#v", runs)
 		}
-		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second)); err != nil {
+		if err := db.ReconcileMissingRecoveryRun(context.Background(), runs[0], "Run Lease expired after container isolation", deadline.Add(time.Second), store.DefaultMaxWorkerAttempts, runs[0].Claim); err != nil {
 			return err
 		}
 		return nil

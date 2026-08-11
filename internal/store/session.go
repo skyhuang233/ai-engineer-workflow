@@ -396,7 +396,7 @@ func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
 	return runs, rows.Err()
 }
 
-func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time, maxAttempts ...int) error {
+func (s *Store) ReconcileMissingRecoveryRun(ctx context.Context, run RecoveryRun, reason string, now time.Time, maxAttempts int, isolated ...TicketClaim) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if run.Claim.RunID == "" || run.Claim.LeaseToken == "" || run.Claim.LeaseGeneration <= 0 || strings.TrimSpace(reason) == "" {
@@ -428,10 +428,10 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 		if launchState != "launched" {
 			return ErrInvalidClaim
 		}
-		limit := DefaultMaxWorkerAttempts
-		if len(maxAttempts) > 0 {
-			limit = maxWorkerAttempts(maxAttempts[0])
+		if err := requireDeliveryIsolationTx(ctx, tx, run.Claim.VersionID, map[int64]bool{run.Claim.TicketID: true}, isolated); err != nil {
+			return err
 		}
+		limit := maxWorkerAttempts(maxAttempts)
 		if err := recoverExpiredDeliveryTx(ctx, tx, run.Claim.VersionID, run.Claim.TicketID, sessionID, run.Claim.RunID, recoveryEpoch, launchState, run.Claim.LeaseToken, limit, now); err != nil {
 			return err
 		}

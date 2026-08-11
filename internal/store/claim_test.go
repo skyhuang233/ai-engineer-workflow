@@ -431,7 +431,16 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if runState != RunRunning || leaseState != LeaseActive {
 		t.Fatalf("pre-isolation delivery state = run %q lease %q", runState, leaseState)
 	}
-	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour)); err != nil {
+	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts); !errors.As(err, &sharedIsolation) {
+		t.Fatalf("recovery without delivery isolation = %v, want DeliveryIsolationRequired", err)
+	}
+	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&runState, &leaseState); err != nil {
+		t.Fatal(err)
+	}
+	if runState != RunRunning || leaseState != LeaseActive {
+		t.Fatalf("unisolated recovery mutated delivery state = run %q lease %q", runState, leaseState)
+	}
+	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts, expired[0].Claim); err != nil {
 		t.Fatal(err)
 	}
 	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(2*time.Hour))

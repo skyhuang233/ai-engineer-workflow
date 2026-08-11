@@ -67,6 +67,7 @@ type Spec struct {
 	Mounts             []Mount
 	ExtraHosts         []string
 	ContainerPreflight string
+	StartAdmission     func(context.Context) error
 }
 
 type Result struct {
@@ -205,6 +206,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if name == "" {
 		name = "docker"
 	}
+	if spec.StartAdmission != nil {
+		return r.runWithStartAdmission(ctx, name, spec)
+	}
 	cidfile, err := os.CreateTemp("", "workflow-worker-cid-*")
 	if err != nil {
 		return Result{}, CertifiedNoLaunchError{Err: fmt.Errorf("create worker container id file: %w", err)}
@@ -242,6 +246,53 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 			if result.ExitCode == 125 {
 				return result, CertifiedNoLaunchError{Err: err}
 			}
+		} else {
+			return result, InfrastructureError{Err: err}
+		}
+	}
+	return result, err
+}
+
+func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, spec Spec) (Result, error) {
+	args := dockerArgs(spec)
+	args[0] = "create"
+	cmd := exec.CommandContext(ctx, name, args...)
+	var createStdout, createStderr bytes.Buffer
+	cmd.Stdout = &createStdout
+	cmd.Stderr = &createStderr
+	if err := cmd.Run(); err != nil {
+		output := append(append([]byte(nil), createStdout.Bytes()...), createStderr.Bytes()...)
+		return Result{Output: output, Stdout: createStdout.Bytes(), Stderr: createStderr.Bytes(), ExitCode: 1}, CertifiedNoLaunchError{Err: err}
+	}
+	containerID := strings.TrimSpace(createStdout.String())
+	if containerID == "" {
+		return Result{}, CertifiedNoLaunchError{Err: errors.New("Docker did not report the prepared worker container ID")}
+	}
+	removePrepared := func() error {
+		output, err := exec.CommandContext(context.WithoutCancel(ctx), name, "container", "rm", "--force", containerID).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("remove prepared worker container %s: %w (%s)", containerID, err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, CertifiedNoLaunchError{Err: errors.Join(err, removePrepared())}
+	}
+	if err := spec.StartAdmission(ctx); err != nil {
+		return Result{}, CertifiedNoLaunchError{Err: errors.Join(err, removePrepared())}
+	}
+	cmd = exec.CommandContext(ctx, name, "container", "start", "--attach", containerID)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	output := append(append([]byte(nil), stdout.Bytes()...), stderr.Bytes()...)
+	result := Result{Output: output, Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ContainerID: containerID}
+	if err != nil {
+		result.ExitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			result.ExitCode = exitErr.ExitCode()
 		} else {
 			return result, InfrastructureError{Err: err}
 		}
@@ -314,12 +365,12 @@ func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error
 	if name == "" {
 		name = "docker"
 	}
-	output, err := exec.CommandContext(ctx, name, "container", "ls", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
+	output, err := exec.CommandContext(ctx, name, "container", "ls", "--all", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
 	if err != nil {
 		return fmt.Errorf("inspect expired worker container: %w", err)
 	}
 	for _, containerID := range strings.Fields(string(output)) {
-		if err := exec.CommandContext(ctx, name, "container", "kill", containerID).Run(); err != nil {
+		if err := exec.CommandContext(ctx, name, "container", "rm", "--force", containerID).Run(); err != nil {
 			return fmt.Errorf("isolate expired worker container %s: %w", containerID, err)
 		}
 	}
@@ -354,6 +405,14 @@ func (r ProcessRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	if len(spec.Command) == 0 {
 		return Result{}, errors.New("worker command is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, CertifiedNoLaunchError{Err: err}
+	}
+	if spec.StartAdmission != nil {
+		if err := spec.StartAdmission(ctx); err != nil {
+			return Result{}, CertifiedNoLaunchError{Err: err}
+		}
 	}
 	name := spec.Command[0]
 	if r.Binary != "" {

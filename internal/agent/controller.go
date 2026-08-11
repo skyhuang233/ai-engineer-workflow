@@ -427,6 +427,9 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		ExtraHosts:         []string{worker.GatewayHostMapping},
 		ContainerPreflight: deliverySourceContainerPreflight,
 	}
+	deliverySpec.StartAdmission = func(startCtx context.Context) error {
+		return c.Store.ReserveDeliveryControllerLaunch(startCtx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now())
+	}
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
@@ -443,16 +446,6 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	defer func() {
 		resultErr = errors.Join(resultErr, cleanupSealedSource())
 	}()
-	if err := c.Store.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, workerLaunchAudit(deliveryClaim, deliverySpec), c.now()); err != nil {
-		if errors.Is(err, store.ErrDeliveryLaunchLeaseExpired) {
-			cause := worker.CertifiedNoLaunchError{Err: err}
-			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, cause, store.FailureInfrastructure)
-		}
-		if errors.Is(err, store.ErrWorkerLaunched) {
-			return err
-		}
-		return c.failDeliveryController(ctx, deliveryClaim, err)
-	}
 	deliveryCtx, cancelDelivery := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt)
 	defer cancelDelivery()
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
