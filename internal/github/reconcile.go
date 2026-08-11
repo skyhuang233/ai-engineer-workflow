@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -84,18 +85,9 @@ func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delive
 	if r.Isolator == nil {
 		return errors.Join(err, errors.New("delivered reconciler cannot isolate an active Delivery Controller"))
 	}
-	fenced, fenceErr := r.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
-	if fenceErr != nil {
-		return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
-	}
-	for _, target := range fenced {
-		if isolateErr := r.Isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-			return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
-		}
-	}
-	fenced, fenceErr = r.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
-	if fenceErr != nil {
-		return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+	fenced, isolationErr := deliveryisolation.DeliveryControllers(ctx, r.Store, r.Isolator, isolation.Targets)
+	if isolationErr != nil {
+		return errors.Join(err, isolationErr)
 	}
 	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, fenced...)
 	return err
@@ -110,18 +102,9 @@ func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.T
 	if r.Isolator == nil {
 		return errors.New("delivered reconciler cannot isolate an active Delivery Controller")
 	}
-	fenced, err := r.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
+	fenced, err := deliveryisolation.DeliveryControllers(ctx, r.Store, r.Isolator, isolation.Targets)
 	if err != nil {
-		return fmt.Errorf("fence delivered Delivery Controller isolation: %w", err)
-	}
-	for _, target := range fenced {
-		if err := r.Isolator.IsolateContainer(ctx, target.RunID); err != nil {
-			return fmt.Errorf("isolate delivered Delivery Controller %s: %w", target.RunID, err)
-		}
-	}
-	fenced, err = r.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
-	if err != nil {
-		return fmt.Errorf("acknowledge delivered Delivery Controller isolation: %w", err)
+		return err
 	}
 	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, fenced[0])
 	return err

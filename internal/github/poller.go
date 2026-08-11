@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -751,18 +752,9 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 		if p.ContainerIsolator == nil {
 			return errors.Join(result, attentionErr, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
 		}
-		fenced, fenceErr := p.Store.FenceDeliveryIsolation(persistenceCtx, isolation.Targets)
+		fenced, fenceErr := deliveryisolation.DeliveryControllers(persistenceCtx, p.Store, p.ContainerIsolator, isolation.Targets)
 		if fenceErr != nil {
-			return errors.Join(result, attentionErr, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
-		}
-		for _, target := range fenced {
-			if isolateErr := p.ContainerIsolator.IsolateContainer(persistenceCtx, target.RunID); isolateErr != nil {
-				return errors.Join(result, attentionErr, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
-			}
-		}
-		fenced, fenceErr = p.Store.AcknowledgeDeliveryIsolation(persistenceCtx, fenced)
-		if fenceErr != nil {
-			return errors.Join(result, attentionErr, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+			return errors.Join(result, attentionErr, fenceErr)
 		}
 		disposition, attentionErr = resolve(fenced...)
 	}
@@ -964,18 +956,9 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 					if p.ContainerIsolator == nil {
 						return errors.Join(err, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
 					}
-					fenced, fenceErr := p.Store.FenceDeliveryIsolation(ctx, isolation.Targets)
+					fenced, fenceErr := deliveryisolation.DeliveryControllers(ctx, p.Store, p.ContainerIsolator, isolation.Targets)
 					if fenceErr != nil {
-						return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
-					}
-					for _, target := range fenced {
-						if isolateErr := p.ContainerIsolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-							return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
-						}
-					}
-					fenced, fenceErr = p.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
-					if fenceErr != nil {
-						return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+						return errors.Join(err, fenceErr)
 					}
 					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), fenced...)
 				}

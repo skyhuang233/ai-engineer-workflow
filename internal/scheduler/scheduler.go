@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -200,21 +201,13 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 	for _, run := range expired {
 		proof := run.Claim
 		if run.Kind == store.RunDelivery {
-			fenced, err := d.Store.FenceDeliveryIsolation(ctx, []store.TicketClaim{run.Claim})
+			fenced, err := isolation.DeliveryControllers(ctx, d.Store, d.Recovery, []store.TicketClaim{run.Claim})
 			if err != nil {
-				return fmt.Errorf("fence expired Delivery Controller isolation: %w", err)
+				return fmt.Errorf("isolate expired Delivery Controller: %w", err)
 			}
 			proof = fenced[0]
-		}
-		if err := d.Recovery.IsolateContainer(ctx, proof.RunID); err != nil {
+		} else if err := d.Recovery.IsolateContainer(ctx, proof.RunID); err != nil {
 			return fmt.Errorf("isolate expired worker container %s: %w", proof.RunID, err)
-		}
-		if run.Kind == store.RunDelivery {
-			acknowledged, err := d.Store.AcknowledgeDeliveryIsolation(ctx, []store.TicketClaim{proof})
-			if err != nil {
-				return fmt.Errorf("acknowledge expired Delivery Controller isolation: %w", err)
-			}
-			proof = acknowledged[0]
 		}
 		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts, proof); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
 			return err

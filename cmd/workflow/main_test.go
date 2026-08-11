@@ -37,6 +37,23 @@ func (f restoreContainerIsolatorFunc) IsolateContainer(ctx context.Context, runI
 	return f(ctx, runID)
 }
 
+func (restoreContainerIsolatorFunc) IsolateControlPlaneDeliveryContainers(context.Context) error {
+	return nil
+}
+
+type fakeRestoreContainerIsolator struct {
+	isolateRun          func(context.Context, string) error
+	isolateControlPlane func(context.Context) error
+}
+
+func (f fakeRestoreContainerIsolator) IsolateContainer(ctx context.Context, runID string) error {
+	return f.isolateRun(ctx, runID)
+}
+
+func (f fakeRestoreContainerIsolator) IsolateControlPlaneDeliveryContainers(ctx context.Context) error {
+	return f.isolateControlPlane(ctx)
+}
+
 func TestReconcileRestoredControlPlaneIsolatesPreparedDeliveryBeforeApplying(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
@@ -158,8 +175,19 @@ func TestRestoreReplacesCorruptCurrentDatabase(t *testing.T) {
 	if err := os.WriteFile(databasePath, []byte("not a sqlite database"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreControlPlane(ctx, backupPath, databasePath, restoreContainerIsolatorFunc(func(context.Context, string) error { return nil }), now); err != nil {
+	contained := false
+	isolator := fakeRestoreContainerIsolator{
+		isolateRun: func(context.Context, string) error { return nil },
+		isolateControlPlane: func(context.Context) error {
+			contained = true
+			return nil
+		},
+	}
+	if err := restoreControlPlane(ctx, backupPath, databasePath, isolator, now); err != nil {
 		t.Fatal(err)
+	}
+	if !contained {
+		t.Fatal("corrupt current Control Plane was replaced without database-independent container isolation")
 	}
 	restored, err := store.Open(ctx, databasePath)
 	if err != nil {

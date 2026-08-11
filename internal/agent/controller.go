@@ -12,6 +12,7 @@ import (
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 	"github.com/skyhuang233/workflow/internal/workerrelease"
@@ -161,7 +162,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		"CODEX_HOME": ws.CodexState,
 	}
 	spec := worker.Spec{
-		RunID:   request.Claim.RunID,
+		RunID: request.Claim.RunID, RunKind: store.RunAgent,
 		Command: command, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: environment,
@@ -415,7 +416,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliverySourcePreflight(ctx, deliveryClaim, err)
 	}
 	deliverySpec := worker.Spec{
-		RunID:   deliveryClaim.RunID,
+		RunID: deliveryClaim.RunID, RunKind: store.RunDelivery,
 		Command: []string{noMistakes, "axi", "run", "--intent", intent}, WorkspacePath: ws.Path, CodexStatePath: ws.CodexState, Branch: ws.Branch,
 		AgentIdentity: session.AgentIdentity, ImageDigest: imageDigest, ToolVersions: toolVersions,
 		Environment: deliveryEnvironment,
@@ -751,20 +752,7 @@ func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.
 	if !ok {
 		return nil, errors.New("agent controller cannot isolate an active Delivery Controller")
 	}
-	fenced, err := c.Store.FenceDeliveryIsolation(ctx, targets)
-	if err != nil {
-		return nil, fmt.Errorf("fence Delivery Controller isolation: %w", err)
-	}
-	for _, target := range fenced {
-		if isolateErr := isolator.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
-		}
-	}
-	acknowledged, err := c.Store.AcknowledgeDeliveryIsolation(ctx, fenced)
-	if err != nil {
-		return nil, fmt.Errorf("acknowledge Delivery Controller isolation: %w", err)
-	}
-	return acknowledged, nil
+	return isolation.DeliveryControllers(ctx, c.Store, isolator, targets)
 }
 
 func runtimeStdout(result worker.Result) []byte {

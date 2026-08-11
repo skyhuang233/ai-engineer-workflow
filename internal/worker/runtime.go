@@ -71,6 +71,8 @@ type Mount struct {
 
 type Spec struct {
 	RunID                string
+	RunKind              string
+	ControlPlaneID       string
 	Command              []string
 	WorkspacePath        string
 	CodexStatePath       string
@@ -159,6 +161,7 @@ type ProcessRuntime struct {
 // run and never the Ticket Session's durable state.
 type DockerRuntime struct {
 	Binary                 string
+	ControlPlaneID         string
 	DiskPath               string
 	MemoryThresholdPercent float64
 	DiskThresholdPercent   float64
@@ -212,6 +215,12 @@ func (r DockerRuntime) diskThreshold() float64 {
 }
 
 func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
+	if spec.ControlPlaneID == "" {
+		spec.ControlPlaneID = r.ControlPlaneID
+	}
+	if strings.TrimSpace(spec.RunKind) != "" && strings.TrimSpace(spec.ControlPlaneID) == "" {
+		return Result{}, CertifiedNoLaunchError{Err: errors.New("Control Plane container identity is required for a typed Worker Run")}
+	}
 	if err := spec.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -366,6 +375,12 @@ func dockerArgs(spec Spec) []string {
 	if spec.RunID != "" {
 		args = append(args, "--label", "workflow.run_id="+spec.RunID)
 	}
+	if spec.ControlPlaneID != "" {
+		args = append(args, "--label", "workflow.control_plane="+spec.ControlPlaneID)
+	}
+	if spec.RunKind != "" {
+		args = append(args, "--label", "workflow.run_kind="+spec.RunKind)
+	}
 	for _, host := range spec.ExtraHosts {
 		args = append(args, "--add-host", host)
 	}
@@ -427,8 +442,30 @@ func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error
 	return isolateContainersByRunID(ctx, name, runID)
 }
 
+func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context) error {
+	if strings.TrimSpace(r.ControlPlaneID) == "" {
+		return errors.New("Control Plane container identity is required")
+	}
+	name := r.Binary
+	if name == "" {
+		name = "docker"
+	}
+	return isolateContainersByLabels(ctx, name,
+		"label=workflow.control_plane="+r.ControlPlaneID,
+		"label=workflow.run_kind=delivery_controller",
+	)
+}
+
 func isolateContainersByRunID(ctx context.Context, name, runID string) error {
-	output, err := exec.CommandContext(ctx, name, "container", "ls", "--all", "--quiet", "--filter", "label=workflow.run_id="+runID).Output()
+	return isolateContainersByLabels(ctx, name, "label=workflow.run_id="+runID)
+}
+
+func isolateContainersByLabels(ctx context.Context, name string, filters ...string) error {
+	args := []string{"container", "ls", "--all", "--quiet"}
+	for _, filter := range filters {
+		args = append(args, "--filter", filter)
+	}
+	output, err := exec.CommandContext(ctx, name, args...).Output()
 	if err != nil {
 		return fmt.Errorf("inspect expired worker container: %w", err)
 	}

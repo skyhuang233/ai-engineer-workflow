@@ -85,6 +85,13 @@ func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	}
 }
 
+func TestDockerArgsLabelControlPlaneAndRunKind(t *testing.T) {
+	args := dockerArgs(Spec{RunID: "run-1", RunKind: "delivery_controller", ControlPlaneID: "control-1", ImageDigest: "sha256:image"})
+	if !containsArgs(args, "--label", "workflow.control_plane=control-1") || !containsArgs(args, "--label", "workflow.run_kind=delivery_controller") {
+		t.Fatalf("docker args omit Control Plane delivery labels: %#v", args)
+	}
+}
+
 func TestDockerArgsWrapContainerPreflightAroundCommand(t *testing.T) {
 	spec := Spec{
 		RunID: "run-1", Command: []string{"no-mistakes", "axi", "run"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
@@ -123,7 +130,7 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
 	spec := Spec{
-		RunID: "run-1", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
 		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
 	}
 	fenced := false
@@ -151,7 +158,7 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 		}
 		return nil
 	}
-	result, err := (DockerRuntime{Binary: binary}).Run(context.Background(), spec)
+	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,8 +166,19 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ContainerID != "prepared-container" || strings.TrimSpace(string(result.Stdout)) != "started" || !strings.Contains(string(commands), "container start --attach prepared-container") {
+	if result.ContainerID != "prepared-container" || strings.TrimSpace(string(result.Stdout)) != "started" || !strings.Contains(string(commands), "--label workflow.control_plane=control-1 --label workflow.run_kind=delivery_controller") || !strings.Contains(string(commands), "container start --attach prepared-container") {
 		t.Fatalf("admitted Docker start = result %#v, commands %q", result, commands)
+	}
+}
+
+func TestDockerRuntimeRejectsTypedRunWithoutControlPlaneIdentity(t *testing.T) {
+	spec := Spec{
+		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+	}
+	_, err := (DockerRuntime{}).Run(context.Background(), spec)
+	if !IsCertifiedNoLaunchFailure(err) {
+		t.Fatalf("unscoped typed Worker Run = %T %v", err, err)
 	}
 }
 
@@ -267,6 +285,27 @@ func TestDockerRuntimeIsolationIncludesPreparedContainers(t *testing.T) {
 	log := string(commands)
 	if !strings.Contains(log, "container ls --all --quiet --filter label=workflow.run_id=run-1") || !strings.Contains(log, "container rm --force prepared-container") {
 		t.Fatalf("prepared container isolation commands = %q", log)
+	}
+}
+
+func TestDockerRuntimeIsolatesControlPlaneDeliveryContainers(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	if err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).IsolateControlPlaneDeliveryContainers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(commands)
+	if !strings.Contains(log, "--filter label=workflow.control_plane=control-1 --filter label=workflow.run_kind=delivery_controller") || !strings.Contains(log, "container rm --force prepared-container") {
+		t.Fatalf("Control Plane delivery isolation commands = %q", log)
 	}
 }
 

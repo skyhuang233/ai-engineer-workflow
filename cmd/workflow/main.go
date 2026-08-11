@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/githubcontract"
+	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
@@ -46,6 +48,24 @@ func defaultCodexAuthFile() string {
 		return ""
 	}
 	return filepath.Join(home, ".codex", codexauth.FileName)
+}
+
+func controlPlaneContainerID(databasePath string) string {
+	absolute, err := filepath.Abs(databasePath)
+	if err != nil {
+		absolute = filepath.Clean(databasePath)
+	}
+	canonical := filepath.Clean(absolute)
+	if resolved, resolveErr := filepath.EvalSymlinks(canonical); resolveErr == nil {
+		canonical = resolved
+	} else if resolvedParent, parentErr := filepath.EvalSymlinks(filepath.Dir(canonical)); parentErr == nil {
+		canonical = filepath.Join(resolvedParent, filepath.Base(canonical))
+	}
+	if goruntime.GOOS == "windows" {
+		canonical = strings.ToLower(canonical)
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(digest[:])
 }
 
 type admittedCredential string
@@ -150,14 +170,19 @@ func runRestore(args []string) {
 	}
 	defer lock.Close()
 	ctx := context.Background()
-	isolator := worker.DockerRuntime{}
+	isolator := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
 	if err := restoreControlPlane(ctx, *backupPath, *databasePath, isolator, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
 }
 
-func restoreControlPlane(ctx context.Context, backupPath, databasePath string, isolator worker.ContainerIsolator, now time.Time) error {
+type restoreContainerIsolator interface {
+	worker.ContainerIsolator
+	IsolateControlPlaneDeliveryContainers(context.Context) error
+}
+
+func restoreControlPlane(ctx context.Context, backupPath, databasePath string, isolator restoreContainerIsolator, now time.Time) error {
 	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
 		return err
 	}
@@ -197,16 +222,16 @@ func restoreControlPlane(ctx context.Context, backupPath, databasePath string, i
 	return store.PublishRestoredBackup(ctx, stagedPath, databasePath)
 }
 
-func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolator worker.ContainerIsolator) error {
+func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolator restoreContainerIsolator) error {
 	if _, err := os.Stat(databasePath); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return isolateControlPlaneDeliveryContainers(ctx, isolator)
 	} else if err != nil {
 		return err
 	}
 	db, err := store.Open(ctx, databasePath)
 	if err != nil {
 		if store.IsDatabaseError(err) || errors.Is(err, store.ErrDatabaseIntegrity) {
-			return nil
+			return isolateControlPlaneDeliveryContainers(ctx, isolator)
 		}
 		return fmt.Errorf("open current Control Plane before restore: %w", err)
 	}
@@ -214,33 +239,32 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 	if targetErr == nil && len(targets) > 0 {
 		_, targetErr = isolateDeliveryTargets(ctx, db, isolator, targets)
 	}
-	return errors.Join(targetErr, db.Close())
+	if closeErr := db.Close(); targetErr != nil || closeErr != nil {
+		return errors.Join(targetErr, closeErr)
+	}
+	return isolateControlPlaneDeliveryContainers(ctx, isolator)
 }
 
 func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.TicketClaim, error) {
 	if isolator == nil {
 		return nil, errors.New("restore cannot isolate an active Delivery Controller")
 	}
-	fenced, err := db.FenceDeliveryIsolation(ctx, targets)
-	if err != nil {
-		return nil, fmt.Errorf("fence Delivery Controller isolation: %w", err)
-	}
-	for _, target := range fenced {
-		isolationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreIsolationTimeout)
-		isolateErr := isolator.IsolateContainer(isolationCtx, target.RunID)
-		cancel()
-		if isolateErr != nil {
-			return nil, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr)
-		}
-	}
-	acknowledged, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
-	if err != nil {
-		return nil, fmt.Errorf("acknowledge Delivery Controller isolation: %w", err)
-	}
-	return acknowledged, nil
+	return deliveryisolation.DeliveryControllers(ctx, db, isolator, targets)
 }
 
-func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, now time.Time) error {
+func isolateControlPlaneDeliveryContainers(ctx context.Context, isolator restoreContainerIsolator) error {
+	if isolator == nil {
+		return errors.New("restore cannot isolate active Delivery Controllers without the current database")
+	}
+	isolationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreIsolationTimeout)
+	defer cancel()
+	if err := isolator.IsolateControlPlaneDeliveryContainers(isolationCtx); err != nil {
+		return fmt.Errorf("isolate Control Plane Delivery Controllers: %w", err)
+	}
+	return nil
+}
+
+func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator restoreContainerIsolator, now time.Time) error {
 	var isolated []store.TicketClaim
 	for {
 		err := db.ReconcileRestoredControlPlane(ctx, now, isolated...)
@@ -605,7 +629,8 @@ func runTicket(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	if err := syncReviewFeedback(ctx, db, client, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
+	runtime := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
+	if err := syncReviewFeedback(ctx, db, client, runtime, *repository, version.ID, *ticketID, *reviewFeedback); err != nil {
 		fail(err)
 	}
 	claim, revisionPrompt, err := acquireTicketClaim(ctx, db, version.ID, *ticketID, config.Runtime.MaxWorkerAttempts, time.Now().UTC(), workspaceManager.ProvisionCodexSession)
@@ -619,7 +644,7 @@ func runTicket(args []string) {
 	if *branch == "" {
 		*branch = "workflow/ticket-" + fmt.Sprint(claim.TicketNumber)
 	}
-	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
+	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: runtime, GatewayURL: *gatewayURL, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 	candidate, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: *source, Branch: *branch, Prompt: *prompt, Publication: store.CandidatePublication{Repository: *repository, Branch: *branch, ExpectedRemoteHead: *expectedHead, ExpectRemoteAbsent: *expectAbsent, Title: claim.TicketTitle}})
 	if err != nil {
 		fail(err)
@@ -628,11 +653,11 @@ func runTicket(args []string) {
 	fmt.Println(string(encoded))
 }
 
-func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Client, repository, versionID string, ticketID int64, manual string) error {
+func syncReviewFeedback(ctx context.Context, db *store.Store, client *github.Client, isolator worker.ContainerIsolator, repository, versionID string, ticketID int64, manual string) error {
 	var feedback []store.ReviewFeedback
 	delivery, err := db.TicketDelivery(ctx, versionID, ticketID)
 	if err == nil {
-		terminal, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: worker.DockerRuntime{}}).ReconcileTicket(ctx, delivery)
+		terminal, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: isolator}).ReconcileTicket(ctx, delivery)
 		if err != nil {
 			return err
 		}
@@ -735,7 +760,8 @@ func runReconcileDelivered(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	marked, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: worker.DockerRuntime{}}).Reconcile(ctx, *repository)
+	runtime := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
+	marked, err := (github.DeliveredReconciler{Store: db, Client: client, Isolator: runtime}).Reconcile(ctx, *repository)
 	if err != nil {
 		fail(persistGitHubAppAdmissionError(ctx, db, err, time.Now().UTC()))
 	}
@@ -790,7 +816,7 @@ func runPollGitHub(args []string) {
 		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
-	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot}
+	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot, ControlPlaneID: controlPlaneContainerID(*databasePath)}
 	if reason, err := runtime.Inspect(context.Background()); err != nil {
 		fail(err)
 	} else if reason != "" {
@@ -809,7 +835,7 @@ func runPollGitHub(args []string) {
 		}
 		workerCtx := context.WithoutCancel(ctx)
 		run := func() {
-			err := runClaimWorker(workerCtx, db, *repository, *source, workspaceManager, *gatewayURL, config.Runtime.MaxWorkerAttempts, claim, prompt, branch, expectedHead, expectAbsent)
+			err := runClaimWorker(workerCtx, db, runtime, *repository, *source, workspaceManager, *gatewayURL, config.Runtime.MaxWorkerAttempts, claim, prompt, branch, expectedHead, expectAbsent)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "workflow worker:", err)
 				if *once {
@@ -842,7 +868,7 @@ func runPollGitHub(args []string) {
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
-		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, SourceRepository: *source, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
+		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: runtime, GatewayURL: *gatewayURL, SourceRepository: *source, MaxWorkerAttempts: config.Runtime.MaxWorkerAttempts}
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult
@@ -889,18 +915,9 @@ func runPollGitHub(args []string) {
 			activeRoot, err := db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC())
 			var isolation *store.DeliveryIsolationRequired
 			if errors.As(err, &isolation) {
-				fenced, fenceErr := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+				fenced, fenceErr := deliveryisolation.DeliveryControllers(ctx, db, runtime, isolation.Targets)
 				if fenceErr != nil {
-					return errors.Join(err, fmt.Errorf("fence Delivery Controller isolation: %w", fenceErr))
-				}
-				for _, target := range fenced {
-					if isolateErr := runtime.IsolateContainer(ctx, target.RunID); isolateErr != nil {
-						return errors.Join(err, fmt.Errorf("isolate Delivery Controller %s: %w", target.RunID, isolateErr))
-					}
-				}
-				fenced, fenceErr = db.AcknowledgeDeliveryIsolation(ctx, fenced)
-				if fenceErr != nil {
-					return errors.Join(err, fmt.Errorf("acknowledge Delivery Controller isolation: %w", fenceErr))
+					return errors.Join(err, fenceErr)
 				}
 				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), fenced...)
 			}
@@ -1062,8 +1079,8 @@ func nextPollDelay(db *store.Store, repository string, interval time.Duration, r
 	return interval
 }
 
-func runClaimWorker(ctx context.Context, db *store.Store, repository, source string, workspaceManager agent.WorkspaceManager, gatewayURL string, maxWorkerAttempts int, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
-	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: gatewayURL, MaxWorkerAttempts: maxWorkerAttempts}
+func runClaimWorker(ctx context.Context, db *store.Store, runtime worker.Runtime, repository, source string, workspaceManager agent.WorkspaceManager, gatewayURL string, maxWorkerAttempts int, claim store.TicketClaim, prompt, branch, expectedHead string, expectAbsent bool) error {
+	controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: runtime, GatewayURL: gatewayURL, MaxWorkerAttempts: maxWorkerAttempts}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: repository, Branch: branch, ExpectedRemoteHead: expectedHead, ExpectRemoteAbsent: expectAbsent, Title: claim.TicketTitle}})
 	return err
 }
