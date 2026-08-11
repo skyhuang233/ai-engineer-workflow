@@ -25,6 +25,7 @@ type Controller struct {
 	ToolVersions     map[string]string
 	NoMistakes       string
 	GatewayURL       string
+	SourceRepository string
 	DeliveryLeaseTTL time.Duration
 	Now              func() time.Time
 }
@@ -75,7 +76,7 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return Candidate{}, err
 	}
-	ws, err := c.Workspace.ensure(ctx, session.SessionID, request.SourceRepository, request.Branch)
+	ws, err := c.Workspace.ensure(ctx, session.SessionID, request.Claim.RunID, request.SourceRepository, request.Branch)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -238,12 +239,24 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
-	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, session.WorkspacePath)
-	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
-	}
-	if err := validateDeliverySource(finalizationCtx, deliverySource); err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
+	var deliverySource string
+	if strings.TrimSpace(c.SourceRepository) != "" {
+		sourceRepository, err := localSourceRepository(c.SourceRepository)
+		if err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, session.WorkspacePath, sourceRepository)
+		if err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+	} else {
+		deliverySource, err = c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID, session.WorkspacePath)
+		if err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
+		if err := validateDeliverySource(finalizationCtx, deliverySource); err != nil {
+			return c.failDeliveryController(finalizationCtx, claim, err)
+		}
 	}
 	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)

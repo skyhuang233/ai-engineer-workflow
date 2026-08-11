@@ -739,7 +739,7 @@ func runPollGitHub(args []string) {
 		return launch(ctx, claim, prompt, deliveryState.Branch, expectedHead, false)
 	}
 	launchDelivery := func(ctx context.Context, claim store.TicketClaim) error {
-		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL}
+		controller := agent.Controller{Store: db, Workspace: workspaceManager, Runtime: worker.DockerRuntime{}, GatewayURL: *gatewayURL, SourceRepository: *source}
 		return controller.RetryDelivery(ctx, claim)
 	}
 	var lastPollResult github.PollResult

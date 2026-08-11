@@ -1314,7 +1314,7 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	t.Cleanup(func() { _ = db.Close() })
 	workspacePath := filepath.Join(root, "workspace")
 	for _, command := range [][]string{
-		{"clone", "--config", "core.autocrlf=false", source, workspacePath},
+		{"clone", "--config", "core.autocrlf=false", "--no-hardlinks", source, workspacePath},
 		{"-C", workspacePath, "checkout", "-b", "ticket-1"},
 		{"-C", workspacePath, "config", "user.name", "Test"},
 		{"-C", workspacePath, "config", "user.email", "test@example.com"},
@@ -1338,19 +1338,6 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 	codexStatePath := filepath.Join(root, "codex", claim.SessionID)
 	if err := os.MkdirAll(codexStatePath, 0o755); err != nil {
 		t.Fatal(err)
-	}
-	deliverySourcePath := filepath.Join(root, ".delivery-sources", claim.SessionID+".git")
-	if err := os.MkdirAll(filepath.Dir(deliverySourcePath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, command := range [][]string{
-		{"init", "--bare", "--template=", deliverySourcePath},
-		{"-C", deliverySourcePath, "fetch", "--no-tags", source, "+refs/heads/*:refs/heads/*"},
-		{"-C", deliverySourcePath, "symbolic-ref", "HEAD", "refs/heads/main"},
-	} {
-		if output, err := exec.Command("git", command...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", command, err, output)
-		}
 	}
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-" + claim.SessionID, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
@@ -1398,13 +1385,14 @@ func TestControllerRetryDeliveryPreservesCandidateRuntimeForOriginalReadyRunAfte
 		t.Fatal(err)
 	}
 	runtime := &fakeRuntime{}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test"}
+	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test", SourceRepository: source}
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
 		t.Fatalf("resume original ready Delivery Worker Run: %v", err)
 	}
 	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage || runtime.specs[0].ToolVersions["github-cli"] != "2.97.0" {
 		t.Fatalf("original Delivery Worker runtime = %#v, want Candidate runtime", runtime.specs)
 	}
+	assertDeliveryOriginMount(t, runtime.specs[0], source)
 	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
 	if err != nil || candidateTools["github-cli"] != "" {
 		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
