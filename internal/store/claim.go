@@ -233,23 +233,18 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?)`, sessionID, request.VersionID, selected.IssueID
 		}
 		expiredAgentRunID := ""
 		if currentRunID != "" {
-			var runKind, runState, leaseState, expiresText string
-			if err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, l.state, l.expires_at
+			var runKind, runState, launchState, leaseToken, leaseState, expiresText string
+			var runRecoveryEpoch int64
+			if err := tx.QueryRowContext(ctx, `SELECT r.run_kind, r.state, r.launch_state, r.recovery_epoch, l.lease_token, l.state, l.expires_at
 FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &leaseState, &expiresText); err == nil {
+WHERE r.run_id = ?`, currentRunID).Scan(&runKind, &runState, &launchState, &runRecoveryEpoch, &leaseToken, &leaseState, &expiresText); err == nil {
 				expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresText)
 				live := parseErr == nil && runState == RunRunning && leaseState == LeaseActive && expiresAt.After(request.Now)
 				if currentOwner != "" && live {
 					return TicketClaim{}, ErrFencingConflict
 				}
 				if runKind == RunDelivery && runState == RunRunning {
-					if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = ?, finished_at = ? WHERE run_id = ? AND state = ?`, "failed", formatTimestamp(request.Now), currentRunID, RunRunning); err != nil {
-						return TicketClaim{}, err
-					}
-					if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = ? WHERE run_id = ? AND state = ?`, "expired", currentRunID, LeaseActive); err != nil {
-						return TicketClaim{}, err
-					}
-					if err := markTicketNeedsAttentionTx(ctx, tx, request.VersionID, selected.IssueID, "Delivery Controller lease expired before completion", request.Now); err != nil {
+					if err := recoverExpiredDeliveryTx(ctx, tx, request.VersionID, selected.IssueID, sessionID, currentRunID, runRecoveryEpoch, launchState, leaseToken, request.Now); err != nil {
 						return TicketClaim{}, err
 					}
 					if err := tx.Commit(); err != nil {

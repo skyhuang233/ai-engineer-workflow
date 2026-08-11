@@ -27,6 +27,18 @@ func IsInfrastructureFailure(err error) bool {
 	return errors.As(err, &failure) && failure.InfrastructureFailure()
 }
 
+type CertifiedNoLaunchError struct{ Err error }
+
+func (e CertifiedNoLaunchError) Error() string               { return e.Err.Error() }
+func (e CertifiedNoLaunchError) Unwrap() error               { return e.Err }
+func (e CertifiedNoLaunchError) InfrastructureFailure() bool { return true }
+func (e CertifiedNoLaunchError) NoContainerStarted() bool    { return true }
+
+func IsCertifiedNoLaunchFailure(err error) bool {
+	var failure interface{ NoContainerStarted() bool }
+	return errors.As(err, &failure) && failure.NoContainerStarted()
+}
+
 const GatewayHostMapping = "host.docker.internal:host-gateway"
 
 // CodexSandboxDockerArgs returns the Docker permissions required by Codex's
@@ -43,17 +55,18 @@ type Mount struct {
 }
 
 type Spec struct {
-	RunID          string
-	Command        []string
-	WorkspacePath  string
-	CodexStatePath string
-	Branch         string
-	AgentIdentity  string
-	ImageDigest    string
-	ToolVersions   map[string]string
-	Environment    map[string]string
-	Mounts         []Mount
-	ExtraHosts     []string
+	RunID              string
+	Command            []string
+	WorkspacePath      string
+	CodexStatePath     string
+	Branch             string
+	AgentIdentity      string
+	ImageDigest        string
+	ToolVersions       map[string]string
+	Environment        map[string]string
+	Mounts             []Mount
+	ExtraHosts         []string
+	ContainerPreflight string
 }
 
 type Result struct {
@@ -191,15 +204,15 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	cidfile, err := os.CreateTemp("", "workflow-worker-cid-*")
 	if err != nil {
-		return Result{}, InfrastructureError{Err: fmt.Errorf("create worker container id file: %w", err)}
+		return Result{}, CertifiedNoLaunchError{Err: fmt.Errorf("create worker container id file: %w", err)}
 	}
 	cidfilePath := cidfile.Name()
 	if err := cidfile.Close(); err != nil {
 		_ = os.Remove(cidfilePath)
-		return Result{}, InfrastructureError{Err: fmt.Errorf("close worker container id file: %w", err)}
+		return Result{}, CertifiedNoLaunchError{Err: fmt.Errorf("close worker container id file: %w", err)}
 	}
 	if err := os.Remove(cidfilePath); err != nil {
-		return Result{}, InfrastructureError{Err: fmt.Errorf("prepare worker container id file: %w", err)}
+		return Result{}, CertifiedNoLaunchError{Err: fmt.Errorf("prepare worker container id file: %w", err)}
 	}
 	defer os.Remove(cidfilePath)
 	args := dockerArgs(spec)
@@ -262,7 +275,11 @@ func dockerArgs(spec Spec) []string {
 		}
 	}
 	args = append(args, spec.ImageDigest)
-	for _, value := range spec.Command {
+	command := spec.Command
+	if spec.ContainerPreflight != "" {
+		command = append([]string{"sh", "-ceu", spec.ContainerPreflight, "--"}, command...)
+	}
+	for _, value := range command {
 		args = append(args, containerPath(value, spec.Mounts))
 	}
 	return args

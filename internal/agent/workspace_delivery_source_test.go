@@ -469,6 +469,35 @@ func TestDeliverySourcePreflightDistinguishesInfrastructureFromIntegrity(t *test
 	}
 }
 
+func TestDeliverySourceDigestRejectsMissingReachableObjects(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
+		t.Fatal(err)
+	}
+	configureDeliverySourceTestIdentity(t, ctx, source)
+	writeDeliverySourceCommit(t, ctx, source, "first")
+	manager := WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	deliverySource, err := manager.ensureDeliverySource(ctx, "session-1", "revision-1", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := gitOutput(ctx, deliverySource, "rev-parse", "refs/heads/main^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree = strings.TrimSpace(tree)
+	if err := os.Remove(filepath.Join(deliverySource, "objects", tree[:2], tree[2:])); err != nil {
+		t.Fatal(err)
+	}
+	_, err = digestDeliverySource(ctx, deliverySource)
+	var integrityFailure *deliverySourceIntegrityFailure
+	if err == nil || !errors.As(err, &integrityFailure) {
+		t.Fatalf("missing reachable object classification = %v", err)
+	}
+}
+
 func TestDeliveryWorkspaceRestoresDurableAdmittedOriginAfterRetry(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

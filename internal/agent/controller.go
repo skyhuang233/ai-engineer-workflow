@@ -62,8 +62,26 @@ type Candidate struct {
 }
 
 const (
-	codexAuthenticationFailure = "Ticket Session Codex authentication cache is unavailable"
-	workerAuditTimeout         = 10 * time.Second
+	codexAuthenticationFailure       = "Ticket Session Codex authentication cache is unavailable"
+	workerAuditTimeout               = 10 * time.Second
+	deliverySourcePreflightExitCode  = 78
+	deliverySourceContainerPreflight = `
+source_failure() {
+  echo "Delivery Source failed isolated launch revalidation" >&2
+  exit 78
+}
+rm -rf /source-repository || source_failure
+git clone --bare --no-local /source-seed /source-repository >/dev/null 2>&1 || source_failure
+git --git-dir=/source-repository remote remove origin || source_failure
+identity=$(git --git-dir=/source-seed config --local --get workflow.sourceIdentity) || source_failure
+git --git-dir=/source-repository config --local workflow.sourceIdentity "$identity" || source_failure
+git --git-dir=/source-repository fsck --connectivity-only --no-dangling >/dev/null 2>&1 || source_failure
+head=$(git --git-dir=/source-repository symbolic-ref HEAD) || source_failure
+refs=$(git --git-dir=/source-repository for-each-ref --sort=refname '--format=%(refname) %(objectname)' refs/heads refs/tags) || source_failure
+actual=$(printf '%s\n%s\n%s' "$head" "$identity" "$refs" | sha256sum | awk '{print $1}') || source_failure
+[ "$actual" = "$NO_MISTAKES_DELIVERY_SOURCE_DIGEST" ] || source_failure
+exec "$@"
+`
 )
 
 func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, error) {
@@ -77,7 +95,11 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if err != nil {
 		return Candidate{}, err
 	}
-	ws, err := c.Workspace.ensure(ctx, session.SessionID, request.Claim.RunID, request.SourceRepository, request.Branch)
+	revisionRoundID, err := c.Store.RevisionRoundID(ctx, request.Claim.RunID)
+	if err != nil {
+		return Candidate{}, err
+	}
+	ws, err := c.Workspace.ensure(ctx, session.SessionID, revisionRoundID, request.SourceRepository, request.Branch)
 	if err != nil {
 		return c.failInitialSource(context.WithoutCancel(ctx), request, err)
 	}
@@ -244,7 +266,11 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
-	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, session.AcceptedCandidateRunID)
+	revisionRoundID, err := c.Store.RevisionRoundID(finalizationCtx, session.AcceptedCandidateRunID)
+	if err != nil {
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("load accepted Revision Round: %w", err)))
+	}
+	deliverySource, err := c.Workspace.deliverySourcePath(session.SessionID, revisionRoundID)
 	if err != nil {
 		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 	}
@@ -265,7 +291,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 		if err := replaceWorkspaceOriginURLs(finalizationCtx, session.WorkspacePath, []string{sourceRepository}); err != nil {
 			return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("restore ticket workspace origin: %w", err)))
 		}
-		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, session.AcceptedCandidateRunID, sourceRepository)
+		deliverySource, err = c.Workspace.ensureDeliverySource(finalizationCtx, session.SessionID, revisionRoundID, sourceRepository)
 	} else {
 		err = validateDeliverySource(finalizationCtx, deliverySource)
 	}
@@ -278,7 +304,7 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 			return c.failDeliverySourcePreflight(finalizationCtx, claim, errors.Join(err, removeErr))
 		}
 	}
-	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, SourceRepository: sourceRepository, Branch: session.Branch}
+	ws := workspace{Path: session.WorkspacePath, CodexState: session.CodexStatePath, DeliverySource: deliverySource, RevisionRoundID: revisionRoundID, SourceRepository: sourceRepository, Branch: session.Branch}
 	commit, branch, clean, err := c.Workspace.status(finalizationCtx, ws)
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
@@ -306,7 +332,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if gatewayURL == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Gateway URL is required before delivery launch"))
 	}
-	if session.SessionID == "" || session.AcceptedCandidateRunID == "" {
+	if session.SessionID == "" || session.AcceptedCandidateRunID == "" || ws.RevisionRoundID == "" {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New("Delivery Cycle or Revision Round is incomplete"))
 	}
 	noMistakes := c.NoMistakes
@@ -322,26 +348,27 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
 	deliveryEnvironment := map[string]string{
-		"CODEX_HOME":                       ws.CodexState,
-		"GIT_CONFIG_COUNT":                 "0",
-		"GIT_CONFIG_GLOBAL":                "/dev/null",
-		"GIT_CONFIG_NOSYSTEM":              "1",
-		"NM_HOME":                          "/codex-state/no-mistakes",
-		"NO_MISTAKES_WORKFLOW_MODE":        "true",
-		"NO_MISTAKES_DELIVERY_CYCLE":       session.SessionID,
-		"NO_MISTAKES_REVISION_ROUND":       session.AcceptedCandidateRunID,
-		"NO_MISTAKES_CORRELATION_ID":       deliveryClaim.RunID,
-		"NO_MISTAKES_RUN_ID":               deliveryClaim.RunID,
-		"NO_MISTAKES_LEASE_TOKEN":          deliveryClaim.LeaseToken,
-		"NO_MISTAKES_LEASE_GENERATION":     fmt.Sprint(deliveryClaim.LeaseGeneration),
-		"NO_MISTAKES_REPOSITORY":           publication.Repository,
-		"NO_MISTAKES_DEFAULT_BRANCH":       defaultBranch,
-		"NO_MISTAKES_BRANCH":               publication.Branch,
-		"NO_MISTAKES_COMMIT_SHA":           session.AcceptedCommit,
-		"NO_MISTAKES_EXPECTED_REMOTE_HEAD": publication.ExpectedRemoteHead,
-		"NO_MISTAKES_EXPECT_REMOTE_ABSENT": fmt.Sprint(publication.ExpectRemoteAbsent),
-		"NO_MISTAKES_PULL_REQUEST_TITLE":   publication.Title,
-		"NO_MISTAKES_PULL_REQUEST_BODY":    publication.Body,
+		"CODEX_HOME":                         ws.CodexState,
+		"GIT_CONFIG_COUNT":                   "0",
+		"GIT_CONFIG_GLOBAL":                  "/dev/null",
+		"GIT_CONFIG_NOSYSTEM":                "1",
+		"NM_HOME":                            "/codex-state/no-mistakes",
+		"NO_MISTAKES_WORKFLOW_MODE":          "true",
+		"NO_MISTAKES_DELIVERY_CYCLE":         session.SessionID,
+		"NO_MISTAKES_REVISION_ROUND":         ws.RevisionRoundID,
+		"NO_MISTAKES_DELIVERY_SOURCE_DIGEST": expectedSourceDigest,
+		"NO_MISTAKES_CORRELATION_ID":         deliveryClaim.RunID,
+		"NO_MISTAKES_RUN_ID":                 deliveryClaim.RunID,
+		"NO_MISTAKES_LEASE_TOKEN":            deliveryClaim.LeaseToken,
+		"NO_MISTAKES_LEASE_GENERATION":       fmt.Sprint(deliveryClaim.LeaseGeneration),
+		"NO_MISTAKES_REPOSITORY":             publication.Repository,
+		"NO_MISTAKES_DEFAULT_BRANCH":         defaultBranch,
+		"NO_MISTAKES_BRANCH":                 publication.Branch,
+		"NO_MISTAKES_COMMIT_SHA":             session.AcceptedCommit,
+		"NO_MISTAKES_EXPECTED_REMOTE_HEAD":   publication.ExpectedRemoteHead,
+		"NO_MISTAKES_EXPECT_REMOTE_ABSENT":   fmt.Sprint(publication.ExpectRemoteAbsent),
+		"NO_MISTAKES_PULL_REQUEST_TITLE":     publication.Title,
+		"NO_MISTAKES_PULL_REQUEST_BODY":      publication.Body,
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	if gate, answer, err := c.Store.DeliveryQualityGateAnswer(ctx, session.SessionID); err == nil {
@@ -357,10 +384,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
 	}
-	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, session.AcceptedCandidateRunID); err != nil {
+	if err := c.Workspace.reclaimSupersededDeliverySources(ctx, session.SessionID, ws.RevisionRoundID); err != nil {
 		return c.failDeliveryControllerWithClass(ctx, deliveryClaim, fmt.Errorf("reclaim superseded Delivery Sources: %w", err), store.FailureInfrastructure)
 	}
-	sealedSource, cleanupSealedSource, err := c.Workspace.sealDeliverySource(ctx, session.SessionID, session.AcceptedCandidateRunID, deliveryClaim.RunID, ws.DeliverySource, expectedSourceDigest)
+	sealedSource, cleanupSealedSource, err := c.Workspace.sealDeliverySource(ctx, session.SessionID, ws.RevisionRoundID, deliveryClaim.RunID, ws.DeliverySource, expectedSourceDigest)
 	if err != nil {
 		if cleanupSealedSource != nil {
 			err = errors.Join(err, cleanupSealedSource())
@@ -378,9 +405,10 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		Mounts: []worker.Mount{
 			{Source: ws.Path, Target: "/workspace"},
 			{Source: ws.CodexState, Target: "/codex-state"},
-			{Source: sealedSource, Target: "/source-repository", ReadOnly: true},
+			{Source: sealedSource, Target: "/source-seed", ReadOnly: true},
 		},
-		ExtraHosts: []string{worker.GatewayHostMapping},
+		ExtraHosts:         []string{worker.GatewayHostMapping},
+		ContainerPreflight: deliverySourceContainerPreflight,
 	}
 	if err := deliverySpec.Validate(); err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
@@ -396,16 +424,23 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	deliveryResult, deliveryErr := runInValidatedDeliveryWorkspace(deliveryCtx, c.Runtime, deliverySpec, ws.SourceRepository, sealedSource, expectedSourceDigest)
 	if deliveryErr != nil && deliveryResult.ContainerID == "" {
 		var integrityFailure *deliverySourceIntegrityFailure
-		if errors.As(deliveryErr, &integrityFailure) {
+		var infrastructureFailure *deliverySourceInfrastructureFailure
+		if errors.As(deliveryErr, &integrityFailure) || errors.As(deliveryErr, &infrastructureFailure) {
 			return c.failDeliverySourcePreflight(context.WithoutCancel(ctx), deliveryClaim, deliveryErr)
 		}
-		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		if worker.IsCertifiedNoLaunchFailure(deliveryErr) {
+			return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
+		}
+		return c.failDeliveryController(context.WithoutCancel(ctx), deliveryClaim, fmt.Errorf("Delivery Controller launch outcome is uncertain: %w", deliveryErr))
 	}
 	auditErr := c.recordWorkerContainer(deliveryClaim, deliveryResult)
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), deliveryClaim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
 	if auditErr != nil {
 		return c.failDeliveryController(finalizationCtx, deliveryClaim, errors.New(preDeliveryRedactor.String(auditErr.Error())))
+	}
+	if deliveryResult.ExitCode == deliverySourcePreflightExitCode {
+		return c.failDeliverySourcePreflight(finalizationCtx, deliveryClaim, deliverySourceIntegrityError(errors.New("mounted Delivery Source failed isolated launch revalidation")))
 	}
 	postDeliveryRedactor, err := c.Workspace.authenticationRedactor(ws)
 	if err != nil {

@@ -46,6 +46,25 @@ func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	}
 }
 
+func TestDockerArgsWrapContainerPreflightAroundCommand(t *testing.T) {
+	spec := Spec{
+		RunID: "run-1", Command: []string{"no-mistakes", "axi", "run"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"},
+		ExtraHosts: []string{GatewayHostMapping}, ContainerPreflight: "verify-source",
+	}
+	args := dockerArgs(spec)
+	if !containsArgs(args, "-ceu", "verify-source") || !containsArgs(args, "--", "no-mistakes") {
+		t.Fatalf("docker args omit isolated preflight wrapper: %#v", args)
+	}
+}
+
+func TestCertifiedNoLaunchFailureIsInfrastructure(t *testing.T) {
+	err := CertifiedNoLaunchError{Err: errors.New("launch preparation failed")}
+	if !IsCertifiedNoLaunchFailure(err) || !IsInfrastructureFailure(err) {
+		t.Fatalf("certified no-launch classification = %v", err)
+	}
+}
+
 func containsArgs(args []string, first, second string) bool {
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == first && args[i+1] == second {

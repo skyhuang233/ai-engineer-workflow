@@ -250,7 +250,7 @@ func TestCandidateAcceptanceRejectsAdditionalStructuredOutputProperties(t *testi
 	}
 }
 
-func TestExpiredDeliveryControllerNeedsAttentionBeforeAgentRecovery(t *testing.T) {
+func TestExpiredReadyDeliveryControllerRequeuesBeforeAgentRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -274,7 +274,7 @@ func TestExpiredDeliveryControllerNeedsAttentionBeforeAgentRecovery(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	_, err = db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,14 +290,12 @@ JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE rt.version_id = ? AND rt.issue_id = ?`, version.ID, claim.TicketID).Scan(&runtimeState, &runState, &leaseState); err != nil {
 		t.Fatal(err)
 	}
-	if runtimeState != plan.StateNeedsAttention || runState != "failed" || leaseState != "expired" {
+	if runtimeState != plan.StateWaitingReview || runState != "failed" || leaseState != "expired" {
 		t.Fatalf("expired delivery state = runtime %q, run %q, lease %q", runtimeState, runState, leaseState)
 	}
-	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(3 * time.Hour)}); !errors.Is(err, ErrFencingConflict) {
-		t.Fatalf("needs-attention recovery = %v, want ErrFencingConflict", err)
-	}
-	if _, err := db.CurrentClaim(ctx, version.ID, delivery.TicketID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expired delivery current claim = %v, want ErrNotFound", err)
+	pending, err := db.ClaimPendingDeliveryClaims(ctx, snapshot.Repository, 1, time.Hour, now.Add(3*time.Hour))
+	if err != nil || len(pending) != 1 || pending[0].SessionID != claim.SessionID {
+		t.Fatalf("ready-state delivery recovery = %#v, %v", pending, err)
 	}
 }
 
@@ -325,7 +323,11 @@ func TestRecoveryExpiresDeliveryControllersBeforeReturningLiveRuns(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, delivery, WorkerAudit{RunID: delivery.RunID, LeaseGeneration: delivery.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0.0", "github-cli": "1.0.0", "go": "1.0.0", "no-mistakes": "1.0.0"}}, now); err != nil {
 		t.Fatal(err)
 	}
 	runs, err := db.ActiveRecoveryRuns(ctx, version.ID, now.Add(2*time.Hour))

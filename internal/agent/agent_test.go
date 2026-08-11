@@ -78,7 +78,7 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 		r.deliveryOrigin = strings.TrimSpace(string(originOutput))
 		if r.waitForDeliveryDeadline {
 			<-ctx.Done()
-			return worker.Result{}, worker.InfrastructureError{Err: ctx.Err()}
+			return worker.Result{}, worker.CertifiedNoLaunchError{Err: ctx.Err()}
 		}
 		if r.deliveryErr != nil {
 			return worker.Result{}, r.deliveryErr
@@ -1188,6 +1188,17 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 	if err != nil {
 		t.Fatalf("claim replacement: %v", err)
 	}
+	firstRound, err := db.RevisionRoundID(ctx, claim.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementRound, err := db.RevisionRoundID(ctx, replacement.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacementRound != firstRound {
+		t.Fatalf("replacement Revision Round = %q, want %q", replacementRound, firstRound)
+	}
 	replacementRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("replacement-session", "replacement"), ContainerID: "replacement-container"}}}
 	replacementController := agent.Controller{Store: db, Workspace: manager, Runtime: replacementRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := replacementController.Run(ctx, candidateRequest(replacement, source, "ticket-1", "replace"))
@@ -1356,7 +1367,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
 		t.Fatalf("Delivery Controller Gateway fence environment = %#v", first.specs[1].Environment)
 	}
-	assertWorkflowDeliveryEnvironment(t, first.specs[1], claim.SessionID, claim.RunID, first.specs[1].RunID)
+	assertWorkflowDeliveryEnvironment(t, first.specs[1], claim.SessionID, revisionRoundIDForRun(t, ctx, db, claim.RunID), first.specs[1].RunID)
 	if first.specs[1].Environment["NO_MISTAKES_GATEWAY_URL"] != "http://gateway.test" {
 		t.Fatalf("Delivery Controller Gateway URL = %#v", first.specs[1].Environment)
 	}
@@ -1383,7 +1394,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 	if len(second.specs) != 2 || strings.Join(second.specs[1].Command, " ") != "no-mistakes axi run --intent address the review feedback" {
 		t.Fatalf("review worker specs = %#v", second.specs)
 	}
-	assertWorkflowDeliveryEnvironment(t, second.specs[1], claim.SessionID, revision.RunID, second.specs[1].RunID)
+	assertWorkflowDeliveryEnvironment(t, second.specs[1], claim.SessionID, revisionRoundIDForRun(t, ctx, db, revision.RunID), second.specs[1].RunID)
 	if command := second.specs[0].Command; len(command) != 11 || command[0] != "codex" || command[1] != "exec" || command[2] != "--sandbox" || command[3] != "danger-full-access" || command[4] != "resume" || command[5] != "--json" || command[6] != "--output-schema" || command[8] != "--skip-git-repo-check" || command[9] != "codex-session-1" || command[10] != "address the review feedback" {
 		t.Fatalf("resumed Codex command = %#v", command)
 	}
@@ -1443,7 +1454,7 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
 			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+			deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 		},
 		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		Now: func() time.Time { return now },
@@ -1465,7 +1476,7 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("claim credential-blocked delivery = %#v, %v", pending, err)
 	}
-	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	deliverySource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	if err := os.RemoveAll(deliverySource); err != nil {
 		t.Fatal(err)
 	}
@@ -1513,7 +1524,7 @@ func TestControllerRetryDeliveryUsesRetainedSourceWhenCheckoutIsUnavailable(t *t
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
 			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+			deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 		},
 		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		Now: func() time.Time { return now },
@@ -1546,7 +1557,7 @@ func TestControllerRevalidatesDeliverySourceDigestBeforeInitialLaunch(t *testing
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
-	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	deliverySource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	runtime := &fakeRuntime{
 		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
 		afterCandidate: func() error {
@@ -1583,11 +1594,14 @@ func TestControllerSealsDeliverySourceAcrossRuntimeLaunch(t *testing.T) {
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
-	retainedSource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	retainedSource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	runtime := &fakeRuntime{
 		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
 		beforeDelivery: func(spec worker.Spec) error {
 			sealedSource := spec.Mounts[2].Source
+			if spec.Mounts[2].Target != "/source-seed" || spec.ContainerPreflight == "" {
+				return errors.New("Delivery Worker omitted isolated source materialization")
+			}
 			if filepath.Clean(sealedSource) == filepath.Clean(retainedSource) {
 				return errors.New("Delivery Worker mounted the retained mutable source")
 			}
@@ -1677,6 +1691,34 @@ func TestControllerRetriesPrecontainerDeliveryTimeout(t *testing.T) {
 	}
 }
 
+func TestControllerDoesNotRetryUncertainEmptyContainerLaunch(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr: worker.InfrastructureError{Err: errors.New("lost Docker launch response")},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
+	if runErr == nil || !strings.Contains(runErr.Error(), "launch outcome is uncertain") {
+		t.Fatalf("uncertain launch error = %v", runErr)
+	}
+	pending, err := db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC().Add(time.Hour))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("uncertain launch retries = %#v, %v", pending, err)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 1 || questions[0].Kind != "needs_attention" {
+		t.Fatalf("uncertain launch questions = %#v, %v", questions, err)
+	}
+}
+
 func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
@@ -1689,7 +1731,7 @@ func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
 			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+			deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 		},
 		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		Now: func() time.Time { return now },
@@ -1701,7 +1743,7 @@ func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
 	}
-	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	deliverySource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	command := exec.Command("git", "--git-dir", deliverySource, "update-ref", "refs/tags/tampered", "refs/heads/main")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("tamper Delivery Source: %v\n%s", err, output)
@@ -1736,7 +1778,7 @@ func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
 			results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-			deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+			deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 		},
 		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		Now: func() time.Time { return now },
@@ -1752,7 +1794,7 @@ func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("claim delivery recovery = %#v, %v", pending, err)
 	}
-	deliverySource := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	deliverySource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	if err := os.RemoveAll(deliverySource); err != nil {
 		t.Fatal(err)
 	}
@@ -1886,7 +1928,7 @@ func TestControllerRetryDeliveryRevalidatesLegacyCandidateWithoutSourceDigest(t 
 	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "lacks verifiable Delivery Source provenance") {
 		t.Fatalf("Delivery Source revalidation = %#v, prompt %q", revision, prompt)
 	}
-	deliverySource := filepath.Join(root, ".delivery-sources", claim.SessionID, claim.RunID+".git")
+	deliverySource := retainedDeliverySourcePath(t, ctx, db, root, claim)
 	if _, err := os.Stat(deliverySource); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy Delivery Source was reconstructed: %v", err)
 	}
@@ -1979,7 +2021,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	}
 	t.Logf("accepted Candidate preserved: run=%s commit=%s image=%s tools=%v", claim.RunID, candidate.CommitSHA, candidateImage, candidateTools)
 	t.Logf("recovery Delivery Worker launched: run=%s image=%s tools=%v mounts=%s extra_hosts=%s github_write_credentials=%t container=%s", retryRunID, audit.ImageDigest, auditedTools, audit.MountsJSON, audit.ExtraHostsJSON, audit.GitHubWriteCredentials, audit.ContainerID)
-	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, claim.RunID, pending[0].RunID)
+	assertWorkflowDeliveryEnvironment(t, retryRuntime.specs[0], claim.SessionID, revisionRoundIDForRun(t, ctx, db, claim.RunID), pending[0].RunID)
 	pending, err = db.PendingDeliveryClaims(ctx, "owner/repo", time.Now().UTC())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending delivery claims after retry = %#v, %v", pending, err)
@@ -1994,7 +2036,7 @@ func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T
 	defer db.Close()
 	runtime := &fakeRuntime{
 		results:     []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
-		deliveryErr: worker.InfrastructureError{Err: errors.New("Docker daemon unavailable")},
+		deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 	}
 	controller := agent.Controller{
 		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
@@ -2136,35 +2178,26 @@ func assertWorkflowDeliveryEnvironment(t *testing.T, spec worker.Spec, deliveryC
 
 func assertDeliveryOriginMount(t *testing.T, runtime *fakeRuntime, spec worker.Spec, source string) {
 	t.Helper()
-	if _, exists := spec.Environment["GIT_CONFIG_COUNT"]; exists {
-		t.Fatalf("Delivery Controller retained additive Git origin override = %#v", spec.Environment)
+	if spec.Environment["GIT_CONFIG_COUNT"] != "0" || spec.Environment["GIT_CONFIG_GLOBAL"] != "/dev/null" || spec.Environment["GIT_CONFIG_NOSYSTEM"] != "1" {
+		t.Fatalf("Delivery Controller Git transport isolation = %#v", spec.Environment)
 	}
 	if runtime.deliveryOrigin != "/source-repository" {
 		t.Fatalf("Delivery Controller workspace origin = %q", runtime.deliveryOrigin)
+	}
+	if spec.ContainerPreflight == "" {
+		t.Fatal("Delivery Controller omitted isolated source materialization")
 	}
 	workspaceOrigin := exec.Command("git", "-C", spec.WorkspacePath, "remote", "get-url", "--all", "origin")
 	if output, err := workspaceOrigin.Output(); err != nil || !strings.EqualFold(filepath.Clean(strings.TrimSpace(string(output))), filepath.Clean(source)) {
 		t.Fatalf("restored Ticket Workspace origin = %q, %v", output, err)
 	}
 	for _, mount := range spec.Mounts {
-		if mount.Target == "/source-repository" {
+		if mount.Target == "/source-seed" {
 			if mount.Source == source || !mount.ReadOnly {
 				t.Fatalf("Delivery Controller source mount = %#v, want credential-free snapshot distinct from %q", mount, source)
 			}
-			bare := exec.Command("git", "-C", mount.Source, "rev-parse", "--is-bare-repository")
-			if output, err := bare.Output(); err != nil || strings.TrimSpace(string(output)) != "true" {
-				t.Fatalf("Delivery Controller source snapshot is not bare: %q, %v", output, err)
-			}
-			remotes := exec.Command("git", "-C", mount.Source, "remote")
-			if output, err := remotes.Output(); err != nil || strings.TrimSpace(string(output)) != "" {
-				t.Fatalf("Delivery Controller source snapshot remotes = %q, %v", output, err)
-			}
-			credentials := exec.Command("git", "-C", mount.Source, "config", "--local", "--get-regexp", "credential")
-			if output, err := credentials.CombinedOutput(); err == nil || len(output) != 0 {
-				t.Fatalf("Delivery Controller source snapshot exposed credential config: %q, %v", output, err)
-			}
-			if _, err := os.Stat(filepath.Join(mount.Source, "untracked-credential.txt")); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("Delivery Controller source snapshot exposed untracked credential file: %v", err)
+			if _, err := os.Stat(mount.Source); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Delivery Controller source snapshot cleanup = %v", err)
 			}
 			return
 		}
@@ -2229,8 +2262,8 @@ func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
 	if len(runtime.specs) != 0 {
 		t.Fatal("worker started with a credential-bearing workspace source")
 	}
-	if err := db.ReserveWorkerLaunch(ctx, claim, store.WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, time.Now().UTC()); err != nil {
-		t.Fatalf("preflight failure reserved worker launch: %v", err)
+	if err := db.ReserveWorkerLaunch(ctx, claim, store.WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, time.Now().UTC()); !errors.Is(err, store.ErrWorkerLaunched) {
+		t.Fatalf("preflight failure launch reservation = %v, want ErrWorkerLaunched", err)
 	}
 }
 
@@ -2430,6 +2463,21 @@ func codexOutputWithCommit(sessionID, summary string, commit any) []byte {
 
 func candidateRequest(claim store.TicketClaim, source, branch, prompt string) agent.RunRequest {
 	return agent.RunRequest{Claim: claim, SourceRepository: source, Branch: branch, Prompt: prompt, Publication: store.CandidatePublication{Repository: "owner/repo", Branch: branch, ExpectRemoteAbsent: true, Title: claim.TicketTitle}}
+}
+
+func retainedDeliverySourcePath(t *testing.T, ctx context.Context, db *store.Store, root string, claim store.TicketClaim) string {
+	t.Helper()
+	revisionRoundID := revisionRoundIDForRun(t, ctx, db, claim.RunID)
+	return filepath.Join(root, ".delivery-sources", claim.SessionID, revisionRoundID+".git")
+}
+
+func revisionRoundIDForRun(t *testing.T, ctx context.Context, db *store.Store, runID string) string {
+	t.Helper()
+	revisionRoundID, err := db.RevisionRoundID(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revisionRoundID
 }
 
 func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {

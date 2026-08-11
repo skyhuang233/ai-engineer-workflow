@@ -217,7 +217,7 @@ func (s *Store) ActiveRecoveryRuns(ctx context.Context, versionID string, now ti
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, r.run_id, l.lease_token
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id, s.session_id, r.run_id, r.recovery_epoch, r.launch_state, l.lease_token
 FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
@@ -226,13 +226,15 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 		return nil, err
 	}
 	type expiredDelivery struct {
-		issueID           int64
-		runID, leaseToken string
+		issueID                 int64
+		recoveryEpoch           int64
+		sessionID, runID        string
+		launchState, leaseToken string
 	}
 	var expired []expiredDelivery
 	for rows.Next() {
 		var delivery expiredDelivery
-		if err := rows.Scan(&delivery.issueID, &delivery.runID, &delivery.leaseToken); err != nil {
+		if err := rows.Scan(&delivery.issueID, &delivery.sessionID, &delivery.runID, &delivery.recoveryEpoch, &delivery.launchState, &delivery.leaseToken); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -246,13 +248,7 @@ WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.
 		return nil, err
 	}
 	for _, delivery := range expired {
-		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), delivery.runID, RunRunning); err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, delivery.runID, delivery.leaseToken, LeaseActive); err != nil {
-			return nil, err
-		}
-		if err := markTicketNeedsAttentionTx(ctx, tx, versionID, delivery.issueID, "Delivery Controller lease expired during restart recovery", now); err != nil {
+		if err := recoverExpiredDeliveryTx(ctx, tx, versionID, delivery.issueID, delivery.sessionID, delivery.runID, delivery.recoveryEpoch, delivery.launchState, delivery.leaseToken, now); err != nil {
 			return nil, err
 		}
 	}
@@ -280,6 +276,38 @@ ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTime
 		return nil, err
 	}
 	return runs, nil
+}
+
+func recoverExpiredDeliveryTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, sessionID, runID string, recoveryEpoch int64, launchState, leaseToken string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'failed', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), runID, RunRunning); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'expired' WHERE run_id = ? AND lease_token = ? AND state = ?`, runID, leaseToken, LeaseActive); err != nil {
+		return err
+	}
+	if launchState == "ready" {
+		reason := "Delivery Controller lease expired before launch reservation"
+		if err := recordRunFailureDetailTx(ctx, tx, runID, FailureInfrastructure, reason, now); err != nil {
+			return err
+		}
+		if err := updateInfrastructureRetryTx(ctx, tx, runID, FailureInfrastructure, now); err != nil {
+			return err
+		}
+		var attempts int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_runs r JOIN run_failures failure ON failure.run_id = r.run_id WHERE r.session_id = ? AND r.recovery_epoch = ? AND r.run_kind = ?`, sessionID, recoveryEpoch, RunDelivery).Scan(&attempts); err != nil {
+			return err
+		}
+		if attempts < DefaultMaxWorkerAttempts {
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, formatTimestamp(now), sessionID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, updated_at = ? WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateWaitingReview, formatTimestamp(now), versionID, issueID); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, "Delivery Controller lease expired during restart recovery", now)
 }
 
 func scanRecoveryRuns(rows *sql.Rows) ([]RecoveryRun, error) {
@@ -551,6 +579,19 @@ func (s *Store) CandidateDeliverySourceDigest(ctx context.Context, runID string)
 		return "", ErrNotFound
 	}
 	return digest, err
+}
+
+func (s *Store) RevisionRoundID(ctx context.Context, runID string) (string, error) {
+	if runID == "" {
+		return "", ErrInvalidClaim
+	}
+	var recoveryEpoch int64
+	if err := s.db.QueryRowContext(ctx, `SELECT recovery_epoch FROM worker_runs WHERE run_id = ?`, runID).Scan(&recoveryEpoch); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("round-%d", recoveryEpoch), nil
 }
 
 func (s *Store) DeliveryWorkerRuntime(ctx context.Context, claim TicketClaim) (string, map[string]string, bool, error) {

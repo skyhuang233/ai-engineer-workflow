@@ -29,6 +29,7 @@ type workspace struct {
 	CodexState           string
 	DeliverySource       string
 	DeliverySourceDigest string
+	RevisionRoundID      string
 	SourceRepository     string
 	Branch               string
 	BaseCommit           string
@@ -38,8 +39,9 @@ type deliverySourceInfrastructureFailure struct {
 	err error
 }
 
-func (e *deliverySourceInfrastructureFailure) Error() string { return e.err.Error() }
-func (e *deliverySourceInfrastructureFailure) Unwrap() error { return e.err }
+func (e *deliverySourceInfrastructureFailure) Error() string               { return e.err.Error() }
+func (e *deliverySourceInfrastructureFailure) Unwrap() error               { return e.err }
+func (e *deliverySourceInfrastructureFailure) InfrastructureFailure() bool { return true }
 
 func deliverySourceInfrastructureError(err error) error {
 	if err == nil {
@@ -430,9 +432,9 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	}
 	deliverySourceDigest, err := digestDeliverySource(ctx, deliverySource)
 	if err != nil {
-		return workspace{}, deliverySourceInfrastructureError(err)
+		return workspace{}, err
 	}
-	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, DeliverySourceDigest: deliverySourceDigest, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
+	return workspace{Path: path, CodexState: state, DeliverySource: deliverySource, DeliverySourceDigest: deliverySourceDigest, RevisionRoundID: revisionRoundID, SourceRepository: sourceRepository, Branch: branch, BaseCommit: strings.TrimSpace(base)}, nil
 }
 
 func (m WorkspaceManager) deliverySourceSessionPath(sessionID string) (string, error) {
@@ -496,7 +498,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 			return "", deliverySourceInfrastructureError(errors.New("persisted Delivery Source identity does not match the admitted source repository"))
 		}
 		if err := validateDeliverySource(ctx, path); err != nil {
-			return "", deliverySourceInfrastructureError(err)
+			return "", err
 		}
 		return path, nil
 	} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -543,7 +545,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 		return "", deliverySourceInfrastructureError(fmt.Errorf("record Delivery Source identity: %w", err))
 	}
 	if err := validateDeliverySource(ctx, temporaryPath); err != nil {
-		return "", deliverySourceInfrastructureError(err)
+		return "", err
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("persist Delivery Source: %w", err))
@@ -723,7 +725,13 @@ func digestDeliverySource(ctx context.Context, sourcePath string) (string, error
 	if err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source identity: %w", err))
 	}
-	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags")
+	if err := runGit(ctx, sourcePath, "fsck", "--connectivity-only", "--no-dangling"); err != nil {
+		if ctx.Err() != nil {
+			return "", deliverySourceInfrastructureError(fmt.Errorf("validate Delivery Source connectivity: %w", ctx.Err()))
+		}
+		return "", deliverySourceIntegrityError(fmt.Errorf("Delivery Source contains missing or corrupt reachable objects: %w", err))
+	}
+	refs, err := gitOutput(ctx, sourcePath, "for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
 	if err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("read Delivery Source refs: %w", err))
 	}
