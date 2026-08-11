@@ -40,6 +40,22 @@ func TestDeliverySourceAuthenticationFailure(t *testing.T) {
 	}
 }
 
+func TestDeliverySourcePathClassifiesOperationalAndIntegrityFailures(t *testing.T) {
+	manager := WorkspaceManager{RootDir: "invalid\x00root"}
+	_, err := manager.ensureDeliverySource(context.Background(), "session-1", "revision-1", "source")
+	var infrastructureFailure *deliverySourceInfrastructureFailure
+	if !errors.As(err, &infrastructureFailure) {
+		t.Fatalf("operational path-resolution error = %T %v, want Delivery Source infrastructure failure", err, err)
+	}
+
+	manager.RootDir = t.TempDir()
+	_, err = manager.ensureDeliverySource(context.Background(), "../session-1", "revision-1", "source")
+	var integrityFailure *deliverySourceIntegrityFailure
+	if !errors.As(err, &integrityFailure) {
+		t.Fatalf("invalid managed ID error = %T %v, want Delivery Source integrity failure", err, err)
+	}
+}
+
 func TestDeliverySourceRefreshesPerRevisionAndPinsRetries(t *testing.T) {
 	ctx := context.Background()
 	source := filepath.Join(t.TempDir(), "source")

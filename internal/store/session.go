@@ -776,28 +776,11 @@ func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, c
 		return err
 	}
 	defer tx.Rollback()
-	var sessionID string
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id
-FROM ticket_sessions s
-JOIN worker_runs r ON r.run_id = s.current_run_id
-JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-JOIN ticket_runtime runtime ON runtime.version_id = s.version_id AND runtime.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ?
-AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? AND runtime.delivered = 0`,
-		claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrInvalidClaim
-	}
+	sessionID, _, err := supersedeActiveDeliveryTx(ctx, tx, claim, now)
 	if err != nil {
 		return err
 	}
 	nowText := formatTimestamp(now)
-	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 1, updated_at = ? WHERE session_id = ?`, nowText, sessionID); err != nil {
 		return err
 	}
@@ -824,18 +807,7 @@ func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
-	var sessionID, candidateRunID string
-	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.accepted_candidate_run_id
-FROM ticket_sessions s
-JOIN worker_runs r ON r.run_id = s.current_run_id
-JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-JOIN ticket_runtime runtime ON runtime.version_id = s.version_id AND runtime.issue_id = s.issue_id
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ?
-AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? AND runtime.delivered = 0`,
-		claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID, &candidateRunID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrInvalidClaim
-	}
+	sessionID, candidateRunID, err := supersedeActiveDeliveryTx(ctx, tx, claim, now)
 	if err != nil {
 		return err
 	}
@@ -843,12 +815,6 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 		return ErrInvalidClaim
 	}
 	nowText := formatTimestamp(now)
-	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET delivery_retry_pending = 0, updated_at = ? WHERE session_id = ?`, nowText, sessionID); err != nil {
 		return err
 	}
@@ -863,6 +829,33 @@ VALUES (?, ?, ?, ?, ?) ON CONFLICT(version_id, issue_id, event_id) DO NOTHING`, 
 		return err
 	}
 	return tx.Commit()
+}
+
+func supersedeActiveDeliveryTx(ctx context.Context, tx *sql.Tx, claim TicketClaim, now time.Time) (string, string, error) {
+	var sessionID string
+	var candidateRunID sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT s.session_id, s.accepted_candidate_run_id
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_runtime runtime ON runtime.version_id = s.version_id AND runtime.issue_id = s.issue_id
+WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AND r.state = ?
+AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? AND runtime.delivered = 0`,
+		claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseToken, claim.LeaseGeneration, LeaseActive, formatTimestamp(now)).Scan(&sessionID, &candidateRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrInvalidClaim
+	}
+	if err != nil {
+		return "", "", err
+	}
+	nowText := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, nowText, claim.RunID, RunRunning); err != nil {
+		return "", "", err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE run_id = ? AND lease_token = ? AND state = ?`, claim.RunID, claim.LeaseToken, LeaseActive); err != nil {
+		return "", "", err
+	}
+	return sessionID, candidateRunID.String, nil
 }
 
 func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry bool, now time.Time) error {

@@ -288,7 +288,10 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	}
 	if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
 		if sourceWasMissing {
-			err = errors.Join(err, os.RemoveAll(deliverySource))
+			if removeErr := os.RemoveAll(deliverySource); removeErr != nil {
+				return c.failDeliveryControllerWithClass(finalizationCtx, claim, errors.Join(err, removeErr), store.FailureInfrastructure)
+			}
+			return c.Store.RevalidateDeliverySource(finalizationCtx, claim, "The accepted Candidate Revision's Delivery Source is no longer available at its pinned revision. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain.", c.now())
 		}
 		return c.failDeliveryControllerWithClass(finalizationCtx, claim, err, store.FailureInfrastructure)
 	}

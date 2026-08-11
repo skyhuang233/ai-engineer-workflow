@@ -369,7 +369,7 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 	}
 	sourceRepository, err := localSourceRepository(sourceRepository)
 	if err != nil {
-		return workspace{}, deliverySourceInfrastructureError(err)
+		return workspace{}, err
 	}
 	path, state, err := m.sessionPaths(sessionID)
 	if err != nil {
@@ -437,35 +437,35 @@ func (m WorkspaceManager) ensure(ctx context.Context, sessionID, revisionRoundID
 
 func (m WorkspaceManager) deliverySourceSessionPath(sessionID string) (string, error) {
 	if strings.TrimSpace(m.RootDir) == "" {
-		return "", errors.New("workspace configuration is incomplete")
+		return "", deliverySourceIntegrityError(errors.New("workspace configuration is incomplete"))
 	}
 	if sessionID == "" || filepath.Base(sessionID) != sessionID {
-		return "", errors.New("Ticket Session ID is invalid")
+		return "", deliverySourceIntegrityError(errors.New("Ticket Session ID is invalid"))
 	}
 	workspaceRoot, err := canonicalPath(m.RootDir)
 	if err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve workspace root: %w", err))
 	}
 	root, err := canonicalPath(filepath.Join(workspaceRoot, ".delivery-sources"))
 	if err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve Delivery Source root: %w", err))
 	}
 	if _, err := managedPath(workspaceRoot, root); err != nil {
-		return "", err
+		return "", deliverySourceIntegrityError(err)
 	}
 	path, err := canonicalPath(filepath.Join(root, sessionID))
 	if err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve Ticket Session Delivery Source path: %w", err))
 	}
 	if _, err := managedPath(root, path); err != nil {
-		return "", err
+		return "", deliverySourceIntegrityError(err)
 	}
 	return path, nil
 }
 
 func (m WorkspaceManager) deliverySourcePath(sessionID, revisionRoundID string) (string, error) {
 	if revisionRoundID == "" || filepath.Base(revisionRoundID) != revisionRoundID {
-		return "", errors.New("Revision Round ID is invalid")
+		return "", deliverySourceIntegrityError(errors.New("Revision Round ID is invalid"))
 	}
 	root, err := m.deliverySourceSessionPath(sessionID)
 	if err != nil {
@@ -473,10 +473,10 @@ func (m WorkspaceManager) deliverySourcePath(sessionID, revisionRoundID string) 
 	}
 	path, err := canonicalPath(filepath.Join(root, revisionRoundID+".git"))
 	if err != nil {
-		return "", err
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve Revision Round Delivery Source path: %w", err))
 	}
 	if _, err := managedPath(root, path); err != nil {
-		return "", err
+		return "", deliverySourceIntegrityError(err)
 	}
 	return path, nil
 }
@@ -740,18 +740,18 @@ func validateAdmittedSourceRepository(sourceRepository string) (string, error) {
 
 func localSourceRepository(source string) (string, error) {
 	if !filepath.IsAbs(source) {
-		return "", errors.New("workspace source repository must be an absolute local path")
+		return "", deliverySourceIntegrityError(errors.New("workspace source repository must be an absolute local path"))
 	}
 	resolved, err := filepath.EvalSymlinks(filepath.Clean(source))
 	if err != nil {
-		return "", fmt.Errorf("resolve workspace source repository: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve workspace source repository: %w", err))
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return "", fmt.Errorf("inspect workspace source repository: %w", err)
+		return "", deliverySourceInfrastructureError(fmt.Errorf("inspect workspace source repository: %w", err))
 	}
 	if !info.IsDir() {
-		return "", errors.New("workspace source repository must be a local directory")
+		return "", deliverySourceIntegrityError(errors.New("workspace source repository must be a local directory"))
 	}
 	return resolved, nil
 }

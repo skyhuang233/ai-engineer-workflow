@@ -1501,11 +1501,11 @@ func TestControllerRetryDeliveryUsesRetainedSourceWhenCheckoutIsUnavailable(t *t
 	}
 }
 
-func TestControllerRetryDeliveryRejectsRepinnedModernSource(t *testing.T) {
+func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
-	db, _, claim := createClaim(t, ctx, root)
+	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
@@ -1547,14 +1547,21 @@ func TestControllerRetryDeliveryRejectsRepinnedModernSource(t *testing.T) {
 	retryRuntime := &fakeRuntime{}
 	controller.Runtime = retryRuntime
 	controller.SourceRepository = source
-	if err := controller.RetryDelivery(ctx, pending[0]); err == nil || !strings.Contains(err.Error(), "does not match its pinned Candidate Revision") {
-		t.Fatalf("repinned Delivery Source error = %v", err)
+	if err := controller.RetryDelivery(ctx, pending[0]); err != nil {
+		t.Fatalf("revalidate repinned Delivery Source: %v", err)
 	}
 	if len(retryRuntime.specs) != 0 {
 		t.Fatal("Delivery Controller launched with a repinned source")
 	}
 	if _, err := os.Stat(deliverySource); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("mismatched reconstructed Delivery Source was retained: %v", err)
+	}
+	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, now.Add(3*time.Minute), 1, store.DefaultMaxWorkerAttempts)
+	if err != nil {
+		t.Fatalf("claim modern Delivery Source revalidation: %v", err)
+	}
+	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "no longer available at its pinned revision") {
+		t.Fatalf("modern Delivery Source revalidation = %#v, prompt %q", revision, prompt)
 	}
 }
 
