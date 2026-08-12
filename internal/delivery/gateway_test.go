@@ -37,6 +37,37 @@ type enqueueFailingStore struct {
 	err error
 }
 
+type isolationClaimStore struct {
+	*store.Store
+	target     store.TicketClaim
+	claimCalls int
+}
+
+type recordingIsolator struct {
+	runIDs []string
+}
+
+func (s *isolationClaimStore) ClaimDeliveryOutboxForDispatcher(_ context.Context, _ string, _ string, _ time.Time, isolated ...store.WorkerIsolationProof) (store.DeliveryOutbox, error) {
+	s.claimCalls++
+	if len(isolated) == 0 {
+		return store.DeliveryOutbox{}, &store.WorkerIsolationRequired{Targets: []store.TicketClaim{s.target}}
+	}
+	return store.DeliveryOutbox{}, fmt.Errorf("%w: delivery retries exhausted", store.ErrDeliveryRejected)
+}
+
+func (s *isolationClaimStore) FenceWorkerIsolation(_ context.Context, requested []store.TicketClaim) ([]store.TicketClaim, error) {
+	return requested, nil
+}
+
+func (s *isolationClaimStore) AcknowledgeWorkerIsolation(_ context.Context, fenced []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
+	return []store.WorkerIsolationProof{{}}, nil
+}
+
+func (i *recordingIsolator) IsolateContainer(_ context.Context, runID string) error {
+	i.runIDs = append(i.runIDs, runID)
+	return nil
+}
+
 func (s enqueueFailingStore) EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error) {
 	return store.DeliveryOutbox{}, s.err
 }
@@ -1217,6 +1248,27 @@ func TestGatewayDispatchReportsTerminalUncertainInboxRecoveryKey(t *testing.T) {
 	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
 	if !errors.Is(err, store.ErrDeliveryRejected) || !strings.Contains(err.Error(), queued.IdempotencyKey) || !strings.Contains(err.Error(), "workflow recover-inbox-delivery") {
 		t.Fatalf("terminal uncertain Inbox dispatch = %v", err)
+	}
+}
+
+func TestGatewayIsolatesWorkerBeforeExhaustedOutboxEscalation(t *testing.T) {
+	ctx := context.Background()
+	db, claim := newAcceptedClaim(t, ctx)
+	defer db.Close()
+	now := time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC)
+	queued, err := db.EnqueueDelivery(ctx, candidatePush(claim, "base", false), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &isolationClaimStore{Store: db, target: claim}
+	isolator := &recordingIsolator{}
+	gateway := delivery.Gateway{Store: wrapped, Remote: &fakeRemote{}, WorkerIsolator: isolator, Now: func() time.Time { return now }}
+	err = gateway.Dispatch(ctx, queued.IdempotencyKey)
+	if !errors.Is(err, store.ErrDeliveryRejected) {
+		t.Fatalf("isolated exhausted dispatch = %v, want delivery rejection", err)
+	}
+	if wrapped.claimCalls != 2 || len(isolator.runIDs) != 1 || isolator.runIDs[0] != claim.RunID {
+		t.Fatalf("isolation replay calls = %d, isolated = %#v", wrapped.claimCalls, isolator.runIDs)
 	}
 }
 

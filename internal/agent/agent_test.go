@@ -1906,6 +1906,39 @@ func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 	}
 }
 
+func TestControllerIsolatesDeliverySourceIntegrityExitBeforeRevalidation(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, version, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	now := time.Now().UTC()
+	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	runtime := &fakeRuntime{
+		results:             []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr:         errors.New("exit status 78"),
+		deliveryErrorResult: worker.Result{ContainerID: "delivery-container", ExitCode: 78},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: manager, Runtime: runtime,
+		ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+		Now: func() time.Time { return now },
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
+		t.Fatalf("Delivery Source integrity revalidation: %v", err)
+	}
+	if len(runtime.isolatedRuns) != 1 {
+		t.Fatalf("isolated Delivery Controller runs = %#v", runtime.isolatedRuns)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Waiting Review" {
+		t.Fatalf("ticket state = %q, want Waiting Review", projection.Tickets[0].State)
+	}
+}
+
 func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

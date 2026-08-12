@@ -1134,7 +1134,7 @@ func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.
 	})
 }
 
-func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
+func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time, isolated ...WorkerIsolationProof) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
@@ -1150,6 +1150,9 @@ func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, c
 		return err
 	}
 	defer tx.Rollback()
+	if err := requireWorkerIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+		return err
+	}
 	sessionID, _, err := supersedeActiveDeliveryTx(ctx, tx, claim, now)
 	if err != nil {
 		return err
@@ -1164,7 +1167,7 @@ func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, c
 	return tx.Commit()
 }
 
-func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim, reason string, now time.Time) error {
+func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim, reason string, now time.Time, isolated ...WorkerIsolationProof) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	reason = strings.TrimSpace(reason)
@@ -1181,6 +1184,9 @@ func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
+	if err := requireWorkerIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+		return err
+	}
 	sessionID, candidateRunID, err := supersedeActiveDeliveryTx(ctx, tx, claim, now)
 	if err != nil {
 		return err

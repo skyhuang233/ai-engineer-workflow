@@ -591,21 +591,21 @@ func (s *Store) RecordPullRequestChecksETag(ctx context.Context, versionID strin
 	return nil
 }
 
-func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Time) (DeliveryOutbox, error) {
+func (s *Store) ClaimDeliveryOutbox(ctx context.Context, key string, now time.Time, isolated ...WorkerIsolationProof) (DeliveryOutbox, error) {
 	if err := s.EnsureGatewayDispatcher(ctx, "legacy-gateway-dispatcher", now); err != nil {
 		return DeliveryOutbox{}, err
 	}
-	return s.claimDeliveryOutbox(ctx, key, "legacy-gateway-dispatcher", now)
+	return s.claimDeliveryOutbox(ctx, key, "legacy-gateway-dispatcher", now, isolated...)
 }
 
-func (s *Store) ClaimDeliveryOutboxForDispatcher(ctx context.Context, key, dispatcherToken string, now time.Time) (DeliveryOutbox, error) {
+func (s *Store) ClaimDeliveryOutboxForDispatcher(ctx context.Context, key, dispatcherToken string, now time.Time, isolated ...WorkerIsolationProof) (DeliveryOutbox, error) {
 	if dispatcherToken == "" {
 		return DeliveryOutbox{}, errors.New("Gateway dispatcher token is required")
 	}
-	return s.claimDeliveryOutbox(ctx, key, dispatcherToken, now)
+	return s.claimDeliveryOutbox(ctx, key, dispatcherToken, now, isolated...)
 }
 
-func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken string, now time.Time) (DeliveryOutbox, error) {
+func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken string, now time.Time, isolated ...WorkerIsolationProof) (DeliveryOutbox, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if now.IsZero() {
@@ -665,7 +665,7 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	}
 	if attempts >= maxDeliveryAttempts {
 		lastError := inboxDeliveryRecoveryReason(request, key, "delivery retries exhausted", uncertain != 0)
-		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain != 0, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
+		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain != 0, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 			return DeliveryOutbox{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ? WHERE idempotency_key = ?`, OutboxRejected, lastError, formatTimestamp(now), formatTimestamp(now), key); err != nil {
@@ -767,24 +767,24 @@ func deliveryOutboxClaimRecoverableTx(ctx context.Context, tx *sql.Tx, raw, upda
 	return !expiresAt.After(now), nil
 }
 
-func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true, time.Time{})
+func (s *Store) FinishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, now time.Time, isolated ...WorkerIsolationProof) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, state, lastError, false, now, true, time.Time{}, isolated...)
 }
 
-func (s *Store) RejectDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxRejected, lastError, uncertain, now, true, time.Time{})
+func (s *Store) RejectDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time, isolated ...WorkerIsolationProof) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxRejected, lastError, uncertain, now, true, time.Time{}, isolated...)
 }
 
-func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true, time.Time{})
+func (s *Store) MarkDeliveryOutboxUncertain(ctx context.Context, key, claimToken, lastError string, now time.Time, isolated ...WorkerIsolationProof) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, true, now, true, time.Time{}, isolated...)
 }
 
-func (s *Store) RequeueDeliveryOutboxClaim(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false, time.Time{})
+func (s *Store) RequeueDeliveryOutboxClaim(ctx context.Context, key, claimToken, lastError string, uncertain bool, now time.Time, isolated ...WorkerIsolationProof) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, false, time.Time{}, isolated...)
 }
 
-func (s *Store) DeferDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, retryAt, now time.Time) error {
-	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, true, retryAt)
+func (s *Store) DeferDeliveryOutbox(ctx context.Context, key, claimToken, lastError string, uncertain bool, retryAt, now time.Time, isolated ...WorkerIsolationProof) error {
+	return s.finishDeliveryOutbox(ctx, key, claimToken, OutboxPending, lastError, uncertain, now, true, retryAt, isolated...)
 }
 
 func (s *Store) RecoverUncertainInboxDelivery(ctx context.Context, repository, key, questionID, answer string, now time.Time) (DeliveryOutbox, error) {
@@ -908,7 +908,7 @@ WHERE idempotency_key = ? AND operation = ? AND state = ? AND uncertain != 0
 	return outbox, nil
 }
 
-func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool, retryAt time.Time) error {
+func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state, lastError string, uncertain bool, now time.Time, requireDispatcher bool, retryAt time.Time, isolated ...WorkerIsolationProof) error {
 	if state != OutboxPending && state != OutboxSucceeded && state != OutboxRejected {
 		return ErrInvalidClaim
 	}
@@ -948,15 +948,15 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		if state == OutboxRejected {
 			lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
 			if request.Operation == DeliveryProjectInbox && uncertain {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			} else if request.Operation == DeliveryProjectPlan && request.RunID == "" {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			} else if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			}
@@ -966,7 +966,7 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
 		lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
-		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
+		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 			return err
 		}
 	} else {

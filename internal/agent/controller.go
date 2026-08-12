@@ -939,7 +939,10 @@ func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store
 		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), claim, cause, store.FailureInfrastructure)
 	}
 	if isDeliverySourceAuthenticationFailure(err) {
-		deferErr := c.Store.DeferDeliveryControllerForCredentialPause(ctx, claim, c.now())
+		isolator, _ := c.Runtime.(worker.ContainerIsolator)
+		deferErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+			return c.Store.DeferDeliveryControllerForCredentialPause(ctx, claim, c.now(), isolated...)
+		})
 		return errors.Join(err, deferErr)
 	}
 	var integrityFailure *deliverySourceIntegrityFailure
@@ -950,7 +953,10 @@ func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store
 		} else if errors.Is(err, errDeliverySourceDigestMismatch) {
 			reason = "The accepted Candidate Revision's Delivery Source is no longer available at its pinned revision. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain."
 		}
-		return c.Store.RevalidateDeliverySource(ctx, claim, reason, c.now())
+		isolator, _ := c.Runtime.(worker.ContainerIsolator)
+		return isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+			return c.Store.RevalidateDeliverySource(ctx, claim, reason, c.now(), isolated...)
+		})
 	}
 	var infrastructureFailure *deliverySourceInfrastructureFailure
 	if errors.As(err, &infrastructureFailure) {

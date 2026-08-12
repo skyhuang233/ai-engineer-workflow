@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +34,21 @@ func init() {
 		if os.Getenv("WORKFLOW_DOCKER_RUNTIME_START_FAIL") == "1" {
 			os.Exit(3)
 		}
+		os.Exit(0)
+	}
+	if len(os.Args) > 5 && os.Args[1] == "container" && os.Args[2] == "inspect" && os.Args[4] == "{{json .State}}" {
+		state := os.Getenv("WORKFLOW_DOCKER_RUNTIME_INSPECT_STATE")
+		if state == "error" {
+			os.Exit(3)
+		}
+		if state == "" {
+			exitCode := 0
+			if os.Getenv("WORKFLOW_DOCKER_RUNTIME_START_FAIL") == "1" {
+				exitCode = 3
+			}
+			state = fmt.Sprintf(`{"Status":"exited","Running":false,"ExitCode":%d}`, exitCode)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, state)
 		os.Exit(0)
 	}
 	if len(os.Args) > 3 && os.Args[1] == "container" && os.Args[2] == "ls" {
@@ -206,7 +222,7 @@ func TestDockerRuntimeMarksPostAdmissionStartFailureUncertain(t *testing.T) {
 	}
 }
 
-func TestDockerRuntimeMarksStartExitErrorUncertain(t *testing.T) {
+func TestDockerRuntimePreservesCertifiedWorkloadExit(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -221,8 +237,37 @@ func TestDockerRuntimeMarksStartExitErrorUncertain(t *testing.T) {
 		StartAdmission: func(context.Context) error { return nil }, ContainerCreateFence: successfulCreateFence,
 	}
 	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(context.Background(), spec)
-	if result.ContainerID != "prepared-container" || result.ExitCode != 3 || !IsUncertainContainerStateFailure(err) || !IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
+	var exitErr *exec.ExitError
+	if result.ContainerID != "prepared-container" || result.ExitCode != 3 || !errors.As(err, &exitErr) || IsUncertainContainerStateFailure(err) || IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
 		t.Fatalf("start ExitError = result %#v, error %T %v", result, err, err)
+	}
+	commands, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(commands), "container inspect --format {{json .State}} prepared-container") || !strings.Contains(string(commands), "container rm --force prepared-container") {
+		t.Fatalf("certified workload exit commands = %q", commands)
+	}
+}
+
+func TestDockerRuntimeKeepsUncertifiedStartExitUncertain(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_START_FAIL", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_INSPECT_STATE", `{"Status":"running","Running":true,"ExitCode":0}`)
+	spec := Spec{
+		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+		StartAdmission: func(context.Context) error { return nil }, ContainerCreateFence: successfulCreateFence,
+	}
+	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(context.Background(), spec)
+	if result.ContainerID != "prepared-container" || result.ExitCode != 3 || !IsUncertainContainerStateFailure(err) || !IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
+		t.Fatalf("uncertified start ExitError = result %#v, error %T %v", result, err, err)
 	}
 }
 

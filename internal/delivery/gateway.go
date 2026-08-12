@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -56,7 +57,7 @@ type credentialAwareRemote interface {
 type gatewayStore interface {
 	EnqueueDelivery(context.Context, store.DeliveryRequest, time.Time) (store.DeliveryOutbox, error)
 	EnsureGatewayDispatcher(context.Context, string, time.Time) error
-	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time) (store.DeliveryOutbox, error)
+	ClaimDeliveryOutboxForDispatcher(context.Context, string, string, time.Time, ...store.WorkerIsolationProof) (store.DeliveryOutbox, error)
 	ExecuteDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	ReconcileDelivery(context.Context, store.DeliveryRequest, string, func() time.Time, func(context.Context, store.DeliveryRequest) (store.DeliveryResult, error)) (store.DeliveryResult, error)
 	PlanProjectionAt(context.Context, string, time.Time) (plan.Projection, error)
@@ -66,13 +67,15 @@ type gatewayStore interface {
 	DueDeliveryOutboxKeys(context.Context, time.Time, int) ([]string, error)
 	GatewayCredentialAttentionRepositories(context.Context) ([]string, error)
 	RenewGatewayDispatcher(context.Context, string, time.Time) error
-	RequeueDeliveryOutboxClaim(context.Context, string, string, string, bool, time.Time) error
+	RequeueDeliveryOutboxClaim(context.Context, string, string, string, bool, time.Time, ...store.WorkerIsolationProof) error
 	CompleteDeliveryOutbox(context.Context, string, string, store.DeliveryResult, time.Time) error
-	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time) error
+	MarkDeliveryOutboxUncertain(context.Context, string, string, string, time.Time, ...store.WorkerIsolationProof) error
 	RecordDeliveryAudit(context.Context, store.DeliveryRequest, string, string, time.Time) error
-	RejectDeliveryOutbox(context.Context, string, string, string, bool, time.Time) error
-	DeferDeliveryOutbox(context.Context, string, string, string, bool, time.Time, time.Time) error
+	RejectDeliveryOutbox(context.Context, string, string, string, bool, time.Time, ...store.WorkerIsolationProof) error
+	DeferDeliveryOutbox(context.Context, string, string, string, bool, time.Time, time.Time, ...store.WorkerIsolationProof) error
 	PauseGatewayWrites(context.Context, string, time.Time) error
+	FenceWorkerIsolation(context.Context, []store.TicketClaim) ([]store.TicketClaim, error)
+	AcknowledgeWorkerIsolation(context.Context, []store.TicketClaim) ([]store.WorkerIsolationProof, error)
 }
 
 type Gateway struct {
@@ -80,6 +83,7 @@ type Gateway struct {
 	Remote          Remote
 	Now             func() time.Time
 	DispatcherToken string
+	WorkerIsolator  isolation.ContainerIsolator
 }
 
 func NewGateway(store *store.Store, remote Remote) (Gateway, error) {
@@ -154,7 +158,13 @@ func (g Gateway) Dispatch(ctx context.Context, key string) (dispatchErr error) {
 	if err := g.Store.EnsureGatewayDispatcher(ctx, dispatcherToken, g.now()); err != nil {
 		return err
 	}
-	outbox, err := g.Store.ClaimDeliveryOutboxForDispatcher(ctx, key, dispatcherToken, g.now())
+	claimNow := g.now()
+	var outbox store.DeliveryOutbox
+	err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+		var claimErr error
+		outbox, claimErr = g.Store.ClaimDeliveryOutboxForDispatcher(ctx, key, dispatcherToken, claimNow, isolated...)
+		return claimErr
+	})
 	if err != nil {
 		if errors.Is(err, store.ErrGatewayWritesPaused) {
 			return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, err)
@@ -446,6 +456,10 @@ func (g Gateway) cleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), outboxCleanupTimeout)
 }
 
+func (g Gateway) retryWorkerTransition(ctx context.Context, transition func([]store.WorkerIsolationProof) error) error {
+	return isolation.RetryWorkerTransition(ctx, g.Store, g.WorkerIsolator, transition)
+}
+
 func (g Gateway) renewDispatcher(dispatcherToken string) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
@@ -456,7 +470,10 @@ func (g Gateway) requeueClaim(outbox store.DeliveryOutbox, cause error, uncertai
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	uncertain = uncertain || outbox.Uncertain
-	err := g.Store.RequeueDeliveryOutboxClaim(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), uncertain, g.now())
+	now := g.now()
+	err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+		return g.Store.RequeueDeliveryOutboxClaim(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), uncertain, now, isolated...)
+	})
 	if errors.Is(err, store.ErrFencingConflict) {
 		return nil
 	}
@@ -478,13 +495,17 @@ func (g Gateway) markUncertain(outbox store.DeliveryOutbox, cause error) error {
 	defer cancel()
 	now := g.now()
 	if retryAfter := retryAt(cause); retryAfter.After(now) {
-		err := g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), true, retryAfter, now)
+		err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+			return g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), true, retryAfter, now, isolated...)
+		})
 		if err != nil {
 			return errors.Join(err, g.requeueClaim(outbox, cause, true))
 		}
 		return nil
 	}
-	err := g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), now)
+	err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+		return g.Store.MarkDeliveryOutboxUncertain(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), now, isolated...)
+	})
 	if err != nil {
 		return errors.Join(err, g.requeueClaim(outbox, cause, true))
 	}
@@ -495,7 +516,10 @@ func (g Gateway) reject(outbox store.DeliveryOutbox, cause error) error {
 	ctx, cancel := g.cleanupContext()
 	defer cancel()
 	_ = g.Store.RecordDeliveryAudit(ctx, outbox.Request, "rejected", cause.Error(), g.now())
-	err := g.Store.RejectDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, g.now())
+	now := g.now()
+	err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+		return g.Store.RejectDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, now, isolated...)
+	})
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
 	}
@@ -508,9 +532,13 @@ func (g Gateway) retry(outbox store.DeliveryOutbox, cause error) error {
 	now := g.now()
 	var err error
 	if retryAfter := retryAt(cause); retryAfter.After(now) {
-		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, retryAfter, now)
+		err = g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+			return g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, retryAfter, now, isolated...)
+		})
 	} else {
-		err = g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, time.Time{}, now)
+		err = g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+			return g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, cause.Error(), outbox.Uncertain, time.Time{}, now, isolated...)
+		})
 	}
 	if err != nil {
 		return errors.Join(cause, err, g.requeueClaim(outbox, cause, false))
@@ -528,7 +556,10 @@ func (g Gateway) pauseForCredential(outbox store.DeliveryOutbox, cause error) er
 	if err := g.QueueGatewayCredentialInboxProjections(ctx); err != nil {
 		return errors.Join(fmt.Errorf("%v; queue Workflow Inbox recovery request: %w", cause, err), g.requeueClaim(outbox, cause, false))
 	}
-	if err := g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, reason, outbox.Uncertain, time.Time{}, g.now()); err != nil {
+	now := g.now()
+	if err := g.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
+		return g.Store.DeferDeliveryOutbox(ctx, outbox.IdempotencyKey, outbox.ClaimToken, reason, outbox.Uncertain, time.Time{}, now, isolated...)
+	}); err != nil {
 		return errors.Join(fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause), err, g.requeueClaim(outbox, cause, false))
 	}
 	return fmt.Errorf("%w: %v", ErrGatewayWritesPaused, cause)

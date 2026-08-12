@@ -1176,6 +1176,9 @@ func TestDeliveryInfrastructureFailureBacksOffAtAcceptedCandidateBoundary(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: agentClaim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
 	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -1275,6 +1278,79 @@ func TestSupersededDeliveryOutboxCannotEscalateTicket(t *testing.T) {
 	}
 	if projection.Tickets[0].State != "Waiting Review" {
 		t.Fatalf("ticket state = %q, want waiting review", projection.Tickets[0].State)
+	}
+}
+
+func TestExhaustedDeliveryOutboxRequiresWorkerIsolation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	agentClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: agentClaim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerLaunch(ctx, deliveryClaim, WorkerAudit{RunID: deliveryClaim.RunID, LeaseGeneration: deliveryClaim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := db.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: deliveryClaim.RunID, LeaseToken: deliveryClaim.LeaseToken, LeaseGeneration: deliveryClaim.LeaseGeneration, Repository: snapshot.Repository, Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE delivery_outbox SET attempts = ?, state = ?, next_attempt_at = ? WHERE idempotency_key = ?`, maxDeliveryAttempts, OutboxPending, formatTimestamp(now), queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(time.Second))
+	var required *WorkerIsolationRequired
+	if !errors.As(err, &required) || len(required.Targets) != 1 || required.Targets[0].RunID != deliveryClaim.RunID {
+		t.Fatalf("exhausted outbox isolation requirement = %#v, %v", required, err)
+	}
+	fenced, err := db.FenceWorkerIsolation(ctx, required.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := db.AcknowledgeWorkerIsolation(ctx, fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(time.Second), proofs...); !errors.Is(err, ErrDeliveryRejected) {
+		t.Fatalf("isolated exhausted outbox = %v, want delivery rejection", err)
+	}
+	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil || outbox.State != OutboxRejected {
+		t.Fatalf("isolated exhausted outbox = %#v, %v", outbox, err)
+	}
+	projection, err := db.PlanProjection(ctx, version.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Tickets[0].State != "Needs Attention" {
+		t.Fatalf("ticket state = %q, want Needs Attention", projection.Tickets[0].State)
 	}
 }
 

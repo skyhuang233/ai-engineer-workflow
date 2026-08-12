@@ -298,6 +298,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, spec Spec) (Result, error) {
 	args := dockerArgs(spec)
 	args[0] = "create"
+	if len(args) > 1 && args[1] == "--rm" {
+		args = append(args[:1], args[2:]...)
+	}
 	releaseCreate := func(context.Context) error { return nil }
 	if spec.ContainerCreateFence != nil {
 		var err error
@@ -363,10 +366,39 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
+			inspectCtx, cancelInspect := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+			certified, inspectErr := certifiedContainerExit(inspectCtx, name, containerID, result.ExitCode)
+			cancelInspect()
+			if certified {
+				if cleanupErr := removePrepared(); cleanupErr != nil {
+					return result, InfrastructureError{Err: errors.Join(err, cleanupErr)}
+				}
+				return result, err
+			}
+			return result, UncertainContainerStateError{Err: errors.Join(err, inspectErr)}
 		}
 		return result, UncertainContainerStateError{Err: err}
 	}
+	if cleanupErr := removePrepared(); cleanupErr != nil {
+		return result, InfrastructureError{Err: cleanupErr}
+	}
 	return result, nil
+}
+
+func certifiedContainerExit(ctx context.Context, name, containerID string, exitCode int) (bool, error) {
+	output, err := exec.CommandContext(ctx, name, "container", "inspect", "--format", "{{json .State}}", containerID).Output()
+	if err != nil {
+		return false, fmt.Errorf("inspect completed worker container %s: %w", containerID, err)
+	}
+	var state struct {
+		Status   string `json:"Status"`
+		Running  bool   `json:"Running"`
+		ExitCode int    `json:"ExitCode"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(output), &state); err != nil {
+		return false, fmt.Errorf("decode completed worker container %s state: %w", containerID, err)
+	}
+	return state.Status == "exited" && !state.Running && state.ExitCode == exitCode, nil
 }
 
 func cleanupPreparedContainers(name, runID string, result Result, cause error) (Result, error) {

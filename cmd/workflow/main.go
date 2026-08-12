@@ -1260,7 +1260,10 @@ func (g *restoreFencedGateway) withGateway(ctx context.Context, action func(*sto
 		Client: github.NewClient(g.githubURL, "", nil).WithRepositoryOwner(g.config.GitHub.Credential.Owner),
 		Store:  db, PushURL: g.pushURL, CredentialSource: credentialSource,
 	}
-	gateway := delivery.Gateway{Store: db, Remote: remote, DispatcherToken: g.dispatcherToken}
+	gateway := delivery.Gateway{
+		Store: db, Remote: remote, DispatcherToken: g.dispatcherToken,
+		WorkerIsolator: worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(g.databasePath)},
+	}
 	return action(db, gateway, credentialSource)
 }
 
