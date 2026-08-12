@@ -518,6 +518,50 @@ func TestRecoverReleasesUnreservedDeliveryWithoutIsolation(t *testing.T) {
 	}
 }
 
+func TestRecoverLeavesActiveDeliveryControllerToItsLease(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2099, 8, 9, 12, 0, 0, 0, time.UTC)
+	agentClaim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, deliveryClaim, now); err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	dispatcher := scheduler.Dispatcher{Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{}, Recovery: recoveryInspector{workspaceReady: true, isolate: func(runID string) { isolated = append(isolated, runID) }}, Now: func() time.Time { return now.Add(time.Minute) }}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 0 {
+		t.Fatalf("active Delivery Controller was isolated: %#v", isolated)
+	}
+	if runs, err := db.ActiveRecoveryRuns(ctx, version.ID, now.Add(time.Minute)); err != nil || len(runs) != 0 {
+		t.Fatalf("active recovery runs = %#v, %v", runs, err)
+	}
+}
+
 func TestRecoverFailsRunWhenEstablishedSessionAuthenticationIsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}

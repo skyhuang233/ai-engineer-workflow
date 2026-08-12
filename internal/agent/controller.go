@@ -479,6 +479,17 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		}
 		return errors.Join(deliveryErr, c.Store.FailDeliveryControllerLaunchWithClassAfterIsolation(context.WithoutCancel(ctx), deliveryClaim, deliveryErr.Error(), failureClass(deliveryErr), c.now(), c.maxWorkerAttempts(), isolated...))
 	}
+	if deliveryErr != nil && worker.IsUncertainContainerStateFailure(deliveryErr) {
+		target, targetErr := c.Store.DeliveryContainerIsolationTarget(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
+		if targetErr != nil {
+			return errors.Join(deliveryErr, targetErr)
+		}
+		isolated, isolateErr := c.isolateDeliveryTargets(ctx, []store.TicketClaim{target})
+		if isolateErr != nil {
+			return errors.Join(deliveryErr, isolateErr)
+		}
+		return errors.Join(deliveryErr, c.Store.FailDeliveryControllerWithClassAfterIsolation(context.WithoutCancel(ctx), deliveryClaim, deliveryErr.Error(), failureClass(deliveryErr), c.now(), c.maxWorkerAttempts(), isolated...))
+	}
 	if deliveryErr != nil && worker.IsCertifiedNoLaunchFailure(deliveryErr) {
 		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), deliveryClaim, deliveryErr, failureClass(deliveryErr))
 	}

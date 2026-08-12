@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,62 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/plan"
 )
+
+func TestPlanAmendmentIsolatesAffectedAgentBeforeRevokingLease(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snapshot := amendmentSnapshot(10, []plan.Issue{
+		{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}},
+		{ID: 2, Number: 12, Title: "second", Labels: []string{plan.TicketLabel}},
+	}, map[int64][]plan.Issue{2: {{ID: 1, Number: 11, Labels: []string{plan.TicketLabel}}}})
+	version := activateAmendmentSnapshot(t, ctx, db, snapshot)
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerLaunch(ctx, claim, WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	amendment := PlanAmendment{
+		VersionID:          version.ID,
+		TicketID:           1,
+		Summary:            "ticket #11 discovered that the dependency is obsolete",
+		RemoveDependencies: []AmendmentEdge{{BlockedTicketID: 2, BlockerTicketID: 1}},
+	}
+	_, err = db.ProposePlanAmendment(ctx, amendment, now.Add(time.Minute))
+	var isolation *DeliveryIsolationRequired
+	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != claim.RunID {
+		t.Fatalf("agent isolation requirement = %#v, %v", isolation, err)
+	}
+	fenced, err := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := db.ProposePlanAmendment(ctx, amendment, now.Add(time.Minute), proofs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, snapshot.Repository, proposal.QuestionID, `{"action":"reject"}`, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-2", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now.Add(3 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.RunID == claim.RunID {
+		t.Fatalf("replacement retained isolated Agent run %q", claim.RunID)
+	}
+}
 
 func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *testing.T) {
 	ctx := context.Background()

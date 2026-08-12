@@ -177,7 +177,7 @@ type DeliveryIsolationRequired struct {
 }
 
 func (e *DeliveryIsolationRequired) Error() string {
-	return "active Delivery Controller must be isolated before terminalization"
+	return "active Worker must be isolated before terminalization"
 }
 
 func (e *DeliveryIsolationRequired) Unwrap() error { return ErrWorkerLaunched }
@@ -187,10 +187,10 @@ func deliveryIsolationTargetsTx(ctx context.Context, tx *sql.Tx, versionID strin
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND r.run_kind = ? AND r.state = ?
-AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))
+WHERE s.version_id = ? AND r.state = ?
+AND (r.launch_state = 'launched' OR (r.run_kind = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1))
 AND l.state = ?
-ORDER BY s.issue_id, r.run_id`, versionID, RunDelivery, RunRunning, LeaseActive)
+ORDER BY s.issue_id, r.run_id`, versionID, RunRunning, RunDelivery, LeaseActive)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -252,8 +252,8 @@ func (s *Store) DeliveryIsolationTargets(ctx context.Context) ([]TicketClaim, er
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_kind = ? AND r.state = ? AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
-ORDER BY s.version_id`, RunDelivery, RunRunning, LeaseActive)
+WHERE r.state = ? AND (r.launch_state = 'launched' OR (r.run_kind = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
+ORDER BY s.version_id`, RunRunning, RunDelivery, LeaseActive)
 	if err != nil {
 		return nil, err
 	}
@@ -475,8 +475,8 @@ FROM worker_runs r
 JOIN ticket_sessions s ON s.session_id = r.session_id
 JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.state = ? AND l.state = ? AND l.expires_at > ?
-ORDER BY r.started_at, r.run_id`, versionID, RunRunning, LeaseActive, formatTimestamp(now))
+WHERE s.version_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.state = ? AND l.expires_at > ?
+ORDER BY r.started_at, r.run_id`, versionID, RunAgent, RunRunning, LeaseActive, formatTimestamp(now))
 	if err != nil {
 		return nil, err
 	}
@@ -1093,12 +1093,13 @@ func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim Ticke
 
 func (s *Store) FailDeliveryControllerWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
 	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
-		reason:   reason,
-		class:    class,
-		retry:    true,
-		now:      now,
-		limit:    maxWorkerAttempts(maxAttempts),
-		isolated: isolated,
+		reason:           reason,
+		class:            class,
+		retry:            true,
+		requireIsolation: true,
+		now:              now,
+		limit:            maxWorkerAttempts(maxAttempts),
+		isolated:         isolated,
 	})
 }
 
@@ -1123,6 +1124,7 @@ func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.
 		class:                 class,
 		retry:                 true,
 		allowExpiredUnstarted: true,
+		requireIsolation:      true,
 		now:                   now,
 		limit:                 maxWorkerAttempts(maxAttempts),
 		isolated:              isolated,
@@ -1232,6 +1234,7 @@ type deliveryControllerFinishPolicy struct {
 	class                 FailureClass
 	retry                 bool
 	allowExpiredUnstarted bool
+	requireIsolation      bool
 	now                   time.Time
 	limit                 int
 	isolated              []DeliveryIsolationProof
@@ -1299,6 +1302,11 @@ AND NOT EXISTS (SELECT 1 FROM worker_container_results result WHERE result.run_i
 			if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
 				return err
 			}
+		}
+	}
+	if policy.requireIsolation {
+		if err := requireDeliveryIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
+			return err
 		}
 	}
 	expired := !expiresAt.After(now)

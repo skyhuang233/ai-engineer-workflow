@@ -179,6 +179,29 @@ func TestDockerRuntimeCreatesContainerBeforeStartAdmission(t *testing.T) {
 	}
 }
 
+func TestDockerRuntimeMarksPostAdmissionStartFailureUncertain(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "docker.log")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	spec := Spec{
+		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
+		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
+		StartAdmission: func(context.Context) error {
+			cancel()
+			return nil
+		},
+	}
+	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(ctx, spec)
+	if result.ContainerID != "prepared-container" || !IsUncertainContainerStateFailure(err) || !IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
+		t.Fatalf("post-admission start failure = result %#v, error %T %v", result, err, err)
+	}
+}
+
 func TestDockerRuntimeRejectsTypedRunWithoutControlPlaneIdentity(t *testing.T) {
 	spec := Spec{
 		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",

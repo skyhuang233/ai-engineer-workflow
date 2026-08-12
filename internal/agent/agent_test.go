@@ -1783,6 +1783,37 @@ func TestControllerDoesNotRetryUncertainEmptyContainerLaunch(t *testing.T) {
 	}
 }
 
+func TestControllerIsolatesUncertainStartedContainerBeforeRetry(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		results:             []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
+		deliveryErr:         worker.UncertainContainerStateError{Err: errors.New("lost Docker start response")},
+		deliveryErrorResult: worker.Result{ContainerID: "uncertain-container"},
+	}
+	controller := agent.Controller{
+		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "lost Docker start response") {
+		t.Fatalf("uncertain start error = %v", err)
+	}
+	if len(runtime.isolatedRuns) != 1 || runtime.isolatedRuns[0] == "" {
+		t.Fatalf("uncertain start isolation = %#v", runtime.isolatedRuns)
+	}
+	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repo", 10)
+	if err != nil || len(questions) != 0 {
+		t.Fatalf("uncertain start escalated: questions=%#v, err=%v", questions, err)
+	}
+	retries, err := db.ClaimPendingDeliveryClaims(ctx, "owner/repo", 1, time.Minute, time.Now().UTC().Add(2*time.Minute))
+	if err != nil || len(retries) != 1 || retries[0].SessionID != claim.SessionID {
+		t.Fatalf("uncertain start retry = %#v, %v", retries, err)
+	}
+}
+
 func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)

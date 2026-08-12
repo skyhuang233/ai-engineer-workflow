@@ -54,6 +54,17 @@ func IsPreparedContainerCleanupFailure(err error) bool {
 	return errors.As(err, &failure)
 }
 
+type UncertainContainerStateError struct{ Err error }
+
+func (e UncertainContainerStateError) Error() string               { return e.Err.Error() }
+func (e UncertainContainerStateError) Unwrap() error               { return e.Err }
+func (e UncertainContainerStateError) InfrastructureFailure() bool { return true }
+
+func IsUncertainContainerStateFailure(err error) bool {
+	var failure UncertainContainerStateError
+	return errors.As(err, &failure)
+}
+
 const (
 	GatewayHostMapping              = "host.docker.internal:host-gateway"
 	preparedContainerCleanupTimeout = 10 * time.Second
@@ -365,7 +376,7 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
-			return result, InfrastructureError{Err: err}
+			return result, UncertainContainerStateError{Err: err}
 		}
 	}
 	return result, err
