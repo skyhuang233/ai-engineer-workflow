@@ -41,25 +41,33 @@ type VulnerabilityScanPolicy struct {
 }
 
 type workerBuildInputs struct {
-	SchemaVersion             int           `json:"schema_version"`
-	DeployWorkerTree          string        `json:"deploy_worker_tree"`
-	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
-	Codex                     ToolPin       `json:"codex"`
-	GitHubCLI                 GitHubCLIPin  `json:"github_cli"`
-	Go                        GoPin         `json:"go"`
-	NoMistakes                NoMistakesPin `json:"no_mistakes"`
-	Worker                    WorkerPin     `json:"worker"`
+	SchemaVersion                   int           `json:"schema_version"`
+	DeployWorkerTree                string        `json:"deploy_worker_tree"`
+	DeliverySourceDigestCommandTree string        `json:"delivery_source_digest_command_tree"`
+	DeliverySourceDigestPackageTree string        `json:"delivery_source_digest_package_tree"`
+	GoModBlob                       string        `json:"go_mod_blob"`
+	GoSumBlob                       string        `json:"go_sum_blob"`
+	PublishWorkerWorkflowBlob       string        `json:"publish_worker_workflow_blob"`
+	Codex                           ToolPin       `json:"codex"`
+	GitHubCLI                       GitHubCLIPin  `json:"github_cli"`
+	Go                              GoPin         `json:"go"`
+	NoMistakes                      NoMistakesPin `json:"no_mistakes"`
+	Worker                          WorkerPin     `json:"worker"`
 }
 
 type canonicalWorkerBuildInputs struct {
-	SchemaVersion             int           `json:"schema_version"`
-	DeployWorkerTree          string        `json:"deploy_worker_tree"`
-	PublishWorkerWorkflowBlob string        `json:"publish_worker_workflow_blob"`
-	Codex                     ToolPin       `json:"codex"`
-	GitHubCLI                 GitHubCLIPin  `json:"github_cli"`
-	Go                        GoPin         `json:"go"`
-	NoMistakes                NoMistakesPin `json:"no_mistakes"`
-	Worker                    WorkerPin     `json:"worker"`
+	SchemaVersion                   int           `json:"schema_version"`
+	DeployWorkerTree                string        `json:"deploy_worker_tree"`
+	DeliverySourceDigestCommandTree string        `json:"delivery_source_digest_command_tree"`
+	DeliverySourceDigestPackageTree string        `json:"delivery_source_digest_package_tree"`
+	GoModBlob                       string        `json:"go_mod_blob"`
+	GoSumBlob                       string        `json:"go_sum_blob"`
+	PublishWorkerWorkflowBlob       string        `json:"publish_worker_workflow_blob"`
+	Codex                           ToolPin       `json:"codex"`
+	GitHubCLI                       GitHubCLIPin  `json:"github_cli"`
+	Go                              GoPin         `json:"go"`
+	NoMistakes                      NoMistakesPin `json:"no_mistakes"`
+	Worker                          WorkerPin     `json:"worker"`
 }
 
 type resolvedWorkerBuildInputs struct {
@@ -326,6 +334,30 @@ func resolveWorkerBuildInputs(ctx context.Context, client *githubapi.Client, rep
 	if err != nil {
 		return resolvedWorkerBuildInputs{}, err
 	}
+	cmdTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "cmd", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	deliverySourceDigestCommandTree, err := gitTreeEntry(ctx, client, repository, cmdTree, "delivery-source-digest", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	internalTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "internal", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	deliverySourceDigestPackageTree, err := gitTreeEntry(ctx, client, repository, internalTree, "deliverysource", "tree")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	goModBlob, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "go.mod", "blob")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
+	goSumBlob, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, "go.sum", "blob")
+	if err != nil {
+		return resolvedWorkerBuildInputs{}, err
+	}
 	githubTree, err := gitTreeEntry(ctx, client, repository, commit.Commit.Tree.SHA, ".github", "tree")
 	if err != nil {
 		return resolvedWorkerBuildInputs{}, err
@@ -338,7 +370,7 @@ func resolveWorkerBuildInputs(ctx context.Context, client *githubapi.Client, rep
 	if err != nil {
 		return resolvedWorkerBuildInputs{}, err
 	}
-	return resolvedWorkerBuildInputs{CommitSHA: commit.SHA, Config: config, Identity: workerBuildInputIdentity(config, workerTree, publisherWorkflow)}, nil
+	return resolvedWorkerBuildInputs{CommitSHA: commit.SHA, Config: config, Identity: workerBuildInputIdentity(config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow)}, nil
 }
 
 func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tree, path, objectType string) (string, error) {
@@ -360,16 +392,20 @@ func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tre
 	return "", fmt.Errorf("Git tree %q lacks %s %q", tree, objectType, path)
 }
 
-func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow string) string {
+func workerBuildInputIdentity(config Config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow string) string {
 	inputs := workerBuildInputs{
-		SchemaVersion:             5,
-		DeployWorkerTree:          workerTree,
-		PublishWorkerWorkflowBlob: publisherWorkflow,
-		Codex:                     config.Codex,
-		GitHubCLI:                 config.GitHubCLI,
-		Go:                        config.Go,
-		NoMistakes:                config.NoMistakes,
-		Worker:                    config.Worker,
+		SchemaVersion:                   6,
+		DeployWorkerTree:                workerTree,
+		DeliverySourceDigestCommandTree: deliverySourceDigestCommandTree,
+		DeliverySourceDigestPackageTree: deliverySourceDigestPackageTree,
+		GoModBlob:                       goModBlob,
+		GoSumBlob:                       goSumBlob,
+		PublishWorkerWorkflowBlob:       publisherWorkflow,
+		Codex:                           config.Codex,
+		GitHubCLI:                       config.GitHubCLI,
+		Go:                              config.Go,
+		NoMistakes:                      config.NoMistakes,
+		Worker:                          config.Worker,
 	}
 	encoded, _ := json.Marshal(canonicalizeWorkerBuildInputs(inputs))
 	digest := sha256.Sum256(encoded)
@@ -378,9 +414,13 @@ func workerBuildInputIdentity(config Config, workerTree, publisherWorkflow strin
 
 func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuildInputs {
 	return canonicalWorkerBuildInputs{
-		SchemaVersion:             inputs.SchemaVersion,
-		DeployWorkerTree:          base64.StdEncoding.EncodeToString([]byte(inputs.DeployWorkerTree)),
-		PublishWorkerWorkflowBlob: base64.StdEncoding.EncodeToString([]byte(inputs.PublishWorkerWorkflowBlob)),
+		SchemaVersion:                   inputs.SchemaVersion,
+		DeployWorkerTree:                base64.StdEncoding.EncodeToString([]byte(inputs.DeployWorkerTree)),
+		DeliverySourceDigestCommandTree: base64.StdEncoding.EncodeToString([]byte(inputs.DeliverySourceDigestCommandTree)),
+		DeliverySourceDigestPackageTree: base64.StdEncoding.EncodeToString([]byte(inputs.DeliverySourceDigestPackageTree)),
+		GoModBlob:                       base64.StdEncoding.EncodeToString([]byte(inputs.GoModBlob)),
+		GoSumBlob:                       base64.StdEncoding.EncodeToString([]byte(inputs.GoSumBlob)),
+		PublishWorkerWorkflowBlob:       base64.StdEncoding.EncodeToString([]byte(inputs.PublishWorkerWorkflowBlob)),
 		Codex: ToolPin{
 			Version: base64.StdEncoding.EncodeToString([]byte(inputs.Codex.Version)),
 		},

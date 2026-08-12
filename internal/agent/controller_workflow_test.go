@@ -10,6 +10,15 @@ import (
 	"github.com/skyhuang233/workflow/internal/worker"
 )
 
+func TestDeliverySourcePreflightClassifiesUnavailableDigestHelperAsInfrastructure(t *testing.T) {
+	if !strings.Contains(deliverySourceContainerPreflight, `126|127) infrastructure_failure`) {
+		t.Fatal("Delivery Source preflight does not classify unavailable digest helper as infrastructure")
+	}
+	if strings.Contains(deliverySourceContainerPreflight, `actual=$(delivery-source-digest /source-seed) || integrity_failure`) {
+		t.Fatal("Delivery Source preflight collapses digest helper availability into integrity failure")
+	}
+}
+
 type recordingDeliveryRuntime struct {
 	specs []worker.Spec
 }

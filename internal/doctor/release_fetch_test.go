@@ -27,13 +27,22 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	mainDeployTree := strings.Repeat("4", 40)
 	sourceWorkerTree := strings.Repeat("5", 40)
 	currentWorkerTree := sourceWorkerTree
+	sourceCmdTree := strings.Repeat("a1", 20)
+	mainCmdTree := strings.Repeat("a2", 20)
+	sourceDigestCommandTree := strings.Repeat("a3", 20)
+	currentDigestCommandTree := sourceDigestCommandTree
+	sourceInternalTree := strings.Repeat("a4", 20)
+	mainInternalTree := strings.Repeat("a5", 20)
+	digestPackageTree := strings.Repeat("a6", 20)
+	goModBlob := strings.Repeat("a7", 20)
+	goSumBlob := strings.Repeat("a8", 20)
 	sourceGitHubTree := strings.Repeat("6", 40)
 	mainGitHubTree := strings.Repeat("7", 40)
 	sourceWorkflowsTree := strings.Repeat("8", 40)
 	mainWorkflowsTree := strings.Repeat("9", 40)
 	publisherWorkflowBlob := strings.Repeat("b", 40)
 	currentPublisherWorkflowBlob := publisherWorkflowBlob
-	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, publisherWorkflowBlob)
+	buildInputIdentity := workerBuildInputIdentity(config, sourceWorkerTree, sourceDigestCommandTree, digestPackageTree, goModBlob, goSumBlob, publisherWorkflowBlob)
 	manifestData, err := json.Marshal(WorkerReleaseManifest{
 		ToolProvenance: workerrelease.ToolProvenance{
 			CodexVersion: config.Codex.Version, GitHubCLIVersion: config.GitHubCLI.Version,
@@ -106,13 +115,19 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 				_, _ = w.Write(configData)
 			}
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceRootTree:
-			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + sourceDeployTree + `"},{"path":".github","type":"tree","sha":"` + sourceGitHubTree + `"}]}`))
+			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + sourceDeployTree + `"},{"path":"cmd","type":"tree","sha":"` + sourceCmdTree + `"},{"path":"internal","type":"tree","sha":"` + sourceInternalTree + `"},{"path":"go.mod","type":"blob","sha":"` + goModBlob + `"},{"path":"go.sum","type":"blob","sha":"` + goSumBlob + `"},{"path":".github","type":"tree","sha":"` + sourceGitHubTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainRootTree:
-			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + mainDeployTree + `"},{"path":".github","type":"tree","sha":"` + mainGitHubTree + `"}]}`))
+			_, _ = w.Write([]byte(`{"tree":[{"path":"deploy","type":"tree","sha":"` + mainDeployTree + `"},{"path":"cmd","type":"tree","sha":"` + mainCmdTree + `"},{"path":"internal","type":"tree","sha":"` + mainInternalTree + `"},{"path":"go.mod","type":"blob","sha":"` + goModBlob + `"},{"path":"go.sum","type":"blob","sha":"` + goSumBlob + `"},{"path":".github","type":"tree","sha":"` + mainGitHubTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceDeployTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"worker","type":"tree","sha":"` + sourceWorkerTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainDeployTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"worker","type":"tree","sha":"` + currentWorkerTree + `"}]}`))
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceCmdTree:
+			_, _ = w.Write([]byte(`{"tree":[{"path":"delivery-source-digest","type":"tree","sha":"` + sourceDigestCommandTree + `"}]}`))
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainCmdTree:
+			_, _ = w.Write([]byte(`{"tree":[{"path":"delivery-source-digest","type":"tree","sha":"` + currentDigestCommandTree + `"}]}`))
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceInternalTree, "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainInternalTree:
+			_, _ = w.Write([]byte(`{"tree":[{"path":"deliverysource","type":"tree","sha":"` + digestPackageTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + sourceGitHubTree:
 			_, _ = w.Write([]byte(`{"tree":[{"path":"workflows","type":"tree","sha":"` + sourceWorkflowsTree + `"}]}`))
 		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + mainGitHubTree:
@@ -193,6 +208,11 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	currentPublisherWorkflowBlob = strings.Repeat("d", 40)
 	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
 		t.Fatal("accepted a manifest after the current Worker publisher workflow changed")
+	}
+	currentPublisherWorkflowBlob = publisherWorkflowBlob
+	currentDigestCommandTree = strings.Repeat("d1", 20)
+	if _, _, err := fetcher.Fetch(context.Background(), config, "github_pat_test"); err == nil {
+		t.Fatal("accepted a manifest after the current digest helper changed")
 	}
 }
 

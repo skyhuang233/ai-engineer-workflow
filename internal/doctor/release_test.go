@@ -17,16 +17,20 @@ func TestWorkerBuildInputIdentityUsesCanonicalBase64JSON(t *testing.T) {
 	config := validConfig()
 	config.NoMistakes.ForkRelease = "worker&release"
 	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	deliverySourceDigestCommandTree := "cccccccccccccccccccccccccccccccccccccccc"
+	deliverySourceDigestPackageTree := "dddddddddddddddddddddddddddddddddddddddd"
+	goModBlob := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	goSumBlob := "ffffffffffffffffffffffffffffffffffffffff"
 	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	b64 := base64.StdEncoding.EncodeToString
-	canonical := fmt.Sprintf(`{"schema_version":5,"deploy_worker_tree":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"github_cli":{"version":%q,"linux_amd64_sha256":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_commit":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
-		b64([]byte(workerTree)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.GitHubCLI.Version)), b64([]byte(config.GitHubCLI.LinuxAMD64SHA256)), b64([]byte(config.Go.Version)), b64([]byte(config.Go.LinuxAMD64SHA256)), b64([]byte(config.NoMistakes.Version)),
+	canonical := fmt.Sprintf(`{"schema_version":6,"deploy_worker_tree":%q,"delivery_source_digest_command_tree":%q,"delivery_source_digest_package_tree":%q,"go_mod_blob":%q,"go_sum_blob":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"github_cli":{"version":%q,"linux_amd64_sha256":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_commit":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
+		b64([]byte(workerTree)), b64([]byte(deliverySourceDigestCommandTree)), b64([]byte(deliverySourceDigestPackageTree)), b64([]byte(goModBlob)), b64([]byte(goSumBlob)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.GitHubCLI.Version)), b64([]byte(config.GitHubCLI.LinuxAMD64SHA256)), b64([]byte(config.Go.Version)), b64([]byte(config.Go.LinuxAMD64SHA256)), b64([]byte(config.NoMistakes.Version)),
 		b64([]byte(config.NoMistakes.UpstreamRepository)), b64([]byte(config.NoMistakes.UpstreamCommit)),
 		b64([]byte(config.NoMistakes.ForkRepository)), b64([]byte(config.NoMistakes.ForkCommit)), b64([]byte(config.NoMistakes.ForkRelease)),
 		b64([]byte(config.NoMistakes.LinuxAMD64SHA256)), b64([]byte(config.Worker.Version)),
 		b64([]byte(config.Worker.ImageRepository)), b64([]byte(config.Worker.ReleaseRepository)))
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
-	if got := workerBuildInputIdentity(config, workerTree, publisherWorkflow); got != want {
+	if got := workerBuildInputIdentity(config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow); got != want {
 		t.Fatalf("identity = %s, want canonical newline-free SHA-256 %s", got, want)
 	}
 }
@@ -51,13 +55,17 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	config := validConfig()
 	config.NoMistakes.ForkRelease = "worker&release"
 	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	deliverySourceDigestCommandTree := "cccccccccccccccccccccccccccccccccccccccc"
+	deliverySourceDigestPackageTree := "dddddddddddddddddddddddddddddddddddddddd"
+	goModBlob := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	goSumBlob := "ffffffffffffffffffffffffffffffffffffffff"
 	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	configJSON, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	filter := `{schema_version:5,deploy_worker_tree:($deploy_worker_tree | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
-	command := exec.Command(jq, "--compact-output", "--arg", "deploy_worker_tree", workerTree, "--arg", "publish_worker_workflow_blob", publisherWorkflow, filter)
+	filter := `{schema_version:6,deploy_worker_tree:($deploy_worker_tree | @base64),delivery_source_digest_command_tree:($delivery_source_digest_command_tree | @base64),delivery_source_digest_package_tree:($delivery_source_digest_package_tree | @base64),go_mod_blob:($go_mod_blob | @base64),go_sum_blob:($go_sum_blob | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
+	command := exec.Command(jq, "--compact-output", "--arg", "deploy_worker_tree", workerTree, "--arg", "delivery_source_digest_command_tree", deliverySourceDigestCommandTree, "--arg", "delivery_source_digest_package_tree", deliverySourceDigestPackageTree, "--arg", "go_mod_blob", goModBlob, "--arg", "go_sum_blob", goSumBlob, "--arg", "publish_worker_workflow_blob", publisherWorkflow, filter)
 	command.Stdin = bytes.NewReader(configJSON)
 	publisherJSON, err := command.Output()
 	if err != nil {
@@ -65,14 +73,18 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 	}
 	publisherCanonicalJSON := strings.TrimRight(string(publisherJSON), "\r\n")
 	goJSON, err := json.Marshal(canonicalizeWorkerBuildInputs(workerBuildInputs{
-		SchemaVersion:             5,
-		DeployWorkerTree:          workerTree,
-		PublishWorkerWorkflowBlob: publisherWorkflow,
-		Codex:                     config.Codex,
-		GitHubCLI:                 config.GitHubCLI,
-		Go:                        config.Go,
-		NoMistakes:                config.NoMistakes,
-		Worker:                    config.Worker,
+		SchemaVersion:                   6,
+		DeployWorkerTree:                workerTree,
+		DeliverySourceDigestCommandTree: deliverySourceDigestCommandTree,
+		DeliverySourceDigestPackageTree: deliverySourceDigestPackageTree,
+		GoModBlob:                       goModBlob,
+		GoSumBlob:                       goSumBlob,
+		PublishWorkerWorkflowBlob:       publisherWorkflow,
+		Codex:                           config.Codex,
+		GitHubCLI:                       config.GitHubCLI,
+		Go:                              config.Go,
+		NoMistakes:                      config.NoMistakes,
+		Worker:                          config.Worker,
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +93,7 @@ func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
 		t.Fatalf("Go canonical JSON = %s, publisher canonical JSON = %s", goJSON, publisherCanonicalJSON)
 	}
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(publisherCanonicalJSON)))
-	if got := workerBuildInputIdentity(config, workerTree, publisherWorkflow); got != want {
+	if got := workerBuildInputIdentity(config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow); got != want {
 		t.Fatalf("Go identity = %s, publisher jq identity = %s", got, want)
 	}
 }

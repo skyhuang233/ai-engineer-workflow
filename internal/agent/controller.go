@@ -85,7 +85,15 @@ infrastructure_failure() {
   exit 79
 }
 git --git-dir=/source-seed fsck --connectivity-only --no-dangling >/dev/null 2>&1 || integrity_failure
-actual=$(delivery-source-digest /source-seed) || integrity_failure
+if actual=$(delivery-source-digest /source-seed); then
+  :
+else
+  status=$?
+  case "$status" in
+    126|127) infrastructure_failure ;;
+    *) integrity_failure ;;
+  esac
+fi
 identity=$(git --git-dir=/source-seed config --local --get workflow.sourceIdentity) || integrity_failure
 [ "$actual" = "$NO_MISTAKES_DELIVERY_SOURCE_DIGEST" ] || integrity_failure
 rm -rf /source-repository || infrastructure_failure

@@ -18,6 +18,9 @@ func DatabaseIdentity(dsn string) (string, error) {
 	if memory {
 		return "", nil
 	}
+	if runtime.GOOS == "windows" {
+		path = normalizeWindowsNamespacePath(path)
+	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve database path: %w", err)
@@ -31,6 +34,24 @@ func DatabaseIdentity(dsn string) (string, error) {
 		canonical = strings.ToLower(canonical)
 	}
 	return canonical, nil
+}
+
+func normalizeWindowsNamespacePath(path string) string {
+	for _, prefix := range []string{`\\?\UNC\`, `\\.\UNC\`, `\??\UNC\`} {
+		if len(path) >= len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) {
+			return `\\` + path[len(prefix):]
+		}
+	}
+	for _, prefix := range []string{`\\?\`, `\\.\`, `\??\`} {
+		if len(path) < len(prefix) || !strings.EqualFold(path[:len(prefix)], prefix) {
+			continue
+		}
+		remainder := path[len(prefix):]
+		if len(remainder) >= 3 && remainder[1] == ':' && (remainder[2] == '\\' || remainder[2] == '/') {
+			return remainder
+		}
+	}
+	return path
 }
 
 func databasePath(dsn string) (string, bool, error) {

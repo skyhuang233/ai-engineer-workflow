@@ -665,7 +665,7 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	}
 	if attempts >= maxDeliveryAttempts {
 		lastError := inboxDeliveryRecoveryReason(request, key, "delivery retries exhausted", uncertain != 0)
-		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain != 0, lastError, now); err != nil {
+		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain != 0, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 			return DeliveryOutbox{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, last_error = ?, claim_token = '', completed_at = ?, updated_at = ? WHERE idempotency_key = ?`, OutboxRejected, lastError, formatTimestamp(now), formatTimestamp(now), key); err != nil {
@@ -948,15 +948,15 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		if state == OutboxRejected {
 			lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
 			if request.Operation == DeliveryProjectInbox && uncertain {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			} else if request.Operation == DeliveryProjectPlan && request.RunID == "" {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			} else if (request.Operation == DeliveryPushCandidate || request.Operation == DeliveryUpsertPR) && request.RunID != "" {
-				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
+				if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 					return err
 				}
 			}
@@ -966,7 +966,7 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
 		lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
-		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil {
+		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain, lastError, now); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 			return err
 		}
 	} else {
@@ -1095,26 +1095,22 @@ func (s *Store) markDeliveryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, re
 		return insertDeliveryAuditTx(ctx, tx, request, "needs_attention", reason, now)
 	}
 	var delivered int
-	err := tx.QueryRowContext(ctx, `SELECT rt.delivered FROM ticket_runtime rt
-JOIN worker_runs r ON r.run_id = ?
-JOIN ticket_sessions s ON s.session_id = r.session_id
-WHERE rt.version_id = s.version_id AND rt.issue_id = s.issue_id`, request.RunID).Scan(&delivered)
+	var versionID string
+	var issueID int64
+	err := tx.QueryRowContext(ctx, `SELECT rt.delivered, s.version_id, s.issue_id
+FROM ticket_sessions s
+JOIN worker_runs r ON r.run_id = s.current_run_id AND r.session_id = s.session_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
+WHERE r.run_id = ? AND r.lease_generation = ? AND s.current_lease_generation = ? AND l.lease_token = ?`, request.RunID, request.LeaseGeneration, request.LeaseGeneration, request.LeaseToken).Scan(&delivered, &versionID, &issueID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			return ErrDeliverySuperseded
 		}
 		return err
 	}
 	if delivered != 0 {
 		return nil
-	}
-	var versionID string
-	var issueID int64
-	if err := tx.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?`, request.RunID).Scan(&versionID, &issueID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
 	}
 	if err := markTicketNeedsAttentionTx(ctx, tx, versionID, issueID, reason, now, isolated...); err != nil {
 		return err
