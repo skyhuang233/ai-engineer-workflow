@@ -13,6 +13,7 @@ import (
 )
 
 func normalizeDatabasePathCase(path string) (string, error) {
+	path = normalizeWindowsVolumeCase(path)
 	caseSensitive, known, err := windowsDirectoryCaseSensitivity(filepath.Dir(path))
 	if err != nil {
 		return "", err
@@ -21,6 +22,14 @@ func normalizeDatabasePathCase(path string) (string, error) {
 		return path, nil
 	}
 	return filepath.Join(filepath.Dir(path), strings.ToLower(filepath.Base(path))), nil
+}
+
+func normalizeWindowsVolumeCase(path string) string {
+	volume := filepath.VolumeName(path)
+	if volume == "" {
+		return path
+	}
+	return strings.ToLower(volume) + path[len(volume):]
 }
 
 func windowsDirectoryCaseSensitivity(path string) (bool, bool, error) {
