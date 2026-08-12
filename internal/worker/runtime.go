@@ -445,7 +445,7 @@ func (r DockerRuntime) IsolateContainer(ctx context.Context, runID string) error
 	return isolateContainersByRunID(ctx, name, runID)
 }
 
-func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context) error {
+func (r DockerRuntime) IsolateControlPlaneContainers(ctx context.Context) error {
 	if strings.TrimSpace(r.ControlPlaneID) == "" {
 		return errors.New("Control Plane container identity is required")
 	}
@@ -457,7 +457,6 @@ func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("inspect Control Plane worker containers: %w", err)
 	}
-	var deliveries []string
 	var ambiguous []string
 	for _, containerID := range strings.Fields(string(output)) {
 		labelsOutput, err := exec.CommandContext(ctx, name, "container", "inspect", "--format", "{{json .Config.Labels}}", containerID).Output()
@@ -469,20 +468,16 @@ func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context
 			return fmt.Errorf("decode workflow container %s labels: %w", containerID, err)
 		}
 		controlPlaneID := strings.TrimSpace(labels["workflow.control_plane"])
-		runKind := strings.TrimSpace(labels["workflow.run_kind"])
-		if controlPlaneID == "" || runKind == "" {
+		if controlPlaneID == "" {
 			ambiguous = append(ambiguous, containerID)
 			continue
-		}
-		if controlPlaneID == r.ControlPlaneID && runKind == workerrun.DeliveryController {
-			deliveries = append(deliveries, containerID)
 		}
 	}
 	if len(ambiguous) > 0 {
 		sort.Strings(ambiguous)
 		return fmt.Errorf("ambiguous legacy workflow containers require manual isolation: %s", strings.Join(ambiguous, ", "))
 	}
-	return removeContainers(ctx, name, deliveries)
+	return isolateContainersByLabels(ctx, name, "label=workflow.control_plane="+r.ControlPlaneID)
 }
 
 func isolateContainersByRunID(ctx context.Context, name, runID string) error {

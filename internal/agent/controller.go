@@ -714,52 +714,44 @@ func (c Controller) recordWorkerContainer(claim store.TicketClaim, result worker
 }
 
 func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.PlanAmendment) (store.PlanAmendmentProposal, error) {
-	proposal, err := c.Store.ProposePlanAmendment(ctx, amendment, c.now())
-	var isolation *store.DeliveryIsolationRequired
-	if !errors.As(err, &isolation) {
-		return proposal, err
-	}
-	isolated, isolateErr := c.isolateDeliveryTargets(ctx, isolation.Targets)
-	if isolateErr != nil {
-		return store.PlanAmendmentProposal{}, errors.Join(err, isolateErr)
-	}
-	return c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolated...)
+	isolator, _ := c.Runtime.(worker.ContainerIsolator)
+	var proposal store.PlanAmendmentProposal
+	err := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+		var err error
+		proposal, err = c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolated...)
+		return err
+	})
+	return proposal, err
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
-	storeErr := c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
+	isolator, _ := c.Runtime.(worker.ContainerIsolator)
+	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
 		return c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	storeErr := c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
+	isolator, _ := c.Runtime.(worker.ContainerIsolator)
+	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+		if len(isolated) == 0 {
+			return c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
+		}
 		return c.Store.FailDeliveryControllerWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	storeErr := c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
-	storeErr = c.retryAfterDeliveryIsolation(ctx, storeErr, func(isolated []store.DeliveryIsolationProof) error {
+	isolator, _ := c.Runtime.(worker.ContainerIsolator)
+	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+		if len(isolated) == 0 {
+			return c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
+		}
 		return c.Store.FailDeliveryControllerLaunchWithClassAfterIsolation(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
-}
-
-func (c Controller) retryAfterDeliveryIsolation(ctx context.Context, err error, retry func([]store.DeliveryIsolationProof) error) error {
-	var isolation *store.DeliveryIsolationRequired
-	if !errors.As(err, &isolation) {
-		return err
-	}
-	isolated, isolateErr := c.isolateDeliveryTargets(ctx, isolation.Targets)
-	if isolateErr != nil {
-		return errors.Join(err, isolateErr)
-	}
-	return retry(isolated)
 }
 
 func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {

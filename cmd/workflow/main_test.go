@@ -69,7 +69,7 @@ func (f restoreContainerIsolatorFunc) IsolateContainer(ctx context.Context, runI
 	return f(ctx, runID)
 }
 
-func (restoreContainerIsolatorFunc) IsolateControlPlaneDeliveryContainers(context.Context) error {
+func (restoreContainerIsolatorFunc) IsolateControlPlaneContainers(context.Context) error {
 	return nil
 }
 
@@ -82,7 +82,7 @@ func (f fakeRestoreContainerIsolator) IsolateContainer(ctx context.Context, runI
 	return f.isolateRun(ctx, runID)
 }
 
-func (f fakeRestoreContainerIsolator) IsolateControlPlaneDeliveryContainers(ctx context.Context) error {
+func (f fakeRestoreContainerIsolator) IsolateControlPlaneContainers(ctx context.Context) error {
 	return f.isolateControlPlane(ctx)
 }
 

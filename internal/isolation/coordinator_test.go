@@ -26,14 +26,14 @@ func (s *coordinatorStore) AcknowledgeDeliveryIsolation(ctx context.Context, tar
 }
 
 type coordinatorIsolator struct {
-	isolated bool
+	isolated []string
 }
 
-func (i *coordinatorIsolator) IsolateContainer(ctx context.Context, _ string) error {
+func (i *coordinatorIsolator) IsolateContainer(ctx context.Context, runID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	i.isolated = true
+	i.isolated = append(i.isolated, runID)
 	return nil
 }
 
@@ -47,7 +47,28 @@ func TestDeliveryControllersCompletesHandshakeAfterCallerCancellation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isolator.isolated || !database.acknowledged || len(acknowledged) != 1 {
-		t.Fatalf("isolation handshake incomplete: isolated=%t acknowledged=%t proofs=%#v", isolator.isolated, database.acknowledged, acknowledged)
+	if len(isolator.isolated) != 1 || !database.acknowledged || len(acknowledged) != 1 {
+		t.Fatalf("isolation handshake incomplete: isolated=%v acknowledged=%t proofs=%#v", isolator.isolated, database.acknowledged, acknowledged)
+	}
+}
+
+func TestRetryDeliveryControllerTransitionAccumulatesConcurrentIsolation(t *testing.T) {
+	database := &coordinatorStore{cancel: func() {}}
+	isolator := &coordinatorIsolator{}
+	targets := []store.TicketClaim{{RunID: "delivery-1"}, {RunID: "delivery-2"}}
+	calls := 0
+
+	err := RetryDeliveryControllerTransition(context.Background(), database, isolator, func(isolated []store.DeliveryIsolationProof) error {
+		calls++
+		if len(isolated) < len(targets) {
+			return &store.DeliveryIsolationRequired{Targets: []store.TicketClaim{targets[len(isolated)]}}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || len(isolator.isolated) != 2 || !database.acknowledged {
+		t.Fatalf("transition retries = %d, isolated = %v, acknowledged = %t", calls, isolator.isolated, database.acknowledged)
 	}
 }

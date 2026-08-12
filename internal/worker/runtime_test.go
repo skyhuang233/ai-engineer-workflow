@@ -296,7 +296,7 @@ func TestDockerRuntimeIsolationIncludesPreparedContainers(t *testing.T) {
 	}
 }
 
-func TestDockerRuntimeIsolatesControlPlaneDeliveryContainers(t *testing.T) {
+func TestDockerRuntimeIsolatesEveryControlPlaneWorkerContainer(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +304,8 @@ func TestDockerRuntimeIsolatesControlPlaneDeliveryContainers(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "docker.log")
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
-	if err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).IsolateControlPlaneDeliveryContainers(context.Background()); err != nil {
+	t.Setenv("WORKFLOW_DOCKER_RUNTIME_INSPECT_LABELS", `{"workflow.run_id":"run-1","workflow.control_plane":"control-1","workflow.run_kind":"agent"}`)
+	if err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).IsolateControlPlaneContainers(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := os.ReadFile(logPath)
@@ -312,8 +313,8 @@ func TestDockerRuntimeIsolatesControlPlaneDeliveryContainers(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := string(commands)
-	if !strings.Contains(log, "container ls --all --quiet --filter label=workflow.run_id") || !strings.Contains(log, "container inspect --format {{json .Config.Labels}} prepared-container") || !strings.Contains(log, "container rm --force prepared-container") {
-		t.Fatalf("Control Plane delivery isolation commands = %q", log)
+	if !strings.Contains(log, "container ls --all --quiet --filter label=workflow.run_id") || !strings.Contains(log, "container inspect --format {{json .Config.Labels}} prepared-container") || !strings.Contains(log, "container ls --all --quiet --filter label=workflow.control_plane=control-1") || !strings.Contains(log, "container rm --force prepared-container") {
+		t.Fatalf("Control Plane Worker isolation commands = %q", log)
 	}
 }
 
@@ -326,7 +327,7 @@ func TestDockerRuntimeRefusesAmbiguousLegacyWorkflowContainers(t *testing.T) {
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_HELPER", "1")
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_LOG", logPath)
 	t.Setenv("WORKFLOW_DOCKER_RUNTIME_INSPECT_LABELS", `{"workflow.run_id":"legacy-run"}`)
-	err = (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).IsolateControlPlaneDeliveryContainers(context.Background())
+	err = (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).IsolateControlPlaneContainers(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ambiguous legacy workflow containers") {
 		t.Fatalf("legacy workflow container isolation = %v", err)
 	}

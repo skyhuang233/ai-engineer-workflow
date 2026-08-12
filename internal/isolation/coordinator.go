@@ -20,6 +20,25 @@ type ContainerIsolator interface {
 	IsolateContainer(context.Context, string) error
 }
 
+func RetryDeliveryControllerTransition(ctx context.Context, database Store, isolator ContainerIsolator, transition func([]store.DeliveryIsolationProof) error) error {
+	if transition == nil {
+		return errors.New("Delivery Controller transition is required")
+	}
+	var isolated []store.DeliveryIsolationProof
+	for {
+		err := transition(isolated)
+		var required *store.DeliveryIsolationRequired
+		if !errors.As(err, &required) {
+			return err
+		}
+		acknowledged, isolationErr := DeliveryControllers(ctx, database, isolator, required.Targets)
+		if isolationErr != nil {
+			return errors.Join(err, isolationErr)
+		}
+		isolated = append(isolated, acknowledged...)
+	}
+}
+
 func DeliveryControllers(ctx context.Context, database Store, isolator ContainerIsolator, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
 	if database == nil || isolator == nil {
 		return nil, errors.New("Delivery Controller isolation dependencies are incomplete")

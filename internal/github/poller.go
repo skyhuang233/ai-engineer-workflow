@@ -746,18 +746,12 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 		}
 		return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
 	}
-	disposition, attentionErr := resolve()
-	var isolation *store.DeliveryIsolationRequired
-	if errors.As(attentionErr, &isolation) {
-		if p.ContainerIsolator == nil {
-			return errors.Join(result, attentionErr, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
-		}
-		fenced, fenceErr := deliveryisolation.DeliveryControllers(persistenceCtx, p.Store, p.ContainerIsolator, isolation.Targets)
-		if fenceErr != nil {
-			return errors.Join(result, attentionErr, fenceErr)
-		}
-		disposition, attentionErr = resolve(fenced...)
-	}
+	var disposition store.GitHubPollTerminalFailureDisposition
+	attentionErr := deliveryisolation.RetryDeliveryControllerTransition(persistenceCtx, p.Store, p.ContainerIsolator, func(isolated []store.DeliveryIsolationProof) error {
+		var err error
+		disposition, err = resolve(isolated...)
+		return err
+	})
 	if attentionErr != nil {
 		result = errors.Join(result, attentionErr)
 		return result
@@ -950,18 +944,10 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 			if question.Kind == "inbox_delivery_recovery" {
 				_, err = p.Store.RecoverUncertainInboxDeliveryQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
 			} else {
-				_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
-				var isolation *store.DeliveryIsolationRequired
-				if errors.As(err, &isolation) {
-					if p.ContainerIsolator == nil {
-						return errors.Join(err, errors.New("GitHub poller cannot isolate an active Delivery Controller"))
-					}
-					fenced, fenceErr := deliveryisolation.DeliveryControllers(ctx, p.Store, p.ContainerIsolator, isolation.Targets)
-					if fenceErr != nil {
-						return errors.Join(err, fenceErr)
-					}
-					_, err = p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), fenced...)
-				}
+				err = deliveryisolation.RetryDeliveryControllerTransition(ctx, p.Store, p.ContainerIsolator, func(isolated []store.DeliveryIsolationProof) error {
+					_, err := p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), isolated...)
+					return err
+				})
 			}
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return wrapPollStoreError(err)

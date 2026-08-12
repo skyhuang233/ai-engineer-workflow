@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -77,37 +76,21 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 
 func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delivery store.TicketDelivery) error {
 	now := time.Now().UTC()
-	_, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now)
-	var isolation *store.DeliveryIsolationRequired
-	if !errors.As(err, &isolation) {
+	return deliveryisolation.RetryDeliveryControllerTransition(ctx, r.Store, r.Isolator, func(isolated []store.DeliveryIsolationProof) error {
+		_, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, isolated...)
 		return err
-	}
-	if r.Isolator == nil {
-		return errors.Join(err, errors.New("delivered reconciler cannot isolate an active Delivery Controller"))
-	}
-	fenced, isolationErr := deliveryisolation.DeliveryControllers(ctx, r.Store, r.Isolator, isolation.Targets)
-	if isolationErr != nil {
-		return errors.Join(err, isolationErr)
-	}
-	_, err = r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, fenced...)
-	return err
+	})
 }
 
 func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {
-	_, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
-	var isolation *store.DeliveryIsolationRequired
-	if !errors.As(err, &isolation) {
+	return deliveryisolation.RetryDeliveryControllerTransition(ctx, r.Store, r.Isolator, func(isolated []store.DeliveryIsolationProof) error {
+		if len(isolated) == 0 {
+			_, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
+			return err
+		}
+		_, err := r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, isolated[len(isolated)-1])
 		return err
-	}
-	if r.Isolator == nil {
-		return errors.New("delivered reconciler cannot isolate an active Delivery Controller")
-	}
-	fenced, err := deliveryisolation.DeliveryControllers(ctx, r.Store, r.Isolator, isolation.Targets)
-	if err != nil {
-		return err
-	}
-	_, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, fenced[0])
-	return err
+	})
 }
 
 type pullRequestState int
