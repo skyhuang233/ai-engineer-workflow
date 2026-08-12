@@ -4,6 +4,7 @@ package startup
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,34 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+func validateLocalDatabasePath(path string) error {
+	volume := filepath.VolumeName(path)
+	if volume == "" {
+		return nil
+	}
+	if strings.HasPrefix(volume, `\\`) && !strings.HasPrefix(strings.ToLower(volume), `\\?\volume{`) {
+		return errors.New("database path must use a local filesystem")
+	}
+	root := volume
+	if len(root) == 2 && root[1] == ':' {
+		root += `\`
+	} else if !strings.HasSuffix(root, `\`) {
+		root += `\`
+	}
+	pointer, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return err
+	}
+	switch driveType := windows.GetDriveType(pointer); driveType {
+	case windows.DRIVE_REMOTE:
+		return errors.New("database path must use a local filesystem")
+	case windows.DRIVE_UNKNOWN, windows.DRIVE_NO_ROOT_DIR:
+		return fmt.Errorf("database path volume %q is unavailable", volume)
+	default:
+		return nil
+	}
+}
 
 func normalizeDatabasePathCase(path string) (string, error) {
 	path, err := normalizeWindowsVolumeIdentity(path)

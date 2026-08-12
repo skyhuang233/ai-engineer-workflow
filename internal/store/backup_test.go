@@ -199,6 +199,53 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	_ = processing
 }
 
+func TestRestoreBackupMigratesLegacySchemaWithoutDeliverySourceProvenance(t *testing.T) {
+	ctx := context.Background()
+	backupPath := filepath.Join(t.TempDir(), "workflow-v50.db")
+	db, err := Open(ctx, backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "ALTER TABLE candidate_revisions DROP COLUMN delivery_source_digest"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version >= ?", deliverySourceBackupSchemaVersion); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checksum, err := checksumFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := BackupMetadata{BackupPath: backupPath, ChecksumSHA256: checksum, SchemaVersion: deliverySourceBackupSchemaVersion - 1}
+	if err := writeBackupMetadata(backupPath, metadata); err != nil {
+		t.Fatal(err)
+	}
+	restoredPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := RestoreBackup(ctx, backupPath, restoredPath); err != nil {
+		t.Fatalf("restore schema 50 backup: %v", err)
+	}
+	restored, err := OpenForStartup(ctx, restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	version, err := restored.schemaVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != latestSchemaVersion {
+		t.Fatalf("restored schema version = %d, want %d", version, latestSchemaVersion)
+	}
+	if !hasColumn(t, ctx, restored.db, "candidate_revisions", "delivery_source_digest") {
+		t.Fatal("restored Delivery Source column is missing")
+	}
+}
+
 func TestBackupDrillRequiresCurrentCandidateDeliverySource(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)

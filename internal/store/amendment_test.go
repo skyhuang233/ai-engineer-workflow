@@ -84,6 +84,7 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 		{ID: 2, Number: 12, Title: "second", Labels: []string{plan.TicketLabel}},
 		{ID: 3, Number: 13, Title: "unaffected", Labels: []string{plan.TicketLabel}},
 		{ID: 5, Number: 15, Title: "unaffected gate", Labels: []string{plan.TicketLabel}},
+		{ID: 6, Number: 16, Title: "unaffected queued agent", Labels: []string{plan.TicketLabel}},
 	}, map[int64][]plan.Issue{2: {{ID: 1, Number: 11, Labels: []string{plan.TicketLabel}}}})
 	primaryVersion := activateAmendmentSnapshot(t, ctx, db, primary)
 	secondary := amendmentSnapshot(20, []plan.Issue{{ID: 4, Number: 21, Title: "other plan", Labels: []string{plan.TicketLabel}}}, nil)
@@ -104,6 +105,10 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	unaffectedAgentClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: primaryVersion.ID, TicketID: 6, Owner: "agent-6", MaxParallelRuns: 4, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	proposal, err := db.ProposePlanAmendment(ctx, PlanAmendment{
 		VersionID:          primaryVersion.ID,
@@ -120,7 +125,7 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 		}
 	}
 
-	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 3, now)
+	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 4, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +139,7 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if err := db.AnswerWorkflowQuestion(ctx, primary.Repository, proposal.QuestionID, `{"action":"reject"}`, now); err != nil {
 		t.Fatalf("repeated rejection = %v", err)
 	}
-	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 4, now)
+	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 5, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +178,20 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	}
 	if _, err := db.TicketSession(ctx, primaryVersion.ID, 3); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("source version retained unaffected session: %v", err)
+	}
+	resolvedAgentClaim, agentSession, err := db.ResolveAgentLaunchContext(ctx, unaffectedAgentClaim, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resolve queued Agent launch after approval: %v", err)
+	}
+	if resolvedAgentClaim.VersionID != updated.ID || agentSession.VersionID != updated.ID {
+		t.Fatalf("queued Agent launch context versions = %q, %q, want %q", resolvedAgentClaim.VersionID, agentSession.VersionID, updated.ID)
+	}
+	resolvedDeliveryClaim, deliverySession, delivery, err := db.ResolveDeliveryLaunchContext(ctx, unaffectedClaim, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resolve queued Delivery Controller launch after approval: %v", err)
+	}
+	if resolvedDeliveryClaim.VersionID != updated.ID || deliverySession.VersionID != updated.ID || delivery.VersionID != updated.ID {
+		t.Fatalf("queued Delivery Controller launch context versions = %q, %q, %q, want %q", resolvedDeliveryClaim.VersionID, deliverySession.VersionID, delivery.VersionID, updated.ID)
 	}
 	if err := db.RequireCurrentDeliveryLease(ctx, unaffectedClaim, now.Add(time.Minute)); err != nil {
 		t.Fatalf("source-version delivery claim lost after approval: %v", err)

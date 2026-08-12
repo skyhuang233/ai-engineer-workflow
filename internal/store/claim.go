@@ -492,6 +492,81 @@ func (s *Store) CurrentClaim(ctx context.Context, versionID string, issueID int6
 	return s.currentClaimAt(ctx, versionID, issueID, time.Now().UTC())
 }
 
+func (s *Store) ResolveAgentLaunchContext(ctx context.Context, claim TicketClaim, now time.Time) (TicketClaim, TicketSession, error) {
+	resolved, session, _, err := s.resolveWorkerLaunchContext(ctx, claim, RunAgent, now)
+	return resolved, session, err
+}
+
+func (s *Store) ResolveDeliveryLaunchContext(ctx context.Context, claim TicketClaim, now time.Time) (TicketClaim, TicketSession, TicketDelivery, error) {
+	return s.resolveWorkerLaunchContext(ctx, claim, RunDelivery, now)
+}
+
+func (s *Store) resolveWorkerLaunchContext(ctx context.Context, claim TicketClaim, runKind RunKind, now time.Time) (TicketClaim, TicketSession, TicketDelivery, error) {
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.SessionID == "" || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 || (runKind != RunAgent && runKind != RunDelivery) {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, err
+	}
+	defer tx.Rollback()
+	var session TicketSession
+	var expiresText string
+	err = tx.QueryRowContext(ctx, `SELECT s.session_id, s.version_id, s.issue_id, s.agent_identity, s.codex_session_id,
+s.workspace_path, s.codex_state_path, s.branch, s.accepted_commit, s.accepted_candidate_run_id,
+s.owner, r.attempt, l.expires_at, t.issue_number, t.title
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id AND s.current_run_id = r.run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+JOIN plan_tickets t ON t.version_id = s.version_id AND t.issue_id = s.issue_id
+WHERE r.run_id = ? AND r.session_id = ? AND s.issue_id = ? AND r.lease_generation = ? AND r.run_kind = ?
+AND r.state = ? AND s.state = ? AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?`,
+		claim.RunID, claim.SessionID, claim.TicketID, claim.LeaseGeneration, runKind,
+		RunRunning, SessionRunning, claim.LeaseToken, LeaseActive, formatTimestamp(now)).Scan(
+		&session.SessionID, &session.VersionID, &session.TicketID, &session.AgentIdentity, &session.CodexSessionID,
+		&session.WorkspacePath, &session.CodexStatePath, &session.Branch, &session.AcceptedCommit, &session.AcceptedCandidateRunID,
+		&claim.Owner, &claim.Attempt, &expiresText, &claim.TicketNumber, &claim.TicketTitle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, ErrInvalidClaim
+	}
+	if err != nil {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, err
+	}
+	claim.VersionID = session.VersionID
+	claim.TicketID = session.TicketID
+	claim.SessionID = session.SessionID
+	claim.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, expiresText)
+	if err != nil {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, err
+	}
+	var delivery TicketDelivery
+	if runKind == RunDelivery {
+		err = tx.QueryRowContext(ctx, `SELECT d.version_id, d.issue_id, d.repository, d.pull_request_number, s.accepted_commit, d.branch, d.remote_head, d.merge_commit, d.checks_etag
+FROM ticket_deliveries d
+JOIN ticket_sessions s ON s.version_id = d.version_id AND s.issue_id = d.issue_id
+WHERE s.session_id = ? AND s.current_run_id = ? AND s.accepted_commit != ''`, claim.SessionID, claim.RunID).Scan(
+			&delivery.VersionID, &delivery.IssueID, &delivery.Repository, &delivery.PullRequestNumber,
+			&delivery.CandidateCommit, &delivery.Branch, &delivery.RemoteHead, &delivery.MergeCommit, &delivery.ChecksETag)
+		if errors.Is(err, sql.ErrNoRows) {
+			return TicketClaim{}, TicketSession{}, TicketDelivery{}, ErrNotFound
+		}
+		if err != nil {
+			return TicketClaim{}, TicketSession{}, TicketDelivery{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return TicketClaim{}, TicketSession{}, TicketDelivery{}, err
+	}
+	return claim, session, delivery, nil
+}
+
 func (s *Store) PendingDeliveryClaims(ctx context.Context, repository string, now time.Time) ([]TicketClaim, error) {
 	if repository == "" {
 		return nil, ErrInvalidClaim

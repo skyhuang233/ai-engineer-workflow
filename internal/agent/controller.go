@@ -118,10 +118,11 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if request.Claim.SessionID == "" || request.Claim.RunID == "" || request.Prompt == "" {
 		return Candidate{}, store.ErrInvalidClaim
 	}
-	session, err := c.Store.TicketSession(ctx, request.Claim.VersionID, request.Claim.TicketID)
+	claim, session, err := c.Store.ResolveAgentLaunchContext(ctx, request.Claim, c.now())
 	if err != nil {
 		return Candidate{}, err
 	}
+	request.Claim = claim
 	revisionRoundID, err := c.Store.RevisionRoundID(ctx, request.Claim.RunID)
 	if err != nil {
 		return Candidate{}, err
@@ -292,7 +293,8 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if c.Store == nil || c.Runtime == nil {
 		return errors.New("agent controller dependencies are incomplete")
 	}
-	if err := c.Store.RequireCurrentDeliveryLease(ctx, claim, c.now()); err != nil {
+	claim, session, delivery, err := c.Store.ResolveDeliveryLaunchContext(ctx, claim, c.now())
+	if err != nil {
 		return err
 	}
 	if err := c.Store.ReserveDeliveryControllerPrelaunch(ctx, claim, c.now()); err != nil {
@@ -300,14 +302,6 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	}
 	finalizationCtx, cancelFinalization := context.WithDeadline(context.Background(), claim.LeaseExpiresAt.Add(10*time.Second))
 	defer cancelFinalization()
-	session, err := c.Store.TicketSession(finalizationCtx, claim.VersionID, claim.TicketID)
-	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
-	}
-	delivery, err := c.Store.CandidateDelivery(finalizationCtx, claim.VersionID, claim.TicketID)
-	if err != nil {
-		return c.failDeliveryController(finalizationCtx, claim, err)
-	}
 	expectedSourceDigest, err := c.Store.CandidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
 	if err != nil {
 		return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("load Candidate Delivery Source provenance: %w", err)))

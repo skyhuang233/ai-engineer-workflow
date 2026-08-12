@@ -45,6 +45,12 @@ func TestDatabaseIdentityRejectsNetworkPaths(t *testing.T) {
 	}
 }
 
+func TestCanonicalDatabasePathRejectsResolvedUNCVolume(t *testing.T) {
+	if err := validateLocalDatabasePath(`\\server\share\workflow.db`); err == nil || !strings.Contains(err.Error(), "local filesystem") {
+		t.Fatalf("canonical UNC locality error = %v, want local filesystem error", err)
+	}
+}
+
 func TestDatabaseIdentityRejectsUnsupportedWindowsDeviceNamespaces(t *testing.T) {
 	for _, path := range []string{
 		`\\?\GLOBALROOT\Device\HarddiskVolume1\workflow.db`,

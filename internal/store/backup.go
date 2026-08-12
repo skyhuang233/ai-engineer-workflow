@@ -19,6 +19,8 @@ import (
 
 const backupMetadataSuffix = ".metadata.json"
 
+const deliverySourceBackupSchemaVersion = 51
+
 // BackupMetadata is the transportable provenance for an online Control Plane
 // backup. The same reference records are persisted in SQLite for audit.
 type BackupMetadata struct {
@@ -554,6 +556,9 @@ func verifyBackup(ctx context.Context, path string, metadata BackupMetadata) err
 	}
 	if version != metadata.SchemaVersion {
 		return fmt.Errorf("SQLite backup schema version mismatch: got %d want %d", version, metadata.SchemaVersion)
+	}
+	if version < deliverySourceBackupSchemaVersion {
+		return nil
 	}
 	references, err := backupReferencesAt(ctx, path)
 	if err != nil {
