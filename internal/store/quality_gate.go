@@ -81,6 +81,9 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	if !expiresAt.After(now) {
 		return WorkflowQuestion{}, ErrInvalidClaim
 	}
+	if err := requireDeliveryRunTerminalizationTx(ctx, tx, claim.RunID, claim.LeaseGeneration); err != nil {
+		return WorkflowQuestion{}, err
+	}
 	fingerprint := qualityGateFingerprint(gate)
 	var question WorkflowQuestion
 	err = tx.QueryRowContext(ctx, `SELECT q.question_id, q.prompt, q.state, q.answer

@@ -266,6 +266,19 @@ WHERE s.version_id = ?`, versionID)
 	return rows.Err()
 }
 
+func requireDeliveryRunTerminalizationTx(ctx context.Context, tx *sql.Tx, runID string, leaseGeneration int64) error {
+	var fenced int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM delivery_write_fences WHERE run_id = ? AND lease_generation = ?
+)`, runID, leaseGeneration).Scan(&fenced); err != nil {
+		return err
+	}
+	if fenced != 0 {
+		return ErrDeliveryInProgress
+	}
+	return nil
+}
+
 func (s *Store) WorkerIsolationTargets(ctx context.Context) ([]TicketClaim, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -1326,6 +1339,9 @@ WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.run_kind = ? AN
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, expiresText)
 	if err != nil {
+		return err
+	}
+	if err := requireDeliveryRunTerminalizationTx(ctx, tx, claim.RunID, claim.LeaseGeneration); err != nil {
 		return err
 	}
 	certifiedUnstarted := false

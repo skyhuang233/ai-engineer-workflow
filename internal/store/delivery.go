@@ -337,9 +337,10 @@ func (s *Store) executeDelivery(ctx context.Context, request DeliveryRequest, cl
 	}
 	if target.RunID != "" {
 		result, err := tx.ExecContext(ctx, `INSERT INTO delivery_write_fences(idempotency_key, run_id, lease_generation, claim_token, acquired_at)
-VALUES (?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ? FROM worker_runs
+WHERE run_id = ? AND lease_generation = ? AND isolation_pending = 0
 ON CONFLICT(idempotency_key) DO UPDATE SET claim_token = excluded.claim_token, acquired_at = excluded.acquired_at
-WHERE delivery_write_fences.run_id = excluded.run_id AND delivery_write_fences.lease_generation = excluded.lease_generation`, normalized.IdempotencyKey, target.RunID, target.LeaseGeneration, claimToken, formatTimestamp(validatedAt))
+WHERE delivery_write_fences.run_id = excluded.run_id AND delivery_write_fences.lease_generation = excluded.lease_generation`, normalized.IdempotencyKey, target.RunID, target.LeaseGeneration, claimToken, formatTimestamp(validatedAt), target.RunID, target.LeaseGeneration)
 		if err != nil {
 			return DeliveryResult{}, err
 		}
@@ -677,6 +678,9 @@ func (s *Store) claimDeliveryOutbox(ctx context.Context, key, dispatcherToken st
 	}
 	if attempts >= maxDeliveryAttempts {
 		lastError := inboxDeliveryRecoveryReason(request, key, "delivery retries exhausted", uncertain != 0)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM delivery_write_fences WHERE idempotency_key = ?`, key); err != nil {
+			return DeliveryOutbox{}, err
+		}
 		if err := s.markDeliveryNeedsAttentionTx(ctx, tx, request, key, uncertain != 0, lastError, now, isolated...); err != nil && !errors.Is(err, ErrDeliverySuperseded) {
 			return DeliveryOutbox{}, err
 		}
@@ -1432,7 +1436,7 @@ JOIN plans p ON p.id = v.plan_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 JOIN ticket_runtime rt ON rt.version_id = s.version_id AND rt.issue_id = s.issue_id
 LEFT JOIN ticket_deliveries td ON td.version_id = s.version_id AND td.issue_id = s.issue_id
-WHERE r.run_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND l.lease_token = ? AND l.generation = ? AND l.state = ?
+WHERE r.run_id = ? AND s.current_run_id = r.run_id AND r.run_kind = ? AND r.state = ? AND r.isolation_pending = 0 AND l.lease_token = ? AND l.generation = ? AND l.state = ?
 AND `+currentActiveUnfrozenPlanPredicate,
 		request.RunID, RunDelivery, RunRunning, request.LeaseToken, request.LeaseGeneration, LeaseActive).
 		Scan(&target.VersionID, &target.TicketID, &target.SessionID, &target.RunID, &target.LeaseGeneration, &target.Repository, &target.RootNumber, &target.Branch, &target.AcceptedCommit, &mappedNumber, &mappedNode, &mappedHead, &expiresText)

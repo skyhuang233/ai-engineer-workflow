@@ -1354,6 +1354,160 @@ func TestExhaustedDeliveryOutboxRequiresWorkerIsolation(t *testing.T) {
 	}
 }
 
+func TestDeliveryRunTerminalizationWaitsForGatewayWriteFence(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	controller, claim, now := newDeliveryFenceTestClaim(t, ctx, databasePath)
+	defer controller.Close()
+	gateway, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	queued, err := controller.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxClaim, err := controller.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ExecuteDelivery(ctx, outboxClaim.Request, outboxClaim.ClaimToken, func() time.Time { return now }, func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		return DeliveryResult{}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CompleteDeliveryController(ctx, claim, now.Add(time.Second)); !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("completion during gateway write = %v, want ErrDeliveryInProgress", err)
+	}
+	if err := controller.FailDeliveryControllerWithClass(ctx, claim, "retry", FailureInfrastructure, now.Add(time.Second)); !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("retry during gateway write = %v, want ErrDeliveryInProgress", err)
+	}
+	_, err = controller.PauseDeliveryControllerForQualityGate(ctx, claim, QualityGate{GateID: "review", FindingID: "finding", Action: QualityGateAskUser, Reason: "decision required", AllowedAnswers: []string{"approve"}}, now.Add(time.Second))
+	if !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("quality gate during gateway write = %v, want ErrDeliveryInProgress", err)
+	}
+}
+
+func TestGatewayWriteAdmissionRejectsPendingWorkerIsolation(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	controller, claim, now := newDeliveryFenceTestClaim(t, ctx, databasePath)
+	defer controller.Close()
+	if err := controller.ReserveDeliveryControllerPrelaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.ReserveDeliveryControllerLaunch(ctx, claim, WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := controller.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxClaim, err := controller.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := controller.WorkerIsolationTargets(ctx)
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("isolation targets = %#v, %v", targets, err)
+	}
+	if _, err := controller.FenceWorkerIsolation(ctx, targets); err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	applyCalls := 0
+	if _, err := gateway.ExecuteDelivery(ctx, outboxClaim.Request, outboxClaim.ClaimToken, func() time.Time { return now }, func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		applyCalls++
+		return DeliveryResult{}, nil
+	}); !errors.Is(err, ErrDeliveryRejected) {
+		t.Fatalf("gateway admission during isolation = %v, want ErrDeliveryRejected", err)
+	}
+	if applyCalls != 0 {
+		t.Fatalf("gateway apply calls = %d, want 0", applyCalls)
+	}
+}
+
+func TestExhaustedRecoveredClaimReleasesGatewayWriteFence(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	controller, claim, now := newDeliveryFenceTestClaim(t, ctx, databasePath)
+	defer controller.Close()
+	queued, err := controller.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxClaim, err := controller.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ExecuteDelivery(ctx, outboxClaim.Request, outboxClaim.ClaimToken, func() time.Time { return now }, func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		return DeliveryResult{}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.ExecContext(ctx, `UPDATE delivery_outbox SET attempts = ?, updated_at = ? WHERE idempotency_key = ?`, maxDeliveryAttempts, formatTimestamp(now.Add(-time.Hour)), queued.IdempotencyKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1 WHERE run_id = ?`, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	proof := WorkerIsolationProof{target: claim}
+	if _, err := controller.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now.Add(4*time.Hour), proof); !errors.Is(err, ErrDeliveryRejected) {
+		t.Fatalf("exhausted recovered claim = %v, want ErrDeliveryRejected", err)
+	}
+	var fences int
+	if err := controller.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_write_fences WHERE idempotency_key = ?`, queued.IdempotencyKey).Scan(&fences); err != nil {
+		t.Fatal(err)
+	}
+	if fences != 0 {
+		t.Fatalf("retained gateway write fences = %d, want 0", fences)
+	}
+}
+
+func newDeliveryFenceTestClaim(t *testing.T, ctx context.Context, databasePath string) (*Store, TicketClaim, time.Time) {
+	t.Helper()
+	db, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	agentClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.BindAgent(ctx, AgentBinding{SessionID: agentClaim.SessionID, AgentIdentity: "agent-1", WorkspacePath: "workspace", CodexStatePath: "codex", Branch: "ticket-1"}); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	claim, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: agentClaim.RunID, LeaseToken: agentClaim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, 3*time.Hour)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	return db, claim, now
+}
+
 func TestNoProgressEscalationKeepsOneFingerprintQuestionWithSafeRecovery(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
