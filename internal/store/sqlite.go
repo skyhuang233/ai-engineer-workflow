@@ -13,6 +13,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/startup"
+	"github.com/skyhuang233/workflow/internal/workerrun"
 	"modernc.org/sqlite"
 )
 
@@ -49,9 +50,11 @@ const (
 	SessionClosed  = "closed"
 	RunRunning     = "running"
 	LeaseActive    = "active"
-	RunAgent       = "agent"
-	RunDelivery    = "delivery_controller"
+	RunAgent       = workerrun.Agent
+	RunDelivery    = workerrun.DeliveryController
 )
+
+type RunKind = workerrun.Kind
 
 type Store struct {
 	db             *sql.DB

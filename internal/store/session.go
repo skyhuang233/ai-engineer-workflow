@@ -14,6 +14,7 @@ import (
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/workerrelease"
+	"github.com/skyhuang233/workflow/internal/workerrun"
 )
 
 var ErrSessionConflict = errors.New("ticket session identity conflict")
@@ -167,7 +168,7 @@ type CandidateRecord struct {
 
 type RecoveryRun struct {
 	Claim   TicketClaim
-	Kind    string
+	Kind    workerrun.Kind
 	Session TicketSession
 }
 
@@ -1020,11 +1021,21 @@ WHERE s.session_id = ? AND s.state = ?`, sessionID, SessionRunning).Scan(&claim.
 }
 
 func (s *Store) CompleteDeliveryController(ctx context.Context, claim TicketClaim, now time.Time) error {
-	return s.finishDeliveryController(ctx, claim, "", FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, nil)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		class: FailureCodeQuality,
+		now:   now,
+		limit: DefaultMaxWorkerAttempts,
+	})
 }
 
 func (s *Store) FailDeliveryController(ctx context.Context, claim TicketClaim, reason string, now time.Time, isolated ...DeliveryIsolationProof) error {
-	return s.finishDeliveryController(ctx, claim, reason, FailureCodeQuality, false, false, now, DefaultMaxWorkerAttempts, isolated)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		reason:   reason,
+		class:    FailureCodeQuality,
+		now:      now,
+		limit:    DefaultMaxWorkerAttempts,
+		isolated: isolated,
+	})
 }
 
 // FailDeliveryControllerWithClass releases the failed Delivery Controller and
@@ -1035,11 +1046,24 @@ func (s *Store) FailDeliveryControllerWithClass(ctx context.Context, claim Ticke
 	if len(maxAttempts) > 0 {
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
-	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, limit, nil)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		reason: reason,
+		class:  class,
+		retry:  true,
+		now:    now,
+		limit:  limit,
+	})
 }
 
 func (s *Store) FailDeliveryControllerWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, false, now, maxWorkerAttempts(maxAttempts), isolated)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		reason:   reason,
+		class:    class,
+		retry:    true,
+		now:      now,
+		limit:    maxWorkerAttempts(maxAttempts),
+		isolated: isolated,
+	})
 }
 
 func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts ...int) error {
@@ -1047,11 +1071,26 @@ func (s *Store) FailDeliveryControllerLaunchWithClass(ctx context.Context, claim
 	if len(maxAttempts) > 0 {
 		limit = maxWorkerAttempts(maxAttempts[0])
 	}
-	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, limit, nil)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		reason:                reason,
+		class:                 class,
+		retry:                 true,
+		allowExpiredUnstarted: true,
+		now:                   now,
+		limit:                 limit,
+	})
 }
 
 func (s *Store) FailDeliveryControllerLaunchWithClassAfterIsolation(ctx context.Context, claim TicketClaim, reason string, class FailureClass, now time.Time, maxAttempts int, isolated ...DeliveryIsolationProof) error {
-	return s.finishDeliveryController(ctx, claim, reason, class, true, true, now, maxWorkerAttempts(maxAttempts), isolated)
+	return s.finishDeliveryController(ctx, claim, deliveryControllerFinishPolicy{
+		reason:                reason,
+		class:                 class,
+		retry:                 true,
+		allowExpiredUnstarted: true,
+		now:                   now,
+		limit:                 maxWorkerAttempts(maxAttempts),
+		isolated:              isolated,
+	})
 }
 
 func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, claim TicketClaim, now time.Time) error {
@@ -1152,9 +1191,26 @@ AND l.lease_token = ? AND l.generation = ? AND l.state = ? AND l.expires_at > ? 
 	return sessionID, candidateRunID.String, nil
 }
 
-func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, reason string, class FailureClass, retry, allowExpiredUnstarted bool, now time.Time, limit int, isolated []DeliveryIsolationProof) error {
+type deliveryControllerFinishPolicy struct {
+	reason                string
+	class                 FailureClass
+	retry                 bool
+	allowExpiredUnstarted bool
+	now                   time.Time
+	limit                 int
+	isolated              []DeliveryIsolationProof
+}
+
+func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim, policy deliveryControllerFinishPolicy) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	reason := policy.reason
+	class := policy.class
+	retry := policy.retry
+	allowExpiredUnstarted := policy.allowExpiredUnstarted
+	now := policy.now
+	limit := policy.limit
+	isolated := policy.isolated
 	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
 		return ErrInvalidClaim
 	}

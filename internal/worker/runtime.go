@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/workerrun"
 )
 
 var ErrGitHubCredential = errors.New("worker spec contains a GitHub write credential")
@@ -72,7 +74,7 @@ type Mount struct {
 
 type Spec struct {
 	RunID                string
-	RunKind              string
+	RunKind              workerrun.Kind
 	ControlPlaneID       string
 	Command              []string
 	WorkspacePath        string
@@ -219,7 +221,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if spec.ControlPlaneID == "" {
 		spec.ControlPlaneID = r.ControlPlaneID
 	}
-	if strings.TrimSpace(spec.RunKind) != "" && strings.TrimSpace(spec.ControlPlaneID) == "" {
+	if strings.TrimSpace(string(spec.RunKind)) != "" && strings.TrimSpace(spec.ControlPlaneID) == "" {
 		return Result{}, CertifiedNoLaunchError{Err: errors.New("Control Plane container identity is required for a typed Worker Run")}
 	}
 	if err := spec.Validate(); err != nil {
@@ -380,7 +382,7 @@ func dockerArgs(spec Spec) []string {
 		args = append(args, "--label", "workflow.control_plane="+spec.ControlPlaneID)
 	}
 	if spec.RunKind != "" {
-		args = append(args, "--label", "workflow.run_kind="+spec.RunKind)
+		args = append(args, "--label", "workflow.run_kind="+string(spec.RunKind))
 	}
 	for _, host := range spec.ExtraHosts {
 		args = append(args, "--add-host", host)
@@ -472,7 +474,7 @@ func (r DockerRuntime) IsolateControlPlaneDeliveryContainers(ctx context.Context
 			ambiguous = append(ambiguous, containerID)
 			continue
 		}
-		if controlPlaneID == r.ControlPlaneID && runKind == "delivery_controller" {
+		if controlPlaneID == r.ControlPlaneID && runKind == workerrun.DeliveryController {
 			deliveries = append(deliveries, containerID)
 		}
 	}

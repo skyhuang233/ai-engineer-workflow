@@ -732,7 +732,7 @@ func (s *Store) ReserveDeliveryControllerLaunch(ctx context.Context, claim Ticke
 	return s.reserveWorkerLaunch(ctx, claim, audit, now, RunDelivery)
 }
 
-func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time, runKind string) error {
+func (s *Store) reserveWorkerLaunch(ctx context.Context, claim TicketClaim, audit WorkerAudit, now time.Time, runKind RunKind) error {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 || audit.RunID != claim.RunID || audit.LeaseGeneration != claim.LeaseGeneration || audit.ContainerID != "" || audit.ImageDigest == "" || !validWorkerToolVersions(audit.ToolVersions) || audit.GitHubWriteCredentials {

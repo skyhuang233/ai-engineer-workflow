@@ -13,12 +13,6 @@ import (
 )
 
 func normalizeDatabasePathCase(path string) (string, error) {
-	if _, err := os.Lstat(path); err == nil {
-		return path, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-
 	caseSensitive, known, err := windowsDirectoryCaseSensitivity(filepath.Dir(path))
 	if err != nil {
 		return "", err

@@ -55,21 +55,6 @@ type workerBuildInputs struct {
 	Worker                          WorkerPin     `json:"worker"`
 }
 
-type canonicalWorkerBuildInputs struct {
-	SchemaVersion                   int           `json:"schema_version"`
-	DeployWorkerTree                string        `json:"deploy_worker_tree"`
-	DeliverySourceDigestCommandTree string        `json:"delivery_source_digest_command_tree"`
-	DeliverySourceDigestPackageTree string        `json:"delivery_source_digest_package_tree"`
-	GoModBlob                       string        `json:"go_mod_blob"`
-	GoSumBlob                       string        `json:"go_sum_blob"`
-	PublishWorkerWorkflowBlob       string        `json:"publish_worker_workflow_blob"`
-	Codex                           ToolPin       `json:"codex"`
-	GitHubCLI                       GitHubCLIPin  `json:"github_cli"`
-	Go                              GoPin         `json:"go"`
-	NoMistakes                      NoMistakesPin `json:"no_mistakes"`
-	Worker                          WorkerPin     `json:"worker"`
-}
-
 type resolvedWorkerBuildInputs struct {
 	CommitSHA string
 	Config    Config
@@ -412,8 +397,8 @@ func workerBuildInputIdentity(config Config, workerTree, deliverySourceDigestCom
 	return fmt.Sprintf("%x", digest)
 }
 
-func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) canonicalWorkerBuildInputs {
-	return canonicalWorkerBuildInputs{
+func canonicalizeWorkerBuildInputs(inputs workerBuildInputs) workerBuildInputs {
+	return workerBuildInputs{
 		SchemaVersion:                   inputs.SchemaVersion,
 		DeployWorkerTree:                base64.StdEncoding.EncodeToString([]byte(inputs.DeployWorkerTree)),
 		DeliverySourceDigestCommandTree: base64.StdEncoding.EncodeToString([]byte(inputs.DeliverySourceDigestCommandTree)),

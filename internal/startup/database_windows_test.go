@@ -36,17 +36,31 @@ func TestDatabaseIdentityNormalizesWindowsNamespaceAliases(t *testing.T) {
 	}
 }
 
-func TestDatabaseIdentityPreservesCanonicalWindowsCase(t *testing.T) {
+func TestDatabaseIdentityKeepsStableWindowsCaseAcrossLifecycle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "Workflow.db")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	identity, err := DatabaseIdentity(path)
+	beforeCreate, err := DatabaseIdentity(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := filepath.Base(identity), filepath.Base(path); got != want {
-		t.Fatalf("database identity base = %q, want canonical case %q", got, want)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterCreate, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCreate != beforeCreate {
+		t.Fatalf("existing database identity = %q, want pre-creation identity %q", afterCreate, beforeCreate)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete != beforeCreate {
+		t.Fatalf("deleted database identity = %q, want pre-creation identity %q", afterDelete, beforeCreate)
 	}
 	caseSensitive, known, err := windowsDirectoryCaseSensitivity(filepath.Dir(path))
 	if err != nil {
@@ -55,11 +69,14 @@ func TestDatabaseIdentityPreservesCanonicalWindowsCase(t *testing.T) {
 	if !known || caseSensitive {
 		return
 	}
+	if got, want := filepath.Base(beforeCreate), "workflow.db"; got != want {
+		t.Fatalf("case-insensitive database identity base = %q, want %q", got, want)
+	}
 	alias, err := DatabaseIdentity(filepath.Join(filepath.Dir(path), "WORKFLOW.DB"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if alias != identity {
-		t.Fatalf("case-insensitive alias identity = %q, want %q", alias, identity)
+	if alias != beforeCreate {
+		t.Fatalf("case-insensitive alias identity = %q, want %q", alias, beforeCreate)
 	}
 }
