@@ -80,6 +80,12 @@ func OpenForRestore(ctx context.Context, dsn string) (*Store, error) {
 	return open(ctx, dsn, false)
 }
 
+// OpenForRuntime configures SQLite and acquires the restore barrier without
+// repeating startup integrity checks or migration discovery.
+func OpenForRuntime(ctx context.Context, dsn string) (*Store, error) {
+	return openForStartup(ctx, dsn, true)
+}
+
 func open(ctx context.Context, dsn string, restoreBarrier bool) (*Store, error) {
 	store, err := openForStartup(ctx, dsn, restoreBarrier)
 	if err != nil {

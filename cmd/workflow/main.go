@@ -1242,9 +1242,13 @@ func newRestoreFencedGateway(databasePath string, config doctor.Config, githubUR
 }
 
 func (g *restoreFencedGateway) withGateway(ctx context.Context, action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
+	return g.withGatewayStore(ctx, store.OpenForRuntime, action)
+}
+
+func (g *restoreFencedGateway) withGatewayStore(ctx context.Context, openStore func(context.Context, string) (*store.Store, error), action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	db, err := store.Open(ctx, g.databasePath)
+	db, err := openStore(ctx, g.databasePath)
 	if err != nil {
 		return err
 	}
@@ -1277,7 +1281,7 @@ func (g *restoreFencedGateway) Deliver(ctx context.Context, request store.Delive
 }
 
 func (g *restoreFencedGateway) Initialize(ctx context.Context) error {
-	return g.withGateway(ctx, func(db *store.Store, gateway delivery.Gateway, credentialSource func(context.Context) (string, error)) error {
+	return g.withGatewayStore(ctx, store.Open, func(db *store.Store, gateway delivery.Gateway, credentialSource func(context.Context) (string, error)) error {
 		if _, err := credentialSource(ctx); shouldPauseGatewayForCredential(err) {
 			if pauseErr := db.PauseGatewayWrites(ctx, store.ControlPlaneGitHubAppRecoveryRemediation, time.Now().UTC()); pauseErr != nil {
 				return pauseErr

@@ -271,6 +271,66 @@ func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *test
 	}
 }
 
+func TestRestoreRetiresSnapshottedGatewayWriteFence(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "workflow.db")
+	controller, claim, now := newDeliveryFenceTestClaim(t, ctx, databasePath)
+	defer controller.Close()
+	gateway, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	queued, err := controller.EnqueueDelivery(ctx, DeliveryRequest{Operation: DeliveryPushCandidate, RunID: claim.RunID, LeaseToken: claim.LeaseToken, LeaseGeneration: claim.LeaseGeneration, Repository: "owner/repo", Branch: "ticket-1", CommitSHA: "accepted", ExpectRemoteAbsent: true}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxClaim, err := controller.ClaimDeliveryOutbox(ctx, queued.IdempotencyKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.ExecuteDelivery(ctx, outboxClaim.Request, outboxClaim.ClaimToken, func() time.Time { return now }, func(context.Context, DeliveryRequest) (DeliveryResult, error) {
+		return DeliveryResult{}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(directory, "workflow.backup.db")
+	metadata, err := controller.CreateOnlineBackup(ctx, backupPath, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !metadata.LastDrill.Succeeded {
+		t.Fatalf("snapshotted Gateway fence drill = %#v", metadata.LastDrill)
+	}
+	restoredPath := filepath.Join(directory, "restored.db")
+	if err := RestoreBackup(ctx, backupPath, restoredPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(ctx, restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if err := restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := restored.DeliveryOutbox(ctx, queued.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != OutboxPending || !recovered.Uncertain || recovered.ClaimToken != "" {
+		t.Fatalf("restored fenced outbox = %#v, want uncertain pending", recovered)
+	}
+	var fences int
+	if err := restored.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_write_fences`).Scan(&fences); err != nil {
+		t.Fatal(err)
+	}
+	if fences != 0 {
+		t.Fatalf("restored Gateway write fences = %d, want 0", fences)
+	}
+}
+
 func TestRestoreDryRunModelsParallelWorkerIsolation(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)

@@ -30,6 +30,50 @@ func TestOpenFileURIHoldsCanonicalRestoreBarrier(t *testing.T) {
 	}
 }
 
+func TestOpenForRuntimeSkipsMigrationDiscoveryAndHoldsRestoreBarrier(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 55`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `DROP TABLE delivery_write_fences`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtimeStore, err := OpenForRuntime(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+	var tables int
+	if err := runtimeStore.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'delivery_write_fences'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatal("runtime open unexpectedly ran pending migration")
+	}
+	blocked, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := startup.AcquireRestoreBarrier(blocked, path); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("restore crossed runtime Store database access: %v", err)
+	}
+}
+
 func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	ctx := context.Background()

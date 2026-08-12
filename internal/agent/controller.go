@@ -740,10 +740,14 @@ func (c Controller) recordWorkerContainer(claim store.TicketClaim, result worker
 	return c.Store.RecordWorkerContainer(auditCtx, claim.RunID, claim.LeaseGeneration, result.ContainerID)
 }
 
-func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.PlanAmendment) (store.PlanAmendmentProposal, error) {
+func (c Controller) retryWorkerTransition(ctx context.Context, transition func([]store.WorkerIsolationProof) error) error {
 	isolator, _ := c.Runtime.(worker.ContainerIsolator)
+	return isolation.RetryWorkerTransition(ctx, c.Store, isolator, transition)
+}
+
+func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.PlanAmendment) (store.PlanAmendmentProposal, error) {
 	var proposal store.PlanAmendmentProposal
-	err := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+	err := c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 		var err error
 		proposal, err = c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolated...)
 		return err
@@ -752,16 +756,14 @@ func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.Pl
 }
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
-	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+	storeErr := c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 		return c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
 }
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+	storeErr := c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
 			return c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
 		}
@@ -771,8 +773,7 @@ func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim s
 }
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
-	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+	storeErr := c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
 			return c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
 		}
@@ -939,8 +940,7 @@ func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store
 		return c.failDeliveryControllerLaunchWithClass(context.WithoutCancel(ctx), claim, cause, store.FailureInfrastructure)
 	}
 	if isDeliverySourceAuthenticationFailure(err) {
-		isolator, _ := c.Runtime.(worker.ContainerIsolator)
-		deferErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+		deferErr := c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 			return c.Store.DeferDeliveryControllerForCredentialPause(ctx, claim, c.now(), isolated...)
 		})
 		return errors.Join(err, deferErr)
@@ -953,8 +953,7 @@ func (c Controller) failDeliverySourcePreflight(ctx context.Context, claim store
 		} else if errors.Is(err, errDeliverySourceDigestMismatch) {
 			reason = "The accepted Candidate Revision's Delivery Source is no longer available at its pinned revision. Create a new Candidate Revision against a freshly pinned Delivery Source and rerun the complete quality chain."
 		}
-		isolator, _ := c.Runtime.(worker.ContainerIsolator)
-		return isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
+		return c.retryWorkerTransition(ctx, func(isolated []store.WorkerIsolationProof) error {
 			return c.Store.RevalidateDeliverySource(ctx, claim, reason, c.now(), isolated...)
 		})
 	}

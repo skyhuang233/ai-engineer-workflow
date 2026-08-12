@@ -642,6 +642,17 @@ func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time
 	}
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	retireTx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := retireRestoredDeliveryWritesTx(ctx, retireTx, now); err != nil {
+		retireTx.Rollback()
+		return err
+	}
+	if err := retireTx.Commit(); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -669,7 +680,20 @@ func (s *Store) ReconcileRestoredControlPlaneDryRun(ctx context.Context, now tim
 		return err
 	}
 	defer tx.Rollback()
+	if err := retireRestoredDeliveryWritesTx(ctx, tx, now); err != nil {
+		return err
+	}
 	return reconcileRestoredControlPlaneTx(ctx, tx, now, nil, true)
+}
+
+func retireRestoredDeliveryWritesTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	stamp := formatTimestamp(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', dispatcher_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ?
+WHERE state = ? OR EXISTS (SELECT 1 FROM delivery_write_fences fence WHERE fence.idempotency_key = delivery_outbox.idempotency_key)`, OutboxPending, "delivery state was interrupted by Control Plane restore", stamp, stamp, OutboxProcessing); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM delivery_write_fences`)
+	return err
 }
 
 func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []WorkerIsolationProof, modelIsolation bool) error {
@@ -714,9 +738,6 @@ AND run_id IN (SELECT current_run_id FROM ticket_sessions)`, RunRunning); err !=
 		if err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
 			return err
 		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE delivery_outbox SET state = ?, claim_token = '', dispatcher_token = '', uncertain = 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE state = ?`, OutboxPending, "delivery state was interrupted by Control Plane restore", stamp, stamp, OutboxProcessing); err != nil {
-		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET last_success_at = '', last_full_reconcile_at = '', next_attempt_at = ?, updated_at = ?`, stamp, stamp); err != nil {
 		return err
