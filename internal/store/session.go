@@ -188,9 +188,9 @@ FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE s.version_id = ? AND r.state = ?
-AND (r.launch_state = 'launched' OR (r.run_kind = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1))
+AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))
 AND l.state = ?
-ORDER BY s.issue_id, r.run_id`, versionID, RunRunning, RunDelivery, LeaseActive)
+ORDER BY s.issue_id, r.run_id`, versionID, RunRunning, LeaseActive)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -252,8 +252,8 @@ func (s *Store) WorkerIsolationTargets(ctx context.Context) ([]TicketClaim, erro
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.state = ? AND (r.launch_state = 'launched' OR (r.run_kind = ? AND r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
-ORDER BY s.version_id`, RunRunning, RunDelivery, LeaseActive)
+WHERE r.state = ? AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
+ORDER BY s.version_id`, RunRunning, LeaseActive)
 	if err != nil {
 		return nil, err
 	}

@@ -199,15 +199,9 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		return err
 	}
 	for _, run := range expired {
-		var proofs []store.WorkerIsolationProof
-		if run.Kind == store.RunDelivery {
-			fenced, err := isolation.IsolateWorkers(ctx, d.Store, d.Recovery, []store.TicketClaim{run.Claim})
-			if err != nil {
-				return fmt.Errorf("isolate expired Delivery Controller: %w", err)
-			}
-			proofs = fenced
-		} else if err := d.Recovery.IsolateContainer(ctx, run.Claim.RunID); err != nil {
-			return fmt.Errorf("isolate expired worker container %s: %w", run.Claim.RunID, err)
+		proofs, err := isolation.IsolateWorkers(ctx, d.Store, d.Recovery, []store.TicketClaim{run.Claim})
+		if err != nil {
+			return fmt.Errorf("isolate expired Worker: %w", err)
 		}
 		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts, proofs...); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
 			return err

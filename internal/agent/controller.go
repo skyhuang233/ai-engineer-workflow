@@ -175,10 +175,16 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 		Mounts:      []worker.Mount{{Source: ws.Path, Target: "/workspace"}, {Source: ws.CodexState, Target: "/codex-state"}},
 		ExtraHosts:  []string{worker.GatewayHostMapping},
 	}
+	spec.ContainerCreateFence = func(createCtx context.Context) (func(context.Context) error, error) {
+		return c.Store.AcquireWorkerContainerCreateFence(createCtx, request.Claim, c.now())
+	}
+	spec.StartAdmission = func(startCtx context.Context) error {
+		return c.Store.ReserveWorkerLaunch(startCtx, request.Claim, workerLaunchAudit(request.Claim, spec), c.now())
+	}
 	if err := spec.Validate(); err != nil {
 		return Candidate{}, err
 	}
-	if err := c.Store.ReserveWorkerLaunch(ctx, request.Claim, workerLaunchAudit(request.Claim, spec), c.now()); err != nil {
+	if err := c.Store.ReserveWorkerPrelaunch(ctx, request.Claim, c.now()); err != nil {
 		return Candidate{}, err
 	}
 	runCtx := ctx
@@ -188,6 +194,16 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	}
 	result, runErr := c.Runtime.Run(runCtx, spec)
 	defer cancelRun()
+	if runErr != nil && (worker.IsUncertainContainerStateFailure(runErr) || worker.IsPreparedContainerCleanupFailure(runErr)) {
+		isolationCtx := context.WithoutCancel(ctx)
+		target, targetErr := c.Store.WorkerContainerIsolationTarget(isolationCtx, request.Claim)
+		if targetErr != nil {
+			return Candidate{}, errors.Join(runErr, targetErr)
+		}
+		if _, isolateErr := c.isolateWorkerTargets(isolationCtx, []store.TicketClaim{target}); isolateErr != nil {
+			return Candidate{}, errors.Join(runErr, isolateErr)
+		}
+	}
 	auditErr := c.recordWorkerContainer(request.Claim, result)
 	handoffCtx := context.WithoutCancel(ctx)
 	if auditErr != nil {

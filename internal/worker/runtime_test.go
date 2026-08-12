@@ -198,6 +198,7 @@ func TestDockerRuntimeMarksPostAdmissionStartFailureUncertain(t *testing.T) {
 			cancel()
 			return nil
 		},
+		ContainerCreateFence: successfulCreateFence,
 	}
 	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(ctx, spec)
 	if result.ContainerID != "prepared-container" || !IsUncertainContainerStateFailure(err) || !IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
@@ -217,12 +218,16 @@ func TestDockerRuntimeMarksStartExitErrorUncertain(t *testing.T) {
 	spec := Spec{
 		RunID: "run-1", RunKind: "delivery_controller", Command: []string{"worker"}, WorkspacePath: "workspace", CodexStatePath: "state", Branch: "ticket-1",
 		AgentIdentity: "agent-1", ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1.0"}, ExtraHosts: []string{GatewayHostMapping},
-		StartAdmission: func(context.Context) error { return nil },
+		StartAdmission: func(context.Context) error { return nil }, ContainerCreateFence: successfulCreateFence,
 	}
 	result, err := (DockerRuntime{Binary: binary, ControlPlaneID: "control-1"}).Run(context.Background(), spec)
 	if result.ContainerID != "prepared-container" || result.ExitCode != 3 || !IsUncertainContainerStateFailure(err) || !IsInfrastructureFailure(err) || IsCertifiedNoLaunchFailure(err) {
 		t.Fatalf("start ExitError = result %#v, error %T %v", result, err, err)
 	}
+}
+
+func successfulCreateFence(context.Context) (func(context.Context) error, error) {
+	return func(context.Context) error { return nil }, nil
 }
 
 func TestDockerRuntimeRejectsTypedRunWithoutControlPlaneIdentity(t *testing.T) {

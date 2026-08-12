@@ -29,6 +29,9 @@ func TestPlanAmendmentIsolatesAffectedAgentBeforeRevokingLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.ReserveWorkerPrelaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.ReserveWorkerLaunch(ctx, claim, WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
 		t.Fatal(err)
 	}

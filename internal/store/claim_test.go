@@ -1014,11 +1014,57 @@ func TestReserveWorkerLaunchAllowsOnlyOneStarter(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}
+	if err := db.ReserveWorkerPrelaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.ReserveWorkerLaunch(ctx, claim, audit, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.ReserveWorkerLaunch(ctx, claim, audit, now); !errors.Is(err, ErrWorkerLaunched) {
 		t.Fatalf("second launch reservation = %v, want ErrWorkerLaunched", err)
+	}
+}
+
+func TestClaimReadyLeavesExpiredLaunchedAgentForIsolationRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerPrelaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
+	audit := WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:image", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}
+	if err := db.ReserveWorkerLaunch(ctx, claim, audit, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now.Add(2 * time.Minute)}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("replacement claim = %v, want ErrNotReady", err)
+	}
+	runs, err := db.ExpiredLaunchedRecoveryRuns(ctx, version.ID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Claim.RunID != claim.RunID {
+		t.Fatalf("expired recovery runs = %#v", runs)
 	}
 }
 

@@ -235,6 +235,9 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 	if strings.TrimSpace(string(spec.RunKind)) != "" && strings.TrimSpace(spec.ControlPlaneID) == "" {
 		return Result{}, CertifiedNoLaunchError{Err: errors.New("Control Plane container identity is required for a typed Worker Run")}
 	}
+	if strings.TrimSpace(string(spec.RunKind)) != "" && (spec.ContainerCreateFence == nil || spec.StartAdmission == nil) {
+		return Result{}, CertifiedNoLaunchError{Err: errors.New("typed Worker Run requires container create fencing and start admission")}
+	}
 	if err := spec.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -315,32 +318,17 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 	releaseErr := releaseCreate(releaseCtx)
 	cancelRelease()
 	if releaseErr != nil {
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
-		defer cancelCleanup()
-		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
-			return Result{ContainerID: strings.TrimSpace(createStdout.String())}, PreparedContainerCleanupError{Err: errors.Join(createErr, releaseErr, cleanupErr)}
-		}
-		return Result{}, CertifiedNoLaunchError{Err: errors.Join(createErr, releaseErr)}
+		return cleanupPreparedContainers(name, spec.RunID, Result{ContainerID: strings.TrimSpace(createStdout.String())}, errors.Join(createErr, releaseErr))
 	}
 	if createErr != nil {
 		output := append(append([]byte(nil), createStdout.Bytes()...), createStderr.Bytes()...)
 		result := Result{Output: output, Stdout: createStdout.Bytes(), Stderr: createStderr.Bytes(), ContainerID: strings.TrimSpace(createStdout.String()), ExitCode: 1}
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
-		defer cancelCleanup()
-		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
-			return result, PreparedContainerCleanupError{Err: errors.Join(createErr, cleanupErr)}
-		}
-		return Result{}, CertifiedNoLaunchError{Err: createErr}
+		return cleanupPreparedContainers(name, spec.RunID, result, createErr)
 	}
 	containerID := strings.TrimSpace(createStdout.String())
 	if containerID == "" {
 		cause := InfrastructureError{Err: errors.New("Docker did not report the prepared worker container ID")}
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
-		defer cancelCleanup()
-		if cleanupErr := isolateContainersByRunID(cleanupCtx, name, spec.RunID); cleanupErr != nil {
-			return Result{}, PreparedContainerCleanupError{Err: errors.Join(cause, cleanupErr)}
-		}
-		return Result{}, CertifiedNoLaunchError{Err: cause}
+		return cleanupPreparedContainers(name, spec.RunID, Result{}, cause)
 	}
 	removePrepared := func() error {
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
@@ -379,6 +367,15 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		return result, UncertainContainerStateError{Err: err}
 	}
 	return result, nil
+}
+
+func cleanupPreparedContainers(name, runID string, result Result, cause error) (Result, error) {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), preparedContainerCleanupTimeout)
+	defer cancelCleanup()
+	if cleanupErr := isolateContainersByRunID(cleanupCtx, name, runID); cleanupErr != nil {
+		return result, PreparedContainerCleanupError{Err: errors.Join(cause, cleanupErr)}
+	}
+	return Result{}, CertifiedNoLaunchError{Err: cause}
 }
 
 func dockerArgs(spec Spec) []string {

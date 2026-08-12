@@ -33,6 +33,12 @@ func RetryWorkerTransition(ctx context.Context, database Store, isolator Contain
 		}
 		acknowledged, isolationErr := IsolateWorkers(ctx, database, isolator, required.Targets)
 		if isolationErr != nil {
+			if errors.Is(isolationErr, store.ErrFencingConflict) {
+				if err := ctx.Err(); err != nil {
+					return errors.Join(isolationErr, err)
+				}
+				continue
+			}
 			return errors.Join(err, isolationErr)
 		}
 		isolated = append(isolated, acknowledged...)

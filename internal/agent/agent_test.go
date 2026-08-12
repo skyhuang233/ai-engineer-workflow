@@ -59,7 +59,10 @@ func testChatGPTAuth(accessToken string) []byte {
 	return []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"account_id":"account","id_token":"id-token","refresh_token":"refresh-token"}}`, accessToken))
 }
 
-func (r blockingFailureRuntime) Run(_ context.Context, _ worker.Spec) (worker.Result, error) {
+func (r blockingFailureRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result, error) {
+	if err := admitFakeWorker(ctx, spec); err != nil {
+		return worker.Result{}, err
+	}
 	r.started <- struct{}{}
 	<-r.release
 	return worker.Result{Output: []byte(`{"type":"thread.started","thread_id":"expired-agent"}`), ContainerID: "expired-container"}, errors.New("worker crashed")
@@ -73,10 +76,8 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 				return worker.Result{}, err
 			}
 		}
-		if spec.StartAdmission != nil {
-			if err := spec.StartAdmission(ctx); err != nil {
-				return worker.Result{}, worker.CertifiedNoLaunchError{Err: err}
-			}
+		if err := admitFakeWorker(ctx, spec); err != nil {
+			return worker.Result{}, err
 		}
 		origin := exec.Command("git", "-C", spec.WorkspacePath, "config", "--local", "--get-all", "remote.origin.url")
 		originOutput, err := origin.Output()
@@ -108,6 +109,9 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 			}
 		}
 		return result, nil
+	}
+	if err := admitFakeWorker(ctx, spec); err != nil {
+		return worker.Result{}, err
 	}
 	marker := "initial"
 	if slices.Contains(spec.Command, "resume") {
@@ -195,6 +199,27 @@ func (r *fakeRuntime) Run(ctx context.Context, spec worker.Spec) (worker.Result,
 	return result, nil
 }
 
+func admitFakeWorker(ctx context.Context, spec worker.Spec) error {
+	if spec.ContainerCreateFence != nil {
+		release, err := spec.ContainerCreateFence(ctx)
+		if err != nil {
+			return worker.CertifiedNoLaunchError{Err: err}
+		}
+		if release == nil {
+			return worker.CertifiedNoLaunchError{Err: errors.New("missing container create fence release")}
+		}
+		if err := release(ctx); err != nil {
+			return worker.CertifiedNoLaunchError{Err: err}
+		}
+	}
+	if spec.StartAdmission != nil {
+		if err := spec.StartAdmission(ctx); err != nil {
+			return worker.CertifiedNoLaunchError{Err: err}
+		}
+	}
+	return nil
+}
+
 func (r *fakeRuntime) IsolateContainer(_ context.Context, runID string) error {
 	r.isolatedRuns = append(r.isolatedRuns, runID)
 	return r.isolationErr
@@ -245,6 +270,30 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 		}
 	}
 	t.Logf("Controller.Run created Ticket Workspace %q from local origin %q with %d independently copied Git objects (os.SameFile=false for every object)", session.WorkspacePath, originPath, len(relativeObjects))
+}
+
+func TestControllerIsolatesUncertainAgentBeforeFailureHandling(t *testing.T) {
+	ctx := context.Background()
+	source := initRepository(t)
+	root := t.TempDir()
+	db, _, claim := createClaim(t, ctx, root)
+	defer db.Close()
+	runtime := &fakeRuntime{
+		dirty:   true,
+		err:     worker.UncertainContainerStateError{Err: errors.New("Docker start outcome unknown")},
+		results: []worker.Result{{ContainerID: "uncertain-agent"}},
+	}
+	controller := agent.Controller{
+		Store:     db,
+		Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Runtime:   runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
+	}
+	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail uncertainly")); err == nil {
+		t.Fatal("uncertain Agent run returned nil error")
+	}
+	if len(runtime.isolatedRuns) != 1 || runtime.isolatedRuns[0] != claim.RunID {
+		t.Fatalf("uncertain Agent isolation = %#v, want [%q]", runtime.isolatedRuns, claim.RunID)
+	}
 }
 
 func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T) {
@@ -1228,7 +1277,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	}
 }
 
-func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.T) {
+func TestControllerBlocksReplacementUntilAgentRunFinishes(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1245,9 +1294,16 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 	}()
 	<-started
 
+	if _, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(time.Second)}); !errors.Is(err, store.ErrNotReady) {
+		t.Fatalf("unisolated replacement claim = %v, want ErrNotReady", err)
+	}
+	close(release)
+	if err := <-errCh; err == nil {
+		t.Fatal("expired worker run returned nil error")
+	}
 	replacement, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: claim.TicketID, Owner: "replacement", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: claim.LeaseExpiresAt.Add(time.Second)})
 	if err != nil {
-		t.Fatalf("claim replacement: %v", err)
+		t.Fatalf("claim replacement after termination: %v", err)
 	}
 	firstRound, err := db.RevisionRoundID(ctx, claim.RunID)
 	if err != nil {
@@ -1260,7 +1316,7 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 	if replacementRound != firstRound {
 		t.Fatalf("replacement Revision Round = %q, want %q", replacementRound, firstRound)
 	}
-	replacementRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("replacement-session", "replacement"), ContainerID: "replacement-container"}}}
+	replacementRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("expired-agent", "replacement"), ContainerID: "replacement-container"}}}
 	replacementController := agent.Controller{Store: db, Workspace: manager, Runtime: replacementRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := replacementController.Run(ctx, candidateRequest(replacement, source, "ticket-1", "replace"))
 	if err != nil {
@@ -1269,17 +1325,6 @@ func TestControllerDoesNotRestoreWorkspaceAfterConcurrentReplacement(t *testing.
 	session, err := db.TicketSession(ctx, version.ID, claim.TicketID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	marker := filepath.Join(session.WorkspacePath, "replacement.txt")
-	if err := os.WriteFile(marker, []byte("replacement work\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	if err := <-errCh; err == nil {
-		t.Fatal("expired worker run returned nil error")
-	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("expired worker removed replacement work: %v", err)
 	}
 	head := exec.Command("git", "rev-parse", "HEAD")
 	head.Dir = session.WorkspacePath
