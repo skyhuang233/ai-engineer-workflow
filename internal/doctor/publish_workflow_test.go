@@ -17,13 +17,37 @@ func TestPublishWorkflowRequiresReleaseForPublisherChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(workflow), "-- deploy/worker .github/workflows/publish-worker.yml") {
+	text := string(workflow)
+	for _, required := range []string{
+		`- "deploy/worker/**"`,
+		`- "cmd/delivery-source-digest/**"`,
+		`- "internal/deliverysource/**"`,
+		`- "go.mod"`,
+		`- "go.sum"`,
+		`- ".github/workflows/publish-worker.yml"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("publisher workflow does not run for Worker identity input changes: missing %q", required)
+		}
+	}
+	if !strings.Contains(text, "-- deploy/worker cmd/delivery-source-digest internal/deliverysource go.mod go.sum .github/workflows/publish-worker.yml") {
 		t.Fatal("publisher workflow changes do not require a Worker release")
 	}
-	if !strings.Contains(string(workflow), "schema_version:5") || !strings.Contains(string(workflow), "@base64") {
-		t.Fatal("publisher workflow does not use the canonical base64 Worker input encoding")
+	for _, required := range []string{
+		"schema_version:6",
+		"deploy_worker_tree:",
+		"delivery_source_digest_command_tree:",
+		"delivery_source_digest_package_tree:",
+		"go_mod_blob:",
+		"go_sum_blob:",
+		"publish_worker_workflow_blob:",
+		"@base64",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("publisher workflow does not use the canonical schema-6 Worker input encoding: missing %q", required)
+		}
 	}
-	if !strings.Contains(string(workflow), "worker-v${{ steps.pins.outputs.worker_version }}-$identity") {
+	if !strings.Contains(text, "worker-v${{ steps.pins.outputs.worker_version }}-$identity") {
 		t.Fatal("publisher workflow does not key Worker releases by build input identity")
 	}
 	if !strings.Contains(string(workflow), "[[ \"$identity\" =~ ^[0-9a-f]{64}$ ]]") {
