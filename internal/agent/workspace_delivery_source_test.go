@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
 
@@ -455,10 +456,10 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	dockerInfo := exec.CommandContext(ctx, "docker", "info", "--format", "{{.OSType}}")
 	output, err := dockerInfo.CombinedOutput()
 	if err != nil {
-		t.Skipf("Docker is unavailable: %v", err)
+		t.Fatalf("Docker is unavailable: %v\n%s", err, output)
 	}
 	if strings.TrimSpace(string(output)) != "linux" {
-		t.Skip("requires Docker Desktop with Linux containers")
+		t.Fatalf("Docker Desktop OSType = %q, want linux", strings.TrimSpace(string(output)))
 	}
 	source := filepath.Join(t.TempDir(), "source")
 	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
@@ -479,22 +480,33 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configBytes, err := os.ReadFile(filepath.Join("..", "..", "config", "toolchain.json"))
+	databasePath := strings.TrimSpace(os.Getenv("WORKFLOW_QUALIFICATION_DATABASE"))
+	if databasePath == "" {
+		t.Fatal("WORKFLOW_QUALIFICATION_DATABASE must name the production database activated by workflow doctor")
+	}
+	if !filepath.IsAbs(databasePath) {
+		t.Fatalf("WORKFLOW_QUALIFICATION_DATABASE must be absolute: %q", databasePath)
+	}
+	database, err := store.OpenForRuntime(ctx, databasePath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open qualification database: %v", err)
 	}
-	var toolchain struct {
-		Worker struct {
-			Version         string `json:"version"`
-			ImageRepository string `json:"image_repository"`
-		} `json:"worker"`
+	defer database.Close()
+	activeRelease, err := database.ActiveWorkerRelease(ctx)
+	if err != nil {
+		t.Fatalf("load Doctor-activated Worker Release: %v", err)
 	}
-	if err := json.Unmarshal(configBytes, &toolchain); err != nil {
-		t.Fatal(err)
+	var manifest struct {
+		Image string `json:"image"`
 	}
-	image := toolchain.Worker.ImageRepository + ":" + toolchain.Worker.Version
+	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &manifest); err != nil {
+		t.Fatalf("decode active Worker Release Manifest: %v", err)
+	}
+	if manifest.Image != activeRelease.ImageReference {
+		t.Fatalf("active Worker image %q does not match persisted manifest image %q", activeRelease.ImageReference, manifest.Image)
+	}
 	mount := "type=bind,source=" + deliverySource + ",target=/source-repository,readonly"
-	command := exec.CommandContext(ctx, "docker", "run", "--rm", "--mount", mount, "--entrypoint", "sh", image, "-ceu", "git init -q /tmp/checkout && git -C /tmp/checkout fetch -q /source-repository refs/heads/main && git -C /tmp/checkout rev-parse FETCH_HEAD")
+	command := exec.CommandContext(ctx, "docker", "run", "--rm", "--mount", mount, "--entrypoint", "sh", activeRelease.ImageReference, "-ceu", "git init -q /tmp/checkout && git -C /tmp/checkout fetch -q /source-repository refs/heads/main && git -C /tmp/checkout rev-parse FETCH_HEAD")
 	output, err = command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fetch Delivery Source through Linux Worker mount: %v\n%s", err, output)

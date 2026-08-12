@@ -120,9 +120,14 @@ Use fresh fixture plans where a terminal decision would prevent later steps.
 
 ## 4. Automated negative evidence
 
-Run `go test ./...`, `go vet ./...`, and the repository's race-enabled CI. Run
-the fault-injection and contract suites repeatedly, not only once. Use this
-baseline mapping and add the successful run URL beside every row in the issue:
+Set `WORKFLOW_QUALIFICATION_DATABASE` to the absolute production SQLite path
+whose Active Worker Image was activated by the successful Doctor run. Then run
+`go test ./...`, `go vet ./...`, and the repository's race-enabled CI. The
+Windows Delivery Source contract fails if that database, Docker, or the Linux
+container engine is unavailable, and it runs the exact digest recorded in the
+active Worker Release rather than a mutable tag. Run the fault-injection and
+contract suites repeatedly, not only once. Use this baseline mapping and add
+the successful run URL beside every row in the issue:
 
 | Required invariant / boundary | Negative evidence |
 | --- | --- |
