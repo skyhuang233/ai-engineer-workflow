@@ -292,10 +292,11 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliveryController(finalizationCtx, claim, err)
 	}
-	expectedSourceDigest, err := c.candidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
+	expectedSourceDigest, err := c.Store.CandidateDeliverySourceDigest(finalizationCtx, session.AcceptedCandidateRunID)
 	if err != nil {
-		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
+		return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("load Candidate Delivery Source provenance: %w", err)))
 	}
+	expectedSourceDigest = strings.TrimSpace(expectedSourceDigest)
 	if session.WorkspacePath == "" || session.CodexStatePath == "" || session.Branch == "" || session.AcceptedCommit == "" || session.AcceptedCandidateRunID == "" {
 		return c.failDeliveryController(finalizationCtx, claim, errors.New("accepted Candidate workspace is incomplete"))
 	}
@@ -331,7 +332,15 @@ func (c Controller) RetryDelivery(ctx context.Context, claim store.TicketClaim) 
 	if err != nil {
 		return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
 	}
-	if sourceWasMissing {
+	if expectedSourceDigest == "" {
+		expectedSourceDigest, err = digestDeliverySource(finalizationCtx, deliverySource)
+		if err != nil {
+			return c.failDeliverySourcePreflight(finalizationCtx, claim, err)
+		}
+		if err := c.Store.BackfillLegacyCandidateDeliverySourceDigest(finalizationCtx, claim, session.AcceptedCandidateRunID, expectedSourceDigest, c.now()); err != nil {
+			return c.failDeliverySourcePreflight(finalizationCtx, claim, deliverySourceInfrastructureError(fmt.Errorf("pin legacy Candidate Delivery Source provenance: %w", err)))
+		}
+	} else if sourceWasMissing {
 		if err := verifyDeliverySourceDigest(finalizationCtx, deliverySource, expectedSourceDigest); err != nil {
 			removeErr := os.RemoveAll(deliverySource)
 			return c.failDeliverySourcePreflight(finalizationCtx, claim, errors.Join(err, removeErr))

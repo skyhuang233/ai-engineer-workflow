@@ -58,6 +58,23 @@ func TestDatabaseIdentityRejectsUnsupportedWindowsDeviceNamespaces(t *testing.T)
 	}
 }
 
+func TestDatabaseIdentityRejectsNamespaceOnlyPathSemantics(t *testing.T) {
+	root := filepath.Clean(t.TempDir())
+	for _, path := range []string{
+		`\\?\` + root + `.`,
+		`\\?\` + root + ` `,
+		`\\?\` + root + `\.\workflow.db`,
+		`\\?\` + root + `\..\workflow.db`,
+		`\\?\` + root + `\CON.db`,
+		`\\?\UNC\server\share\workflow.db.`,
+		`\\?\UNC\server\share.\workflow.db`,
+	} {
+		if _, err := DatabaseIdentity(path); err == nil || !strings.Contains(err.Error(), "unsupported Windows namespace path component") {
+			t.Fatalf("DatabaseIdentity(%q) error = %v, want namespace component error", path, err)
+		}
+	}
+}
+
 func TestDatabaseIdentityNormalizesWindowsVolumeGUIDAliases(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workflow.db")
 	plain, err := DatabaseIdentity(path)

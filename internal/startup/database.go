@@ -11,6 +11,18 @@ import (
 )
 
 func DatabaseIdentity(dsn string) (string, error) {
+	canonical, err := DatabaseFilePath(dsn)
+	if err != nil || canonical == "" {
+		return canonical, err
+	}
+	canonical, err = normalizeDatabasePathCase(canonical)
+	if err != nil {
+		return "", fmt.Errorf("normalize database path case: %w", err)
+	}
+	return canonical, nil
+}
+
+func DatabaseFilePath(dsn string) (string, error) {
 	path, memory, err := databasePath(dsn)
 	if err != nil {
 		return "", err
@@ -32,19 +44,18 @@ func DatabaseIdentity(dsn string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("canonicalize database path: %w", err)
 	}
-	canonical = filepath.Clean(canonical)
-	canonical, err = normalizeDatabasePathCase(canonical)
-	if err != nil {
-		return "", fmt.Errorf("normalize database path case: %w", err)
-	}
-	return canonical, nil
+	return filepath.Clean(canonical), nil
 }
 
 func normalizeWindowsNamespacePath(path string) (string, error) {
 	path = filepath.FromSlash(path)
 	for _, prefix := range []string{`\\?\UNC\`, `\\.\UNC\`, `\??\UNC\`} {
 		if len(path) >= len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) {
-			return `\\` + path[len(prefix):], nil
+			remainder := path[len(prefix):]
+			if err := validateWindowsNamespaceComponents(remainder, 2); err != nil {
+				return "", err
+			}
+			return `\\` + remainder, nil
 		}
 	}
 	for _, prefix := range []string{`\\?\`, `\\.\`, `\??\`} {
@@ -53,9 +64,15 @@ func normalizeWindowsNamespacePath(path string) (string, error) {
 		}
 		remainder := path[len(prefix):]
 		if len(remainder) >= 3 && remainder[1] == ':' && (remainder[2] == '\\' || remainder[2] == '/') {
+			if err := validateWindowsNamespaceComponents(remainder, 1); err != nil {
+				return "", err
+			}
 			return remainder, nil
 		}
 		if strings.HasPrefix(strings.ToLower(remainder), `volume{`) {
+			if err := validateWindowsNamespaceComponents(remainder, 1); err != nil {
+				return "", err
+			}
 			return `\\?\` + remainder, nil
 		}
 		return "", fmt.Errorf("unsupported Windows device namespace %q", path[:len(prefix)]+strings.SplitN(remainder, `\`, 2)[0])
@@ -63,7 +80,36 @@ func normalizeWindowsNamespacePath(path string) (string, error) {
 	return path, nil
 }
 
+func validateWindowsNamespaceComponents(path string, rootComponents int) error {
+	components := strings.Split(path, `\`)
+	if len(components) <= rootComponents {
+		return errors.New("Windows namespace database path is incomplete")
+	}
+	for index, component := range components {
+		changesParsing := component == "" || component == "." || component == ".." || strings.HasSuffix(component, ".") || strings.HasSuffix(component, " ")
+		if changesParsing || index >= rootComponents && windowsReservedPathComponent(component) {
+			return fmt.Errorf("unsupported Windows namespace path component %q", component)
+		}
+	}
+	return nil
+}
+
+func windowsReservedPathComponent(component string) bool {
+	base := strings.ToUpper(strings.SplitN(component, ".", 2)[0])
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CLOCK$":
+		return true
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9' {
+		return true
+	}
+	return false
+}
+
 func databasePath(dsn string) (string, bool, error) {
+	if runtime.GOOS == "windows" && isWindowsNamespacePath(dsn) {
+		return dsn, false, nil
+	}
 	dsn = strings.TrimSpace(dsn)
 	if dsn == "" {
 		return "", false, errors.New("database path is required")
@@ -104,6 +150,16 @@ func databasePath(dsn string) (string, bool, error) {
 		return "", true, nil
 	}
 	return path, false, nil
+}
+
+func isWindowsNamespacePath(path string) bool {
+	path = filepath.FromSlash(path)
+	for _, prefix := range []string{`\\?\`, `\\.\`, `\??\`} {
+		if len(path) >= len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveExistingPath(path string) (string, error) {

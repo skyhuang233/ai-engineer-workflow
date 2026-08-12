@@ -1894,7 +1894,7 @@ func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 	}
 }
 
-func TestControllerRetryDeliveryRevalidatesLegacyCandidateWithoutSourceDigest(t *testing.T) {
+func TestControllerRetryDeliveryPreservesLegacyCandidateWithoutSourceDigest(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -1976,25 +1976,25 @@ func TestControllerRetryDeliveryRevalidatesLegacyCandidateWithoutSourceDigest(t 
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test", SourceRepository: source}
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
-		t.Fatalf("revalidate legacy delivery: %v", err)
+		t.Fatalf("recover legacy delivery: %v", err)
 	}
-	if len(runtime.specs) != 0 {
-		t.Fatalf("Delivery Controller launched without pinned source provenance: %#v", runtime.specs)
+	if len(runtime.specs) != 1 || runtime.specs[0].ImageDigest != oldImage {
+		t.Fatalf("legacy Delivery Controller runtime = %#v, want original Candidate runtime", runtime.specs)
 	}
 	_, candidateTools, err := db.CandidateWorkerRuntime(ctx, deliveryClaim.VersionID, deliveryClaim.TicketID)
 	if err != nil || candidateTools["github-cli"] != "" {
 		t.Fatalf("legacy Candidate provenance = %#v, %v", candidateTools, err)
 	}
-	revision, prompt, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1, store.DefaultMaxWorkerAttempts)
-	if err != nil {
-		t.Fatalf("claim Delivery Source revalidation: %v", err)
+	digest, err := db.CandidateDeliverySourceDigest(ctx, claim.RunID)
+	if err != nil || len(digest) != 64 {
+		t.Fatalf("legacy Candidate Delivery Source digest = %q, %v", digest, err)
 	}
-	if revision.SessionID != claim.SessionID || revision.RunID == claim.RunID || !strings.Contains(prompt, "lacks verifiable Delivery Source provenance") {
-		t.Fatalf("Delivery Source revalidation = %#v, prompt %q", revision, prompt)
+	if _, _, err := db.ClaimQueuedReviewRevision(ctx, version.ID, claim.TicketID, time.Minute, time.Now().UTC(), 1, store.DefaultMaxWorkerAttempts); !errors.Is(err, store.ErrNotReady) && !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("legacy Candidate queued a replacement Revision Round: %v", err)
 	}
 	deliverySource := retainedDeliverySourcePath(t, ctx, db, root, claim)
-	if _, err := os.Stat(deliverySource); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy Delivery Source was reconstructed: %v", err)
+	if _, err := os.Stat(deliverySource); err != nil {
+		t.Fatalf("legacy Delivery Source was not reconstructed: %v", err)
 	}
 }
 

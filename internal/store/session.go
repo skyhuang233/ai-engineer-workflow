@@ -815,6 +815,42 @@ func (s *Store) CandidateDeliverySourceDigest(ctx context.Context, runID string)
 	return digest, err
 }
 
+func (s *Store) BackfillLegacyCandidateDeliverySourceDigest(ctx context.Context, claim TicketClaim, candidateRunID, digest string, now time.Time) error {
+	decoded, err := hex.DecodeString(digest)
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 || candidateRunID == "" || err != nil || len(decoded) != sha256.Size || strings.ToLower(digest) != digest {
+		return ErrInvalidClaim
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	result, err := s.db.ExecContext(ctx, `UPDATE candidate_revisions
+SET delivery_source_digest = ?
+WHERE run_id = ? AND delivery_source_digest = ''
+AND EXISTS (
+    SELECT 1 FROM ticket_sessions s
+    JOIN worker_runs r ON r.run_id = s.current_run_id
+    JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+    WHERE s.version_id = ? AND s.issue_id = ? AND s.accepted_candidate_run_id = candidate_revisions.run_id
+      AND r.run_id = ? AND r.run_kind = ? AND r.state = ? AND r.lease_generation = ?
+      AND l.lease_token = ? AND l.state = ? AND l.expires_at > ?
+)`, digest, candidateRunID, claim.VersionID, claim.TicketID, claim.RunID, RunDelivery, RunRunning, claim.LeaseGeneration, claim.LeaseToken, LeaseActive, formatTimestamp(now))
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return ErrInvalidClaim
+	}
+	return nil
+}
+
 func (s *Store) RevisionRoundID(ctx context.Context, runID string) (string, error) {
 	if runID == "" {
 		return "", ErrInvalidClaim

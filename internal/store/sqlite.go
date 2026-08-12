@@ -103,7 +103,7 @@ func OpenForStartup(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func openForStartup(ctx context.Context, dsn string, useRestoreBarrier bool) (*Store, error) {
-	databasePath, err := startup.DatabaseIdentity(dsn)
+	databasePath, err := startup.DatabaseFilePath(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +112,7 @@ func openForStartup(ctx context.Context, dsn string, useRestoreBarrier bool) (*S
 	}
 	var barrier *startup.Lock
 	if useRestoreBarrier && databasePath != "" {
-		barrier, err = startup.AcquireDatabaseAccess(ctx, databasePath)
+		barrier, err = startup.AcquireDatabaseAccess(ctx, dsn)
 		if err != nil {
 			return nil, err
 		}
