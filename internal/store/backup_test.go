@@ -247,15 +247,15 @@ func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *test
 	}
 	defer restored.Close()
 	err = restored.ReconcileRestoredControlPlane(ctx, now.Add(2*time.Minute))
-	var isolation *DeliveryIsolationRequired
+	var isolation *WorkerIsolationRequired
 	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("restore isolation requirement = %#v, %v", isolation, err)
 	}
-	fenced, err := restored.FenceDeliveryIsolation(ctx, isolation.Targets)
+	fenced, err := restored.FenceWorkerIsolation(ctx, isolation.Targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofs, err := restored.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := restored.AcknowledgeWorkerIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -375,11 +375,10 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
-		} else {
-			return result, UncertainContainerStateError{Err: err}
 		}
+		return result, UncertainContainerStateError{Err: err}
 	}
-	return result, err
+	return result, nil
 }
 
 func dockerArgs(spec Spec) []string {

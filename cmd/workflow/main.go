@@ -24,7 +24,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubapp"
 	"github.com/skyhuang233/workflow/internal/githubcontract"
-	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
+	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
@@ -231,9 +231,9 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 		}
 		return fmt.Errorf("open current Control Plane before restore: %w", err)
 	}
-	targets, targetErr := db.DeliveryIsolationTargets(ctx)
+	targets, targetErr := db.WorkerIsolationTargets(ctx)
 	if targetErr == nil && len(targets) > 0 {
-		_, targetErr = isolateDeliveryTargets(ctx, db, isolator, targets)
+		_, targetErr = isolateWorkerTargets(ctx, db, isolator, targets)
 	}
 	if closeErr := db.Close(); targetErr != nil || closeErr != nil {
 		return errors.Join(targetErr, closeErr)
@@ -241,11 +241,11 @@ func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolat
 	return isolateControlPlaneContainers(ctx, isolator)
 }
 
-func isolateDeliveryTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
+func isolateWorkerTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
 	if isolator == nil {
-		return nil, errors.New("restore cannot isolate an active Delivery Controller")
+		return nil, errors.New("restore cannot isolate an active Worker")
 	}
-	return deliveryisolation.DeliveryControllers(ctx, db, isolator, targets)
+	return workerisolation.IsolateWorkers(ctx, db, isolator, targets)
 }
 
 func isolateControlPlaneContainers(ctx context.Context, isolator restoreContainerIsolator) error {
@@ -261,7 +261,7 @@ func isolateControlPlaneContainers(ctx context.Context, isolator restoreContaine
 }
 
 func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator restoreContainerIsolator, now time.Time) error {
-	return deliveryisolation.RetryDeliveryControllerTransition(ctx, db, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	return workerisolation.RetryWorkerTransition(ctx, db, isolator, func(isolated []store.WorkerIsolationProof) error {
 		return db.ReconcileRestoredControlPlane(ctx, now, isolated...)
 	})
 }
@@ -896,7 +896,7 @@ func runPollGitHub(args []string) {
 		attemptedPlanAlreadyComplete := false
 		bootstrap := func(ctx context.Context) error {
 			var activeRoot int64
-			err := deliveryisolation.RetryDeliveryControllerTransition(ctx, db, runtime, func(isolated []store.DeliveryIsolationProof) error {
+			err := workerisolation.RetryWorkerTransition(ctx, db, runtime, func(isolated []store.WorkerIsolationProof) error {
 				var err error
 				activeRoot, err = db.SchedulerRoot(ctx, *repository, *rootNumber, time.Now().UTC(), isolated...)
 				return err
@@ -1121,12 +1121,12 @@ func runAnswerInbox(args []string) {
 }
 
 type workflowInboxAnswerStore interface {
-	deliveryisolation.Store
-	AnswerWorkflowQuestionAndQueueInboxProjection(context.Context, string, string, string, time.Time, ...store.DeliveryIsolationProof) (store.DeliveryOutbox, error)
+	workerisolation.Store
+	AnswerWorkflowQuestionAndQueueInboxProjection(context.Context, string, string, string, time.Time, ...store.WorkerIsolationProof) (store.DeliveryOutbox, error)
 }
 
 func answerWorkflowInboxQuestion(ctx context.Context, db workflowInboxAnswerStore, isolator worker.ContainerIsolator, repository, questionID, answer string, now time.Time) error {
-	return deliveryisolation.RetryDeliveryControllerTransition(ctx, db, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	return workerisolation.RetryWorkerTransition(ctx, db, isolator, func(isolated []store.WorkerIsolationProof) error {
 		_, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, repository, questionID, answer, now, isolated...)
 		return err
 	})

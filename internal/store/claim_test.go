@@ -390,19 +390,19 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if err := releaseCreate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var fencedIsolation *DeliveryIsolationRequired
+	var fencedIsolation *WorkerIsolationRequired
 	if err := <-frozen; !errors.As(err, &fencedIsolation) || len(fencedIsolation.Targets) != 1 || fencedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("post-create terminalization isolation requirement = %#v, %v", fencedIsolation, err)
 	}
-	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), DeliveryIsolationProof{}); !errors.As(err, &fencedIsolation) {
-		t.Fatalf("unfenced point-in-time isolation proof = %v, want DeliveryIsolationRequired", err)
+	if _, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), WorkerIsolationProof{}); !errors.As(err, &fencedIsolation) {
+		t.Fatalf("unfenced point-in-time isolation proof = %v, want WorkerIsolationRequired", err)
 	}
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = markTicketNeedsAttentionTx(ctx, tx, version.ID, delivery.TicketID, "manual recovery required", now.Add(time.Minute))
-	var preparedIsolation *DeliveryIsolationRequired
+	var preparedIsolation *WorkerIsolationRequired
 	if !errors.As(err, &preparedIsolation) || len(preparedIsolation.Targets) != 1 || preparedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("prepared Needs Attention isolation requirement = %#v, %v", preparedIsolation, err)
 	}
@@ -417,7 +417,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatalf("expired prepared runs = %#v", preparedExpired)
 	}
 	if err := db.ReconcileMissingRecoveryRun(ctx, preparedExpired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts); !errors.As(err, &preparedIsolation) {
-		t.Fatalf("prepared recovery without isolation = %v, want DeliveryIsolationRequired", err)
+		t.Fatalf("prepared recovery without isolation = %v, want WorkerIsolationRequired", err)
 	}
 	var preparedLaunchState, preparedRunState, preparedLeaseState string
 	if err := db.db.QueryRowContext(ctx, `SELECT r.launch_state, r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&preparedLaunchState, &preparedRunState, &preparedLeaseState); err != nil {
@@ -441,7 +441,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatal(err)
 	}
 	err = markTicketNeedsAttentionTx(ctx, tx, version.ID, delivery.TicketID, "manual recovery required", now.Add(time.Minute))
-	var sharedIsolation *DeliveryIsolationRequired
+	var sharedIsolation *WorkerIsolationRequired
 	if !errors.As(err, &sharedIsolation) || len(sharedIsolation.Targets) != 1 || sharedIsolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("Needs Attention isolation requirement = %#v, %v", sharedIsolation, err)
 	}
@@ -453,7 +453,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatal(err)
 	}
 	err = db.cancelPlanTx(ctx, tx, version.ID, now.Add(time.Minute))
-	var isolation *DeliveryIsolationRequired
+	var isolation *WorkerIsolationRequired
 	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("cancellation isolation requirement = %#v, %v", isolation, err)
 	}
@@ -488,7 +488,7 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 		t.Fatalf("pre-isolation delivery state = run %q lease %q", runState, leaseState)
 	}
 	if err := db.ReconcileMissingRecoveryRun(ctx, expired[0], "Run Lease expired during restart recovery", now.Add(2*time.Hour), DefaultMaxWorkerAttempts); !errors.As(err, &sharedIsolation) {
-		t.Fatalf("recovery without delivery isolation = %v, want DeliveryIsolationRequired", err)
+		t.Fatalf("recovery without delivery isolation = %v, want WorkerIsolationRequired", err)
 	}
 	if err := db.db.QueryRowContext(ctx, `SELECT r.state, l.state FROM worker_runs r JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation WHERE r.run_id = ?`, delivery.RunID).Scan(&runState, &leaseState); err != nil {
 		t.Fatal(err)
@@ -496,11 +496,11 @@ func TestLaunchedDeliveryRecoveryWaitsForIsolationBeforeTerminalization(t *testi
 	if runState != RunRunning || leaseState != LeaseActive {
 		t.Fatalf("unisolated recovery mutated delivery state = run %q lease %q", runState, leaseState)
 	}
-	fenced, err := db.FenceDeliveryIsolation(ctx, sharedIsolation.Targets)
+	fenced, err := db.FenceWorkerIsolation(ctx, sharedIsolation.Targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := db.AcknowledgeWorkerIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,28 +564,28 @@ func TestDeliveryCreateAndIsolationFencesCoordinateAcrossStores(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer isolator.Close()
-	targets, err := isolator.DeliveryIsolationTargets(ctx)
+	targets, err := isolator.WorkerIsolationTargets(ctx)
 	if err != nil || len(targets) != 1 {
 		t.Fatalf("isolation targets = %#v, %v", targets, err)
 	}
 	stale := targets[0]
 	stale.RunID = "stale-run"
-	if _, err := isolator.FenceDeliveryIsolation(ctx, []TicketClaim{stale}); !errors.Is(err, ErrFencingConflict) {
+	if _, err := isolator.FenceWorkerIsolation(ctx, []TicketClaim{stale}); !errors.Is(err, ErrFencingConflict) {
 		t.Fatalf("stale isolation target = %v, want ErrFencingConflict", err)
 	}
 	var isolationPending int
 	if err := isolator.db.QueryRowContext(ctx, `SELECT isolation_pending FROM worker_runs WHERE run_id = ?`, delivery.RunID).Scan(&isolationPending); err != nil || isolationPending != 0 {
 		t.Fatalf("stale target fenced current run = %d, %v", isolationPending, err)
 	}
-	fenced, err := isolator.FenceDeliveryIsolation(ctx, targets)
+	fenced, err := isolator.FenceWorkerIsolation(ctx, targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var isolation *DeliveryIsolationRequired
-	if _, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), DeliveryIsolationProof{}); !errors.As(err, &isolation) {
-		t.Fatalf("unacknowledged create containment = %v, want DeliveryIsolationRequired", err)
+	var isolation *WorkerIsolationRequired
+	if _, err := isolator.FreezePlanForClosedPullRequest(ctx, version.ID, delivery.TicketID, now.Add(time.Minute), WorkerIsolationProof{}); !errors.As(err, &isolation) {
+		t.Fatalf("unacknowledged create containment = %v, want WorkerIsolationRequired", err)
 	}
-	acknowledged, err := isolator.AcknowledgeDeliveryIsolation(ctx, fenced)
+	acknowledged, err := isolator.AcknowledgeWorkerIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2140,15 +2140,15 @@ func TestClosedPullRequestFreezesPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	frozen, err := db.FreezePlanForClosedPullRequest(ctx, version.ID, 1, now.Add(time.Second))
-	var isolation *DeliveryIsolationRequired
+	var isolation *WorkerIsolationRequired
 	if frozen || !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != delivery.RunID {
 		t.Fatalf("closed pull request isolation requirement = frozen %t, %#v, %v", frozen, isolation, err)
 	}
-	fenced, err := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+	fenced, err := db.FenceWorkerIsolation(ctx, isolation.Targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := db.AcknowledgeWorkerIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}

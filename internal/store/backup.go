@@ -634,7 +634,7 @@ func (s *Store) ReconcilePreview(ctx context.Context) (ReconcilePreview, error) 
 // turns unknown outbox writes into reconcile-only work, releases Worker Runs
 // with a fresh lease boundary, preserves Inbox questions, and makes pollers
 // eligible to re-observe GitHub without issuing a write itself.
-func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) ReconcileRestoredControlPlane(ctx context.Context, now time.Time, isolated ...WorkerIsolationProof) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -672,7 +672,7 @@ func (s *Store) ReconcileRestoredControlPlaneDryRun(ctx context.Context, now tim
 	return reconcileRestoredControlPlaneTx(ctx, tx, now, nil, true)
 }
 
-func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []DeliveryIsolationProof, modelIsolation bool) error {
+func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.Time, isolated []WorkerIsolationProof, modelIsolation bool) error {
 	stamp := formatTimestamp(now)
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM worker_runs r
 JOIN ticket_sessions s ON s.current_run_id = r.run_id
@@ -700,17 +700,17 @@ WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticke
 			return err
 		}
 		for _, versionID := range deliveryVersions {
-			targets, _, err := deliveryIsolationTargetsTx(ctx, tx, versionID, nil)
+			targets, _, err := workerIsolationTargetsTx(ctx, tx, versionID, nil)
 			if err != nil {
 				return err
 			}
 			for _, target := range targets {
-				isolated = append(isolated, DeliveryIsolationProof{target: target})
+				isolated = append(isolated, WorkerIsolationProof{target: target})
 			}
 		}
 	}
 	for _, versionID := range deliveryVersions {
-		if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+		if err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
 			return err
 		}
 	}
@@ -752,7 +752,7 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 				if err != nil {
 					return err
 				}
-				proofs = append(proofs, DeliveryIsolationProof{target: TicketClaim{VersionID: run.versionID, TicketID: run.issueID, SessionID: run.sessionID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt}})
+				proofs = append(proofs, WorkerIsolationProof{target: TicketClaim{VersionID: run.versionID, TicketID: run.issueID, SessionID: run.sessionID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt}})
 			}
 			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, proofs...); err != nil {
 				return err

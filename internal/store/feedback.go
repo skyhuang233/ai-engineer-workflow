@@ -419,7 +419,7 @@ WHERE version_id = ? AND issue_id = ? AND batch_id = ? AND claimed_run_id = '' A
 	return TicketClaim{VersionID: versionID, TicketID: issueID, TicketNumber: ticketNumber, TicketTitle: ticketTitle, Owner: owner, SessionID: sessionID, RunID: runID, Attempt: attempt, LeaseToken: leaseToken, LeaseGeneration: generation, LeaseExpiresAt: expiresAt}, prompt.String(), nil
 }
 
-func (s *Store) FreezePlanForClosedPullRequest(ctx context.Context, versionID string, issueID int64, now time.Time, isolated ...DeliveryIsolationProof) (bool, error) {
+func (s *Store) FreezePlanForClosedPullRequest(ctx context.Context, versionID string, issueID int64, now time.Time, isolated ...WorkerIsolationProof) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	if now.IsZero() {

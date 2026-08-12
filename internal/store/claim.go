@@ -102,7 +102,7 @@ type TicketClaim struct {
 	LeaseExpiresAt      time.Time
 }
 
-type DeliveryIsolationProof struct {
+type WorkerIsolationProof struct {
 	target TicketClaim
 }
 
@@ -1095,14 +1095,14 @@ AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_re
 	return claim, nil
 }
 
-func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated DeliveryIsolationProof) (bool, error) {
+func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated WorkerIsolationProof) (bool, error) {
 	if mergeCommit == "" {
 		return false, ErrInvalidClaim
 	}
-	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, []DeliveryIsolationProof{isolated})
+	return s.markTicketDelivered(ctx, versionID, issueID, mergeCommit, []WorkerIsolationProof{isolated})
 }
 
-func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated []DeliveryIsolationProof) (bool, error) {
+func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated []WorkerIsolationProof) (bool, error) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1112,7 +1112,7 @@ func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issue
 	defer tx.Rollback()
 	now := time.Now().UTC()
 	nowText := formatTimestamp(now)
-	if err := requireDeliveryIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
+	if err := requireWorkerIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
 		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, delivered = 1, updated_at = ?

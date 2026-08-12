@@ -39,15 +39,15 @@ func TestPlanAmendmentIsolatesAffectedAgentBeforeRevokingLease(t *testing.T) {
 		RemoveDependencies: []AmendmentEdge{{BlockedTicketID: 2, BlockerTicketID: 1}},
 	}
 	_, err = db.ProposePlanAmendment(ctx, amendment, now.Add(time.Minute))
-	var isolation *DeliveryIsolationRequired
+	var isolation *WorkerIsolationRequired
 	if !errors.As(err, &isolation) || len(isolation.Targets) != 1 || isolation.Targets[0].RunID != claim.RunID {
 		t.Fatalf("agent isolation requirement = %#v, %v", isolation, err)
 	}
-	fenced, err := db.FenceDeliveryIsolation(ctx, isolation.Targets)
+	fenced, err := db.FenceWorkerIsolation(ctx, isolation.Targets)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofs, err := db.AcknowledgeDeliveryIsolation(ctx, fenced)
+	proofs, err := db.AcknowledgeWorkerIsolation(ctx, fenced)
 	if err != nil {
 		t.Fatal(err)
 	}

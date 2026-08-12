@@ -44,7 +44,7 @@ type amendmentDecision struct {
 	Action string `json:"action"`
 }
 
-func (s *Store) ProposePlanAmendment(ctx context.Context, amendment PlanAmendment, now time.Time, isolated ...DeliveryIsolationProof) (PlanAmendmentProposal, error) {
+func (s *Store) ProposePlanAmendment(ctx context.Context, amendment PlanAmendment, now time.Time, isolated ...WorkerIsolationProof) (PlanAmendmentProposal, error) {
 	if amendment.VersionID == "" || amendment.TicketID == 0 || strings.TrimSpace(amendment.Summary) == "" {
 		return PlanAmendmentProposal{}, ErrInvalidClaim
 	}
@@ -76,7 +76,7 @@ func (s *Store) ProposePlanAmendment(ctx context.Context, amendment PlanAmendmen
 	for _, issueID := range affected {
 		affectedIDs[issueID] = true
 	}
-	if err := requireDeliveryIsolationTx(ctx, tx, amendment.VersionID, affectedIDs, isolated); err != nil {
+	if err := requireWorkerIsolationTx(ctx, tx, amendment.VersionID, affectedIDs, isolated); err != nil {
 		return PlanAmendmentProposal{}, err
 	}
 	impact, err := amendmentImpactTx(ctx, tx, amendment.VersionID, source, target, affected)
@@ -398,7 +398,7 @@ func amendmentDependentsTx(ctx context.Context, tx *sql.Tx, versionID string, af
 	return strings.Join(values, ", "), nil
 }
 
-func (s *Store) resolvePlanAmendmentTx(ctx context.Context, tx *sql.Tx, questionID, sourceVersionID, action string, now time.Time, isolated []DeliveryIsolationProof) error {
+func (s *Store) resolvePlanAmendmentTx(ctx context.Context, tx *sql.Tx, questionID, sourceVersionID, action string, now time.Time, isolated []WorkerIsolationProof) error {
 	var amendmentID, raw, state string
 	err := tx.QueryRowContext(ctx, `SELECT amendment_id, proposal_json, state FROM plan_amendments WHERE question_id = ? AND version_id = ?`, questionID, sourceVersionID).Scan(&amendmentID, &raw, &state)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -428,11 +428,11 @@ func (s *Store) resolvePlanAmendmentTx(ctx context.Context, tx *sql.Tx, question
 	}
 }
 
-func (s *Store) applyPlanAmendmentTx(ctx context.Context, tx *sql.Tx, amendmentID, sourceVersionID string, target plan.Snapshot, now time.Time, isolated []DeliveryIsolationProof) error {
+func (s *Store) applyPlanAmendmentTx(ctx context.Context, tx *sql.Tx, amendmentID, sourceVersionID string, target plan.Snapshot, now time.Time, isolated []WorkerIsolationProof) error {
 	if err := target.Validate(); err != nil {
 		return err
 	}
-	if err := requireDeliveryIsolationTx(ctx, tx, sourceVersionID, nil, isolated); err != nil {
+	if err := requireWorkerIsolationTx(ctx, tx, sourceVersionID, nil, isolated); err != nil {
 		return err
 	}
 	var planID int64

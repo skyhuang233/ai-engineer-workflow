@@ -473,7 +473,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		if targetErr != nil {
 			return errors.Join(deliveryErr, targetErr)
 		}
-		isolated, isolateErr := c.isolateDeliveryTargets(ctx, []store.TicketClaim{target})
+		isolated, isolateErr := c.isolateWorkerTargets(ctx, []store.TicketClaim{target})
 		if isolateErr != nil {
 			return errors.Join(deliveryErr, isolateErr)
 		}
@@ -484,7 +484,7 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		if targetErr != nil {
 			return errors.Join(deliveryErr, targetErr)
 		}
-		isolated, isolateErr := c.isolateDeliveryTargets(ctx, []store.TicketClaim{target})
+		isolated, isolateErr := c.isolateWorkerTargets(ctx, []store.TicketClaim{target})
 		if isolateErr != nil {
 			return errors.Join(deliveryErr, isolateErr)
 		}
@@ -727,7 +727,7 @@ func (c Controller) recordWorkerContainer(claim store.TicketClaim, result worker
 func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.PlanAmendment) (store.PlanAmendmentProposal, error) {
 	isolator, _ := c.Runtime.(worker.ContainerIsolator)
 	var proposal store.PlanAmendmentProposal
-	err := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	err := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
 		var err error
 		proposal, err = c.Store.ProposePlanAmendment(ctx, amendment, c.now(), isolated...)
 		return err
@@ -737,7 +737,7 @@ func (c Controller) proposePlanAmendment(ctx context.Context, amendment store.Pl
 
 func (c Controller) failDeliveryController(ctx context.Context, claim store.TicketClaim, cause error) error {
 	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
 		return c.Store.FailDeliveryController(ctx, claim, cause.Error(), c.now(), isolated...)
 	})
 	return errors.Join(cause, storeErr)
@@ -745,7 +745,7 @@ func (c Controller) failDeliveryController(ctx context.Context, claim store.Tick
 
 func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
 			return c.Store.FailDeliveryControllerWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
 		}
@@ -756,7 +756,7 @@ func (c Controller) failDeliveryControllerWithClass(ctx context.Context, claim s
 
 func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, claim store.TicketClaim, cause error, class store.FailureClass) error {
 	isolator, _ := c.Runtime.(worker.ContainerIsolator)
-	storeErr := isolation.RetryDeliveryControllerTransition(ctx, c.Store, isolator, func(isolated []store.DeliveryIsolationProof) error {
+	storeErr := isolation.RetryWorkerTransition(ctx, c.Store, isolator, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
 			return c.Store.FailDeliveryControllerLaunchWithClass(ctx, claim, cause.Error(), class, c.now(), c.maxWorkerAttempts())
 		}
@@ -765,12 +765,12 @@ func (c Controller) failDeliveryControllerLaunchWithClass(ctx context.Context, c
 	return errors.Join(cause, storeErr)
 }
 
-func (c Controller) isolateDeliveryTargets(ctx context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
+func (c Controller) isolateWorkerTargets(ctx context.Context, targets []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
 	isolator, ok := c.Runtime.(worker.ContainerIsolator)
 	if !ok {
-		return nil, errors.New("agent controller cannot isolate an active Delivery Controller")
+		return nil, errors.New("agent controller cannot isolate an active Worker")
 	}
-	return isolation.DeliveryControllers(ctx, c.Store, isolator, targets)
+	return isolation.IsolateWorkers(ctx, c.Store, isolator, targets)
 }
 
 func runtimeStdout(result worker.Result) []byte {

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/delivery"
-	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
+	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -740,14 +740,14 @@ func (p Poller) terminalFailureForPlanAttemptsPolicy(ctx context.Context, reposi
 	if !leased {
 		return errors.Join(result, store.ErrFencingConflict)
 	}
-	resolve := func(isolated ...store.DeliveryIsolationProof) (store.GitHubPollTerminalFailureDisposition, error) {
+	resolve := func(isolated ...store.WorkerIsolationProof) (store.GitHubPollTerminalFailureDisposition, error) {
 		if retryUnowned {
 			return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
 		}
 		return p.Store.ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(persistenceCtx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, p.now(), isolated...)
 	}
 	var disposition store.GitHubPollTerminalFailureDisposition
-	attentionErr := deliveryisolation.RetryDeliveryControllerTransition(persistenceCtx, p.Store, p.ContainerIsolator, func(isolated []store.DeliveryIsolationProof) error {
+	attentionErr := workerisolation.RetryWorkerTransition(persistenceCtx, p.Store, p.ContainerIsolator, func(isolated []store.WorkerIsolationProof) error {
 		var err error
 		disposition, err = resolve(isolated...)
 		return err
@@ -944,7 +944,7 @@ func (p Poller) routeInboxAnswers(ctx context.Context, repository string) error 
 			if question.Kind == "inbox_delivery_recovery" {
 				_, err = p.Store.RecoverUncertainInboxDeliveryQuestionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now())
 			} else {
-				err = deliveryisolation.RetryDeliveryControllerTransition(ctx, p.Store, p.ContainerIsolator, func(isolated []store.DeliveryIsolationProof) error {
+				err = workerisolation.RetryWorkerTransition(ctx, p.Store, p.ContainerIsolator, func(isolated []store.WorkerIsolationProof) error {
 					_, err := p.Store.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, question.ID, answer, p.now(), leaseToken, p.now(), isolated...)
 					return err
 				})

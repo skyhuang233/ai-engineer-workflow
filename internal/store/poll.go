@@ -821,7 +821,7 @@ func (s *Store) DeferGitHubPollBootstrapRecoveryForPlanAttemptsLeased(ctx contex
 	return s.advanceGitHubPollFailureLeased(ctx, repository, now, GitHubPollFailurePreActivationInboxConflict, recoveryPlanVersionID, attemptedPlanVersionIDs, retryAt, leaseToken, leaseNow)
 }
 
-func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...WorkerIsolationProof) error {
 	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
 	if err != nil {
 		return err
@@ -830,7 +830,7 @@ func (s *Store) MarkRepositoryNeedsAttention(ctx context.Context, repository str
 	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -850,7 +850,7 @@ func (s *Store) MarkRepositoryNeedsAttentionLeased(ctx context.Context, reposito
 	return tx.Commit()
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ctx context.Context, repository string, now time.Time, isolated ...WorkerIsolationProof) error {
 	token, leaseNow, err := s.acquireGitHubPollMutationLease(ctx, repository)
 	if err != nil {
 		return err
@@ -859,29 +859,29 @@ func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttention(ct
 	return errors.Join(markErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionLeased(ctx context.Context, repository string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) error {
 	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, "", nil, now, leaseToken, leaseNow, false, isolated)
 	return err
 }
 
-func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) MarkGitHubPollFailureUnrecoverableAndRepositoryNeedsAttentionForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) error {
 	_, err := s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, false, isolated)
 	return err
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
 	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, nil, now, leaseToken, leaseNow, true, isolated)
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
 	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, true, isolated)
 }
 
-func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) ResolveGitHubPollTerminalFailureForPlanAttemptsStrictLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
 	return s.resolveGitHubPollTerminalFailureForPlanLeased(ctx, repository, recoveryPlanVersionID, attemptedPlanVersionIDs, now, leaseToken, leaseNow, false, isolated)
 }
 
-func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, retryUnowned bool, isolated []DeliveryIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
+func (s *Store) resolveGitHubPollTerminalFailureForPlanLeased(ctx context.Context, repository, recoveryPlanVersionID string, attemptedPlanVersionIDs []string, now time.Time, leaseToken string, leaseNow time.Time, retryUnowned bool, isolated []WorkerIsolationProof) (GitHubPollTerminalFailureDisposition, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -1018,7 +1018,7 @@ func markFrozenAttemptedPlansPollRecoveryTx(ctx context.Context, tx *sql.Tx, rep
 	return owned, nil
 }
 
-func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time, isolated ...DeliveryIsolationProof) (bool, error) {
+func markRepositoryNeedsAttentionTx(ctx context.Context, tx *sql.Tx, repository, recoveryPlanVersionID string, now time.Time, isolated ...WorkerIsolationProof) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT v.version_id FROM plans p JOIN plan_versions v ON v.version_id = p.current_version_id
 WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
     v.version_id = ? AND ((
@@ -1048,8 +1048,8 @@ WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
 	}
 	var isolationTargets []TicketClaim
 	for _, versionID := range versionIDs {
-		err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated)
-		var isolation *DeliveryIsolationRequired
+		err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated)
+		var isolation *WorkerIsolationRequired
 		if errors.As(err, &isolation) {
 			isolationTargets = append(isolationTargets, isolation.Targets...)
 			continue
@@ -1059,7 +1059,7 @@ WHERE p.repository = ? AND ((`+currentActiveUnfrozenPlanPredicate+`) OR (
 		}
 	}
 	if len(isolationTargets) > 0 {
-		return false, &DeliveryIsolationRequired{Targets: isolationTargets}
+		return false, &WorkerIsolationRequired{Targets: isolationTargets}
 	}
 	for _, versionID := range versionIDs {
 		if err := ensureWorkflowQuestionTx(ctx, tx, repository, versionID, 0, "poll_failure", "GitHub polling exhausted its retry budget. Reply with an id-addressed retry decision after resolving the GitHub access failure.", now); err != nil {
@@ -1127,7 +1127,7 @@ WHERE q.question_id = ? AND q.repository = ?`, questionID, repository).
 	return question, err
 }
 
-func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...WorkerIsolationProof) error {
 	if repository == "" || questionID == "" || answer == "" {
 		return ErrInvalidClaim
 	}
@@ -1142,12 +1142,12 @@ func (s *Store) AnswerWorkflowQuestion(ctx context.Context, repository, question
 	return errors.Join(answerErr, s.releaseGitHubPollMutationLease(ctx, repository, token))
 }
 
-func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) error {
+func (s *Store) AnswerWorkflowQuestionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) error {
 	_, err := s.AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx, repository, questionID, answer, now, leaseToken, leaseNow, isolated...)
 	return err
 }
 
-func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...DeliveryIsolationProof) (DeliveryOutbox, error) {
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.Context, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated ...WorkerIsolationProof) (DeliveryOutbox, error) {
 	if repository == "" || questionID == "" || answer == "" {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
@@ -1185,7 +1185,7 @@ func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjectionLeased(ctx context.
 	return outbox, nil
 }
 
-func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...DeliveryIsolationProof) (DeliveryOutbox, error) {
+func (s *Store) AnswerWorkflowQuestionAndQueueInboxProjection(ctx context.Context, repository, questionID, answer string, now time.Time, isolated ...WorkerIsolationProof) (DeliveryOutbox, error) {
 	if repository == "" || questionID == "" || answer == "" {
 		return DeliveryOutbox{}, ErrInvalidClaim
 	}
@@ -1339,7 +1339,7 @@ func WorkflowQuestionProjections(questions []WorkflowQuestion) []plan.WorkflowQu
 	return projected
 }
 
-func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated []DeliveryIsolationProof) error {
+func (s *Store) answerWorkflowQuestionTx(ctx context.Context, tx *sql.Tx, repository, questionID, answer string, now time.Time, leaseToken string, leaseNow time.Time, isolated []WorkerIsolationProof) error {
 	var kind, versionID, state, priorAnswer string
 	var issueID int64
 	err := tx.QueryRowContext(ctx, `SELECT kind, version_id, issue_id, state, COALESCE(answer, '') FROM workflow_questions WHERE question_id = ? AND repository = ?`, questionID, repository).Scan(&kind, &versionID, &issueID, &state, &priorAnswer)
@@ -1569,8 +1569,8 @@ WHERE repository = ?`, failureKind, recoveryState, recoveryPlanVersionID, string
 	return err
 }
 
-func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time, isolated ...DeliveryIsolationProof) error {
-	if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+func (s *Store) cancelPlanTx(ctx context.Context, tx *sql.Tx, versionID string, now time.Time, isolated ...WorkerIsolationProof) error {
+	if err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
 		return err
 	}
 	stamp := formatTimestamp(now)
@@ -1671,7 +1671,7 @@ VALUES (?, ?, ?, ?, ?, ?, 'approved', ?)`, questionID, versionID, frozenIssueID,
 	return nil
 }
 
-func (s *Store) SchedulerRoot(ctx context.Context, repository string, configuredRoot int64, now time.Time, isolated ...DeliveryIsolationProof) (int64, error) {
+func (s *Store) SchedulerRoot(ctx context.Context, repository string, configuredRoot int64, now time.Time, isolated ...WorkerIsolationProof) (int64, error) {
 	if repository == "" || configuredRoot <= 0 {
 		return 0, ErrInvalidClaim
 	}
@@ -1793,8 +1793,8 @@ ON CONFLICT(repository, version_id, issue_id, kind, generation) DO NOTHING`, que
 	return err
 }
 
-func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time, isolated ...DeliveryIsolationProof) error {
-	if err := requireDeliveryIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
+func markTicketNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, reason string, now time.Time, isolated ...WorkerIsolationProof) error {
+	if err := requireWorkerIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
 		return err
 	}
 	var repository string
@@ -1895,8 +1895,8 @@ VALUES (?, ?, ?, ?, 'needs_attention', ?, ?, 'open', ?)`, questionID, repository
 	return err
 }
 
-func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time, isolated ...DeliveryIsolationProof) error {
-	if err := requireDeliveryIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
+func markPlanNeedsAttentionTx(ctx context.Context, tx *sql.Tx, versionID, reason string, now time.Time, isolated ...WorkerIsolationProof) error {
+	if err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
 		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT issue_id FROM ticket_runtime WHERE version_id = ? AND delivered = 0`, versionID)

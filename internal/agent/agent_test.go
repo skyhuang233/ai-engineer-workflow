@@ -979,11 +979,11 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		if len(runs) != 1 {
 			return fmt.Errorf("expired launched recovery runs = %#v", runs)
 		}
-		fenced, err := db.FenceDeliveryIsolation(context.Background(), []store.TicketClaim{runs[0].Claim})
+		fenced, err := db.FenceWorkerIsolation(context.Background(), []store.TicketClaim{runs[0].Claim})
 		if err != nil {
 			t.Fatal(err)
 		}
-		proofs, err := db.AcknowledgeDeliveryIsolation(context.Background(), fenced)
+		proofs, err := db.AcknowledgeWorkerIsolation(context.Background(), fenced)
 		if err != nil {
 			t.Fatal(err)
 		}

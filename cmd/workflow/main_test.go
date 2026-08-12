@@ -39,10 +39,10 @@ type fakeWorkflowInboxAnswerStore struct {
 	acknowledged bool
 }
 
-func (f *fakeWorkflowInboxAnswerStore) AnswerWorkflowQuestionAndQueueInboxProjection(_ context.Context, _, _, _ string, _ time.Time, isolated ...store.DeliveryIsolationProof) (store.DeliveryOutbox, error) {
+func (f *fakeWorkflowInboxAnswerStore) AnswerWorkflowQuestionAndQueueInboxProjection(_ context.Context, _, _, _ string, _ time.Time, isolated ...store.WorkerIsolationProof) (store.DeliveryOutbox, error) {
 	f.answerCalls++
 	if f.answerCalls == 1 {
-		return store.DeliveryOutbox{}, &store.DeliveryIsolationRequired{Targets: []store.TicketClaim{f.target}}
+		return store.DeliveryOutbox{}, &store.WorkerIsolationRequired{Targets: []store.TicketClaim{f.target}}
 	}
 	if len(isolated) != 1 || !f.acknowledged {
 		return store.DeliveryOutbox{}, errors.New("answer replayed without acknowledged isolation")
@@ -50,17 +50,17 @@ func (f *fakeWorkflowInboxAnswerStore) AnswerWorkflowQuestionAndQueueInboxProjec
 	return store.DeliveryOutbox{}, nil
 }
 
-func (f *fakeWorkflowInboxAnswerStore) FenceDeliveryIsolation(_ context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+func (f *fakeWorkflowInboxAnswerStore) FenceWorkerIsolation(_ context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
 	f.fenceCalls++
 	return targets, nil
 }
 
-func (f *fakeWorkflowInboxAnswerStore) AcknowledgeDeliveryIsolation(_ context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
+func (f *fakeWorkflowInboxAnswerStore) AcknowledgeWorkerIsolation(_ context.Context, targets []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
 	if len(targets) != 1 || targets[0].RunID != f.target.RunID {
 		return nil, errors.New("unexpected isolation target")
 	}
 	f.acknowledged = true
-	return []store.DeliveryIsolationProof{{}}, nil
+	return []store.WorkerIsolationProof{{}}, nil
 }
 
 type restoreContainerIsolatorFunc func(context.Context, string) error

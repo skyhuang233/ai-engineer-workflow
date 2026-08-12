@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	deliveryisolation "github.com/skyhuang233/workflow/internal/isolation"
+	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -76,14 +76,14 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 
 func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delivery store.TicketDelivery) error {
 	now := time.Now().UTC()
-	return deliveryisolation.RetryDeliveryControllerTransition(ctx, r.Store, r.Isolator, func(isolated []store.DeliveryIsolationProof) error {
+	return workerisolation.RetryWorkerTransition(ctx, r.Store, r.Isolator, func(isolated []store.WorkerIsolationProof) error {
 		_, err := r.Store.FreezePlanForClosedPullRequest(ctx, delivery.VersionID, delivery.IssueID, now, isolated...)
 		return err
 	})
 }
 
 func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {
-	return deliveryisolation.RetryDeliveryControllerTransition(ctx, r.Store, r.Isolator, func(isolated []store.DeliveryIsolationProof) error {
+	return workerisolation.RetryWorkerTransition(ctx, r.Store, r.Isolator, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
 			_, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
 			return err
