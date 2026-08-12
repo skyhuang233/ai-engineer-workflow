@@ -29,14 +29,32 @@ func TestDatabaseIdentityNormalizesWindowsNamespaceAliases(t *testing.T) {
 	if forwardNamespaced != plain {
 		t.Fatalf("forward-slash namespace identity = %q, want %q", forwardNamespaced, plain)
 	}
-	if got, want := normalizeWindowsNamespacePath(`\\?\UNC\server\share\workflow.db`), `\\server\share\workflow.db`; got != want {
+	if got, err := normalizeWindowsNamespacePath(`\\?\UNC\server\share\workflow.db`); err != nil || got != `\\server\share\workflow.db` {
+		want := `\\server\share\workflow.db`
 		t.Fatalf("UNC namespace path = %q, want %q", got, want)
 	}
-	if got, want := normalizeWindowsNamespacePath(`//?/UNC/server/share/workflow.db`), `\\server\share\workflow.db`; got != want {
+	if got, err := normalizeWindowsNamespacePath(`//?/UNC/server/share/workflow.db`); err != nil || got != `\\server\share\workflow.db` {
+		want := `\\server\share\workflow.db`
 		t.Fatalf("forward-slash UNC namespace path = %q, want %q", got, want)
 	}
-	if got, want := normalizeWindowsVolumeCase(normalizeWindowsNamespacePath(`\\?\UNC\SERVER\SHARE\CaseSensitive\Workflow.db`)), `\\server\share\CaseSensitive\Workflow.db`; got != want {
+	uncPath, err := normalizeWindowsNamespacePath(`\\?\UNC\SERVER\SHARE\CaseSensitive\Workflow.db`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := normalizeWindowsVolumeCase(uncPath), `\\server\share\CaseSensitive\Workflow.db`; got != want {
 		t.Fatalf("UNC volume identity = %q, want %q", got, want)
+	}
+}
+
+func TestDatabaseIdentityRejectsUnsupportedWindowsDeviceNamespaces(t *testing.T) {
+	for _, path := range []string{
+		`\\?\GLOBALROOT\Device\HarddiskVolume1\workflow.db`,
+		`\\.\GLOBALROOT\Device\HarddiskVolume1\workflow.db`,
+		`\??\GLOBALROOT\Device\HarddiskVolume1\workflow.db`,
+	} {
+		if _, err := DatabaseIdentity(path); err == nil || !strings.Contains(err.Error(), "unsupported Windows device namespace") {
+			t.Fatalf("DatabaseIdentity(%q) error = %v, want unsupported namespace error", path, err)
+		}
 	}
 }
 
@@ -116,5 +134,44 @@ func TestDatabaseIdentityKeepsStableWindowsCaseAcrossLifecycle(t *testing.T) {
 	}
 	if alias != beforeCreate {
 		t.Fatalf("case-insensitive alias identity = %q, want %q", alias, beforeCreate)
+	}
+}
+
+func TestDatabaseIdentityKeepsStableWindowsCaseWithMissingParent(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "New", "Workflow.db")
+	beforeCreate, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	afterParentCreate, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterDatabaseCreate, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for state, identity := range map[string]string{
+		"parent creation":   afterParentCreate,
+		"database creation": afterDatabaseCreate,
+		"deletion":          afterDelete,
+	} {
+		if identity != beforeCreate {
+			t.Fatalf("identity after %s = %q, want %q", state, identity, beforeCreate)
+		}
 	}
 }

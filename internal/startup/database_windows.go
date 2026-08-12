@@ -13,18 +13,11 @@ import (
 )
 
 func normalizeDatabasePathCase(path string) (string, error) {
-	caseSensitive, known, err := windowsDirectoryCaseSensitivity(filepath.Dir(path))
+	path, err := normalizeWindowsVolumeIdentity(path)
 	if err != nil {
 		return "", err
 	}
-	if known && !caseSensitive {
-		path = filepath.Join(filepath.Dir(path), strings.ToLower(filepath.Base(path)))
-	}
-	path, err = normalizeWindowsVolumeIdentity(path)
-	if err != nil {
-		return "", err
-	}
-	return normalizeWindowsVolumeCase(path), nil
+	return normalizeWindowsPathCase(normalizeWindowsVolumeCase(path))
 }
 
 func normalizeWindowsVolumeCase(path string) string {
@@ -33,6 +26,47 @@ func normalizeWindowsVolumeCase(path string) string {
 		return path
 	}
 	return strings.ToLower(volume) + path[len(volume):]
+}
+
+func normalizeWindowsPathCase(path string) (string, error) {
+	volume := filepath.VolumeName(path)
+	if volume == "" {
+		return path, nil
+	}
+	remainder := strings.TrimLeft(path[len(volume):], `\`)
+	current := volume + `\`
+	caseSensitive, known, err := windowsDirectoryCaseSensitivity(current)
+	if err != nil {
+		return "", err
+	}
+	if remainder == "" {
+		return current, nil
+	}
+	components := strings.Split(remainder, `\`)
+	for index, component := range components {
+		if known && !caseSensitive {
+			component = strings.ToLower(component)
+		}
+		current = filepath.Join(current, component)
+		if index == len(components)-1 {
+			continue
+		}
+		nextCaseSensitive, nextKnown, err := windowsDirectoryCaseSensitivity(current)
+		if err != nil {
+			return "", err
+		}
+		if nextKnown {
+			caseSensitive = nextCaseSensitive
+			known = true
+			continue
+		}
+		if _, err := os.Stat(current); err == nil {
+			known = false
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return current, nil
 }
 
 func normalizeWindowsVolumeIdentity(path string) (string, error) {

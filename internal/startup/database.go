@@ -19,7 +19,10 @@ func DatabaseIdentity(dsn string) (string, error) {
 		return "", nil
 	}
 	if runtime.GOOS == "windows" {
-		path = normalizeWindowsNamespacePath(path)
+		path, err = normalizeWindowsNamespacePath(path)
+		if err != nil {
+			return "", fmt.Errorf("normalize Windows database path: %w", err)
+		}
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -37,11 +40,11 @@ func DatabaseIdentity(dsn string) (string, error) {
 	return canonical, nil
 }
 
-func normalizeWindowsNamespacePath(path string) string {
+func normalizeWindowsNamespacePath(path string) (string, error) {
 	path = filepath.FromSlash(path)
 	for _, prefix := range []string{`\\?\UNC\`, `\\.\UNC\`, `\??\UNC\`} {
 		if len(path) >= len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) {
-			return `\\` + path[len(prefix):]
+			return `\\` + path[len(prefix):], nil
 		}
 	}
 	for _, prefix := range []string{`\\?\`, `\\.\`, `\??\`} {
@@ -50,13 +53,14 @@ func normalizeWindowsNamespacePath(path string) string {
 		}
 		remainder := path[len(prefix):]
 		if len(remainder) >= 3 && remainder[1] == ':' && (remainder[2] == '\\' || remainder[2] == '/') {
-			return remainder
+			return remainder, nil
 		}
 		if strings.HasPrefix(strings.ToLower(remainder), `volume{`) {
-			return `\\?\` + remainder
+			return `\\?\` + remainder, nil
 		}
+		return "", fmt.Errorf("unsupported Windows device namespace %q", path[:len(prefix)]+strings.SplitN(remainder, `\`, 2)[0])
 	}
-	return path
+	return path, nil
 }
 
 func databasePath(dsn string) (string, bool, error) {
