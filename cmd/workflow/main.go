@@ -1130,9 +1130,32 @@ func runAnswerInbox(args []string) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	if _, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
+	runtime := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
+	if err := answerWorkflowInboxQuestion(ctx, db, runtime, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
+}
+
+type workflowInboxAnswerStore interface {
+	deliveryisolation.Store
+	AnswerWorkflowQuestionAndQueueInboxProjection(context.Context, string, string, string, time.Time, ...store.DeliveryIsolationProof) (store.DeliveryOutbox, error)
+}
+
+func answerWorkflowInboxQuestion(ctx context.Context, db workflowInboxAnswerStore, isolator worker.ContainerIsolator, repository, questionID, answer string, now time.Time) error {
+	_, err := db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, repository, questionID, answer, now)
+	var isolation *store.DeliveryIsolationRequired
+	if !errors.As(err, &isolation) {
+		return err
+	}
+	if isolator == nil {
+		return errors.Join(err, errors.New("answer-inbox cannot isolate an active Delivery Controller"))
+	}
+	fenced, fenceErr := deliveryisolation.DeliveryControllers(ctx, db, isolator, isolation.Targets)
+	if fenceErr != nil {
+		return errors.Join(err, fenceErr)
+	}
+	_, err = db.AnswerWorkflowQuestionAndQueueInboxProjection(ctx, repository, questionID, answer, now, fenced...)
+	return err
 }
 
 func runRecoverInboxDelivery(args []string) {

@@ -32,6 +32,37 @@ type githubTokenProviderFunc func(context.Context) (string, error)
 
 func (f githubTokenProviderFunc) Token(ctx context.Context) (string, error) { return f(ctx) }
 
+type fakeWorkflowInboxAnswerStore struct {
+	target       store.TicketClaim
+	answerCalls  int
+	fenceCalls   int
+	acknowledged bool
+}
+
+func (f *fakeWorkflowInboxAnswerStore) AnswerWorkflowQuestionAndQueueInboxProjection(_ context.Context, _, _, _ string, _ time.Time, isolated ...store.DeliveryIsolationProof) (store.DeliveryOutbox, error) {
+	f.answerCalls++
+	if f.answerCalls == 1 {
+		return store.DeliveryOutbox{}, &store.DeliveryIsolationRequired{Targets: []store.TicketClaim{f.target}}
+	}
+	if len(isolated) != 1 || !f.acknowledged {
+		return store.DeliveryOutbox{}, errors.New("answer replayed without acknowledged isolation")
+	}
+	return store.DeliveryOutbox{}, nil
+}
+
+func (f *fakeWorkflowInboxAnswerStore) FenceDeliveryIsolation(_ context.Context, targets []store.TicketClaim) ([]store.TicketClaim, error) {
+	f.fenceCalls++
+	return targets, nil
+}
+
+func (f *fakeWorkflowInboxAnswerStore) AcknowledgeDeliveryIsolation(_ context.Context, targets []store.TicketClaim) ([]store.DeliveryIsolationProof, error) {
+	if len(targets) != 1 || targets[0].RunID != f.target.RunID {
+		return nil, errors.New("unexpected isolation target")
+	}
+	f.acknowledged = true
+	return []store.DeliveryIsolationProof{{}}, nil
+}
+
 type restoreContainerIsolatorFunc func(context.Context, string) error
 
 func (f restoreContainerIsolatorFunc) IsolateContainer(ctx context.Context, runID string) error {
@@ -53,6 +84,26 @@ func (f fakeRestoreContainerIsolator) IsolateContainer(ctx context.Context, runI
 
 func (f fakeRestoreContainerIsolator) IsolateControlPlaneDeliveryContainers(ctx context.Context) error {
 	return f.isolateControlPlane(ctx)
+}
+
+func TestAnswerWorkflowInboxQuestionIsolatesDeliveryControllerBeforeReplay(t *testing.T) {
+	ctx := context.Background()
+	target := store.TicketClaim{RunID: "delivery-run"}
+	db := &fakeWorkflowInboxAnswerStore{target: target}
+	var isolated []string
+	err := answerWorkflowInboxQuestion(ctx, db, restoreContainerIsolatorFunc(func(_ context.Context, runID string) error {
+		isolated = append(isolated, runID)
+		return nil
+	}), "owner/repository", "question-1", `{"action":"cancel-plan"}`, time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.answerCalls != 2 || db.fenceCalls != 1 || !db.acknowledged {
+		t.Fatalf("answer isolation handshake = answers %d, fences %d, acknowledged %t", db.answerCalls, db.fenceCalls, db.acknowledged)
+	}
+	if len(isolated) != 1 || isolated[0] != target.RunID {
+		t.Fatalf("isolated Delivery Controllers = %#v", isolated)
+	}
 }
 
 func TestReconcileRestoredControlPlaneIsolatesPreparedDeliveryBeforeApplying(t *testing.T) {
