@@ -601,6 +601,9 @@ WHERE r.run_id = ? AND l.lease_token = ? AND l.generation = ? AND r.state = ? AN
 		}
 		return tx.Commit()
 	}
+	if err := requireWorkerIsolationTx(ctx, tx, run.Claim.VersionID, map[int64]bool{run.Claim.TicketID: true}, isolated); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'superseded', finished_at = ? WHERE run_id = ? AND state = ?`, formatTimestamp(now), run.Claim.RunID, RunRunning); err != nil {
 		return err
 	}

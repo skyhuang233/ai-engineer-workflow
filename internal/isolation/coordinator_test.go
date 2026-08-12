@@ -2,6 +2,7 @@ package isolation
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/store"
@@ -97,5 +98,25 @@ func TestRetryWorkerTransitionAccumulatesConcurrentIsolation(t *testing.T) {
 	}
 	if calls != 3 || len(isolator.isolated) != 2 || !database.acknowledged {
 		t.Fatalf("transition retries = %d, isolated = %v, acknowledged = %t", calls, isolator.isolated, database.acknowledged)
+	}
+}
+
+func TestRetryWorkerTransitionStopsAfterBoundedFencingConflicts(t *testing.T) {
+	database := &coordinatorStore{cancel: func() {}, fenceErrors: make([]error, defaultTransitionAttempts)}
+	for index := range database.fenceErrors {
+		database.fenceErrors[index] = store.ErrFencingConflict
+	}
+	target := store.TicketClaim{RunID: "churning-worker"}
+	calls := 0
+
+	err := RetryWorkerTransition(context.Background(), database, &coordinatorIsolator{}, func([]store.WorkerIsolationProof) error {
+		calls++
+		return &store.WorkerIsolationRequired{Targets: []store.TicketClaim{target}}
+	})
+	if !errors.Is(err, store.ErrFencingConflict) {
+		t.Fatalf("retry exhaustion = %v, want fencing conflict", err)
+	}
+	if calls != defaultTransitionAttempts {
+		t.Fatalf("transition calls = %d, want %d", calls, defaultTransitionAttempts)
 	}
 }

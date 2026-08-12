@@ -677,29 +677,30 @@ func reconcileRestoredControlPlaneTx(ctx context.Context, tx *sql.Tx, now time.T
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT s.version_id FROM worker_runs r
 JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE r.run_kind = ? AND r.state = ? AND l.state = ?
-ORDER BY s.version_id`, RunDelivery, RunRunning, LeaseActive)
+WHERE r.state = ? AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1)) AND l.state = ?
+ORDER BY s.version_id`, RunRunning, LeaseActive)
 	if err != nil {
 		return err
 	}
-	var deliveryVersions []string
+	var workerVersions []string
 	for rows.Next() {
 		var versionID string
 		if err := rows.Scan(&versionID); err != nil {
 			rows.Close()
 			return err
 		}
-		deliveryVersions = append(deliveryVersions, versionID)
+		workerVersions = append(workerVersions, versionID)
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	if modelIsolation {
 		if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1, container_create_pending = 0
-WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticket_sessions)`, RunDelivery, RunRunning); err != nil {
+WHERE state = ? AND (launch_state = 'launched' OR (launch_state = 'ready' AND prelaunch_reserved = 1))
+AND run_id IN (SELECT current_run_id FROM ticket_sessions)`, RunRunning); err != nil {
 			return err
 		}
-		for _, versionID := range deliveryVersions {
+		for _, versionID := range workerVersions {
 			targets, _, err := workerIsolationTargetsTx(ctx, tx, versionID, nil)
 			if err != nil {
 				return err
@@ -709,7 +710,7 @@ WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticke
 			}
 		}
 	}
-	for _, versionID := range deliveryVersions {
+	for _, versionID := range workerVersions {
 		if err := requireWorkerIsolationTx(ctx, tx, versionID, nil, isolated); err != nil {
 			return err
 		}
@@ -720,7 +721,7 @@ WHERE run_kind = ? AND state = ? AND run_id IN (SELECT current_run_id FROM ticke
 	if _, err := tx.ExecContext(ctx, `UPDATE github_poll_cursors SET last_success_at = '', last_full_reconcile_at = '', next_attempt_at = ?, updated_at = ?`, stamp, stamp); err != nil {
 		return err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, s.session_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
+	rows, err = tx.QueryContext(ctx, `SELECT r.run_id, r.run_kind, s.version_id, s.issue_id, s.session_id, l.lease_token
 FROM worker_runs r JOIN ticket_sessions s ON s.current_run_id = r.run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
@@ -728,14 +729,13 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 		return err
 	}
 	type activeRun struct {
-		runID, kind, versionID, sessionID, lease, expiresAt string
-		issueID                                             int64
-		leaseGeneration, isolationGeneration                int64
+		runID, kind, versionID, sessionID, lease string
+		issueID                                  int64
 	}
 	var active []activeRun
 	for rows.Next() {
 		var run activeRun
-		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.sessionID, &run.leaseGeneration, &run.isolationGeneration, &run.lease, &run.expiresAt); err != nil {
+		if err := rows.Scan(&run.runID, &run.kind, &run.versionID, &run.issueID, &run.sessionID, &run.lease); err != nil {
 			rows.Close()
 			return err
 		}
@@ -746,15 +746,7 @@ WHERE r.state = ? AND l.state = ?`, RunRunning, LeaseActive)
 	}
 	for _, run := range active {
 		if run.kind == RunDelivery {
-			proofs := isolated
-			if modelIsolation {
-				expiresAt, err := time.Parse(time.RFC3339Nano, run.expiresAt)
-				if err != nil {
-					return err
-				}
-				proofs = append(proofs, WorkerIsolationProof{target: TicketClaim{VersionID: run.versionID, TicketID: run.issueID, SessionID: run.sessionID, RunID: run.runID, LeaseGeneration: run.leaseGeneration, IsolationGeneration: run.isolationGeneration, LeaseToken: run.lease, LeaseExpiresAt: expiresAt}})
-			}
-			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, proofs...); err != nil {
+			if err := markTicketNeedsAttentionTx(ctx, tx, run.versionID, run.issueID, "Delivery Controller was interrupted by Control Plane restore", now, isolated...); err != nil {
 				return err
 			}
 			continue

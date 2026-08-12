@@ -310,6 +310,88 @@ func TestRecoverReleasesMissingAgentContainerBeforeProjection(t *testing.T) {
 	}
 }
 
+func TestRecoverReleasesExpiredUnreservedAgentWithoutIsolation(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Minute, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	dispatcher := scheduler.Dispatcher{Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{}, Recovery: recoveryInspector{workspaceReady: true, isolate: func(runID string) { isolated = append(isolated, runID) }}, Now: func() time.Time { return now.Add(2 * time.Minute) }}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 0 {
+		t.Fatalf("unreserved Agent was isolated: %#v", isolated)
+	}
+	replacement, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(2 * time.Minute)})
+	if err != nil || replacement.RunID == claim.RunID {
+		t.Fatalf("expired unreserved Agent replacement = %#v, %v", replacement, err)
+	}
+}
+
+func TestRecoverIsolatesAdmittedActiveAgentBeforeReplacement(t *testing.T) {
+	ctx := context.Background()
+	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerPrelaunch(ctx, claim, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerLaunch(ctx, claim, store.WorkerAudit{RunID: claim.RunID, LeaseGeneration: claim.LeaseGeneration, ImageDigest: "sha256:agent", ToolVersions: map[string]string{"codex": "1", "github-cli": "1", "go": "1", "no-mistakes": "1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var isolated []string
+	dispatcher := scheduler.Dispatcher{Store: db, Reader: &reader{snapshot: snapshot}, Projector: &projector{}, Recovery: recoveryInspector{workspaceReady: true, isolate: func(runID string) { isolated = append(isolated, runID) }}, Now: func() time.Time { return now.Add(time.Minute) }}
+	if err := dispatcher.Recover(ctx, snapshot.Repository, snapshot.Root.Number); err != nil {
+		t.Fatal(err)
+	}
+	if len(isolated) != 1 || isolated[0] != claim.RunID {
+		t.Fatalf("active admitted Agent isolation = %#v, want [%q]", isolated, claim.RunID)
+	}
+	replacement, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-2", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now.Add(time.Minute)})
+	if err != nil || replacement.RunID == claim.RunID {
+		t.Fatalf("active admitted Agent replacement = %#v, %v", replacement, err)
+	}
+}
+
 func TestRecoverIsolatesExpiredContainerBeforeReplacementRun(t *testing.T) {
 	ctx := context.Background()
 	snapshot := plan.Snapshot{Repository: "owner/repo", Root: plan.Issue{ID: 100, Number: 10, Body: "spec", Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}, State: "open"}}}

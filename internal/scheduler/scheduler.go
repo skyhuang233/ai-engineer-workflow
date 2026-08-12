@@ -199,11 +199,10 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		return err
 	}
 	for _, run := range expired {
-		proofs, err := isolation.IsolateWorkers(ctx, d.Store, d.Recovery, []store.TicketClaim{run.Claim})
-		if err != nil {
-			return fmt.Errorf("isolate expired Worker: %w", err)
-		}
-		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts, proofs...); err != nil && !errors.Is(err, store.ErrInvalidClaim) {
+		err := isolation.RetryWorkerTransition(ctx, d.Store, d.Recovery, func(proofs []store.WorkerIsolationProof) error {
+			return d.Store.ReconcileMissingRecoveryRun(ctx, run, "Run Lease expired during restart recovery", now, d.MaxWorkerAttempts, proofs...)
+		})
+		if err != nil && !errors.Is(err, store.ErrInvalidClaim) {
 			return err
 		}
 	}
@@ -240,7 +239,9 @@ func (d Dispatcher) reconcileVersionLocal(ctx context.Context, versionID string,
 		if !workspaceAvailable {
 			reason = "ticket workspace is unavailable"
 		}
-		if err := d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now, d.MaxWorkerAttempts); err != nil {
+		if err := isolation.RetryWorkerTransition(ctx, d.Store, d.Recovery, func(proofs []store.WorkerIsolationProof) error {
+			return d.Store.ReconcileMissingRecoveryRun(ctx, run, reason, now, d.MaxWorkerAttempts, proofs...)
+		}); err != nil {
 			return err
 		}
 	}

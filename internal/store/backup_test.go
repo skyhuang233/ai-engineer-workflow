@@ -270,3 +270,69 @@ func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *test
 		t.Fatalf("restored prepared delivery state = %q", projection.Tickets[0].State)
 	}
 }
+
+func TestRestoreDryRunModelsParallelWorkerIsolation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := plan.Snapshot{
+		Repository: "owner/repo",
+		Root:       plan.Issue{ID: 100, Number: 10, Title: "Plan", Labels: []string{plan.PlanLabel}},
+		Children: []plan.Issue{
+			{ID: 1, Number: 11, Title: "delivery", Labels: []string{plan.TicketLabel}, State: "open"},
+			{ID: 2, Number: 12, Title: "agent", Labels: []string{plan.TicketLabel}, State: "open"},
+		},
+	}
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent-1", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: first.RunID, LeaseToken: first.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 2, Owner: "agent-2", MaxParallelRuns: 2, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReserveWorkerPrelaunch(ctx, agent, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReconcileRestoredControlPlaneDryRun(ctx, now.Add(time.Minute)); err != nil {
+		t.Fatalf("parallel Worker restore drill = %v", err)
+	}
+	err = db.ReconcileRestoredControlPlane(ctx, now.Add(time.Minute))
+	var isolation *WorkerIsolationRequired
+	if !errors.As(err, &isolation) || len(isolation.Targets) != 2 {
+		t.Fatalf("parallel Worker restore isolation = %#v, %v", isolation, err)
+	}
+	fenced, err := db.FenceWorkerIsolation(ctx, isolation.Targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs, err := db.AcknowledgeWorkerIsolation(ctx, fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReconcileRestoredControlPlane(ctx, now.Add(time.Minute), proofs...); err != nil {
+		t.Fatal(err)
+	}
+}

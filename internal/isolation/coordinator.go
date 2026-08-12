@@ -9,7 +9,11 @@ import (
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
-const defaultTimeout = 30 * time.Second
+const (
+	defaultTimeout            = 30 * time.Second
+	defaultTransitionAttempts = 5
+	defaultRetryDelay         = 10 * time.Millisecond
+)
 
 type Store interface {
 	FenceWorkerIsolation(context.Context, []store.TicketClaim) ([]store.TicketClaim, error)
@@ -25,7 +29,7 @@ func RetryWorkerTransition(ctx context.Context, database Store, isolator Contain
 		return errors.New("Worker transition is required")
 	}
 	var isolated []store.WorkerIsolationProof
-	for {
+	for attempt := 0; attempt < defaultTransitionAttempts; attempt++ {
 		err := transition(isolated)
 		var required *store.WorkerIsolationRequired
 		if !errors.As(err, &required) {
@@ -33,16 +37,28 @@ func RetryWorkerTransition(ctx context.Context, database Store, isolator Contain
 		}
 		acknowledged, isolationErr := IsolateWorkers(ctx, database, isolator, required.Targets)
 		if isolationErr != nil {
-			if errors.Is(isolationErr, store.ErrFencingConflict) {
-				if err := ctx.Err(); err != nil {
-					return errors.Join(isolationErr, err)
-				}
-				continue
+			if !errors.Is(isolationErr, store.ErrFencingConflict) {
+				return errors.Join(err, isolationErr)
 			}
-			return errors.Join(err, isolationErr)
+		} else {
+			isolated = append(isolated, acknowledged...)
 		}
-		isolated = append(isolated, acknowledged...)
+		if attempt+1 == defaultTransitionAttempts {
+			retryErr := errors.New("Worker transition isolation retry limit reached")
+			if isolationErr != nil {
+				retryErr = fmt.Errorf("Worker transition isolation retry limit reached: %w", isolationErr)
+			}
+			return errors.Join(err, retryErr)
+		}
+		timer := time.NewTimer(defaultRetryDelay << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, isolationErr, ctx.Err())
+		case <-timer.C:
+		}
 	}
+	return errors.New("Worker transition isolation retry limit reached")
 }
 
 func IsolateWorkers(ctx context.Context, database Store, isolator ContainerIsolator, targets []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
