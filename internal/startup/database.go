@@ -37,6 +37,7 @@ func DatabaseIdentity(dsn string) (string, error) {
 }
 
 func normalizeWindowsNamespacePath(path string) string {
+	path = filepath.FromSlash(path)
 	for _, prefix := range []string{`\\?\UNC\`, `\\.\UNC\`, `\??\UNC\`} {
 		if len(path) >= len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) {
 			return `\\` + path[len(prefix):]
