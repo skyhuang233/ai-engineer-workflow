@@ -52,6 +52,9 @@ func normalizeWindowsNamespacePath(path string) string {
 		if len(remainder) >= 3 && remainder[1] == ':' && (remainder[2] == '\\' || remainder[2] == '/') {
 			return remainder
 		}
+		if strings.HasPrefix(strings.ToLower(remainder), `volume{`) {
+			return `\\?\` + remainder
+		}
 	}
 	return path
 }

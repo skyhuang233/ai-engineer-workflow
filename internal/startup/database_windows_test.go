@@ -5,6 +5,7 @@ package startup
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -36,6 +37,40 @@ func TestDatabaseIdentityNormalizesWindowsNamespaceAliases(t *testing.T) {
 	}
 	if got, want := normalizeWindowsVolumeCase(normalizeWindowsNamespacePath(`\\?\UNC\SERVER\SHARE\CaseSensitive\Workflow.db`)), `\\server\share\CaseSensitive\Workflow.db`; got != want {
 		t.Fatalf("UNC volume identity = %q, want %q", got, want)
+	}
+}
+
+func TestDatabaseIdentityNormalizesWindowsVolumeGUIDAliases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	plain, err := DatabaseIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountPoint, err := windowsVolumeMountPoint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumeName, err := windowsVolumeName(mountPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(mountPoint, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumeAlias := filepath.Join(volumeName, relative)
+	for _, alias := range []string{
+		volumeAlias,
+		strings.Replace(volumeAlias, `\\?\`, `\\.\`, 1),
+		strings.Replace(volumeAlias, `\\?\`, `\??\`, 1),
+	} {
+		identity, err := DatabaseIdentity(alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if identity != plain {
+			t.Fatalf("volume alias %q identity = %q, want %q", alias, identity, plain)
+		}
 	}
 }
 

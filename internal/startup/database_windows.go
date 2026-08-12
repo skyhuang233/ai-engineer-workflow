@@ -13,15 +13,18 @@ import (
 )
 
 func normalizeDatabasePathCase(path string) (string, error) {
-	path = normalizeWindowsVolumeCase(path)
 	caseSensitive, known, err := windowsDirectoryCaseSensitivity(filepath.Dir(path))
 	if err != nil {
 		return "", err
 	}
-	if !known || caseSensitive {
-		return path, nil
+	if known && !caseSensitive {
+		path = filepath.Join(filepath.Dir(path), strings.ToLower(filepath.Base(path)))
 	}
-	return filepath.Join(filepath.Dir(path), strings.ToLower(filepath.Base(path))), nil
+	path, err = normalizeWindowsVolumeIdentity(path)
+	if err != nil {
+		return "", err
+	}
+	return normalizeWindowsVolumeCase(path), nil
 }
 
 func normalizeWindowsVolumeCase(path string) string {
@@ -30,6 +33,61 @@ func normalizeWindowsVolumeCase(path string) string {
 		return path
 	}
 	return strings.ToLower(volume) + path[len(volume):]
+}
+
+func normalizeWindowsVolumeIdentity(path string) (string, error) {
+	volume := filepath.VolumeName(path)
+	if volume == "" || (strings.HasPrefix(volume, `\\`) && !strings.HasPrefix(strings.ToLower(volume), `\\?\volume{`)) {
+		return path, nil
+	}
+	mountPoint, err := windowsVolumeMountPoint(path)
+	if err != nil {
+		return "", err
+	}
+	volumeName, err := windowsVolumeName(mountPoint)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(mountPoint, path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(strings.TrimSuffix(volumeName, `\`), relative), nil
+}
+
+func windowsVolumeMountPoint(path string) (string, error) {
+	probe := path
+	for {
+		pathPointer, err := windows.UTF16PtrFromString(probe)
+		if err != nil {
+			return "", err
+		}
+		buffer := make([]uint16, windows.MAX_PATH+1)
+		err = windows.GetVolumePathName(pathPointer, &buffer[0], uint32(len(buffer)))
+		if err == nil {
+			return windows.UTF16ToString(buffer), nil
+		}
+		if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+			return "", err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", err
+		}
+		probe = parent
+	}
+}
+
+func windowsVolumeName(mountPoint string) (string, error) {
+	mountPointPointer, err := windows.UTF16PtrFromString(mountPoint)
+	if err != nil {
+		return "", err
+	}
+	buffer := make([]uint16, windows.MAX_PATH+1)
+	if err := windows.GetVolumeNameForVolumeMountPoint(mountPointPointer, &buffer[0], uint32(len(buffer))); err != nil {
+		return "", err
+	}
+	return windows.UTF16ToString(buffer), nil
 }
 
 func windowsDirectoryCaseSensitivity(path string) (bool, bool, error) {
