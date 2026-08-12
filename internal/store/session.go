@@ -222,6 +222,9 @@ ORDER BY s.issue_id, r.run_id`, versionID, RunRunning, LeaseActive)
 }
 
 func requireWorkerIsolationTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool, isolated []WorkerIsolationProof) error {
+	if err := requireNoDeliveryWriteFenceTx(ctx, tx, versionID, issueIDs); err != nil {
+		return err
+	}
 	targets, pending, err := workerIsolationTargetsTx(ctx, tx, versionID, issueIDs)
 	if err != nil {
 		return err
@@ -239,6 +242,28 @@ func requireWorkerIsolationTx(ctx context.Context, tx *sql.Tx, versionID string,
 		}
 	}
 	return nil
+}
+
+func requireNoDeliveryWriteFenceTx(ctx context.Context, tx *sql.Tx, versionID string, issueIDs map[int64]bool) error {
+	rows, err := tx.QueryContext(ctx, `SELECT s.issue_id
+FROM delivery_write_fences fence
+JOIN worker_runs run ON run.run_id = fence.run_id AND run.lease_generation = fence.lease_generation
+JOIN ticket_sessions s ON s.session_id = run.session_id AND s.current_run_id = run.run_id
+WHERE s.version_id = ?`, versionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var issueID int64
+		if err := rows.Scan(&issueID); err != nil {
+			return err
+		}
+		if len(issueIDs) == 0 || issueIDs[issueID] {
+			return ErrDeliveryInProgress
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Store) WorkerIsolationTargets(ctx context.Context) ([]TicketClaim, error) {
@@ -310,6 +335,15 @@ func (s *Store) FenceWorkerIsolation(ctx context.Context, requested []TicketClai
 		}
 		if seen[target.RunID] {
 			continue
+		}
+		var writeFenced int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+    SELECT 1 FROM delivery_write_fences WHERE run_id = ? AND lease_generation = ?
+)`, target.RunID, target.LeaseGeneration).Scan(&writeFenced); err != nil {
+			return nil, err
+		}
+		if writeFenced != 0 {
+			return nil, ErrDeliveryInProgress
 		}
 		seen[target.RunID] = true
 		result, err := tx.ExecContext(ctx, `UPDATE worker_runs SET isolation_pending = 1

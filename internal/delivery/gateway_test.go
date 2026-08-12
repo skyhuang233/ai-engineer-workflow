@@ -1556,8 +1556,14 @@ func TestGatewayRejectsRemoteHeadDriftBeforeExternalWrite(t *testing.T) {
 
 func TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite(t *testing.T) {
 	ctx := context.Background()
-	db, claim := newAcceptedClaim(t, ctx)
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, claim := newCandidateClaimWithPublicationAtPath(t, ctx, databasePath, store.CandidatePublication{Repository: "owner/repo", Branch: "ticket-1", ExpectedRemoteHead: "base", Title: "ticket", Body: "evidence"})
 	defer db.Close()
+	takeoverDB, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer takeoverDB.Close()
 	remote := &blockingRemote{entered: make(chan struct{}), release: make(chan struct{})}
 	gateway := delivery.Gateway{Store: db, Remote: remote, Now: func() time.Time { return time.Date(2026, 7, 31, 0, 30, 0, 0, time.UTC) }}
 	queued, err := gateway.Submit(ctx, store.DeliveryRequest{
@@ -1583,20 +1589,14 @@ func TestLeaseTakeoverCannotCommitAcrossInflightExternalWrite(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("external write held the SQLite transaction")
 	}
-	takeover := make(chan error, 1)
-	go func() {
-		takeover <- db.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID)
-	}()
-	select {
-	case err := <-takeover:
-		t.Fatalf("lease takeover completed before external write returned: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	if err := takeoverDB.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); !errors.Is(err, store.ErrDeliveryInProgress) {
+		t.Fatalf("cross-Store lease takeover = %v, want ErrDeliveryInProgress", err)
 	}
 	close(remote.release)
 	if err := <-dispatched; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-takeover; err != nil {
+	if err := takeoverDB.MarkTicketDelivered(ctx, claim.VersionID, claim.TicketID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1835,8 +1835,12 @@ func newCandidateClaim(t *testing.T, ctx context.Context) (*store.Store, store.T
 }
 
 func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publication store.CandidatePublication) (*store.Store, store.TicketClaim) {
+	return newCandidateClaimWithPublicationAtPath(t, ctx, filepath.Join(t.TempDir(), "workflow.db"), publication)
+}
+
+func newCandidateClaimWithPublicationAtPath(t *testing.T, ctx context.Context, databasePath string, publication store.CandidatePublication) (*store.Store, store.TicketClaim) {
 	t.Helper()
-	db, claim := newAgentClaim(t, ctx)
+	db, claim := newAgentClaimAtPath(t, ctx, databasePath)
 	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC), Publication: publication}, time.Hour)
 	if err != nil {
 		db.Close()
@@ -1846,8 +1850,12 @@ func newCandidateClaimWithPublication(t *testing.T, ctx context.Context, publica
 }
 
 func newAgentClaim(t *testing.T, ctx context.Context) (*store.Store, store.TicketClaim) {
+	return newAgentClaimAtPath(t, ctx, filepath.Join(t.TempDir(), "workflow.db"))
+}
+
+func newAgentClaimAtPath(t *testing.T, ctx context.Context, databasePath string) (*store.Store, store.TicketClaim) {
 	t.Helper()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	db, err := store.Open(ctx, databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}

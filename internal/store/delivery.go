@@ -335,6 +335,18 @@ func (s *Store) executeDelivery(ctx context.Context, request DeliveryRequest, cl
 	if err != nil {
 		return DeliveryResult{}, err
 	}
+	if target.RunID != "" {
+		result, err := tx.ExecContext(ctx, `INSERT INTO delivery_write_fences(idempotency_key, run_id, lease_generation, claim_token, acquired_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(idempotency_key) DO UPDATE SET claim_token = excluded.claim_token, acquired_at = excluded.acquired_at
+WHERE delivery_write_fences.run_id = excluded.run_id AND delivery_write_fences.lease_generation = excluded.lease_generation`, normalized.IdempotencyKey, target.RunID, target.LeaseGeneration, claimToken, formatTimestamp(validatedAt))
+		if err != nil {
+			return DeliveryResult{}, err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return DeliveryResult{}, ErrFencingConflict
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryResult{}, err
 	}
@@ -721,6 +733,9 @@ AND (state = ? OR (
 	if count, _ := result.RowsAffected(); count == 0 {
 		return DeliveryOutbox{}, ErrDeliveryInProgress
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE delivery_write_fences SET claim_token = ? WHERE idempotency_key = ?`, claimToken, key); err != nil {
+		return DeliveryOutbox{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryOutbox{}, err
 	}
@@ -944,6 +959,9 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 	completed := ""
 	nextAttempt := formatTimestamp(now)
 	if state == OutboxSucceeded || state == OutboxRejected {
+		if err := deleteDeliveryWriteFenceTx(ctx, tx, key, claimToken); err != nil {
+			return err
+		}
 		completed = formatTimestamp(now)
 		if state == OutboxRejected {
 			lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
@@ -963,6 +981,9 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 		}
 	} else if attempts >= maxDeliveryAttempts {
 		state = OutboxRejected
+		if err := deleteDeliveryWriteFenceTx(ctx, tx, key, claimToken); err != nil {
+			return err
+		}
 		completed = formatTimestamp(now)
 		lastError = "delivery retries exhausted: " + lastError
 		lastError = inboxDeliveryRecoveryReason(request, key, lastError, uncertain)
@@ -970,6 +991,11 @@ func (s *Store) finishDeliveryOutbox(ctx context.Context, key, claimToken, state
 			return err
 		}
 	} else {
+		if !uncertain {
+			if err := deleteDeliveryWriteFenceTx(ctx, tx, key, claimToken); err != nil {
+				return err
+			}
+		}
 		nextAttempt = formatTimestamp(now.Add(time.Second * time.Duration(1<<(attempts-1))))
 		if retryAt.After(now) {
 			nextAttempt = formatTimestamp(retryAt.UTC())
@@ -1013,6 +1039,9 @@ func (s *Store) CompleteDeliveryOutbox(ctx context.Context, key, claimToken stri
 	if err := ensureControlPlaneDispatcherTx(ctx, tx, request, dispatcherToken, now); err != nil {
 		return err
 	}
+	if err := deleteDeliveryWriteFenceTx(ctx, tx, key, claimToken); err != nil {
+		return err
+	}
 	if deliveryResult.PullRequestNumber != 0 && request.Operation == DeliveryUpsertPR {
 		result, err := tx.ExecContext(ctx, `UPDATE ticket_deliveries SET pull_request_number = ?, pull_request_node_id = ?, remote_head = ?, updated_at = ?
 WHERE (version_id, issue_id) = (SELECT s.version_id, s.issue_id FROM worker_runs r JOIN ticket_sessions s ON s.session_id = r.session_id WHERE r.run_id = ?)
@@ -1032,6 +1061,11 @@ AND repository = ? AND branch = ?`, deliveryResult.PullRequestNumber, deliveryRe
 		return ErrFencingConflict
 	}
 	return tx.Commit()
+}
+
+func deleteDeliveryWriteFenceTx(ctx context.Context, tx *sql.Tx, key, claimToken string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM delivery_write_fences WHERE idempotency_key = ? AND claim_token = ?`, key, claimToken)
+	return err
 }
 
 func ensureControlPlaneDispatcherTx(ctx context.Context, tx *sql.Tx, request DeliveryRequest, dispatcherToken string, now time.Time) error {

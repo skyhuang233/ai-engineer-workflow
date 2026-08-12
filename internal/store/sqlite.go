@@ -21,7 +21,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 54
+	latestSchemaVersion = 55
 )
 
 var (
@@ -1504,6 +1504,23 @@ WHERE runtime.delivered = 1 AND (
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (54, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 55 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS delivery_write_fences (
+    idempotency_key TEXT PRIMARY KEY REFERENCES delivery_outbox(idempotency_key) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES worker_runs(run_id),
+    lease_generation INTEGER NOT NULL,
+    claim_token TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 55: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS delivery_write_fences_run_idx ON delivery_write_fences(run_id, lease_generation)`); err != nil {
+			return fmt.Errorf("migration 55: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (55, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
