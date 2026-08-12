@@ -29,20 +29,19 @@ func TestDatabaseIdentityNormalizesWindowsNamespaceAliases(t *testing.T) {
 	if forwardNamespaced != plain {
 		t.Fatalf("forward-slash namespace identity = %q, want %q", forwardNamespaced, plain)
 	}
-	if got, err := normalizeWindowsNamespacePath(`\\?\UNC\server\share\workflow.db`); err != nil || got != `\\server\share\workflow.db` {
-		want := `\\server\share\workflow.db`
-		t.Fatalf("UNC namespace path = %q, want %q", got, want)
-	}
-	if got, err := normalizeWindowsNamespacePath(`//?/UNC/server/share/workflow.db`); err != nil || got != `\\server\share\workflow.db` {
-		want := `\\server\share\workflow.db`
-		t.Fatalf("forward-slash UNC namespace path = %q, want %q", got, want)
-	}
-	uncPath, err := normalizeWindowsNamespacePath(`\\?\UNC\SERVER\SHARE\CaseSensitive\Workflow.db`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := normalizeWindowsVolumeCase(uncPath), `\\server\share\CaseSensitive\Workflow.db`; got != want {
-		t.Fatalf("UNC volume identity = %q, want %q", got, want)
+}
+
+func TestDatabaseIdentityRejectsNetworkPaths(t *testing.T) {
+	for _, path := range []string{
+		`\\server\share\workflow.db`,
+		`\\?\UNC\server\share\workflow.db`,
+		`\\.\UNC\server\share\workflow.db`,
+		`\??\UNC\server\share\workflow.db`,
+		`file://server/share/workflow.db`,
+	} {
+		if _, err := DatabaseIdentity(path); err == nil || !strings.Contains(err.Error(), "local filesystem") {
+			t.Fatalf("DatabaseIdentity(%q) error = %v, want local filesystem error", path, err)
+		}
 	}
 }
 

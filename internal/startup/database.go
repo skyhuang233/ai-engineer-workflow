@@ -35,6 +35,9 @@ func DatabaseFilePath(dsn string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("normalize Windows database path: %w", err)
 		}
+		if volume := filepath.VolumeName(path); strings.HasPrefix(volume, `\\`) {
+			return "", errors.New("database path must use a local filesystem")
+		}
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -140,7 +143,7 @@ func databasePath(dsn string) (string, bool, error) {
 	if runtime.GOOS == "windows" && len(parsed.Host) == 2 && parsed.Host[1] == ':' {
 		path = parsed.Host + "/" + strings.TrimLeft(path, "/")
 	} else if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
-		path = "//" + parsed.Host + "/" + strings.TrimLeft(path, "/")
+		return "", false, errors.New("database path must use a local filesystem")
 	}
 	path = filepath.FromSlash(path)
 	if runtime.GOOS == "windows" && len(path) >= 3 && (path[0] == '\\' || path[0] == '/') && path[2] == ':' {

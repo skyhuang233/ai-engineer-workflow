@@ -55,6 +55,10 @@ func (s *Store) PauseDeliveryControllerForQualityGate(ctx context.Context, claim
 		return WorkflowQuestion{}, err
 	}
 	defer tx.Rollback()
+	claim, err = resolveRunBoundClaimVersion(ctx, tx, claim)
+	if err != nil {
+		return WorkflowQuestion{}, err
+	}
 	var sessionID, repository, expiresText string
 	var ticketNumber int64
 	err = tx.QueryRowContext(ctx, `SELECT s.session_id, p.repository, t.issue_number, l.expires_at

@@ -877,6 +877,10 @@ func (s *Store) BackfillLegacyCandidateDeliverySourceDigest(ctx context.Context,
 	}
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	claim, err = resolveRunBoundClaimVersion(ctx, s.db, claim)
+	if err != nil {
+		return err
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE candidate_revisions
 SET delivery_source_digest = ?
 WHERE run_id = ? AND delivery_source_digest = ''
@@ -1197,6 +1201,10 @@ func (s *Store) DeferDeliveryControllerForCredentialPause(ctx context.Context, c
 		return err
 	}
 	defer tx.Rollback()
+	claim, err = resolveRunBoundClaimVersion(ctx, tx, claim)
+	if err != nil {
+		return err
+	}
 	if err := requireWorkerIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
 		return err
 	}
@@ -1231,6 +1239,10 @@ func (s *Store) RevalidateDeliverySource(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
+	claim, err = resolveRunBoundClaimVersion(ctx, tx, claim)
+	if err != nil {
+		return err
+	}
 	if err := requireWorkerIsolationTx(ctx, tx, claim.VersionID, map[int64]bool{claim.TicketID: true}, isolated); err != nil {
 		return err
 	}
@@ -1325,6 +1337,10 @@ func (s *Store) finishDeliveryController(ctx context.Context, claim TicketClaim,
 		return err
 	}
 	defer tx.Rollback()
+	claim, err = resolveRunBoundClaimVersion(ctx, tx, claim)
+	if err != nil {
+		return err
+	}
 	var sessionID, launchState, expiresText string
 	var createGeneration int64
 	err = tx.QueryRowContext(ctx, `SELECT s.session_id, r.launch_state, r.container_create_generation, l.expires_at

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,6 +197,61 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	}
 
 	_ = processing
+}
+
+func TestBackupDrillRequiresCurrentCandidateDeliverySource(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := testSnapshot()
+	fingerprint, err := snapshot.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkActive(ctx, version.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot := t.TempDir()
+	workspace := filepath.Join(workspaceRoot, claim.SessionID)
+	deliverySource := filepath.Join(workspaceRoot, ".delivery-sources", claim.SessionID, "round-0.git")
+	if err := os.MkdirAll(deliverySource, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deliverySource, "snapshot"), []byte("pinned source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE ticket_sessions SET workspace_path = ? WHERE session_id = ?`, workspace, claim.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), DeliverySourceDigest: strings.Repeat("a", 64), Now: now, Publication: CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(t.TempDir(), "workflow.backup.db")
+	metadata, err := db.CreateOnlineBackup(ctx, backupPath, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata.DeliverySourceReferences) != 1 || metadata.DeliverySourceReferences[0].Path != deliverySource || !metadata.DeliverySourceReferences[0].Available || metadata.DeliverySourceReferences[0].ChecksumSHA256 == "" {
+		t.Fatalf("Delivery Source backup provenance = %#v", metadata.DeliverySourceReferences)
+	}
+	if err := os.RemoveAll(deliverySource); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DrillBackup(ctx, backupPath, now.Add(time.Minute)); err == nil || !strings.Contains(err.Error(), "Delivery Source backup reference") {
+		t.Fatalf("missing Delivery Source drill error = %v", err)
+	}
 }
 
 func TestBackupAndRestorePreparedDeliveryRequireRealIsolationOnlyOnApply(t *testing.T) {

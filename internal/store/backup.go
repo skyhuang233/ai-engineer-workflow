@@ -22,13 +22,14 @@ const backupMetadataSuffix = ".metadata.json"
 // BackupMetadata is the transportable provenance for an online Control Plane
 // backup. The same reference records are persisted in SQLite for audit.
 type BackupMetadata struct {
-	BackupPath          string            `json:"backup_path"`
-	CreatedAt           time.Time         `json:"created_at"`
-	ChecksumSHA256      string            `json:"checksum_sha256"`
-	SchemaVersion       int               `json:"schema_version"`
-	WorkspaceReferences []BackupReference `json:"workspace_references"`
-	ArtifactReferences  []BackupReference `json:"artifact_references"`
-	LastDrill           BackupDrill       `json:"last_drill"`
+	BackupPath               string            `json:"backup_path"`
+	CreatedAt                time.Time         `json:"created_at"`
+	ChecksumSHA256           string            `json:"checksum_sha256"`
+	SchemaVersion            int               `json:"schema_version"`
+	WorkspaceReferences      []BackupReference `json:"workspace_references"`
+	DeliverySourceReferences []BackupReference `json:"delivery_source_references"`
+	ArtifactReferences       []BackupReference `json:"artifact_references"`
+	LastDrill                BackupDrill       `json:"last_drill"`
 }
 
 // BackupReference binds an external workspace or artifact path to the bytes
@@ -111,13 +112,13 @@ func (s *Store) CreateOnlineBackup(ctx context.Context, backupPath string, now t
 	if err != nil {
 		return BackupMetadata{}, err
 	}
-	references, err := s.backupReferences(ctx)
+	references, err := backupReferencesAt(ctx, temporaryPath)
 	if err != nil {
 		return BackupMetadata{}, err
 	}
 	metadata := BackupMetadata{
 		BackupPath: backupPath, CreatedAt: now, ChecksumSHA256: checksum, SchemaVersion: schemaVersion,
-		WorkspaceReferences: references.workspaces, ArtifactReferences: references.artifacts,
+		WorkspaceReferences: references.workspaces, DeliverySourceReferences: references.deliverySources, ArtifactReferences: references.artifacts,
 	}
 	if err := replaceFile(temporaryPath, backupPath); err != nil {
 		return BackupMetadata{}, fmt.Errorf("publish SQLite online backup: %w", err)
@@ -143,10 +144,19 @@ func (s *Store) CreateOnlineBackup(ctx context.Context, backupPath string, now t
 	return metadata, nil
 }
 
-type backupReferences struct{ workspaces, artifacts []BackupReference }
+type backupReferences struct{ workspaces, deliverySources, artifacts []BackupReference }
 
-func (s *Store) backupReferences(ctx context.Context) (backupReferences, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT workspace_path, codex_state_path FROM ticket_sessions WHERE workspace_path != '' OR codex_state_path != ''`)
+func backupReferencesAt(ctx context.Context, path string) (backupReferences, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return backupReferences{}, err
+	}
+	defer db.Close()
+	return backupReferencesFromDB(ctx, db)
+}
+
+func backupReferencesFromDB(ctx context.Context, db *sql.DB) (backupReferences, error) {
+	rows, err := db.QueryContext(ctx, `SELECT workspace_path, codex_state_path FROM ticket_sessions WHERE workspace_path != '' OR codex_state_path != ''`)
 	if err != nil {
 		return backupReferences{}, err
 	}
@@ -162,7 +172,34 @@ func (s *Store) backupReferences(ctx context.Context) (backupReferences, error) 
 	if err := rows.Err(); err != nil {
 		return backupReferences{}, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT diagnostics_path FROM run_diagnostics WHERE diagnostics_path != ''`)
+	rows, err = db.QueryContext(ctx, `SELECT s.workspace_path, s.session_id, run.recovery_epoch
+FROM ticket_sessions s
+JOIN worker_runs run ON run.run_id = s.accepted_candidate_run_id
+JOIN candidate_revisions candidate ON candidate.run_id = s.accepted_candidate_run_id
+WHERE s.state = ? AND candidate.delivery_source_digest != ''`, SessionRunning)
+	if err != nil {
+		return backupReferences{}, err
+	}
+	for rows.Next() {
+		var workspace, sessionID string
+		var recoveryEpoch int64
+		if err := rows.Scan(&workspace, &sessionID, &recoveryEpoch); err != nil {
+			rows.Close()
+			return backupReferences{}, err
+		}
+		if strings.TrimSpace(workspace) == "" {
+			rows.Close()
+			return backupReferences{}, errors.New("current Candidate has no workspace path for Delivery Source provenance")
+		}
+		references.deliverySources = append(references.deliverySources, referenceForPath(filepath.Join(filepath.Dir(workspace), ".delivery-sources", sessionID, fmt.Sprintf("round-%d.git", recoveryEpoch))))
+	}
+	if err := rows.Close(); err != nil {
+		return backupReferences{}, err
+	}
+	if err := rows.Err(); err != nil {
+		return backupReferences{}, err
+	}
+	rows, err = db.QueryContext(ctx, `SELECT diagnostics_path FROM run_diagnostics WHERE diagnostics_path != ''`)
 	if err != nil {
 		return backupReferences{}, err
 	}
@@ -178,6 +215,10 @@ func (s *Store) backupReferences(ctx context.Context) (backupReferences, error) 
 		return backupReferences{}, err
 	}
 	references.workspaces, err = checksumReferences(references.workspaces)
+	if err != nil {
+		return backupReferences{}, err
+	}
+	references.deliverySources, err = checksumReferences(references.deliverySources)
 	if err != nil {
 		return backupReferences{}, err
 	}
@@ -277,7 +318,7 @@ ON CONFLICT(backup_path) DO UPDATE SET checksum_sha256 = excluded.checksum_sha25
 	for _, record := range []struct {
 		kind string
 		refs []BackupReference
-	}{{"workspace", metadata.WorkspaceReferences}, {"artifact", metadata.ArtifactReferences}} {
+	}{{"workspace", metadata.WorkspaceReferences}, {"delivery_source", metadata.DeliverySourceReferences}, {"artifact", metadata.ArtifactReferences}} {
 		for _, reference := range record.refs {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO control_plane_backup_references(backup_path, kind, reference_path, checksum_sha256, available) VALUES (?, ?, ?, ?, ?)`, metadata.BackupPath, record.kind, reference.Path, reference.ChecksumSHA256, boolInt(reference.Available)); err != nil {
 				return err
@@ -513,6 +554,33 @@ func verifyBackup(ctx context.Context, path string, metadata BackupMetadata) err
 	}
 	if version != metadata.SchemaVersion {
 		return fmt.Errorf("SQLite backup schema version mismatch: got %d want %d", version, metadata.SchemaVersion)
+	}
+	references, err := backupReferencesAt(ctx, path)
+	if err != nil {
+		return fmt.Errorf("read Delivery Source backup provenance: %w", err)
+	}
+	if err := verifyDeliverySourceReferences(metadata.DeliverySourceReferences, references.deliverySources); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyDeliverySourceReferences(recorded, current []BackupReference) error {
+	byPath := make(map[string]BackupReference, len(recorded))
+	for _, reference := range recorded {
+		byPath[reference.Path] = reference
+	}
+	if len(byPath) != len(current) {
+		return errors.New("Delivery Source backup provenance is incomplete")
+	}
+	for _, reference := range current {
+		stored, ok := byPath[reference.Path]
+		if !ok || !stored.Available || !reference.Available {
+			return fmt.Errorf("Delivery Source backup reference %q is unavailable", reference.Path)
+		}
+		if stored.ChecksumSHA256 == "" || stored.ChecksumSHA256 != reference.ChecksumSHA256 {
+			return fmt.Errorf("Delivery Source backup reference %q checksum mismatch", reference.Path)
+		}
 	}
 	return nil
 }

@@ -21,7 +21,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 55
+	latestSchemaVersion = 56
 )
 
 var (
@@ -1527,6 +1527,30 @@ WHERE runtime.delivered = 1 AND (
 			return fmt.Errorf("migration 55: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (55, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 56 {
+		statements := []string{
+			`ALTER TABLE control_plane_backup_references RENAME TO control_plane_backup_references_v55`,
+			`CREATE TABLE control_plane_backup_references (
+    backup_path TEXT NOT NULL REFERENCES control_plane_backups(backup_path),
+    kind TEXT NOT NULL CHECK (kind IN ('workspace', 'delivery_source', 'artifact')),
+    reference_path TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL DEFAULT '',
+    available INTEGER NOT NULL CHECK (available IN (0, 1)),
+    PRIMARY KEY (backup_path, kind, reference_path)
+)`,
+			`INSERT INTO control_plane_backup_references(backup_path, kind, reference_path, checksum_sha256, available)
+SELECT backup_path, kind, reference_path, checksum_sha256, available FROM control_plane_backup_references_v55`,
+			`DROP TABLE control_plane_backup_references_v55`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 56: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (56, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

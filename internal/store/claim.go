@@ -669,6 +669,11 @@ func (s *Store) AcquireWorkerContainerCreateFence(ctx context.Context, claim Tic
 		return nil, err
 	}
 	defer tx.Rollback()
+	claim, err = resolveRunBoundClaimVersion(ctx, tx, claim)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE worker_runs
 SET container_create_generation = container_create_generation + 1, container_create_pending = 1
 WHERE run_id = ? AND lease_generation = ? AND state = ?
@@ -826,8 +831,12 @@ func (s *Store) RequireCurrentDeliveryLease(ctx context.Context, claim TicketCla
 	}
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	claim, err := resolveRunBoundClaimVersion(ctx, s.db, claim)
+	if err != nil {
+		return err
+	}
 	var current bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
@@ -855,8 +864,12 @@ func (s *Store) WithCurrentAgentLease(ctx context.Context, claim TicketClaim, no
 	}
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
+	claim, err := resolveRunBoundClaimVersion(ctx, s.db, claim)
+	if err != nil {
+		return false, err
+	}
 	var current bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
@@ -1085,14 +1098,21 @@ func (s *Store) WorkerContainerIsolationTarget(ctx context.Context, requested Ti
 	if requested.VersionID == "" || requested.TicketID == 0 || requested.RunID == "" || requested.LeaseGeneration <= 0 || requested.LeaseToken == "" {
 		return TicketClaim{}, ErrInvalidClaim
 	}
+	resolved, err := resolveRunBoundClaimVersion(ctx, s.db, requested)
+	if err != nil {
+		if errors.Is(err, ErrInvalidClaim) {
+			return TicketClaim{}, ErrNotFound
+		}
+		return TicketClaim{}, err
+	}
 	var claim TicketClaim
 	var expiresText string
-	err := s.db.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id, s.session_id, r.run_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
+	err = s.db.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id, s.session_id, r.run_id, r.lease_generation, r.container_create_generation, l.lease_token, l.expires_at
 FROM ticket_sessions s
 JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
 WHERE s.version_id = ? AND s.issue_id = ? AND r.run_id = ? AND r.lease_generation = ? AND l.lease_token = ? AND r.state = ?
-AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))`, requested.VersionID, requested.TicketID, requested.RunID, requested.LeaseGeneration, requested.LeaseToken, RunRunning).
+AND (r.launch_state = 'launched' OR (r.launch_state = 'ready' AND r.prelaunch_reserved = 1))`, resolved.VersionID, resolved.TicketID, resolved.RunID, resolved.LeaseGeneration, resolved.LeaseToken, RunRunning).
 		Scan(&claim.VersionID, &claim.TicketID, &claim.SessionID, &claim.RunID, &claim.LeaseGeneration, &claim.IsolationGeneration, &claim.LeaseToken, &expiresText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound
@@ -1112,20 +1132,49 @@ func (s *Store) DeliveryContainerIsolationTarget(ctx context.Context, versionID 
 		return TicketClaim{}, ErrInvalidClaim
 	}
 	var requested TicketClaim
-	err := s.db.QueryRowContext(ctx, `SELECT r.run_id, r.lease_generation, l.lease_token
+	err := s.db.QueryRowContext(ctx, `SELECT s.version_id, r.run_id, r.lease_generation, l.lease_token
 FROM ticket_sessions s JOIN worker_runs r ON r.run_id = s.current_run_id
 JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
-WHERE s.version_id = ? AND s.issue_id = ? AND r.run_kind = ?`, versionID, issueID, RunDelivery).
-		Scan(&requested.RunID, &requested.LeaseGeneration, &requested.LeaseToken)
+JOIN plan_versions session_version ON session_version.version_id = s.version_id
+JOIN plan_versions requested_version ON requested_version.version_id = ? AND requested_version.plan_id = session_version.plan_id
+WHERE s.issue_id = ? AND r.run_kind = ?`, versionID, issueID, RunDelivery).
+		Scan(&requested.VersionID, &requested.RunID, &requested.LeaseGeneration, &requested.LeaseToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TicketClaim{}, ErrNotFound
 	}
 	if err != nil {
 		return TicketClaim{}, err
 	}
-	requested.VersionID = versionID
 	requested.TicketID = issueID
 	return s.WorkerContainerIsolationTarget(ctx, requested)
+}
+
+type claimRowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func resolveRunBoundClaimVersion(ctx context.Context, query claimRowQuerier, claim TicketClaim) (TicketClaim, error) {
+	if claim.VersionID == "" || claim.TicketID == 0 || claim.RunID == "" || claim.LeaseToken == "" || claim.LeaseGeneration <= 0 {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	var versionID string
+	var issueID int64
+	err := query.QueryRowContext(ctx, `SELECT s.version_id, s.issue_id
+FROM worker_runs r
+JOIN ticket_sessions s ON s.session_id = r.session_id AND s.current_run_id = r.run_id
+JOIN run_leases l ON l.run_id = r.run_id AND l.generation = r.lease_generation
+WHERE r.run_id = ? AND r.lease_generation = ? AND l.lease_token = ?`, claim.RunID, claim.LeaseGeneration, claim.LeaseToken).Scan(&versionID, &issueID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	if issueID != claim.TicketID {
+		return TicketClaim{}, ErrInvalidClaim
+	}
+	claim.VersionID = versionID
+	return claim, nil
 }
 
 func (s *Store) MarkTicketDeliveredAtMergeAfterIsolation(ctx context.Context, versionID string, issueID int64, mergeCommit string, isolated WorkerIsolationProof) (bool, error) {

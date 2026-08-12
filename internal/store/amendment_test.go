@@ -83,11 +83,24 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 		{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}},
 		{ID: 2, Number: 12, Title: "second", Labels: []string{plan.TicketLabel}},
 		{ID: 3, Number: 13, Title: "unaffected", Labels: []string{plan.TicketLabel}},
+		{ID: 5, Number: 15, Title: "unaffected gate", Labels: []string{plan.TicketLabel}},
 	}, map[int64][]plan.Issue{2: {{ID: 1, Number: 11, Labels: []string{plan.TicketLabel}}}})
 	primaryVersion := activateAmendmentSnapshot(t, ctx, db, primary)
 	secondary := amendmentSnapshot(20, []plan.Issue{{ID: 4, Number: 21, Title: "other plan", Labels: []string{plan.TicketLabel}}}, nil)
 	secondaryVersion := activateAmendmentSnapshot(t, ctx, db, secondary)
-	unaffectedClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: primaryVersion.ID, TicketID: 3, Owner: "agent-3", MaxParallelRuns: 3, LeaseTTL: time.Hour, Now: now})
+	unaffectedClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: primaryVersion.ID, TicketID: 3, Owner: "agent-3", MaxParallelRuns: 4, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unaffectedClaim, err = db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: unaffectedClaim.RunID, LeaseToken: unaffectedClaim.LeaseToken, CodexSessionID: "codex-3", CommitSHA: "accepted-3", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: primary.Repository, Branch: "ticket-3", ExpectRemoteAbsent: true, Title: "ticket-3"}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unaffectedGateClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: primaryVersion.ID, TicketID: 5, Owner: "agent-5", MaxParallelRuns: 4, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unaffectedGateClaim, err = db.AcceptCandidateForDelivery(ctx, CandidateRevision{RunID: unaffectedGateClaim.RunID, LeaseToken: unaffectedGateClaim.LeaseToken, CodexSessionID: "codex-5", CommitSHA: "accepted-5", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: CandidatePublication{Repository: primary.Repository, Branch: "ticket-5", ExpectRemoteAbsent: true, Title: "ticket-5"}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +120,7 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 		}
 	}
 
-	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 2, now)
+	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 3, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,16 +134,15 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if err := db.AnswerWorkflowQuestion(ctx, primary.Repository, proposal.QuestionID, `{"action":"reject"}`, now); err != nil {
 		t.Fatalf("repeated rejection = %v", err)
 	}
-	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 3, now)
+	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 4, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(frontier) != 2 || frontier[0].VersionID != primaryVersion.ID || frontier[0].Ticket.IssueID != 1 {
 		t.Fatalf("rejected amendment frontier = %#v, want restored primary ticket then unaffected ticket", frontier)
 	}
-	continued, err := db.CurrentClaim(ctx, primaryVersion.ID, 3)
-	if err != nil || continued.RunID != unaffectedClaim.RunID || continued.LeaseToken != unaffectedClaim.LeaseToken {
-		t.Fatalf("unaffected claim after rejection = %#v, %v", continued, err)
+	if err := db.RequireCurrentDeliveryLease(ctx, unaffectedClaim, now); err != nil {
+		t.Fatalf("unaffected delivery claim after rejection: %v", err)
 	}
 
 	proposal, err = db.ProposePlanAmendment(ctx, PlanAmendment{
@@ -155,12 +167,25 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if updated.ID == primaryVersion.ID {
 		t.Fatal("approved amendment retained the retired plan version")
 	}
-	continued, err = db.CurrentClaim(ctx, updated.ID, 3)
-	if err != nil || continued.RunID != unaffectedClaim.RunID || continued.LeaseToken != unaffectedClaim.LeaseToken {
-		t.Fatalf("unaffected claim after approval = %#v, %v", continued, err)
+	continued, err := db.TicketSession(ctx, updated.ID, 3)
+	if err != nil || continued.SessionID != unaffectedClaim.SessionID {
+		t.Fatalf("unaffected session after approval = %#v, %v", continued, err)
 	}
-	if _, err := db.CurrentClaim(ctx, primaryVersion.ID, 3); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("source version retained unaffected claim: %v", err)
+	if _, err := db.TicketSession(ctx, primaryVersion.ID, 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("source version retained unaffected session: %v", err)
+	}
+	if err := db.RequireCurrentDeliveryLease(ctx, unaffectedClaim, now.Add(time.Minute)); err != nil {
+		t.Fatalf("source-version delivery claim lost after approval: %v", err)
+	}
+	if err := db.CompleteDeliveryController(ctx, unaffectedClaim, now.Add(time.Minute)); err != nil {
+		t.Fatalf("source-version delivery completion after approval: %v", err)
+	}
+	gateQuestion, err := db.PauseDeliveryControllerForQualityGate(ctx, unaffectedGateClaim, QualityGate{GateID: "owner-decision", Action: QualityGateAskUser, Reason: "owner input required", AllowedAnswers: []string{"approve", "reject"}}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("source-version quality gate after approval: %v", err)
+	}
+	if gateQuestion.VersionID != updated.ID {
+		t.Fatalf("quality gate version = %q, want %q", gateQuestion.VersionID, updated.ID)
 	}
 	updatedFrontier, err := db.ReadyFrontier(ctx, updated.ID, 3, now)
 	if err != nil {
