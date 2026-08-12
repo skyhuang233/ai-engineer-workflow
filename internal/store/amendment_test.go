@@ -13,7 +13,7 @@ import (
 
 func TestPlanAmendmentIsolatesAffectedAgentBeforeRevokingLease(t *testing.T) {
 	ctx := context.Background()
-	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestPlanAmendmentIsolatesAffectedAgentBeforeRevokingLease(t *testing.T) {
 
 func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *testing.T) {
 	ctx := context.Background()
-	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -82,10 +82,15 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	primary := amendmentSnapshot(10, []plan.Issue{
 		{ID: 1, Number: 11, Title: "first", Labels: []string{plan.TicketLabel}},
 		{ID: 2, Number: 12, Title: "second", Labels: []string{plan.TicketLabel}},
+		{ID: 3, Number: 13, Title: "unaffected", Labels: []string{plan.TicketLabel}},
 	}, map[int64][]plan.Issue{2: {{ID: 1, Number: 11, Labels: []string{plan.TicketLabel}}}})
 	primaryVersion := activateAmendmentSnapshot(t, ctx, db, primary)
-	secondary := amendmentSnapshot(20, []plan.Issue{{ID: 3, Number: 21, Title: "unaffected", Labels: []string{plan.TicketLabel}}}, nil)
+	secondary := amendmentSnapshot(20, []plan.Issue{{ID: 4, Number: 21, Title: "other plan", Labels: []string{plan.TicketLabel}}}, nil)
 	secondaryVersion := activateAmendmentSnapshot(t, ctx, db, secondary)
+	unaffectedClaim, err := db.ClaimReady(ctx, ClaimRequest{VersionID: primaryVersion.ID, TicketID: 3, Owner: "agent-3", MaxParallelRuns: 3, LeaseTTL: time.Hour, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	proposal, err := db.ProposePlanAmendment(ctx, PlanAmendment{
 		VersionID:          primaryVersion.ID,
@@ -102,11 +107,11 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 		}
 	}
 
-	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 1, now)
+	frontier, err := db.GlobalReadyFrontier(ctx, primary.Repository, 2, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(frontier) != 1 || frontier[0].VersionID != secondaryVersion.ID || frontier[0].Ticket.IssueID != 3 {
+	if len(frontier) != 1 || frontier[0].VersionID != secondaryVersion.ID || frontier[0].Ticket.IssueID != 4 {
 		t.Fatalf("pending amendment frontier = %#v, want only unaffected ticket", frontier)
 	}
 
@@ -116,12 +121,16 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if err := db.AnswerWorkflowQuestion(ctx, primary.Repository, proposal.QuestionID, `{"action":"reject"}`, now); err != nil {
 		t.Fatalf("repeated rejection = %v", err)
 	}
-	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 2, now)
+	frontier, err = db.GlobalReadyFrontier(ctx, primary.Repository, 3, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(frontier) != 2 || frontier[0].VersionID != primaryVersion.ID || frontier[0].Ticket.IssueID != 1 {
 		t.Fatalf("rejected amendment frontier = %#v, want restored primary ticket then unaffected ticket", frontier)
+	}
+	continued, err := db.CurrentClaim(ctx, primaryVersion.ID, 3)
+	if err != nil || continued.RunID != unaffectedClaim.RunID || continued.LeaseToken != unaffectedClaim.LeaseToken {
+		t.Fatalf("unaffected claim after rejection = %#v, %v", continued, err)
 	}
 
 	proposal, err = db.ProposePlanAmendment(ctx, PlanAmendment{
@@ -146,7 +155,14 @@ func TestPlanAmendmentPausesOnlyAffectedSubgraphAndAppliesOneApprovedVersion(t *
 	if updated.ID == primaryVersion.ID {
 		t.Fatal("approved amendment retained the retired plan version")
 	}
-	updatedFrontier, err := db.ReadyFrontier(ctx, updated.ID, 2, now)
+	continued, err = db.CurrentClaim(ctx, updated.ID, 3)
+	if err != nil || continued.RunID != unaffectedClaim.RunID || continued.LeaseToken != unaffectedClaim.LeaseToken {
+		t.Fatalf("unaffected claim after approval = %#v, %v", continued, err)
+	}
+	if _, err := db.CurrentClaim(ctx, primaryVersion.ID, 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("source version retained unaffected claim: %v", err)
+	}
+	updatedFrontier, err := db.ReadyFrontier(ctx, updated.ID, 3, now)
 	if err != nil {
 		t.Fatal(err)
 	}

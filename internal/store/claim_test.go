@@ -2871,6 +2871,41 @@ func TestMarkTicketDeliveredUnlocksDependentTicket(t *testing.T) {
 	}
 }
 
+func TestMarkTicketDeliveredRequiresExplicitHumanQualityGateAnswer(t *testing.T) {
+	ctx := context.Background()
+	db, delivery, now := newDeliveryFenceTestClaim(t, ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	defer db.Close()
+	question, err := db.PauseDeliveryControllerForQualityGate(ctx, delivery, QualityGate{
+		GateID:         "gate-17",
+		FindingID:      "finding-42",
+		Action:         QualityGateAskUser,
+		Reason:         "choose the migration strategy",
+		AllowedAnswers: []string{"proceed"},
+	}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := db.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.TicketID, "merge-commit")
+	if err != nil || marked {
+		t.Fatalf("delivery with open human gate = marked %t, %v", marked, err)
+	}
+	open, err := db.WorkflowQuestion(ctx, "owner/repo", question.ID)
+	if err != nil || open.State != "open" || open.Answer != "" {
+		t.Fatalf("human gate after merge observation = %#v, %v", open, err)
+	}
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", question.ID, "proceed", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	marked, err = db.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.TicketID, "merge-commit")
+	if err != nil || !marked {
+		t.Fatalf("delivery after explicit human answer = marked %t, %v", marked, err)
+	}
+	answered, err := db.WorkflowQuestion(ctx, "owner/repo", question.ID)
+	if err != nil || answered.State != "answered" || answered.Answer != "proceed" {
+		t.Fatalf("human gate after explicit answer and delivery = %#v, %v", answered, err)
+	}
+}
+
 func TestMarkTicketDeliveredRepairsProjectedQuestionsIdempotently(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
@@ -2901,7 +2936,7 @@ func TestMarkTicketDeliveredRepairsProjectedQuestionsIdempotently(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"needs_attention", "quality_gate", "closed_unmerged_impact"} {
+	for _, kind := range []string{"needs_attention", "closed_unmerged_impact"} {
 		if err := ensureWorkflowQuestionTx(ctx, tx, snapshot.Repository, version.ID, 1, kind, "stale delivery recovery", now.Add(time.Second)); err != nil {
 			t.Fatal(err)
 		}

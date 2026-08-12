@@ -432,8 +432,14 @@ func (s *Store) applyPlanAmendmentTx(ctx context.Context, tx *sql.Tx, amendmentI
 	if err := target.Validate(); err != nil {
 		return err
 	}
-	if err := requireWorkerIsolationTx(ctx, tx, sourceVersionID, nil, isolated); err != nil {
+	affectedIDs, err := planAmendmentAffectedIDsTx(ctx, tx, amendmentID, sourceVersionID)
+	if err != nil {
 		return err
+	}
+	if len(affectedIDs) > 0 {
+		if err := requireWorkerIsolationTx(ctx, tx, sourceVersionID, affectedIDs, isolated); err != nil {
+			return err
+		}
 	}
 	var planID int64
 	var repository string
@@ -470,13 +476,26 @@ func (s *Store) applyPlanAmendmentTx(ctx context.Context, tx *sql.Tx, amendmentI
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = 'running' AND session_id IN (SELECT session_id FROM ticket_sessions WHERE version_id = ?)`, formatTimestamp(now), sourceVersionID); err != nil {
+	if err := carryForwardUnaffectedAmendmentStateTx(ctx, tx, amendmentID, sourceVersionID, versionID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = 'active' AND session_id IN (SELECT session_id FROM ticket_sessions WHERE version_id = ?)`, sourceVersionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_runs SET state = 'cancelled', finished_at = ? WHERE state = 'running' AND session_id IN (
+SELECT session.session_id FROM ticket_sessions session
+JOIN plan_amendment_pauses pause ON pause.version_id = session.version_id AND pause.issue_id = session.issue_id
+WHERE pause.amendment_id = ? AND session.version_id = ?
+)`, formatTimestamp(now), amendmentID, sourceVersionID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET owner = '', updated_at = ? WHERE version_id = ?`, formatTimestamp(now), sourceVersionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE run_leases SET state = 'revoked' WHERE state = 'active' AND session_id IN (
+SELECT session.session_id FROM ticket_sessions session
+JOIN plan_amendment_pauses pause ON pause.version_id = session.version_id AND pause.issue_id = session.issue_id
+WHERE pause.amendment_id = ? AND session.version_id = ?
+)`, amendmentID, sourceVersionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_sessions SET owner = '', updated_at = ? WHERE version_id = ? AND issue_id IN (
+SELECT issue_id FROM plan_amendment_pauses WHERE amendment_id = ? AND version_id = ?
+)`, formatTimestamp(now), sourceVersionID, amendmentID, sourceVersionID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE plans SET current_version_id = ?, state = ?, updated_at = ? WHERE id = ?`, versionID, StateActive, formatTimestamp(now), planID); err != nil {
@@ -490,4 +509,47 @@ func (s *Store) applyPlanAmendmentTx(ctx context.Context, tx *sql.Tx, amendmentI
 	}
 	_, err = s.queueWorkflowInboxProjectionTransitionTx(ctx, tx, repository, now)
 	return err
+}
+
+func planAmendmentAffectedIDsTx(ctx context.Context, tx *sql.Tx, amendmentID, sourceVersionID string) (map[int64]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT issue_id FROM plan_amendment_pauses WHERE amendment_id = ? AND version_id = ?`, amendmentID, sourceVersionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	affected := map[int64]bool{}
+	for rows.Next() {
+		var issueID int64
+		if err := rows.Scan(&issueID); err != nil {
+			return nil, err
+		}
+		affected[issueID] = true
+	}
+	return affected, rows.Err()
+}
+
+func carryForwardUnaffectedAmendmentStateTx(ctx context.Context, tx *sql.Tx, amendmentID, sourceVersionID, targetVersionID string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE ticket_runtime AS target
+SET state = (SELECT source.state FROM ticket_runtime source WHERE source.version_id = ? AND source.issue_id = target.issue_id),
+    delivered = (SELECT source.delivered FROM ticket_runtime source WHERE source.version_id = ? AND source.issue_id = target.issue_id),
+    updated_at = (SELECT source.updated_at FROM ticket_runtime source WHERE source.version_id = ? AND source.issue_id = target.issue_id)
+WHERE target.version_id = ?
+AND EXISTS (SELECT 1 FROM ticket_runtime source WHERE source.version_id = ? AND source.issue_id = target.issue_id)
+AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = target.issue_id)`, sourceVersionID, sourceVersionID, sourceVersionID, targetVersionID, sourceVersionID, amendmentID); err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		`UPDATE ticket_deliveries SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = ticket_deliveries.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = ticket_deliveries.issue_id)`,
+		`UPDATE review_feedback_events SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = review_feedback_events.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = review_feedback_events.issue_id)`,
+		`UPDATE pull_request_checks SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = pull_request_checks.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = pull_request_checks.issue_id)`,
+		`UPDATE merge_ready_revalidations SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = merge_ready_revalidations.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = merge_ready_revalidations.issue_id)`,
+		`UPDATE quality_gate_questions SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = quality_gate_questions.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = quality_gate_questions.issue_id)`,
+		`UPDATE workflow_questions SET version_id = ? WHERE version_id = ? AND issue_id != 0 AND state = 'open' AND kind != 'plan_amendment' AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = workflow_questions.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = workflow_questions.issue_id)`,
+		`UPDATE ticket_sessions SET version_id = ? WHERE version_id = ? AND EXISTS (SELECT 1 FROM plan_tickets target WHERE target.version_id = ? AND target.issue_id = ticket_sessions.issue_id) AND NOT EXISTS (SELECT 1 FROM plan_amendment_pauses pause WHERE pause.amendment_id = ? AND pause.issue_id = ticket_sessions.issue_id)`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, targetVersionID, sourceVersionID, targetVersionID, amendmentID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

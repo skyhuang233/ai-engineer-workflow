@@ -355,8 +355,16 @@ WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_g
 AND state = 'answered' AND answer = 'resolved by delivery' AND answered_at != ''`, version.ID, 1).Scan(&repairedQuestions); err != nil {
 		t.Fatal(err)
 	}
-	if repairedQuestions != 3 {
+	if repairedQuestions != 2 {
 		t.Fatalf("repaired delivered questions after migration = %d", repairedQuestions)
+	}
+	var preservedHumanGates int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_questions
+WHERE version_id = ? AND issue_id = ? AND kind = 'quality_gate' AND state = 'open'`, version.ID, 1).Scan(&preservedHumanGates); err != nil {
+		t.Fatal(err)
+	}
+	if preservedHumanGates != 1 {
+		t.Fatalf("open human gates after migration = %d, want 1", preservedHumanGates)
 	}
 	var remainingFreezes int
 	if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plan_freezes WHERE version_id = ? AND issue_id = ?`, version.ID, 1).Scan(&remainingFreezes); err != nil {

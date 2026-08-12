@@ -1148,6 +1148,16 @@ func (s *Store) markTicketDelivered(ctx context.Context, versionID string, issue
 	if err := requireWorkerIsolationTx(ctx, tx, versionID, map[int64]bool{issueID: true}, isolated); err != nil {
 		return false, err
 	}
+	var unresolvedHumanGate int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+SELECT 1 FROM workflow_questions
+WHERE version_id = ? AND issue_id = ? AND kind = 'quality_gate' AND state = 'open'
+)`, versionID, issueID).Scan(&unresolvedHumanGate); err != nil {
+		return false, err
+	}
+	if unresolvedHumanGate != 0 {
+		return false, nil
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE ticket_runtime SET state = ?, delivered = 1, updated_at = ?
 WHERE version_id = ? AND issue_id = ? AND delivered = 0`, plan.StateDelivered, nowText, versionID, issueID)
 	if err != nil {
@@ -1226,7 +1236,7 @@ WHERE ticket.version_id = ? AND ticket.issue_id = ?`, versionID, issueID).Scan(&
 func resolveDeliveredAttentionTx(ctx context.Context, tx *sql.Tx, versionID string, issueID int64, nowText string) (int64, error) {
 	result, err := tx.ExecContext(ctx, `UPDATE workflow_questions
 SET state = 'answered', answer = ?, answered_at = ?
-WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'quality_gate', 'closed_unmerged_impact') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID)
+WHERE version_id = ? AND issue_id = ? AND kind IN ('needs_attention', 'closed_unmerged_impact') AND state = 'open'`, "resolved by delivery", nowText, versionID, issueID)
 	if err != nil {
 		return 0, err
 	}

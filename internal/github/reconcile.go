@@ -63,8 +63,12 @@ func (r DeliveredReconciler) reconcileTicket(ctx context.Context, delivery store
 	}
 	switch deliveryState.State {
 	case pullRequestDelivered:
-		if err := r.markDelivered(ctx, delivery, deliveryState.MergeCommit); err != nil {
+		marked, err := r.markDelivered(ctx, delivery, deliveryState.MergeCommit)
+		if err != nil {
 			return pullRequestPending, wrapPollStoreError(err)
+		}
+		if !marked {
+			return pullRequestPending, nil
 		}
 	case pullRequestClosedUnmerged:
 		if err := r.freezeClosedPullRequest(ctx, delivery); err != nil {
@@ -82,15 +86,19 @@ func (r DeliveredReconciler) freezeClosedPullRequest(ctx context.Context, delive
 	})
 }
 
-func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) error {
-	return workerisolation.RetryWorkerTransition(ctx, r.Store, r.Isolator, func(isolated []store.WorkerIsolationProof) error {
+func (r DeliveredReconciler) markDelivered(ctx context.Context, delivery store.TicketDelivery, mergeCommit string) (bool, error) {
+	marked := false
+	err := workerisolation.RetryWorkerTransition(ctx, r.Store, r.Isolator, func(isolated []store.WorkerIsolationProof) error {
 		if len(isolated) == 0 {
-			_, err := r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
+			var err error
+			marked, err = r.Store.MarkTicketDeliveredAtMerge(ctx, delivery.VersionID, delivery.IssueID, mergeCommit)
 			return err
 		}
-		_, err := r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, isolated[len(isolated)-1])
+		var err error
+		marked, err = r.Store.MarkTicketDeliveredAtMergeAfterIsolation(ctx, delivery.VersionID, delivery.IssueID, mergeCommit, isolated[len(isolated)-1])
 		return err
 	})
+	return marked, err
 }
 
 type pullRequestState int

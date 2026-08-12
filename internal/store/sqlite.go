@@ -1402,7 +1402,7 @@ WHERE runtime.delivered = 1 AND (
     EXISTS (
         SELECT 1 FROM workflow_questions question
         WHERE question.version_id = runtime.version_id AND question.issue_id = runtime.issue_id
-        AND question.kind IN ('needs_attention', 'quality_gate', 'closed_unmerged_impact') AND question.state = 'open'
+        AND question.kind IN ('needs_attention', 'closed_unmerged_impact') AND question.state = 'open'
     ) OR EXISTS (
         SELECT 1 FROM plan_freezes freeze
         WHERE freeze.version_id = runtime.version_id AND freeze.issue_id = runtime.issue_id
