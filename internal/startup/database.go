@@ -30,8 +30,9 @@ func DatabaseIdentity(dsn string) (string, error) {
 		return "", fmt.Errorf("canonicalize database path: %w", err)
 	}
 	canonical = filepath.Clean(canonical)
-	if runtime.GOOS == "windows" {
-		canonical = strings.ToLower(canonical)
+	canonical, err = normalizeDatabasePathCase(canonical)
+	if err != nil {
+		return "", fmt.Errorf("normalize database path case: %w", err)
 	}
 	return canonical, nil
 }
