@@ -1,0 +1,24 @@
+name: workflow-contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify repository contract
+        shell: bash
+        run: |
+          test -f .workflow/repository.json
+          jq --exit-status '.schema_version == 1 and .contract_version == "1" and .required_check == "workflow-contract"' .workflow/repository.json
+          test -f docs/agents/issue-tracker.md
+          test -f docs/agents/domain.md
+          grep --fixed-strings '<!-- agent-workflow:start -->' AGENTS.md
+          grep --fixed-strings '<!-- agent-workflow:end -->' AGENTS.md

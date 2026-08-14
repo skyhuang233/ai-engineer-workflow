@@ -1,0 +1,55 @@
+package githubcredential
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestVerifierChecksIdentityScopesAndOwner(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatal("missing bearer credential")
+		}
+		w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+		_, _ = w.Write([]byte(`{"login":"SkyHuang233","id":42}`))
+	}))
+	defer server.Close()
+	verification, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), "secret", "skyhuang233")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Login != "SkyHuang233" || verification.Owner != "skyhuang233" || len(verification.Scopes) != 2 {
+		t.Fatalf("verification = %#v", verification)
+	}
+	if len(verification.FingerprintSHA256) != 64 {
+		t.Fatalf("fingerprint = %q", verification.FingerprintSHA256)
+	}
+}
+
+func TestVerifierClassifiesMissingScopeWithoutLeakingToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "repo")
+		_, _ = w.Write([]byte(`{"login":"owner","id":1}`))
+	}))
+	defer server.Close()
+	token := "super-secret-token"
+	_, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), token, "owner")
+	if !errors.Is(err, ErrScopeDeficient) {
+		t.Fatalf("error = %v", err)
+	}
+	if err != nil && contains(err.Error(), token) {
+		t.Fatal("token leaked in error")
+	}
+}
+
+func contains(value, part string) bool {
+	for i := 0; i+len(part) <= len(value); i++ {
+		if value[i:i+len(part)] == part {
+			return true
+		}
+	}
+	return false
+}

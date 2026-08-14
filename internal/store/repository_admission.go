@@ -1,0 +1,42 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+)
+
+type RepositoryAdmission struct {
+	Repository                 string
+	OnboardingPlanDigestSHA256 string
+	ContractVersion            string
+	ManifestDigestSHA256       string
+	Eligible                   bool
+	SuspensionReason           string
+	VerifiedAt                 time.Time
+}
+
+func (s *Store) RecordRepositoryAdmission(ctx context.Context, value RepositoryAdmission) error {
+	if value.Repository == "" || !fingerprintPattern.MatchString(value.OnboardingPlanDigestSHA256) || value.ContractVersion == "" || !fingerprintPattern.MatchString(value.ManifestDigestSHA256) || value.VerifiedAt.IsZero() {
+		return errors.New("invalid Repository Admission")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO repository_admissions(repository,onboarding_plan_digest_sha256,contract_version,manifest_digest_sha256,eligible,suspension_reason,verified_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET onboarding_plan_digest_sha256=excluded.onboarding_plan_digest_sha256,contract_version=excluded.contract_version,manifest_digest_sha256=excluded.manifest_digest_sha256,eligible=excluded.eligible,suspension_reason=excluded.suspension_reason,verified_at=excluded.verified_at`, value.Repository, value.OnboardingPlanDigestSHA256, value.ContractVersion, value.ManifestDigestSHA256, boolInt(value.Eligible), value.SuspensionReason, formatTimestamp(value.VerifiedAt))
+	return err
+}
+
+func (s *Store) RepositoryAdmission(ctx context.Context, repository string) (RepositoryAdmission, error) {
+	var value RepositoryAdmission
+	var eligible int
+	var verified string
+	err := s.db.QueryRowContext(ctx, `SELECT repository,onboarding_plan_digest_sha256,contract_version,manifest_digest_sha256,eligible,suspension_reason,verified_at FROM repository_admissions WHERE repository=?`, repository).Scan(&value.Repository, &value.OnboardingPlanDigestSHA256, &value.ContractVersion, &value.ManifestDigestSHA256, &eligible, &value.SuspensionReason, &verified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositoryAdmission{}, ErrNotFound
+	}
+	if err != nil {
+		return RepositoryAdmission{}, err
+	}
+	value.Eligible = eligible == 1
+	value.VerifiedAt, err = time.Parse(time.RFC3339Nano, verified)
+	return value, err
+}

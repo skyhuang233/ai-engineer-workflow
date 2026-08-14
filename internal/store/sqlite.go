@@ -21,7 +21,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 56
+	latestSchemaVersion = 57
 )
 
 var (
@@ -1551,6 +1551,76 @@ SELECT backup_path, kind, reference_path, checksum_sha256, available FROM contro
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (56, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 57 {
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS platform_installation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    platform_version TEXT NOT NULL,
+    release_manifest_digest TEXT NOT NULL,
+    workflow_home TEXT NOT NULL,
+    installed_at TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS setup_plans (
+    plan_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('platform_bootstrap', 'repository_onboarding')),
+    schema_version INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    digest_sha256 TEXT NOT NULL UNIQUE,
+    canonical_json TEXT NOT NULL,
+    projection TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS setup_execution_results (
+    result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES setup_plans(plan_id),
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('succeeded', 'incomplete', 'drifted', 'blocked')),
+    effects_json TEXT NOT NULL,
+    diagnostic TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    UNIQUE(plan_id, attempt)
+)`,
+			`CREATE TABLE IF NOT EXISTS control_plane_runtime_observation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    pid INTEGER NOT NULL,
+    process_started_at TEXT NOT NULL,
+    endpoints_json TEXT NOT NULL,
+    platform_version TEXT NOT NULL,
+    plan_digest_sha256 TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS github_pat_verifications (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    fingerprint_sha256 TEXT NOT NULL,
+    login TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    credential_path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    verified_at TEXT NOT NULL
+)`,
+			`CREATE TABLE IF NOT EXISTS repository_admissions (
+    repository TEXT PRIMARY KEY,
+    onboarding_plan_digest_sha256 TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    manifest_digest_sha256 TEXT NOT NULL,
+    eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+    suspension_reason TEXT NOT NULL DEFAULT '',
+    verified_at TEXT NOT NULL
+)`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 57: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (57, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

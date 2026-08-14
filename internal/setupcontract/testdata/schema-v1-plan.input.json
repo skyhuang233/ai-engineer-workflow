@@ -1,0 +1,9 @@
+{
+  "expected_results": [{"subject":"workflow.exe","expected":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"file_digest","id":"cli-ready"}],
+  "effects": [{"parameters":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"action":"install","subject":"workflow.exe","kind":"install_file","id":"install-cli"}],
+  "preconditions": [{"expected":"Windows 用户 雪","subject":"current-user","kind":"host_identity","id":"windows-user"}],
+  "target": {"repository_path":"","github_repository":"","workflow_home":"C:\\Users\\Ada\\AgentWorkflow"},
+  "kind": "platform_bootstrap",
+  "plan_id": "platform-001",
+  "schema_version": 1
+}

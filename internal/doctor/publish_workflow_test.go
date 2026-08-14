@@ -176,6 +176,32 @@ func TestWorkerWorkflowsBindSBOMAndFailClosedOnFixableHighVulnerabilities(t *tes
 	}
 }
 
+func TestPlatformPublisherBindsSignedImmutableReleaseContract(t *testing.T) {
+	workflow := readWorkflow(t, ".github", "workflows", "publish-platform.yml")
+	for _, required := range []string{
+		`- "internal/setupcontract/**"`,
+		`- "internal/platformrelease/**"`,
+		`- "deploy/platform/**"`,
+		"go test ./internal/setupcontract ./internal/platformrelease ./internal/doctor",
+		"GOOS: windows",
+		"GOARCH: amd64",
+		"PLATFORM_RELEASE_SIGNING_KEY_B64",
+		"platform-release.json.sig",
+		"platform-sbom.spdx.json",
+		"platform-provenance.json",
+		"workflow-windows-amd64.zip",
+		"sha256sum --check SHA256SUMS",
+		"--draft",
+		`gh release edit "$tag" --draft=false`,
+		"(.immutable == true)",
+		`gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}"`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("Platform publisher omits release contract %q", required)
+		}
+	}
+}
+
 func readWorkflow(t *testing.T, path ...string) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)

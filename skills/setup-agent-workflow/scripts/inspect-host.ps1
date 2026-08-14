@@ -1,0 +1,68 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Repository,
+    [string]$WorkflowHome = ""
+)
+
+$ErrorActionPreference = "Stop"
+$repoPath = [System.IO.Path]::GetFullPath($Repository)
+if (-not (Test-Path -LiteralPath $repoPath -PathType Container)) {
+    throw "Repository directory does not exist: $repoPath"
+}
+
+if ([string]::IsNullOrWhiteSpace($WorkflowHome)) {
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        throw "LOCALAPPDATA is required"
+    }
+    $WorkflowHome = Join-Path $env:LOCALAPPDATA "AgentWorkflow"
+}
+$WorkflowHome = [System.IO.Path]::GetFullPath($WorkflowHome)
+if ($WorkflowHome.StartsWith("\\")) {
+    throw "Workflow Home must be a local path"
+}
+
+function Invoke-ObservedCommand([string]$Name, [string[]]$Arguments) {
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($null -eq $command) {
+        return [ordered]@{ installed = $false; output = ""; exit_code = $null }
+    }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $command.Source @Arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [ordered]@{ installed = $true; output = $output.Trim(); exit_code = $exitCode }
+}
+
+$git = Invoke-ObservedCommand "git" @("-C", $repoPath, "rev-parse", "--show-toplevel")
+$isRepository = $git.installed -and $git.exit_code -eq 0
+$gitFacts = [ordered]@{ installed = $git.installed; is_repository = $isRepository }
+if ($isRepository) {
+    $gitFacts.root = $git.output
+    $gitFacts.branch = (& git -C $repoPath branch --show-current 2>$null | Out-String).Trim()
+    $gitFacts.head = (& git -C $repoPath rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    $gitFacts.origin = (& git -C $repoPath remote get-url origin 2>$null | Out-String).Trim()
+    $gitFacts.status_porcelain_v2 = @(& git -C $repoPath status --porcelain=v2 --untracked-files=all)
+}
+
+$docker = Invoke-ObservedCommand "docker" @("version", "--format", "{{json .}}")
+$codex = Invoke-ObservedCommand "codex" @("--version")
+$workflow = Invoke-ObservedCommand "workflow" @("--version")
+$credentialPath = Join-Path $WorkflowHome "state\credentials\github.pat"
+
+[ordered]@{
+    schema_version = 1
+    observed_at = [DateTime]::UtcNow.ToString("o")
+    supported_host = ($env:OS -eq "Windows_NT")
+    repository = $repoPath
+    workflow_home = $WorkflowHome
+    git = $gitFacts
+    docker = $docker
+    codex = $codex
+    workflow = $workflow
+    github_credential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf) }
+} | ConvertTo-Json -Depth 8

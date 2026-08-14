@@ -78,6 +78,12 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "--version", "version":
+		fmt.Fprintln(os.Stdout, "workflow dev")
+	case "setup":
+		if err := setupCommand(os.Args[2:]); err != nil {
+			fail(err)
+		}
 	case "doctor":
 		runDoctor(os.Args[2:])
 	case "credential":
@@ -110,6 +116,9 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  workflow setup plan --repo <absolute>")
+	fmt.Fprintln(os.Stderr, "  workflow setup apply --plan <path> --approved-digest <sha256>")
+	fmt.Fprintln(os.Stderr, "  workflow setup verify --repo <absolute>")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow credential provision --app-id <GITHUB_APP_ID> [--config path] [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
