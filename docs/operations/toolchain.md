@@ -7,6 +7,30 @@ prerequisite, not the approval itself.
 `config/toolchain.json` is the machine-readable production baseline checked by
 `workflow doctor`. Every executable version and artifact is immutable:
 
+## Platform Release and setup inputs
+
+The entry skill selects only an immutable stable GitHub Release whose
+`platform-release.json` and detached P-256 signature match the pinned repository,
+publisher workflow, key id, provenance subjects, and bootstrap schema. The
+release ZIP, SPDX SBOM, and provenance statement must exactly match the signed
+manifest before extraction. A missing trust key, mutable release, prerelease,
+checksum mismatch, extra subject, or incompatible bootstrap schema fails before
+host mutation.
+
+The verified release contract is the sole source for the exact Docker Desktop
+installer/version/checksum, Worker image digest, Repository Contract, managed
+labels, and user-level Workflow Skill Bundle. An existing same-name Codex skill
+without Agent Workflow ownership metadata blocks installation. Bundle changes
+are staged and switched atomically; setup never replaces its own running entry
+skill.
+
+Docker Desktop must expose a Linux `amd64` engine. Production readiness runs a
+real temporary container with the selected Workflow Home state/workspace mounts
+and network path. Codex readiness uses a temporary copy of the invoking user's
+existing ChatGPT login to prove Worker create-and-resume, then removes the copy.
+
+## Worker toolchain
+
 - Codex CLI is pinned to an exact package version.
 - GitHub CLI is installed from its official Linux amd64 release archive rather
   than Debian's older package, and is pinned by exact version and SHA-256.
@@ -37,9 +61,9 @@ prerequisite, not the approval itself.
   A VEX statement cannot waive a fixable finding; any future VEX must name one
   vulnerability and package and include evidence that the affected code is not
   executable in the Worker contract.
-- The dedicated GitHub integration repository and its required workflow path
+- Each admitted GitHub repository and its required workflow path
   are explicit. The repository may be public or private, but its owner must
-  match the configured Control Plane GitHub App owner. Branch protection is not a
+  match the verified Control Plane GitHub Credential owner. Branch protection is not a
   prerequisite: that owner retains sole merge authority. Its deployable
   workflow verifies only the live GitHub repository contract and does not
   require a copy of the Control Plane source tree. It can be manually rerun
@@ -50,42 +74,24 @@ prerequisite, not the approval itself.
   `WORKFLOW_GATEWAY_CREDENTIAL_OWNER` Actions variables to those configured
   values. Its contract workflow fails closed unless the variables, runner
   repository, and canonical GitHub repository metadata all agree.
-- The trusted host uses one GitHub App installed for all owner repositories with
-  at least metadata/actions/checks read and contents/issues/pull-requests write.
-  The same installation serves host-side observations and Gateway mutations.
-  Its private key is the fixed PEM file configured by `private_key_file`; SQLite
-  records only the App and installation IDs, PEM SHA-256 fingerprint, owner,
-  integration repository, and successful live-contract time. Each process
-  caches the installation token until shortly before GitHub's forced expiry.
+- The trusted current-user host uses one classic PAT with `repo` and `workflow`
+  scopes for all admitted repositories under one owner. The plaintext token is
+  stored at `state\credentials\github.pat` beneath Workflow Home. SQLite records
+  only its fingerprint, authenticated login, owner, scopes, path, status, and
+  verification time. Workers receive neither the value nor its path.
 
-Create and install one GitHub App for **All repositories**. Configure `Metadata: read`,
-`Actions: read`, `Checks: read`, `Contents: write`, `Issues: write`, and
-`Pull requests: write`, download its private key, and place it at
-`C:\ProgramData\workflow\github-app.pem`.
-This command
-verifies Actions read, pushes a temporary Candidate commit, and calls that
-commit's check-runs endpoint to verify Checks read before performing the
-remaining idempotent writes and cleaning up its temporary branch, issue, and PR
-in the dedicated integration repository. Only after the complete live contract,
-including cleanup, passes does it record the discovered installation and resume
-writes. During
-verification, the durable Gateway
-rotation pauses new writes and safely recovers an expired claim before the live
-contract runs; a failed replacement leaves writes paused. A Gateway that starts
-without its verified credential likewise persists the pause and projects one
-recovery request to each affected repository Workflow Inbox:
+The installed `platform-setup-contract.json` is copied only from the verified,
+signed Platform Release. It pins Docker Desktop's version, HTTPS installer and
+SHA-256, the immutable Worker image digest, Workflow Skill Bundle ownership and
+digests, the repository contract, and the managed label vocabulary. Setup
+installs only the current-user CLI shim and current-user Codex skills, and
+reconciles only the current-user `PATH`.
 
-```powershell
-go run ./cmd/workflow credential provision `
-  --config config/toolchain.json `
-  --database C:\ProgramData\workflow\workflow.db `
-  --app-id <GITHUB_APP_ID>
-```
-
-After a successful replacement, the long-running Gateway and poller hot-load the
-new verified App ID, installation ID, and PEM fingerprint on their next token
-request and discard the previous installation-token cache; credential rotation
-does not require restarting either process.
+Credential replacement is an approved Platform Bootstrap repair. A rejected or
+missing PAT pauses Gateway writes and suspends affected Repository Admissions;
+there is no GitHub App fallback. Sensitive backups that contain the plaintext
+PAT must be explicitly created and explicitly restored, and must never be used
+as shareable diagnostic evidence.
 
 Run the complete target-host contract with:
 
@@ -144,7 +150,7 @@ dispatches GitHub mutations itself; it requires the credential-isolated Gateway
 URL and passes it only to the pinned controller. Run `workflow poll-github` as
 the persistent control-plane process; it records durable polling cursors,
 applies retry backoff, and acquires a fenced per-repository SQLite poll lease
-before minting a Control Plane GitHub App installation token or making GitHub requests. Concurrent
+before loading the verified classic PAT or making GitHub requests. Concurrent
 pollers therefore cannot both pass the same `NextAttemptAt` boundary. It runs
 the approved Plan Root control pass before
 projecting the repository Workflow Inbox, so an eligible Delivery Plan is
@@ -192,7 +198,7 @@ image is not evidence of publication: the pinned digest must resolve from the
 registry. The Release Manifest's exact digest must resolve from GHCR and pass
 the Docker contract. Doctor may activate the latest owner-accepted manifest
 even after unrelated `main` commits. It validates the current toolchain
-configuration completely, including the required GitHub App contract, but
+configuration completely, including the required owner-bound classic PAT contract, but
 reconstructs a historical release using only the Worker-consumed build inputs;
 superseded historical `github.credential` values such as
 `kind: fine-grained-pat` do not invalidate that release. Every pinned Worker

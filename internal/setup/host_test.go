@@ -3,17 +3,112 @@ package setup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "workflow.exe")
+	if err := os.WriteFile(source, []byte("workflow executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var persisted string
+	adapter := HostAdapter{Layout: layout, Executable: source, PersistUserPATH: func(path string) error {
+		persisted = path
+		return nil
+	}}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0"}}
+	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != layout.Bin {
+		t.Fatalf("persisted PATH entry = %q, want %q", persisted, layout.Bin)
+	}
+}
+
+func TestHostAdapterStartsAndReadsBackDigestBoundControlPlane(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	record := controlplane.RuntimeRecord{PID: 42, PlatformVersion: "1.0.0", ProcessStartedAt: time.Now().UTC().Round(0), Endpoints: controlplane.Endpoints{Health: "http://127.0.0.1:1234/health", Shutdown: "http://127.0.0.1:1234/shutdown"}, ApprovedPlanDigestSHA256: digest}
+	started := false
+	adapter := HostAdapter{
+		Layout: layout, PlanDigest: digest,
+		StartControlPlane: func(_ context.Context, options controlplane.StartOptions) (controlplane.RuntimeRecord, error) {
+			started = options.PlatformVersion == "1.0.0" && options.ApprovedPlanDigestSHA256 == digest
+			return record, controlplane.WriteRuntimeRecord(layout, record)
+		},
+		InspectControlPlane: func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation {
+			return controlplane.Observation{State: controlplane.StateReady, Record: &record}
+		},
+	}
+	effect := setupcontract.Effect{ID: "serve", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "1.0.0"}}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("initial readback = %s, %v", status, err)
+	}
+	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
+		t.Fatal(err)
+	}
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied || !started {
+		t.Fatalf("final readback = %s, %v, started=%v", status, err, started)
+	}
+}
+
+func TestHostAdapterInstallsExactWorkflowSkillBundle(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "skills")
+	if err := os.MkdirAll(filepath.Join(source, "agent-workflow"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("# Agent Workflow")
+	if err := os.WriteFile(filepath.Join(source, "agent-workflow", "SKILL.md"), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	files, _ := json.Marshal([]workflowhome.SkillBundleFile{{Path: "agent-workflow/SKILL.md", SHA256: hex.EncodeToString(digest[:])}})
+	skills, _ := json.Marshal([]string{"agent-workflow"})
+	effect := setupcontract.Effect{
+		ID: "skills", Kind: "workflow_skill_bundle", Subject: filepath.Join(t.TempDir(), "codex-skills"), Action: "install",
+		Parameters: map[string]string{"version": "1.0.0", "managed_skills_json": string(skills), "files_json": string(files)},
+	}
+	adapter := HostAdapter{Layout: layout, SkillBundleSource: source}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("initial bundle readback = %s, %v", status, err)
+	}
+	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
+		t.Fatal(err)
+	}
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("installed bundle readback = %s, %v", status, err)
+	}
+}
 
 func TestHostAdapterPersistsPATOnlyThroughSecretInput(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))

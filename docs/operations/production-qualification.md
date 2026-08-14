@@ -6,6 +6,22 @@ not production approval. Run every phase on the target Windows host against the
 dedicated private Owner-Guarded integration repository, retain the named evidence, and
 have the repository owner record the final decision in the qualification issue.
 
+The release is not qualified unless the README's `npx skills@latest add ...`
+command, followed by explicit `$setup-agent-workflow` invocation in a clean
+Windows profile, reaches both gates:
+
+- **Platform Ready:** signed Platform Release and exact CLI/bundle installation,
+  Docker Linux `amd64` container/mount/network probe, owner-bound PAT scope and
+  capability verification, live `workflow serve` health, and real Codex Worker
+  create-and-resume all pass.
+- **Repository Admitted:** the digest-bound Onboarding Pull Request is merged,
+  every managed file/block/label/setting/check reads back, and the exact manifest
+  digest is recorded as eligible for that repository.
+
+Every temporary Docker container/image, Codex state copy, onboarding branch,
+download, clone, and GitHub resource must be removed. Cleanup failure is a failed
+qualification, even when the functional probe passed.
+
 ## Evidence directory
 
 Create a new directory outside the repository for each attempt. Record its
@@ -19,20 +35,17 @@ or complete diffs into it.
 
 1. Confirm Docker Desktop uses a Linux `amd64` engine and `codex login status`
    reports the configured ChatGPT identity.
-2. Read the integration repository metadata and fail the attempt unless its
-   canonical owner matches the configured Control Plane GitHub App owner and
+2. Read the target repository metadata and fail the attempt unless its
+   canonical owner matches the verified Control Plane GitHub Credential owner and
    `private` is `true`.
-3. Create the GitHub App, install it for All repositories, place its private-key
-   PEM at the configured host path, and provision it exactly as documented in
-   [toolchain.md](toolchain.md) using `workflow credential provision --app-id`.
-   Retain evidence that installation discovery and permission validation passed,
-   and that the live contract created its temporary branch, queried check runs
-   for the Candidate commit, exercised and reconciled its issue, label, pull
-   request, and evidence reply, and cleaned up every temporary object before the
-   verified installation was recorded and Gateway writes resumed.
-4. Run `workflow doctor` exactly as documented in
+3. Supply the classic PAT through the trusted Codex setup task and confirm that
+   it is stored only at `state\credentials\github.pat` beneath Workflow Home.
+   Retain redacted evidence for login, owner binding, fingerprint, `repo` and
+   `workflow` scopes, SSO/organization policy, and live capabilities. Never
+   retain the PAT body.
+4. Run `workflow setup verify` and `workflow doctor` exactly as documented in
    [toolchain.md](toolchain.md), using the production SQLite path and an evidence
-   report path. Every check must pass.
+   report path. Platform Ready and Repository Admitted must both pass.
 5. Download the two assets from the accepted source-keyed Worker Release. The
    `worker-sbom.spdx.json` SHA-256 must equal `sbom_sha256` in
    `worker-release.json`; the manifest must record the exact Worker digest,
@@ -114,9 +127,10 @@ Use fresh fixture plans where a terminal decision would prevent later steps.
   path, and reconcile dry-run before replacing any production database. Verify
   sessions, leases, outbox, cursors and Inbox questions converge without remote
   duplication.
-- Replace or revoke the GitHub App private key, then rerun `credential provision`.
-  Writes must stay paused until installation discovery and the live contract pass;
-  no Worker state may contain the PEM, App JWT, or installation token.
+- Replace or revoke the classic PAT, then rerun the approved Platform Bootstrap
+  repair. Writes and new scheduling must stay paused until owner, scopes, policy,
+  and repository admissions pass again; no Worker state may contain the PAT or
+  its credential path.
 
 ## 4. Automated negative evidence
 

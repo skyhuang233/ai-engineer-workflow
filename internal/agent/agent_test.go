@@ -1587,7 +1587,7 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 		t.Fatal(err)
 	}
 	manager.RefreshDeliverySource = func(refreshCtx context.Context, _ string) (string, error) {
-		if err := db.PauseGatewayWrites(refreshCtx, store.ControlPlaneGitHubAppRecoveryRemediation, now); err != nil {
+		if err := db.PauseGatewayWrites(refreshCtx, store.ControlPlaneGitHubCredentialRecoveryRemediation, now); err != nil {
 			return "", err
 		}
 		return "", delivery.ErrGatewayCredentialRejected

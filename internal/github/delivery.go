@@ -45,7 +45,7 @@ func (r *DeliveryRemote) CredentialAvailable(ctx context.Context) error {
 		if errors.Is(err, credential.ErrNotFound) || errors.Is(err, delivery.ErrGatewayCredentialRejected) {
 			return delivery.ErrGatewayCredentialRejected
 		}
-		return fmt.Errorf("load Control Plane GitHub App credential: %w", err)
+		return fmt.Errorf("load Control Plane GitHub credential: %w", err)
 	}
 	if strings.TrimSpace(token) == "" {
 		return delivery.ErrGatewayCredentialRejected

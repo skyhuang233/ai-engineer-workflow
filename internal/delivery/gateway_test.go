@@ -961,8 +961,8 @@ func TestMissingCredentialPausesBeforeAnyRemoteCall(t *testing.T) {
 		t.Fatal("missing Gateway Credential reached the remote")
 	}
 	item, err := db.WorkflowInboxItem(ctx, store.GatewayCredentialInboxKey)
-	if err != nil || item.Title != store.ControlPlaneGitHubAppRecoveryTitle || item.Body != store.ControlPlaneGitHubAppRecoveryRemediation {
-		t.Fatalf("Control Plane GitHub App recovery item = %#v, %v", item, err)
+	if err != nil || item.Title != store.ControlPlaneGitHubCredentialRecoveryTitle || item.Body != store.ControlPlaneGitHubCredentialRecoveryRemediation {
+		t.Fatalf("Control Plane GitHub credential recovery item = %#v, %v", item, err)
 	}
 	outbox, err := db.DeliveryOutbox(ctx, queued.IdempotencyKey)
 	if err != nil || outbox.State != store.OutboxPending {

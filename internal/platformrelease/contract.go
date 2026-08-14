@@ -33,9 +33,18 @@ type SkillBundleContract struct {
 }
 
 type RepositoryContractPin struct {
-	Version      string `json:"version"`
-	ManifestPath string `json:"manifest_path"`
-	CheckName    string `json:"check_name"`
+	Version      string            `json:"version"`
+	ManifestPath string            `json:"manifest_path"`
+	CheckName    string            `json:"check_name"`
+	Labels       []RepositoryLabel `json:"labels"`
+}
+
+// RepositoryLabel is platform-owned vocabulary. Repository Onboarding only
+// reconciles this release-declared contract; it never invents another set.
+type RepositoryLabel struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
 }
 
 func (r SchemaRange) Supports(schema int) bool {

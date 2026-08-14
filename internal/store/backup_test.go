@@ -199,6 +199,61 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	_ = processing
 }
 
+func TestCredentialInclusiveBackupIsExplicitSensitivePlaintext(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	databasePath := filepath.Join(t.TempDir(), "workflow.db")
+	db, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	credentialPath := filepath.Join(t.TempDir(), "state", "credentials", "github.pat")
+	if err := os.MkdirAll(filepath.Dir(credentialPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialPath, []byte("ghp_sensitive_plaintext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(t.TempDir(), "workflow.sensitive.db")
+	metadata, err := db.CreateCredentialInclusiveBackup(ctx, backupPath, credentialPath, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Classification != BackupSensitivePlaintext || metadata.ControlPlaneCredential == nil || !metadata.ControlPlaneCredential.Available {
+		t.Fatalf("sensitive backup metadata = %#v", metadata)
+	}
+	if err := RestoreBackup(ctx, backupPath, filepath.Join(t.TempDir(), "ordinary.db")); err == nil || !strings.Contains(err.Error(), "sensitive plaintext") {
+		t.Fatalf("ordinary restore accepted credential-inclusive backup: %v", err)
+	}
+	restoredDatabase := filepath.Join(t.TempDir(), "restored.db")
+	restoredCredential := filepath.Join(t.TempDir(), "state", "credentials", "github.pat")
+	if err := RestoreSensitiveBackup(ctx, backupPath, restoredDatabase, restoredCredential); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := os.ReadFile(restoredCredential)
+	if err != nil || string(credential) != "ghp_sensitive_plaintext" {
+		t.Fatalf("restored credential = %q, %v", credential, err)
+	}
+	restored, err := Open(ctx, restoredDatabase)
+	if err != nil {
+		t.Fatalf("restored database is unusable: %v", err)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ordinary, err := db.CreateOnlineBackup(ctx, backupPath, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.Classification != BackupShareable {
+		t.Fatalf("replacement ordinary backup classification = %q", ordinary.Classification)
+	}
+	if _, err := os.Stat(backupPath + ".github.pat"); !os.IsNotExist(err) {
+		t.Fatalf("ordinary backup retained sensitive plaintext companion: %v", err)
+	}
+}
+
 func TestRestoreBackupMigratesLegacySchemaWithoutDeliverySourceProvenance(t *testing.T) {
 	ctx := context.Background()
 	backupPath := filepath.Join(t.TempDir(), "workflow-v50.db")

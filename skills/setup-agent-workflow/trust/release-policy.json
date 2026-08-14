@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "repository": "skyhuang233/ai-engineer-workflow",
+  "workflow_path": ".github/workflows/publish-platform.yml",
+  "key_id": "platform-release-2026",
+  "signature_algorithm": "ecdsa-p256-sha256",
+  "minimum_platform_version": "0.0.0",
+  "public_key_file": "platform-release-public-key.pem"
+}

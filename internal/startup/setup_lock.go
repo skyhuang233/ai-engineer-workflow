@@ -18,6 +18,26 @@ func AcquireWorkflowHomeLock(workflowHome string) (*Lock, error) {
 	return acquireNamedLock(filepath.Join(identity, "state", "setup.lock"), "Workflow Home")
 }
 
+// AcquireControlPlaneLaunchLock serializes public serve invocations while a
+// foreground child acquires the distinct lifetime lock and becomes healthy.
+func AcquireControlPlaneLaunchLock(workflowHome string) (*Lock, error) {
+	identity, err := canonicalLocalIdentity(workflowHome)
+	if err != nil {
+		return nil, err
+	}
+	return acquireNamedLock(filepath.Join(identity, "state", "control-plane-launch.lock"), "Control Plane launch")
+}
+
+// AcquireControlPlaneRuntimeLock is held by the foreground child for its full
+// lifetime. It is not a service registration or restart authority.
+func AcquireControlPlaneRuntimeLock(workflowHome string) (*Lock, error) {
+	identity, err := canonicalLocalIdentity(workflowHome)
+	if err != nil {
+		return nil, err
+	}
+	return acquireNamedLock(filepath.Join(identity, "state", "control-plane-runtime.lock"), "Control Plane runtime")
+}
+
 func AcquireRepositoryLock(workflowHome, repository string) (*Lock, error) {
 	home, err := canonicalLocalIdentity(workflowHome)
 	if err != nil {

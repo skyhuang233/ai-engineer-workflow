@@ -35,7 +35,7 @@ type Verifier struct {
 
 func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (resultErr error) {
 	if strings.TrimSpace(token) == "" {
-		return errors.New("a GitHub App installation token is required")
+		return errors.New("a verified GitHub credential is required")
 	}
 	if v.APIBase == "" {
 		v.APIBase = "https://api.github.com"
@@ -103,7 +103,7 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 		Number int `json:"number"`
 	}
 	_, err = v.call(ctx, token, http.MethodPost, "repos/"+repository+"/issues",
-		map[string]any{"title": "[workflow-contract] GitHub App verification", "body": "Temporary issue; closed automatically."}, &issue)
+		map[string]any{"title": "[workflow-contract] GitHub credential verification", "body": "Temporary issue; closed automatically."}, &issue)
 	if err != nil {
 		return fmt.Errorf("verify Issues write permission: %w", err)
 	}
@@ -122,13 +122,13 @@ func (v Verifier) Verify(ctx context.Context, token, owner, repository string) (
 		Number int `json:"number"`
 	}
 	_, err = v.call(ctx, token, http.MethodPost, "repos/"+repository+"/pulls",
-		map[string]string{"title": "[workflow-contract] GitHub App verification", "head": gitArtifact.Branch, "base": repo.DefaultBranch, "body": "Temporary PR; closed automatically."}, &pull)
+		map[string]string{"title": "[workflow-contract] GitHub credential verification", "head": gitArtifact.Branch, "base": repo.DefaultBranch, "body": "Temporary PR; closed automatically."}, &pull)
 	if err != nil {
 		return fmt.Errorf("verify Pull requests write permission: %w", err)
 	}
 	pullNumber = pull.Number
 	if _, err := v.call(ctx, token, http.MethodPost, fmt.Sprintf("repos/%s/issues/%d/comments", repository, pull.Number),
-		map[string]string{"body": "Control Plane GitHub App contract verified."}, &struct{}{}); err != nil {
+		map[string]string{"body": "Control Plane GitHub credential contract verified."}, &struct{}{}); err != nil {
 		return fmt.Errorf("verify issue comment permission: %w", err)
 	}
 	return nil
@@ -168,7 +168,7 @@ func verifyGitPush(ctx context.Context, token, repository, defaultBranch string)
 		return GitPushArtifact{}, fmt.Errorf("clone integration repository: %w", err)
 	}
 	marker := ".workflow-credential-contract"
-	if err := os.WriteFile(filepath.Join(workspace, marker), []byte("Control Plane GitHub App Git push contract\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, marker), []byte("Control Plane GitHub credential push contract\n"), 0o600); err != nil {
 		return GitPushArtifact{}, fmt.Errorf("write contract marker: %w", err)
 	}
 	worktree, err := repositoryStore.Worktree()
@@ -178,7 +178,7 @@ func verifyGitPush(ctx context.Context, token, repository, defaultBranch string)
 	if _, err := worktree.Add(marker); err != nil {
 		return GitPushArtifact{}, fmt.Errorf("stage contract marker: %w", err)
 	}
-	commit, err := worktree.Commit("Verify Control Plane GitHub App contract", &git.CommitOptions{Author: &object.Signature{Name: "workflow credential contract", Email: "workflow-contract@localhost", When: time.Now().UTC()}})
+	commit, err := worktree.Commit("Verify Control Plane GitHub credential contract", &git.CommitOptions{Author: &object.Signature{Name: "workflow credential contract", Email: "workflow-contract@localhost", When: time.Now().UTC()}})
 	if err != nil {
 		return GitPushArtifact{}, fmt.Errorf("commit contract marker: %w", err)
 	}

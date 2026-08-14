@@ -40,6 +40,29 @@ func TestSetupPlansAreImmutableAndResultsAppend(t *testing.T) {
 	}
 }
 
+func TestLatestSetupPlanSelectsKindAndNewestCreation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	for _, plan := range []SetupPlanRecord{
+		{PlanID: "platform-old", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\home`, DigestSHA256: repeatHex('1'), CanonicalJSON: `{}`, Projection: "old", CreatedAt: now},
+		{PlanID: "repo", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('2'), CanonicalJSON: `{}`, Projection: "repo", CreatedAt: now.Add(time.Second)},
+		{PlanID: "platform-new", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\home`, DigestSHA256: repeatHex('3'), CanonicalJSON: `{}`, Projection: "new", CreatedAt: now.Add(2 * time.Second)},
+	} {
+		if err := db.RecordSetupPlan(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := db.LatestSetupPlan(ctx, "platform_bootstrap")
+	if err != nil || got.PlanID != "platform-new" {
+		t.Fatalf("latest = %#v, %v", got, err)
+	}
+}
+
 func TestPATVerificationAndAdmissionsSurviveReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "workflow.db")

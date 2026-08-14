@@ -2158,7 +2158,7 @@ func TestMidPollCredentialFailurePausesGatewayWithoutTerminalizingPlan(t *testin
 		t.Fatalf("credential poll error = %v", err)
 	}
 	paused, reason, pauseErr := db.GatewayWritesPaused(ctx)
-	if pauseErr != nil || !paused || reason != store.ControlPlaneGitHubAppRecoveryRemediation {
+	if pauseErr != nil || !paused || reason != store.ControlPlaneGitHubCredentialRecoveryRemediation {
 		t.Fatalf("Gateway pause = %v, %q, %v", paused, reason, pauseErr)
 	}
 	active, activeErr := db.HasActiveDeliveryPlan(ctx, repository)

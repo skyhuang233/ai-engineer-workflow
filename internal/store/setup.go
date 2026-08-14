@@ -82,6 +82,17 @@ func (s *Store) SetupExecutionResults(ctx context.Context, planID string) ([]Set
 	return results, rows.Err()
 }
 
+func (s *Store) LatestSetupPlan(ctx context.Context, kind string) (SetupPlanRecord, error) {
+	if kind == "" {
+		return SetupPlanRecord{}, errors.New("Setup Plan kind is required")
+	}
+	plan, err := scanSetupPlan(s.db.QueryRowContext(ctx, `SELECT plan_id,kind,schema_version,target,digest_sha256,canonical_json,projection,created_at FROM setup_plans WHERE kind=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, kind))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SetupPlanRecord{}, ErrNotFound
+	}
+	return plan, err
+}
+
 func scanSetupPlan(row *sql.Row) (SetupPlanRecord, error) {
 	var p SetupPlanRecord
 	var created string

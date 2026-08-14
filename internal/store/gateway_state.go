@@ -8,8 +8,8 @@ import (
 )
 
 const GatewayCredentialInboxKey = "gateway-credential"
-const ControlPlaneGitHubAppRecoveryTitle = "Control Plane GitHub App requires attention"
-const ControlPlaneGitHubAppRecoveryRemediation = "Control Plane GitHub App is unavailable; run workflow credential provision --app-id <GITHUB_APP_ID> to verify it and resume writes"
+const ControlPlaneGitHubCredentialRecoveryTitle = "Control Plane GitHub credential requires attention"
+const ControlPlaneGitHubCredentialRecoveryRemediation = "Control Plane GitHub PAT is unavailable; rerun workflow setup to verify the PAT and resume writes"
 const gatewayCredentialQuestionKind = "gateway_credential"
 
 const gatewayDispatcherLeaseTTL = 2 * time.Minute
@@ -64,7 +64,7 @@ func (s *Store) pauseGatewayWrites(ctx context.Context, repository, leaseToken, 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_inbox(item_key, kind, title, body, state, created_at, updated_at)
 VALUES (?, 'credential', ?, ?, 'open', ?, ?)
 ON CONFLICT(item_key) DO UPDATE SET title=excluded.title, body=excluded.body, state='open', updated_at=excluded.updated_at`,
-		GatewayCredentialInboxKey, ControlPlaneGitHubAppRecoveryTitle, reason, timestamp, timestamp); err != nil {
+		GatewayCredentialInboxKey, ControlPlaneGitHubCredentialRecoveryTitle, reason, timestamp, timestamp); err != nil {
 		return err
 	}
 	if err := ensureGatewayCredentialQuestionsTx(ctx, tx, reason, now); err != nil {
@@ -111,7 +111,7 @@ func (s *Store) BeginGatewayCredentialRotation(ctx context.Context, owner, reaso
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_inbox(item_key, kind, title, body, state, created_at, updated_at)
 VALUES (?, 'credential', ?, ?, 'open', ?, ?)
-ON CONFLICT(item_key) DO UPDATE SET title=excluded.title, body=excluded.body, state='open', updated_at=excluded.updated_at`, GatewayCredentialInboxKey, ControlPlaneGitHubAppRecoveryTitle, reason, timestamp, timestamp); err != nil {
+ON CONFLICT(item_key) DO UPDATE SET title=excluded.title, body=excluded.body, state='open', updated_at=excluded.updated_at`, GatewayCredentialInboxKey, ControlPlaneGitHubCredentialRecoveryTitle, reason, timestamp, timestamp); err != nil {
 		return GatewayCredentialRotation{}, err
 	}
 	if err := ensureGatewayCredentialQuestionsTx(ctx, tx, reason, now); err != nil {

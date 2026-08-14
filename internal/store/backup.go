@@ -19,18 +19,25 @@ import (
 
 const backupMetadataSuffix = ".metadata.json"
 
+const (
+	BackupShareable          = "shareable"
+	BackupSensitivePlaintext = "sensitive_plaintext"
+)
+
 const deliverySourceBackupSchemaVersion = 51
 
 // BackupMetadata is the transportable provenance for an online Control Plane
 // backup. The same reference records are persisted in SQLite for audit.
 type BackupMetadata struct {
 	BackupPath               string            `json:"backup_path"`
+	Classification           string            `json:"classification"`
 	CreatedAt                time.Time         `json:"created_at"`
 	ChecksumSHA256           string            `json:"checksum_sha256"`
 	SchemaVersion            int               `json:"schema_version"`
 	WorkspaceReferences      []BackupReference `json:"workspace_references"`
 	DeliverySourceReferences []BackupReference `json:"delivery_source_references"`
 	ArtifactReferences       []BackupReference `json:"artifact_references"`
+	ControlPlaneCredential   *BackupReference  `json:"control_plane_credential,omitempty"`
 	LastDrill                BackupDrill       `json:"last_drill"`
 }
 
@@ -119,11 +126,16 @@ func (s *Store) CreateOnlineBackup(ctx context.Context, backupPath string, now t
 		return BackupMetadata{}, err
 	}
 	metadata := BackupMetadata{
-		BackupPath: backupPath, CreatedAt: now, ChecksumSHA256: checksum, SchemaVersion: schemaVersion,
+		BackupPath: backupPath, Classification: BackupShareable, CreatedAt: now, ChecksumSHA256: checksum, SchemaVersion: schemaVersion,
 		WorkspaceReferences: references.workspaces, DeliverySourceReferences: references.deliverySources, ArtifactReferences: references.artifacts,
 	}
 	if err := replaceFile(temporaryPath, backupPath); err != nil {
 		return BackupMetadata{}, fmt.Errorf("publish SQLite online backup: %w", err)
+	}
+	// Reusing a path for an ordinary backup must remove any prior plaintext
+	// credential companion before publishing shareable metadata.
+	if err := os.Remove(credentialBackupPath(backupPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return BackupMetadata{}, fmt.Errorf("remove prior sensitive backup credential: %w", err)
 	}
 	if err := writeBackupMetadata(backupPath, metadata); err != nil {
 		return BackupMetadata{}, err
@@ -144,6 +156,90 @@ func (s *Store) CreateOnlineBackup(ctx context.Context, backupPath string, now t
 		return BackupMetadata{}, err
 	}
 	return metadata, nil
+}
+
+// CreateCredentialInclusiveBackup explicitly creates a sensitive plaintext
+// backup set. The SQLite snapshot remains at backupPath and the dedicated PAT
+// is copied to a checksum-bound companion file. Ordinary backup APIs never add
+// the credential implicitly.
+func (s *Store) CreateCredentialInclusiveBackup(ctx context.Context, backupPath, credentialPath string, now time.Time) (BackupMetadata, error) {
+	if !filepath.IsAbs(credentialPath) || filepath.Base(credentialPath) != "github.pat" {
+		return BackupMetadata{}, errors.New("dedicated Control Plane credential path is required")
+	}
+	info, err := os.Lstat(credentialPath)
+	if err != nil {
+		return BackupMetadata{}, fmt.Errorf("inspect Control Plane credential: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return BackupMetadata{}, errors.New("Control Plane credential must be a regular non-link file")
+	}
+	metadata, err := s.CreateOnlineBackup(ctx, backupPath, now)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	companion := credentialBackupPath(backupPath)
+	checksum, err := checksumFile(credentialPath)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	metadata.Classification = BackupSensitivePlaintext
+	metadata.ControlPlaneCredential = &BackupReference{Path: companion, ChecksumSHA256: checksum, Available: true}
+	// Publish the sensitive classification before copying plaintext so an
+	// interruption can never leave an unlabeled credential-bearing companion.
+	if err := writeBackupMetadata(backupPath, metadata); err != nil {
+		return BackupMetadata{}, err
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.Remove(companion)
+		}
+	}()
+	if err := copyBackupFile(credentialPath, companion, 0o600); err != nil {
+		return BackupMetadata{}, fmt.Errorf("copy Control Plane credential into sensitive backup: %w", err)
+	}
+	if err := verifyBackup(ctx, backupPath, metadata); err != nil {
+		return BackupMetadata{}, err
+	}
+	if err := s.recordBackupProvenance(ctx, metadata); err != nil {
+		return BackupMetadata{}, err
+	}
+	published = true
+	return metadata, nil
+}
+
+func credentialBackupPath(backupPath string) string { return backupPath + ".github.pat" }
+
+func copyBackupFile(source, destination string, mode os.FileMode) error {
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), filepath.Base(destination)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return replaceFile(temporaryPath, destination)
 }
 
 type backupReferences struct{ workspaces, deliverySources, artifacts []BackupReference }
@@ -387,6 +483,36 @@ func RestoreBackup(ctx context.Context, backupPath, destination string) error {
 	if err := verifyBackup(ctx, backupPath, metadata); err != nil {
 		return err
 	}
+	if effectiveBackupClassification(metadata) == BackupSensitivePlaintext {
+		return errors.New("backup contains sensitive plaintext credential material; use RestoreSensitiveBackup")
+	}
+	return restoreBackupDatabase(ctx, backupPath, destination)
+}
+
+// RestoreSensitiveBackup makes credential restoration explicit. It refuses an
+// ordinary backup and validates the credential companion checksum before
+// restoring either destination.
+func RestoreSensitiveBackup(ctx context.Context, backupPath, databaseDestination, credentialDestination string) error {
+	metadata, err := LoadBackupMetadata(backupPath)
+	if err != nil {
+		return err
+	}
+	if effectiveBackupClassification(metadata) != BackupSensitivePlaintext {
+		return errors.New("backup is not classified as sensitive plaintext")
+	}
+	if !filepath.IsAbs(credentialDestination) || filepath.Base(credentialDestination) != "github.pat" {
+		return errors.New("dedicated Control Plane credential destination is required")
+	}
+	if err := verifyBackup(ctx, backupPath, metadata); err != nil {
+		return err
+	}
+	if err := restoreBackupDatabase(ctx, backupPath, databaseDestination); err != nil {
+		return err
+	}
+	return copyBackupFile(metadata.ControlPlaneCredential.Path, credentialDestination, 0o600)
+}
+
+func restoreBackupDatabase(ctx context.Context, backupPath, destination string) error {
 	if strings.TrimSpace(destination) == "" {
 		return ErrInvalidClaim
 	}
@@ -467,7 +593,7 @@ func DrillBackup(ctx context.Context, backupPath string, now time.Time) (BackupD
 	}
 	defer os.RemoveAll(directory)
 	restoredPath := filepath.Join(directory, "restored.db")
-	if err := RestoreBackup(ctx, backupPath, restoredPath); err != nil {
+	if err := restoreBackupDatabase(ctx, backupPath, restoredPath); err != nil {
 		return fail(err)
 	}
 	restored, err := Open(ctx, restoredPath)
@@ -502,6 +628,10 @@ func LoadBackupMetadata(backupPath string) (BackupMetadata, error) {
 	}
 	if metadata.ChecksumSHA256 == "" || metadata.SchemaVersion <= 0 {
 		return BackupMetadata{}, errors.New("SQLite backup metadata is incomplete")
+	}
+	classification := effectiveBackupClassification(metadata)
+	if classification != BackupShareable && classification != BackupSensitivePlaintext {
+		return BackupMetadata{}, fmt.Errorf("unknown backup classification %q", metadata.Classification)
 	}
 	return metadata, nil
 }
@@ -547,6 +677,27 @@ func verifyBackupChecksum(path string, metadata BackupMetadata) error {
 }
 
 func verifyBackup(ctx context.Context, path string, metadata BackupMetadata) error {
+	classification := effectiveBackupClassification(metadata)
+	switch classification {
+	case BackupShareable:
+		if metadata.ControlPlaneCredential != nil {
+			return errors.New("shareable backup metadata must not reference a Control Plane credential")
+		}
+	case BackupSensitivePlaintext:
+		credential := metadata.ControlPlaneCredential
+		if credential == nil || !credential.Available || credential.Path != credentialBackupPath(path) || credential.ChecksumSHA256 == "" {
+			return errors.New("sensitive plaintext backup credential provenance is incomplete")
+		}
+		checksum, err := checksumFile(credential.Path)
+		if err != nil {
+			return fmt.Errorf("verify sensitive plaintext backup credential: %w", err)
+		}
+		if checksum != credential.ChecksumSHA256 {
+			return errors.New("sensitive plaintext backup credential checksum mismatch")
+		}
+	default:
+		return fmt.Errorf("unknown backup classification %q", metadata.Classification)
+	}
 	if err := verifyBackupChecksum(path, metadata); err != nil {
 		return err
 	}
@@ -568,6 +719,15 @@ func verifyBackup(ctx context.Context, path string, metadata BackupMetadata) err
 		return err
 	}
 	return nil
+}
+
+func effectiveBackupClassification(metadata BackupMetadata) string {
+	if strings.TrimSpace(metadata.Classification) == "" {
+		// Metadata written before credential-inclusive backups existed contains
+		// only the SQLite snapshot and is therefore an ordinary shareable backup.
+		return BackupShareable
+	}
+	return metadata.Classification
 }
 
 func verifyDeliverySourceReferences(recorded, current []BackupReference) error {

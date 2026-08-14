@@ -20,7 +20,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	githubapi "github.com/skyhuang233/workflow/internal/github"
-	"github.com/skyhuang233/workflow/internal/githubapp"
+	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
@@ -322,39 +322,27 @@ func (c WorkerRegistryCheck) Run(ctx context.Context) Result {
 	return Result{Status: Pass, Summary: "registry resolves the exact pinned Worker manifest digest"}
 }
 
-type GitHubCredentialCheck struct {
-	Pin                   GitHubCredentialPin
-	IntegrationRepository string
-	PrivateKeyPEM         []byte
-	Verification          store.GitHubAppVerification
-	APIBase               string
-	Client                *http.Client
+type GitHubPATCheck struct {
+	Pin          GitHubCredentialPin
+	Token        string
+	Verification store.GitHubPATVerification
+	APIBase      string
+	Client       *http.Client
 }
 
-func (GitHubCredentialCheck) Name() string { return "Control Plane GitHub App contract" }
-
-func (c GitHubCredentialCheck) Run(ctx context.Context) Result {
-	if !sha256Pattern.MatchString(c.Verification.FingerprintSHA256) || c.Verification.AppID <= 0 || c.Verification.InstallationID <= 0 {
-		return Result{Status: Fail, Summary: "Control Plane GitHub App has not completed its live contract"}
+func (GitHubPATCheck) Name() string { return "Control Plane classic GitHub PAT contract" }
+func (c GitHubPATCheck) Run(ctx context.Context) Result {
+	if c.Token == "" || c.Pin.Kind != "classic-pat" || !strings.EqualFold(c.Pin.Owner, c.Verification.Owner) || credential.Fingerprint(c.Token) != c.Verification.FingerprintSHA256 || c.Verification.Status != "verified" {
+		return Result{Status: Fail, Summary: "classic PAT does not match its verified owner-bound record"}
 	}
-	digest := sha256.Sum256(c.PrivateKeyPEM)
-	if hex.EncodeToString(digest[:]) != c.Verification.FingerprintSHA256 {
-		return Result{Status: Fail, Summary: "GitHub App private key differs from the live-contract verification"}
-	}
-	if !strings.EqualFold(c.Verification.Owner, c.Pin.Owner) {
-		return Result{Status: Fail, Summary: "GitHub App installation owner does not match the verified owner"}
-	}
-	if !strings.EqualFold(c.Verification.IntegrationRepository, c.IntegrationRepository) {
-		return Result{Status: Fail, Summary: "GitHub App verification does not match the configured integration repository"}
-	}
-	_, err := githubapp.VerifyInstallation(ctx, githubapp.DiscoveryConfig{
-		AppID: c.Verification.AppID, PrivateKeyPEM: c.PrivateKeyPEM, Owner: c.Pin.Owner,
-		Repository: c.IntegrationRepository, APIBase: c.APIBase, Client: c.Client,
-	}, c.Verification.InstallationID)
+	live, err := (githubcredential.Verifier{APIBase: c.APIBase, Client: c.Client}).Verify(ctx, c.Token, c.Pin.Owner)
 	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("discover live GitHub App installation: %v", err), Err: err}
+		return Result{Status: Fail, Summary: fmt.Sprintf("verify classic PAT live contract: %v", err), Err: err}
 	}
-	return Result{Status: Pass, Summary: "GitHub App private key, live all-repositories installation, owner, and verification metadata match"}
+	if live.FingerprintSHA256 != c.Verification.FingerprintSHA256 || !strings.EqualFold(live.Login, c.Verification.Login) {
+		return Result{Status: Fail, Summary: "classic PAT live identity differs from persisted verification"}
+	}
+	return Result{Status: Pass, Summary: "classic PAT identity, repo/workflow scopes, owner binding, and fingerprint verified"}
 }
 
 type GitHubCheck struct {
@@ -368,11 +356,11 @@ func (GitHubCheck) Name() string { return "GitHub Owner-Guarded integration cont
 
 func (c GitHubCheck) Run(ctx context.Context) Result {
 	if c.Credentials == nil {
-		return Result{Status: Fail, Summary: "Control Plane GitHub App token source is unavailable"}
+		return Result{Status: Fail, Summary: "Control Plane GitHub credential source is unavailable"}
 	}
 	token, err := c.Credentials.Get(ctx, credential.GatewayTarget)
 	if err != nil {
-		return Result{Status: Fail, Summary: "Control Plane GitHub App installation token is unavailable"}
+		return Result{Status: Fail, Summary: "Control Plane GitHub credential is unavailable"}
 	}
 	var repo githubapi.RepositoryMetadata
 	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.GitHub.TestRepository, &repo); err != nil {

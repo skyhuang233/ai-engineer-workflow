@@ -53,6 +53,27 @@ $docker = Invoke-ObservedCommand "docker" @("version", "--format", "{{json .}}")
 $codex = Invoke-ObservedCommand "codex" @("--version")
 $workflow = Invoke-ObservedCommand "workflow" @("--version")
 $credentialPath = Join-Path $WorkflowHome "state\credentials\github.pat"
+if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) { throw "USERPROFILE is required to resolve Codex user skills" }
+$codexSkillsRoot = Join-Path $env:USERPROFILE ".agents\skills"
+$workflowBin = Join-Path $WorkflowHome "bin"
+$currentUserPath = ""
+try { $currentUserPath = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name Path -ErrorAction Stop).Path } catch { }
+$workflow.path_reconciled = (@($currentUserPath -split ';' | Where-Object { [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1)
+$controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI is unavailable" }
+$installedWorkflow = Join-Path $workflowBin "workflow.exe"
+if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
+    $status = Invoke-ObservedCommand $installedWorkflow @("status", "--workflow-home", $WorkflowHome)
+    if ($status.exit_code -eq 0) {
+        try {
+            $statusJSON = $status.output | ConvertFrom-Json
+            $controlPlane = [ordered]@{ state = [string]$statusJSON.state; diagnostic = [string]$statusJSON.diagnostic; runtime = $statusJSON.runtime }
+        } catch {
+            $controlPlane = [ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI returned invalid status JSON" }
+        }
+    } else {
+        $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI status command failed" }
+    }
+}
 
 [ordered]@{
     schema_version = 1
@@ -63,6 +84,8 @@ $credentialPath = Join-Path $WorkflowHome "state\credentials\github.pat"
     git = $gitFacts
     docker = $docker
     codex = $codex
+    codex_skills_root = $codexSkillsRoot
     workflow = $workflow
+    control_plane = $controlPlane
     github_credential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf) }
 } | ConvertTo-Json -Depth 8

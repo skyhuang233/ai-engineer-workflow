@@ -40,3 +40,27 @@ func (s *Store) RepositoryAdmission(ctx context.Context, repository string) (Rep
 	value.VerifiedAt, err = time.Parse(time.RFC3339Nano, verified)
 	return value, err
 }
+
+func (s *Store) RepositoryAdmissions(ctx context.Context) ([]RepositoryAdmission, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repository,onboarding_plan_digest_sha256,contract_version,manifest_digest_sha256,eligible,suspension_reason,verified_at FROM repository_admissions ORDER BY repository`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []RepositoryAdmission
+	for rows.Next() {
+		var value RepositoryAdmission
+		var eligible int
+		var verified string
+		if err := rows.Scan(&value.Repository, &value.OnboardingPlanDigestSHA256, &value.ContractVersion, &value.ManifestDigestSHA256, &eligible, &value.SuspensionReason, &verified); err != nil {
+			return nil, err
+		}
+		value.Eligible = eligible == 1
+		value.VerifiedAt, err = time.Parse(time.RFC3339Nano, verified)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}

@@ -20,7 +20,18 @@
     "docker_desktop": {"version": "set-by-publisher", "installer_url": "https://example.invalid/set-by-publisher", "windows_amd64_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
     "worker": {"image": "ghcr.io/skyhuang233/workflow-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"},
     "workflow_skill_bundle": {"version": "1.0.0", "install_scope": "user", "managed_skills": ["agent-workflow"]},
-    "repository_contract": {"version": "1", "manifest_path": ".workflow/repository.json", "check_name": "workflow-contract"}
+    "repository_contract": {
+      "version": "1",
+      "manifest_path": ".workflow/repository.json",
+      "check_name": "workflow-contract",
+      "labels": [
+        {"name": "workflow:inbox", "color": "5319e7", "description": "Agent Workflow inbox"},
+        {"name": "workflow:plan", "color": "0e8a16", "description": "Agent Workflow delivery plan"},
+        {"name": "workflow:ticket", "color": "1d76db", "description": "Agent Workflow executable ticket"},
+        {"name": "workflow:active", "color": "fbca04", "description": "Agent Workflow active work"},
+        {"name": "workflow:delivered", "color": "006b75", "description": "Agent Workflow delivered work"}
+      ]
+    }
   },
   "artifacts": [],
   "bundled_files": [],

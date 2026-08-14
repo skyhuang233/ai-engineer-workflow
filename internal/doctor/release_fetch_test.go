@@ -77,12 +77,6 @@ func TestReleaseFetcherProvesManifestReleaseAndPublisherRun(t *testing.T) {
 	}
 	sourceConfig := config
 	sourceConfig.GitHub.Credential.Kind = "fine-grained-pat"
-	sourceConfig.GitHub.Credential.PrivateKeyFile = ""
-	sourceConfig.GitHub.Credential.Permissions = make(map[string]string, len(config.GitHub.Credential.Permissions))
-	for name, access := range config.GitHub.Credential.Permissions {
-		sourceConfig.GitHub.Credential.Permissions[name] = access
-	}
-	delete(sourceConfig.GitHub.Credential.Permissions, "checks")
 	sourceConfigData, err := json.Marshal(sourceConfig)
 	if err != nil {
 		t.Fatal(err)

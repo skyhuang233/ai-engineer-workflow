@@ -22,6 +22,9 @@ type Dispatcher struct {
 	Recovery          RecoveryInspector
 	HostPressure      HostPressureInspector
 	ProvisionSession  store.SessionProvisioner
+	Admission         interface {
+		Require(context.Context, string) error
+	}
 }
 
 type RecoveryInspector interface {
@@ -48,6 +51,11 @@ func (p HostPressure) Unsafe() bool { return p.Reason != "" }
 func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ticketID int64, owner string) (store.TicketClaim, error) {
 	if d.Store == nil || d.Reader == nil || d.Projector == nil {
 		return store.TicketClaim{}, fmt.Errorf("scheduler dependencies are incomplete")
+	}
+	if d.Admission != nil {
+		if err := d.Admission.Require(ctx, repository); err != nil {
+			return store.TicketClaim{}, err
+		}
 	}
 	snapshot, err := d.Reader.ReadPlan(ctx, repository, rootNumber)
 	if err != nil {
@@ -90,6 +98,11 @@ func (d Dispatcher) Claim(ctx context.Context, repository string, rootNumber, ti
 func (d Dispatcher) ClaimNext(ctx context.Context, repository, owner string) (store.TicketClaim, error) {
 	if d.Store == nil || d.Projector == nil {
 		return store.TicketClaim{}, fmt.Errorf("scheduler dependencies are incomplete")
+	}
+	if d.Admission != nil {
+		if err := d.Admission.Require(ctx, repository); err != nil {
+			return store.TicketClaim{}, err
+		}
 	}
 	paused, err := d.DispatchPaused(ctx, repository)
 	if err != nil {

@@ -40,15 +40,11 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"worker image repository", func(c *Config) { c.Worker.ImageRepository = "latest" }},
 		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
 		{"release repository owner", func(c *Config) { c.Worker.ReleaseRepository = "collaborator/workflow" }},
-		{"integration repository", func(c *Config) { c.GitHub.TestRepository = "" }},
-		{"integration repository owner", func(c *Config) { c.GitHub.TestRepository = "collaborator/integration" }},
 		{"required check", func(c *Config) { c.GitHub.RequiredCheck = "" }},
 		{"workflow path", func(c *Config) { c.GitHub.WorkflowPath = "workflow-contract.yml" }},
 		{"GitHub credential kind", func(c *Config) { c.GitHub.Credential.Kind = "fine-grained-pat" }},
-		{"all repositories credential", func(c *Config) { c.GitHub.Credential.AllRepositories = false }},
-		{"checks read permission", func(c *Config) { delete(c.GitHub.Credential.Permissions, "checks") }},
-		{"GitHub App private key file", func(c *Config) { c.GitHub.Credential.PrivateKeyFile = "" }},
-		{"GitHub App private key fixed path", func(c *Config) { c.GitHub.Credential.PrivateKeyFile = `D:\workflow\github-app.pem` }},
+		{"PAT scopes", func(c *Config) { c.GitHub.Credential.RequiredScopes = []string{"repo"} }},
+		{"PAT fixed relative path", func(c *Config) { c.GitHub.Credential.PlaintextRelativePath = `credentials\github.pat` }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -217,7 +213,7 @@ func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 5,
+		SchemaVersion: 6,
 		Codex:         ToolPin{Version: "0.147.0"},
 		GitHubCLI:     GitHubCLIPin{Version: "2.97.0", LinuxAMD64SHA256: "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"},
 		Go:            GoPin{Version: "1.25.12", LinuxAMD64SHA256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"},
@@ -242,17 +238,25 @@ func validConfig() Config {
 			RequiredCheck:  "workflow-contract",
 			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
-				Kind:            "github-app",
-				Owner:           "skyhuang233",
-				AllRepositories: true,
-				PrivateKeyFile:  `C:\ProgramData\workflow\github-app.pem`,
-				Permissions: map[string]string{
-					"actions": "read", "checks": "read", "contents": "write", "issues": "write",
-					"metadata": "read", "pull_requests": "write",
-				},
+				Kind:                  "classic-pat",
+				Owner:                 "skyhuang233",
+				RequiredScopes:        []string{"repo", "workflow"},
+				PlaintextRelativePath: `state\credentials\github.pat`,
 			},
 		},
 		Upgrade: UpgradePolicy{Rule: "Upgrade only after compatibility and integration tests pass."},
+	}
+}
+
+func TestConfigAcceptsClassicPATSchemaSix(t *testing.T) {
+	config := validConfig()
+	config.GitHub.TestRepository = ""
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	config.GitHub.Credential.RequiredScopes = []string{"repo"}
+	if err := config.Validate(); err == nil {
+		t.Fatal("scope-deficient PAT config accepted")
 	}
 }
 

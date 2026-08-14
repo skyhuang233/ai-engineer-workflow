@@ -113,8 +113,24 @@ func (c PlatformSetupContract) validate() error {
 	if strings.TrimSpace(c.RepositoryContract.Version) == "" || c.RepositoryContract.ManifestPath != ".workflow/repository.json" || c.RepositoryContract.CheckName != "workflow-contract" {
 		return errors.New("Repository Contract pin is incomplete")
 	}
+	if len(c.RepositoryContract.Labels) == 0 {
+		return errors.New("Repository Contract label vocabulary is empty")
+	}
+	labels := map[string]struct{}{}
+	for _, label := range c.RepositoryContract.Labels {
+		name := strings.TrimSpace(label.Name)
+		if name == "" || !regexp.MustCompile(`^[0-9a-fA-F]{6}$`).MatchString(label.Color) || strings.TrimSpace(label.Description) == "" {
+			return fmt.Errorf("Repository Contract label %q is invalid", label.Name)
+		}
+		if _, duplicate := labels[strings.ToLower(name)]; duplicate {
+			return fmt.Errorf("duplicate Repository Contract label %q", label.Name)
+		}
+		labels[strings.ToLower(name)] = struct{}{}
+	}
 	return nil
 }
+
+func (c PlatformSetupContract) Validate() error { return c.validate() }
 
 func validateArtifacts(artifacts []Artifact, requireCore bool) error {
 	if len(artifacts) == 0 {

@@ -1,15 +1,28 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
+    [Parameter(Mandatory = $true)][string]$SignaturePath,
     [Parameter(Mandatory = $true)][string]$PlanPath,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ApprovedDigest
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ApprovedDigest,
+    [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
+    [string]$PublicKeyPath = ""
 )
 
 $ErrorActionPreference = "Stop"
+$verificationArguments = @{
+    ManifestPath = $ManifestPath
+    SignaturePath = $SignaturePath
+    PolicyPath = $PolicyPath
+}
+if (-not [string]::IsNullOrWhiteSpace($PublicKeyPath)) { $verificationArguments.PublicKeyPath = $PublicKeyPath }
+& (Join-Path $PSScriptRoot "verify-platform-release.ps1") @verificationArguments | Out-Null
+
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $planEnvelope = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 if ($planEnvelope.digest_sha256 -ne $ApprovedDigest) { throw "Approved digest does not match the Setup Plan" }
 if ($manifest.schema_version -ne 1) { throw "Unsupported Platform Release Manifest schema" }
+$plannedVersions = @($planEnvelope.plan.effects | Where-Object { $_.kind -eq "platform_cli" -and $_.action -eq "install" } | ForEach-Object { [string]$_.parameters.version })
+if ($plannedVersions.Count -gt 1 -or ($plannedVersions.Count -eq 1 -and $plannedVersions[0] -ne [string]$manifest.release.version)) { throw "Approved Setup Plan does not bind the verified Platform Release version" }
 
 $asset = $manifest.artifacts | Where-Object { $_.name -eq "workflow-windows-amd64.zip" } | Select-Object -First 1
 if ($null -eq $asset) { throw "Release has no Windows amd64 Workflow CLI asset" }
@@ -26,7 +39,8 @@ try {
     $executable = Get-ChildItem -LiteralPath $expanded -Filter workflow.exe -Recurse | Select-Object -First 1
     if ($null -eq $executable) { throw "Workflow CLI archive has no workflow.exe" }
     $canonicalPlanPath = Join-Path $temporaryRoot "approved-plan.json"
-    $planEnvelope.plan | ConvertTo-Json -Depth 20 -Compress | Set-Content -LiteralPath $canonicalPlanPath -Encoding utf8NoBOM
+    $canonicalPlan = $planEnvelope.plan | ConvertTo-Json -Depth 20 -Compress
+    [IO.File]::WriteAllText($canonicalPlanPath, $canonicalPlan, (New-Object Text.UTF8Encoding($false)))
     & $executable.FullName setup apply --plan $canonicalPlanPath --approved-digest $ApprovedDigest
     if ($LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }
 } finally {

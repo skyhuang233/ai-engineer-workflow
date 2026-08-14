@@ -142,7 +142,7 @@ func validManifest(artifactData map[string][]byte) Manifest {
 			Docker:              DockerDependency{Version: "4.45.0", InstallerURL: "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe", WindowsAMD64SHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
 			Worker:              WorkerPin{Image: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
 			SkillBundle:         SkillBundleContract{Version: "1.0.0", InstallScope: "user", ManagedSkills: []string{"implement", "review"}},
-			RepositoryContract:  RepositoryContractPin{Version: "1", ManifestPath: ".workflow/repository.json", CheckName: "workflow-contract"},
+			RepositoryContract:  RepositoryContractPin{Version: "1", ManifestPath: ".workflow/repository.json", CheckName: "workflow-contract", Labels: []RepositoryLabel{{Name: "workflow:plan", Color: "0e8a16", Description: "delivery plan"}}},
 		},
 		Artifacts:    artifacts,
 		BundledFiles: []BundledFile{{Path: "skills/implement/SKILL.md", SHA256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}, {Path: "repository-contract/AGENTS.block.md", SHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}},

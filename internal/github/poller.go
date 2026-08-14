@@ -636,7 +636,7 @@ func (p Poller) recordFailureWithKindForPlansPolicy(ctx context.Context, reposit
 		return PollResult{}, errors.Join(cause, store.ErrFencingConflict)
 	}
 	if isPollCredentialFailure(cause) {
-		pauseErr := p.Store.PauseGatewayWritesForGitHubPollCredential(persistenceCtx, repository, leaseToken, store.ControlPlaneGitHubAppRecoveryRemediation, now, p.now())
+		pauseErr := p.Store.PauseGatewayWritesForGitHubPollCredential(persistenceCtx, repository, leaseToken, store.ControlPlaneGitHubCredentialRecoveryRemediation, now, p.now())
 		return PollResult{}, errors.Join(cause, pauseErr)
 	}
 	var existingCursor store.GitHubPollCursor

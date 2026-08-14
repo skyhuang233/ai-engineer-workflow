@@ -35,7 +35,7 @@ func TestGatewayCredentialPauseUsesOneDurableInboxItemAndResumes(t *testing.T) {
 		t.Fatalf("pause = %t, %q, %v", paused, reason, err)
 	}
 	item, err := db.WorkflowInboxItem(ctx, GatewayCredentialInboxKey)
-	if err != nil || item.State != "open" || item.Title != ControlPlaneGitHubAppRecoveryTitle || !item.CreatedAt.Equal(first) {
+	if err != nil || item.State != "open" || item.Title != ControlPlaneGitHubCredentialRecoveryTitle || !item.CreatedAt.Equal(first) {
 		t.Fatalf("inbox item = %#v, %v", item, err)
 	}
 	questions, err := db.OpenWorkflowQuestions(ctx, "owner/repository", 0)

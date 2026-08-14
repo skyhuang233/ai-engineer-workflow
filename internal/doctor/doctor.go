@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,8 +20,6 @@ import (
 )
 
 const Redacted = "[REDACTED]"
-
-const GitHubAppPrivateKeyFile = `C:\ProgramData\workflow\github-app.pem`
 
 type Status string
 
@@ -64,7 +63,9 @@ type RuntimePolicy struct {
 }
 
 type GitHubPin struct {
-	TestRepository string              `json:"test_repository"`
+	// TestRepository is optional and retained for the read-only release
+	// qualification probe. It is not part of credential admission.
+	TestRepository string              `json:"test_repository,omitempty"`
 	DefaultBranch  string              `json:"default_branch"`
 	RequiredCheck  string              `json:"required_check"`
 	WorkflowPath   string              `json:"workflow_path"`
@@ -72,11 +73,10 @@ type GitHubPin struct {
 }
 
 type GitHubCredentialPin struct {
-	Kind            string            `json:"kind"`
-	Owner           string            `json:"owner"`
-	AllRepositories bool              `json:"all_repositories"`
-	PrivateKeyFile  string            `json:"private_key_file"`
-	Permissions     map[string]string `json:"permissions"`
+	Kind                  string   `json:"kind"`
+	Owner                 string   `json:"owner"`
+	RequiredScopes        []string `json:"required_scopes"`
+	PlaintextRelativePath string   `json:"plaintext_relative_path"`
 }
 
 type UpgradePolicy struct {
@@ -128,28 +128,22 @@ func (c Config) Validate() error {
 	switch {
 	case c.Runtime.MaxWorkerAttempts < 1:
 		return errors.New("runtime max worker attempts must be positive")
-	case !repoPattern.MatchString(c.GitHub.TestRepository):
-		return errors.New("GitHub test repository must be owner/name")
 	case strings.TrimSpace(c.GitHub.DefaultBranch) == "":
 		return errors.New("GitHub default branch is required")
 	case strings.TrimSpace(c.GitHub.RequiredCheck) == "":
 		return errors.New("GitHub required check is required")
 	case !workflowPattern.MatchString(c.GitHub.WorkflowPath):
 		return errors.New("GitHub integration workflow path must be a .github/workflows YAML file")
-	case c.GitHub.Credential.Kind != "github-app":
-		return errors.New("Control Plane GitHub credential must be a GitHub App")
 	case strings.TrimSpace(c.GitHub.Credential.Owner) == "":
-		return errors.New("Control Plane GitHub App owner is required")
-	case !strings.EqualFold(strings.TrimSpace(c.GitHub.Credential.PrivateKeyFile), GitHubAppPrivateKeyFile):
-		return fmt.Errorf("Control Plane GitHub App private key file must be %s", GitHubAppPrivateKeyFile)
+		return errors.New("Control Plane GitHub credential owner is required")
 	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
-		return errors.New("worker release repository owner must match the Control Plane GitHub App owner")
-	case !repositoryOwnedBy(c.GitHub.TestRepository, c.GitHub.Credential.Owner):
-		return errors.New("GitHub test repository owner must match the Control Plane GitHub App owner")
-	case !c.GitHub.Credential.AllRepositories:
-		return errors.New("Control Plane GitHub App must cover all repositories")
-	case !validGitHubAppPermissions(c.GitHub.Credential.Permissions):
-		return errors.New("Control Plane GitHub App permissions do not satisfy the GitHub contract")
+		return errors.New("worker release repository owner must match the Control Plane GitHub credential owner")
+	case c.GitHub.Credential.Kind != "classic-pat":
+		return errors.New("schema 6 Control Plane GitHub credential must be a classic PAT")
+	case !requiredPATScopes(c.GitHub.Credential.RequiredScopes):
+		return errors.New("classic PAT requires repo and workflow scopes")
+	case filepath.Clean(c.GitHub.Credential.PlaintextRelativePath) != filepath.Clean(`state\credentials\github.pat`):
+		return errors.New("classic PAT path must be state\\credentials\\github.pat relative to Workflow Home")
 	case strings.TrimSpace(c.Upgrade.Rule) == "":
 		return errors.New("toolchain upgrade rule is required")
 	default:
@@ -159,7 +153,7 @@ func (c Config) Validate() error {
 
 func (c Config) validateWorkerBuildInputs() error {
 	switch {
-	case c.SchemaVersion != 5:
+	case c.SchemaVersion != 6:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
@@ -198,22 +192,21 @@ func (c Config) validateWorkerBuildInputs() error {
 	}
 }
 
-func repositoryOwnedBy(repository, owner string) bool {
-	return githubapi.ValidateOwnerGuardedRepositoryName(repository, owner) == nil
-}
-
-func validGitHubAppPermissions(actual map[string]string) bool {
-	expected := map[string]string{
-		"actions": "read", "checks": "read", "contents": "write", "issues": "write",
-		"metadata": "read", "pull_requests": "write",
-	}
-	for name, access := range expected {
-		got := actual[name]
-		if got != access && !(access == "read" && got == "write") {
-			return false
+func requiredPATScopes(scopes []string) bool {
+	repo, workflow := false, false
+	for _, scope := range scopes {
+		switch strings.ToLower(strings.TrimSpace(scope)) {
+		case "repo":
+			repo = true
+		case "workflow":
+			workflow = true
 		}
 	}
-	return true
+	return repo && workflow
+}
+
+func repositoryOwnedBy(repository, owner string) bool {
+	return githubapi.ValidateOwnerGuardedRepositoryName(repository, owner) == nil
 }
 
 type Result struct {

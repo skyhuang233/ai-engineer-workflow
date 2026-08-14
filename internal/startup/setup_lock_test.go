@@ -27,3 +27,23 @@ func TestWorkflowHomeAndRepositoryLocksFenceOnlyMatchingIdentity(t *testing.T) {
 	}
 	defer repoTwo.Close()
 }
+
+func TestControlPlaneLaunchAndRuntimeLocksAreIndependentAndExclusive(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	launch, err := AcquireControlPlaneLaunchLock(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer launch.Close()
+	if _, err := AcquireControlPlaneLaunchLock(home); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second launch lock = %v", err)
+	}
+	runtime, err := AcquireControlPlaneRuntimeLock(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if _, err := AcquireControlPlaneRuntimeLock(home); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second runtime lock = %v", err)
+	}
+}
