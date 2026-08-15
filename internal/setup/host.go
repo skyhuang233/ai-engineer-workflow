@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,20 +26,21 @@ import (
 )
 
 type HostAdapter struct {
-	Layout                    workflowhome.Layout
-	Executable                string
-	SkillBundleSource         string
-	PersistUserPATH           func(string) error
-	GitHub                    *github.Client
-	GitCredential             onboarding.GitCredential
-	RepositoryPath            string
-	PlanDigest                string
-	TemporaryRoot             string
-	StartControlPlane         func(context.Context, controlplane.StartOptions) (controlplane.RuntimeRecord, error)
-	InspectControlPlane       func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation
-	DockerDesktopHost         hostsetup.DockerDesktopHost
-	CurrentUserPATHReconciled func(string) (bool, error)
-	OnboardingMergeHeads      map[string]string
+	Layout                     workflowhome.Layout
+	Executable                 string
+	SkillBundleSource          string
+	PersistUserPATH            func(string) error
+	GitHub                     *github.Client
+	GitCredential              onboarding.GitCredential
+	RepositoryPath             string
+	PlanDigest                 string
+	TemporaryRoot              string
+	StartControlPlane          func(context.Context, controlplane.StartOptions) (controlplane.RuntimeRecord, error)
+	InspectControlPlane        func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation
+	DockerDesktopHost          hostsetup.DockerDesktopHost
+	CurrentUserPATHReconciled  func(string) (bool, error)
+	OnboardingMergeHeads       map[string]string
+	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
@@ -258,16 +260,19 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 		if a.OnboardingMergeHeads == nil {
 			return setupcontract.EffectFailed, "", errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
 		}
-		content, err := a.GitHub.RepositoryFile(ctx, effect.Subject, repositorycontract.ManifestPath, effect.Parameters["base_branch"])
-		if github.IsNotFound(err) {
-			return setupcontract.EffectRequired, "Repository Contract Manifest is absent", nil
+		var fetchErr error
+		_, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+			content, fileErr := a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["base_branch"])
+			if fileErr != nil && fetchErr == nil {
+				fetchErr = fileErr
+			}
+			return content, fileErr
+		}, effect.Subject, effect.Parameters["base_branch"], effect.Parameters["manifest_digest"])
+		if fetchErr != nil && !github.IsNotFound(fetchErr) {
+			return setupcontract.EffectFailed, "", fetchErr
 		}
 		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		sum := sha256.Sum256(content)
-		if hex.EncodeToString(sum[:]) != effect.Parameters["manifest_digest"] {
-			return setupcontract.EffectRequired, "Repository Contract Manifest differs", nil
+			return setupcontract.EffectRequired, err.Error(), nil
 		}
 		if len(a.PlanDigest) < 12 {
 			return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
@@ -514,6 +519,19 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 	if err := setupcontract.ValidatePreconditionForExecution(value); err != nil {
 		return err
 	}
+	if value.Kind == "host_identity" {
+		if value.Subject != "current-user" {
+			return errors.New("host identity precondition subject must be current-user")
+		}
+		current, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("read current host identity: %w", err)
+		}
+		if value.Expected != current.Uid && !strings.EqualFold(value.Expected, current.Username) && value.Expected != current.Name {
+			return errors.New("current host identity drifted from the approved plan")
+		}
+		return nil
+	}
 	if value.Kind == "github_default_head" {
 		if a.GitHub == nil {
 			return errors.New("GitHub client is required to verify the approved default-branch base")
@@ -607,7 +625,7 @@ func onboardingGitBranch(ctx context.Context, repository string) (string, error)
 	return strings.TrimSpace(string(output)), err
 }
 
-func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupcontract.Effect) error {
+func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupcontract.Effect) (resultErr error) {
 	if a.GitHub == nil || a.PlanDigest == "" {
 		return errors.New("GitHub client and approved plan digest are required")
 	}
@@ -645,8 +663,24 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	if err != nil {
 		return err
 	}
-	defer workspace.Cleanup()
-	defer a.GitHub.DeleteBranch(context.Background(), effect.Subject, workspace.Branch)
+	cleanupWorkspace := a.CleanupOnboardingWorkspace
+	if cleanupWorkspace == nil {
+		cleanupWorkspace = func(workspace onboarding.GitWorkspace) error { return workspace.Cleanup() }
+	}
+	defer func() {
+		branchErr := a.GitHub.DeleteBranch(context.Background(), effect.Subject, workspace.Branch)
+		if github.IsNotFound(branchErr) {
+			branchErr = nil
+		}
+		if branchErr != nil {
+			branchErr = fmt.Errorf("cleanup remote onboarding branch: %w", branchErr)
+		}
+		workspaceErr := cleanupWorkspace(workspace)
+		if workspaceErr != nil {
+			workspaceErr = fmt.Errorf("cleanup temporary onboarding clone: %w", workspaceErr)
+		}
+		resultErr = errors.Join(resultErr, branchErr, workspaceErr)
+	}()
 	body := "Approved Setup Plan SHA-256: " + a.PlanDigest
 	owner := strings.SplitN(effect.Subject, "/", 2)[0]
 	pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, workspace.Branch, effect.Parameters["base_branch"])

@@ -245,7 +245,15 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 }
 
 func testPlan(home string) setupcontract.Plan {
-	return setupcontract.Plan{SchemaVersion: 1, PlanID: "plan-test", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: home}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "first", Kind: "install_file", Subject: "one", Action: "install", Parameters: map[string]string{"sha256": repeat("a", 64)}}, {ID: "second", Kind: "install_file", Subject: "two", Action: "install", Parameters: map[string]string{"sha256": repeat("b", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: home, Expected: "ready"}}}
+	pins := map[string]string{"version": "1.0.0", "sha256": repeat("d", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}
+	copyPins := func() map[string]string {
+		value := map[string]string{}
+		for key, item := range pins {
+			value[key] = item
+		}
+		return value
+	}
+	return setupcontract.Plan{SchemaVersion: 1, PlanID: "plan-test", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: home}, Preconditions: []setupcontract.Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "fake-user"}}, Effects: []setupcontract.Effect{{ID: "first", Kind: "platform_cli", Subject: "one", Action: "install", Parameters: copyPins()}, {ID: "second", Kind: "platform_cli", Subject: "two", Action: "install", Parameters: copyPins()}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: home, Expected: "ready"}}}
 }
 func repeat(value string, count int) string {
 	var b bytes.Buffer

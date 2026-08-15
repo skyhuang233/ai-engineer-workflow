@@ -55,6 +55,16 @@ try {
             }
             "workflow_skill_bundle" {
                 if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { throw "Approved Setup Plan Workflow Skill Bundle effect differs from the verified manifest" }
+                $plannedSkills = @([string]$effect.parameters.managed_skills_json | ConvertFrom-Json | ForEach-Object { [string]$_ })
+                $manifestSkills = @($manifest.platform_setup_contract.workflow_skill_bundle.managed_skills | ForEach-Object { [string]$_ })
+                if ($plannedSkills.Count -ne $manifestSkills.Count) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" }
+                for ($index = 0; $index -lt $manifestSkills.Count; $index++) { if ($plannedSkills[$index] -ne $manifestSkills[$index]) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" } }
+                $plannedFiles = @([string]$effect.parameters.files_json | ConvertFrom-Json)
+                $manifestFiles = @($manifest.bundled_files | Where-Object { ([string]$_.path).StartsWith("skills/") })
+                if ($plannedFiles.Count -ne $manifestFiles.Count) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" }
+                for ($index = 0; $index -lt $manifestFiles.Count; $index++) {
+                    if ([string]$plannedFiles[$index].path -ne ([string]$manifestFiles[$index].path).Substring(7) -or [string]$plannedFiles[$index].sha256 -ne [string]$manifestFiles[$index].sha256) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" }
+                }
             }
             "docker_desktop" {
                 if (@("install", "upgrade", "repair") -notcontains [string]$effect.action -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.docker_desktop.version -or [string]$effect.parameters.installer_url -ne [string]$manifest.platform_setup_contract.docker_desktop.installer_url -or [string]$effect.parameters.windows_amd64_sha256 -ne [string]$manifest.platform_setup_contract.docker_desktop.windows_amd64_sha256) { throw "Approved Setup Plan Docker Desktop effect differs from the verified manifest" }

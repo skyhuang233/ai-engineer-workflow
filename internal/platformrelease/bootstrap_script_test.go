@@ -98,7 +98,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	})
 	write(hostFactsPath, hostFacts)
 	planScript := filepath.Join(filepath.Dir(script), "new-platform-bootstrap-plan.ps1")
-	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
 	var planned struct {
 		DigestSHA256  string `json:"digest_sha256"`
 		CanonicalJSON string `json:"canonical_json"`
@@ -147,17 +147,18 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	write(filepath.Join(skillsRoot, "implement", ".agent-workflow-owner.json"), ownerJSON)
 	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), ownerJSON)
 	contractDigest := parsed.Preconditions[1].Expected
+	controlPlaneDigest := strings.Repeat("f", 64)
 	noOpState := map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
 		"workflow":          map[string]any{"installed": true, "owned": true, "path_reconciled": true, "version": manifest.Release.Version, "sha256": manifest.BundledFiles[0].SHA256},
-		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest},
+		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": manifest.BundledFiles[0].SHA256, "control_plane_plan_digest_sha256": controlPlaneDigest},
 		"docker":            map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
 		"github_credential": map[string]any{"exists": true, "verified": true, "owner": "owner", "scopes": []string{"repo", "workflow"}, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
-		"control_plane":     map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version}}, "codex_skills_root": skillsRoot,
+		"control_plane":     map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}, "codex_skills_root": skillsRoot,
 	}
 	noOpFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, noOpFacts)
-	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
 	var noOp struct {
 		Status        string `json:"status"`
 		DigestSHA256  string `json:"digest_sha256"`
@@ -193,20 +194,64 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	noOpState["workflow"].(map[string]any)["sha256"] = strings.Repeat("0", 64)
 	cliOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cliOnlyFacts)
-	assertSingleRepair("CLI-only", "platform_cli", "install")
+	assertSingleRepair("CLI-only", "platform_cli", "install", "-GitHubOwner", "owner")
 	noOpState["workflow"].(map[string]any)["sha256"] = manifest.BundledFiles[0].SHA256
-	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": map[string]any{"platform_version": manifest.Release.Version}}
+	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
 	cpOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cpOnlyFacts)
-	assertSingleRepair("Control-Plane-only", "control_plane", "start")
-	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": "0.9.0"}}
+	assertSingleRepair("Control-Plane-only", "control_plane", "start", "-GitHubOwner", "owner")
+	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": "0.9.0", "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
 	upgradeFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, upgradeFacts)
-	assertSingleRepair("running Control Plane upgrade", "control_plane", "replace")
-	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version}}
+	assertSingleRepair("running Control Plane upgrade", "control_plane", "replace", "-GitHubOwner", "owner")
+	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
 	ownerFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, ownerFacts)
 	assertSingleRepair("wrong-owner PAT", "github_pat", "replace", "-GitHubOwner", "different-owner")
+	assertInstallationReauthorization := func(name, wantControlPlaneAction string, extra ...string) {
+		t.Helper()
+		output, runErr := run(planScript, append([]string{"-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner"}, extra...)...)
+		var repair struct {
+			CanonicalJSON string `json:"canonical_json"`
+			Plan          struct {
+				Effects []struct{ Kind, Action string } `json:"effects"`
+			} `json:"plan"`
+		}
+		decodeErr := json.Unmarshal([]byte(output), &repair)
+		_, _, _, parseErr := setupcontract.ParsePlan([]byte(repair.CanonicalJSON))
+		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 2 || repair.Plan.Effects[0].Kind != "platform_installation" || repair.Plan.Effects[0].Action != "record" || repair.Plan.Effects[1].Kind != "control_plane" || repair.Plan.Effects[1].Action != wantControlPlaneAction {
+			t.Fatalf("%s did not rewrite installation and reauthorize the running Control Plane: %q, %v, %v, %v", name, output, runErr, decodeErr, parseErr)
+		}
+	}
+	platformState := noOpState["platform"].(map[string]any)
+	platformState["platform_setup_contract_digest"] = strings.Repeat("1", 64)
+	driftFacts, _ := json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	assertInstallationReauthorization("contract-pin drift", "replace")
+	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
+	driftFacts, _ = json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	assertInstallationReauthorization("stopped Control Plane with installation rewrite", "start")
+	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
+	platformState["platform_setup_contract_digest"] = contractDigest
+	platformState["workflow_cli_sha256"] = strings.Repeat("2", 64)
+	driftFacts, _ = json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	assertInstallationReauthorization("CLI-pin drift", "replace")
+	platformState["workflow_cli_sha256"] = manifest.BundledFiles[0].SHA256
+	platformState["control_plane_plan_digest_sha256"] = strings.Repeat("3", 64)
+	driftFacts, _ = json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	assertSingleRepair("Control Plane authorization-pin drift", "control_plane", "replace", "-GitHubOwner", "owner")
+	platformState["control_plane_plan_digest_sha256"] = controlPlaneDigest
+	platformState["release_manifest_digest"] = strings.Repeat("4", 64)
+	driftFacts, _ = json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
+	if err == nil || !strings.Contains(output, "reuse its exact manifest") {
+		t.Fatalf("implicit release switch was accepted: %q, %v", output, err)
+	}
+	assertInstallationReauthorization("explicit release upgrade", "replace", "-AllowUpgrade")
 
 	installScript := filepath.Join(filepath.Dir(script), "install-workflow-cli.ps1")
 	tampered := parsed
@@ -245,6 +290,32 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	if err == nil || !strings.Contains(output, "Workflow Skill Bundle effect differs from the verified manifest") {
 		t.Fatalf("effect version mismatch reached download or apply: %q, %v", output, err)
 	}
+	for name, parameter := range map[string]string{"managed skills": `["different"]`, "bundled files": `[]`} {
+		var wrongPayload setupcontract.Plan
+		_ = json.Unmarshal(deepPlan, &wrongPayload)
+		for index := range wrongPayload.Effects {
+			if wrongPayload.Effects[index].Kind != "workflow_skill_bundle" {
+				continue
+			}
+			if name == "managed skills" {
+				wrongPayload.Effects[index].Parameters["managed_skills_json"] = parameter
+			} else {
+				wrongPayload.Effects[index].Parameters["files_json"] = parameter
+			}
+		}
+		payloadRaw, _ := json.Marshal(wrongPayload)
+		_, payloadCanonical, payloadDigest, payloadParseErr := setupcontract.ParsePlan(payloadRaw)
+		if payloadParseErr != nil {
+			t.Fatal(payloadParseErr)
+		}
+		payloadEnvelope, _ := json.Marshal(map[string]any{"status": "plan_required", "digest_sha256": payloadDigest, "canonical_json": string(payloadCanonical), "plan": wrongPayload, "projection": "wrong payload"})
+		payloadPath := filepath.Join(directory, strings.ReplaceAll(name, " ", "-")+"-plan.json")
+		write(payloadPath, payloadEnvelope)
+		output, err = run(installScript, "-PlanPath", payloadPath, "-ApprovedDigest", payloadDigest)
+		if err == nil || !strings.Contains(output, "Workflow Skill Bundle payload differs from the verified manifest") {
+			t.Fatalf("%s mismatch reached download or apply: %q, %v", name, output, err)
+		}
+	}
 
 	incompatible := manifest
 	incompatible.BootstrapContract.MinimumSchema, incompatible.BootstrapContract.MaximumSchema = 2, 2
@@ -252,7 +323,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	incompatibleSignature, _ := Sign(incompatibleRaw, key)
 	write(manifestPath, incompatibleRaw)
 	write(signaturePath, incompatibleSignature)
-	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
 	if err == nil || !strings.Contains(output, "incompatible with this bootstrap planner") {
 		t.Fatalf("incompatible bootstrap contract reached planning: %q, %v", output, err)
 	}

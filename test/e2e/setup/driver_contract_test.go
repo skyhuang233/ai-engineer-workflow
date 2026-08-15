@@ -61,6 +61,26 @@ func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	}
 }
 
+func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
+	lines := strings.Split(strings.ReplaceAll(read(t, "setup-e2e.ps1"), "\r\n", "\n"), "\n")
+	for command, assignment := range map[string]string{
+		"gh repo list":   "$listExit = $LASTEXITCODE",
+		"gh repo delete": "$deleteExit = $LASTEXITCODE",
+		"docker ps -aq":  "$dockerListExit = $LASTEXITCODE",
+		"docker rm -f":   "$dockerRemoveExit = $LASTEXITCODE",
+	} {
+		found := false
+		for index, line := range lines {
+			if strings.Contains(line, command) && index+1 < len(lines) && strings.TrimSpace(lines[index+1]) == assignment {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s does not immediately preserve its native exit code in %s", command, assignment)
+		}
+	}
+}
+
 func TestPowerShellHarnessAndDriverParse(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {

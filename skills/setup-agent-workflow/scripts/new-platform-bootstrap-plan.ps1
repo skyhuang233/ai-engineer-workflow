@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$SignaturePath,
     [Parameter(Mandatory = $true)][string]$HostFactsPath,
     [Parameter(Mandatory = $true)][string]$OutputPath,
-    [string]$GitHubOwner = "",
+    [Parameter(Mandatory = $true)][string]$GitHubOwner,
+    [switch]$AllowUpgrade,
     [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
     [string]$PublicKeyPath = ""
 )
@@ -31,6 +32,9 @@ if (-not $facts.supported_host) { throw "Agent Workflow setup supports Windows o
 
 $actions = [System.Collections.Generic.List[object]]::new()
 $manifestDigest = (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($facts.platform.installation_recorded -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.release_manifest_digest) -and [string]$facts.platform.release_manifest_digest -ne $manifestDigest -and -not $AllowUpgrade) {
+    throw "The installed Platform Release pin differs; reuse its exact manifest unless the user explicitly requested an upgrade"
+}
 $canonicalizer = Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1"
 $scratchRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-plan-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $scratchRoot | Out-Null
@@ -106,7 +110,8 @@ if (-not $dockerVersionMatches -or -not $dockerEngineMatches) {
 }
 $observedScopes = @($facts.github_credential.scopes | ForEach-Object { [string]$_ })
 $effectiveGitHubOwner = $GitHubOwner
-if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner) -and $facts.github_credential.verified) { $effectiveGitHubOwner = [string]$facts.github_credential.owner }
+$effectiveGitHubOwner = $effectiveGitHubOwner.Trim()
+if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner must be determined before Platform planning" }
 $credentialOwnerMatches = (-not [string]::IsNullOrWhiteSpace($effectiveGitHubOwner) -and [string]::Equals([string]$facts.github_credential.owner, $effectiveGitHubOwner, [StringComparison]::OrdinalIgnoreCase))
 $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $observedScopes -contains "repo" -and $observedScopes -contains "workflow")
 if (-not $credentialCurrent) {
@@ -114,8 +119,9 @@ if (-not $credentialCurrent) {
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
     $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner })) })
 }
-$platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest)
-$controlPlaneReady = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version)
+$platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256)
+$controlPlaneAuthorizationCurrent = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.control_plane_plan_digest_sha256) -and [string]$facts.platform.control_plane_plan_digest_sha256 -eq [string]$facts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256)
+$controlPlaneReady = ($platformRecordCurrent -and $controlPlaneAuthorizationCurrent)
 if (-not $platformRecordCurrent) {
     $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
 }

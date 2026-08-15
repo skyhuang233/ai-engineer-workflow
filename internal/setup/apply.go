@@ -283,6 +283,12 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			}
 		}
 	}
+	if err == nil {
+		if expectedErr := setupcontract.VerifyExpectedResults(plan, result.Effects); expectedErr != nil {
+			result.Status = setupcontract.ExecutionIncomplete
+			err = expectedErr
+		}
+	}
 	result.FinishedAt = time.Now().UTC()
 	if e.Now != nil {
 		result.FinishedAt = e.Now().UTC()

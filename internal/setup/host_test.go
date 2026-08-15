@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,10 +21,231 @@ import (
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/onboarding"
+	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestHostAdapterChecksApprovedCurrentUserIdentity(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := HostAdapter{}
+	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: current.Uid}); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: "different-user"}); err == nil {
+		t.Fatal("accepted drifted host identity")
+	}
+}
+
+func TestRepositoryContractReadbackRequiresRepairForManagedContentDrift(t *testing.T) {
+	files, _, digest, err := repositorycontract.Render("single-context", []byte("# User instructions\n"), "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "managed file", path: "docs/agents/domain.md"},
+		{name: "managed AGENTS block", path: "AGENTS.md"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/repos/owner/repo/contents/") {
+					t.Fatalf("managed drift readback continued to %s %s", r.Method, r.URL.String())
+				}
+				path := strings.TrimPrefix(r.URL.Path, "/repos/owner/repo/contents/")
+				content, ok := files[path]
+				if !ok {
+					t.Fatalf("unexpected repository file %q", path)
+				}
+				if path == test.path {
+					content = []byte("drifted\n")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString(content)})
+			}))
+			defer server.Close()
+
+			adapter := HostAdapter{
+				GitHub:               workflowgithub.NewClient(server.URL, "token", server.Client()),
+				PlanDigest:           strings.Repeat("a", 64),
+				OnboardingMergeHeads: map[string]string{},
+			}
+			effect := setupcontract.Effect{
+				ID:      "repository-contract-pr",
+				Kind:    "repository_contract_pr",
+				Subject: "owner/repo",
+				Action:  "create_check_merge",
+				Parameters: map[string]string{
+					"base_branch":          "main",
+					"base_head":            strings.Repeat("b", 40),
+					"source_url":           "https://github.com/owner/repo.git",
+					"before_files_json":    "[]",
+					"files_json":           "[]",
+					"manifest_digest":      digest,
+					"required_checks_json": "[]",
+				},
+			}
+			status, evidence, err := adapter.Readback(context.Background(), effect)
+			if err != nil || status != setupcontract.EffectRequired || !strings.Contains(strings.ToLower(evidence), "drift") {
+				t.Fatalf("managed drift readback = %s, %q, %v", status, evidence, err)
+			}
+		})
+	}
+}
+
+func TestRepositoryContractApplyPreservesPrimaryAndCleanupFailures(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + base + `"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
+			deleted = true
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"remote branch cleanup denied"}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	files, err := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupCalled := false
+	adapter := HostAdapter{
+		GitHub:               workflowgithub.NewClient(server.URL, "token", server.Client()),
+		PlanDigest:           strings.Repeat("a", 64),
+		TemporaryRoot:        t.TempDir(),
+		OnboardingMergeHeads: map[string]string{},
+		CleanupOnboardingWorkspace: func(onboarding.GitWorkspace) error {
+			cleanupCalled = true
+			return errors.New("temporary clone cleanup failed")
+		},
+	}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[]`,
+	}}
+	err = adapter.applyRepositoryContract(context.Background(), effect)
+	if err == nil {
+		t.Fatal("repository contract apply reported success despite primary and cleanup failures")
+	}
+	for _, wanted := range []string{"lacks approved required checks", "remote branch cleanup denied", "temporary clone cleanup failed"} {
+		if !strings.Contains(err.Error(), wanted) {
+			t.Fatalf("combined error %q lacks %q", err, wanted)
+		}
+	}
+	if !deleted || !cleanupCalled {
+		t.Fatalf("cleanup attempts: remote=%t workspace=%t", deleted, cleanupCalled)
+	}
+}
+
+func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+	branch := "workflow/onboarding-" + strings.Repeat("a", 12)
+	mergeHead := strings.Repeat("c", 40)
+	merged := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		workspaceHead := func() string {
+			return hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main","allow_squash_merge":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			head := base
+			if merged {
+				head = mergeHead
+			}
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + head + `"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/check-runs"):
+			_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
+			_, _ = w.Write([]byte(`{"number":7,"mergeable":true,"head":{"sha":"` + workspaceHead() + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
+			merged = true
+			_, _ = w.Write([]byte(`{"merged":true,"sha":"` + mergeHead + `"}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"remote branch cleanup denied"}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	files, err := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := HostAdapter{
+		GitHub:               workflowgithub.NewClient(server.URL, "token", server.Client()),
+		PlanDigest:           strings.Repeat("a", 64),
+		TemporaryRoot:        t.TempDir(),
+		OnboardingMergeHeads: map[string]string{},
+		CleanupOnboardingWorkspace: func(onboarding.GitWorkspace) error {
+			return errors.New("temporary clone cleanup failed")
+		},
+	}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `["workflow-contract"]`,
+	}}
+	err = adapter.applyRepositoryContract(context.Background(), effect)
+	if err == nil {
+		t.Fatal("repository contract apply reported success despite cleanup residue")
+	}
+	for _, wanted := range []string{"remote branch cleanup denied", "temporary clone cleanup failed"} {
+		if !strings.Contains(err.Error(), wanted) {
+			t.Fatalf("cleanup error %q lacks %q", err, wanted)
+		}
+	}
+}
 
 func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "source")
@@ -83,13 +305,20 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	digest := strings.Repeat("d", 64)
 	mergedHead := strings.Repeat("a", 40)
 	defaultHead := mergedHead
-	manifest := []byte(`{"schema_version":1}`)
-	manifestSum := sha256.Sum256(manifest)
+	contractFiles, _, manifestDigest, err := repositorycontract.Render("single-context", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/.workflow/repository.json":
-			_, _ = w.Write([]byte(`{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString(manifest) + `"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/contents/"):
+			path := strings.TrimPrefix(r.URL.Path, "/repos/owner/repo/contents/")
+			content, ok := contractFiles[path]
+			if !ok {
+				t.Fatalf("unexpected repository file %q", path)
+			}
+			_, _ = w.Write([]byte(`{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString(content) + `"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
 			if r.URL.Query().Get("state") != "all" {
 				t.Fatalf("pull request readback state = %q", r.URL.Query().Get("state"))
@@ -105,7 +334,7 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	}))
 	defer server.Close()
 	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
-	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("c", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": hex.EncodeToString(manifestSum[:]), "required_checks_json": "[]"}}
+	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("c", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": manifestDigest, "required_checks_json": "[]"}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("merged readback = %s, %v", status, err)
@@ -373,7 +602,7 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
@@ -419,7 +648,7 @@ func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
 	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "verified"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {

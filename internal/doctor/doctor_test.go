@@ -311,6 +311,43 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	t.Logf("Doctor result: %s\ncreate: %s\nresume: %s", result.Summary, initial, resumed)
 }
 
+func TestWorkerCodexSessionCheckFailsWhenTemporaryAuthCleanupFails(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingExecutor{outputs: [][]byte{
+		workerCodexTestOutput("worker-session-7", strictCandidate("phase-one")),
+		workerCodexTestOutput("", strictCandidate("worker-nonce-7")),
+	}}
+	result := (WorkerCodexSessionCheck{
+		Executor: executor, Image: "sha256:image", AuthFile: authFile, Nonce: "worker-nonce-7",
+		RemoveAll: func(string) error { return errors.New("cleanup denied") },
+	}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "cleanup") || !strings.Contains(result.Summary, "cleanup denied") {
+		t.Fatalf("cleanup failure result = %#v", result)
+	}
+}
+
+func TestWorkerCodexSessionCheckAggregatesPrimaryAndCleanupFailures(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := (WorkerCodexSessionCheck{
+		Executor:  &recordingExecutor{outputs: [][]byte{[]byte("bad response")}},
+		Image:     "sha256:image",
+		AuthFile:  authFile,
+		RemoveAll: func(string) error { return errors.New("cleanup denied") },
+	}).Run(context.Background())
+	if result.Status != Fail || !strings.Contains(result.Summary, "create schema probe") || !strings.Contains(result.Summary, "cleanup denied") {
+		t.Fatalf("combined failure result = %#v", result)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "create schema probe") || !strings.Contains(result.Err.Error(), "cleanup denied") {
+		t.Fatalf("combined failure error = %v", result.Err)
+	}
+}
+
 func TestWorkerCodexSessionCheckRejectsInvalidStructuredResponse(t *testing.T) {
 	authFile := filepath.Join(t.TempDir(), "auth.json")
 	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {

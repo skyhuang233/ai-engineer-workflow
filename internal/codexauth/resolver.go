@@ -46,18 +46,18 @@ func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 		doctor = func(ctx context.Context) ([]byte, error) {
 			output, err := exec.CommandContext(ctx, "codex", "doctor", "--json").CombinedOutput()
 			if err != nil {
-				return nil, fmt.Errorf("query redacted Codex doctor report: %w", err)
+				return output, fmt.Errorf("query redacted Codex doctor report: %w", err)
 			}
 			return output, nil
 		}
 	}
-	doctorOutput, err := doctor(ctx)
-	if err != nil {
-		return "", err
-	}
-	discovered, err := authenticationSourceFromDoctor(doctorOutput)
-	if err != nil {
-		return "", err
+	doctorOutput, doctorErr := doctor(ctx)
+	discovered, reportErr := authenticationSourceFromDoctor(doctorOutput)
+	if reportErr != nil {
+		if doctorErr != nil {
+			return "", errors.Join(reportErr, doctorErr)
+		}
+		return "", reportErr
 	}
 	status := r.LoginStatus
 	if status == nil {

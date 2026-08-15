@@ -25,7 +25,6 @@ type effectContract struct {
 }
 
 var effectContracts = map[string]effectContract{
-	"install_file":           {PlatformBootstrap, []string{"install"}, []string{"sha256"}, nil},
 	"platform_cli":           {PlatformBootstrap, []string{"install"}, []string{"version", "sha256"}, nil},
 	"workflow_skill_bundle":  {PlatformBootstrap, []string{"install"}, []string{"version", "managed_skills_json", "files_json"}, nil},
 	"docker_desktop":         {PlatformBootstrap, []string{"install", "upgrade", "repair"}, []string{"version", "installer_url", "windows_amd64_sha256"}, nil},
@@ -43,13 +42,49 @@ var effectContracts = map[string]effectContract{
 }
 
 var preconditionPlanKinds = map[string]PlanKind{
-	"host_identity": PlatformBootstrap, "release": PlatformBootstrap, "platform_release": "", "platform_setup_contract": PlatformBootstrap,
+	"host_identity": PlatformBootstrap, "platform_release": "", "platform_setup_contract": PlatformBootstrap,
 	"git_head": RepositoryOnboarding, "github_policy": RepositoryOnboarding, "github_default_head": RepositoryOnboarding,
 }
 
 var expectedResultPlanKinds = map[string]PlanKind{
-	"file_digest": PlatformBootstrap, "platform": PlatformBootstrap, "platform_readiness": PlatformBootstrap,
+	"platform_readiness":   PlatformBootstrap,
 	"repository_admission": RepositoryOnboarding,
+}
+
+// VerifyExpectedResults executes every accepted expected-result semantic after
+// effect readback, so a result kind cannot be a decorative success claim.
+func VerifyExpectedResults(plan Plan, effects []EffectResult) error {
+	statuses := make(map[string]EffectStatus, len(effects))
+	for _, effect := range effects {
+		statuses[effect.EffectID] = effect.Status
+	}
+	for _, effect := range plan.Effects {
+		if statuses[effect.ID] != EffectSatisfied {
+			return fmt.Errorf("effect %q did not satisfy an expected Setup result", effect.ID)
+		}
+	}
+	for _, expected := range plan.ExpectedResults {
+		switch expected.Kind {
+		case "platform_readiness":
+			if expected.Expected != "ready" {
+				return fmt.Errorf("platform readiness expected result %q is invalid", expected.ID)
+			}
+		case "repository_admission":
+			matched := false
+			for _, effect := range plan.Effects {
+				if effect.Kind == "repository_admission" && effect.Subject == expected.Subject && effect.Parameters["manifest_digest"] == expected.Expected {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("repository admission expected result %q is not bound to its verification effect", expected.ID)
+			}
+		default:
+			return fmt.Errorf("unknown expected result kind %q", expected.Kind)
+		}
+	}
+	return nil
 }
 
 func ParsePlan(raw []byte) (Plan, []byte, string, error) {
@@ -143,12 +178,34 @@ func (p Plan) Validate() error {
 		if !ok || allowed != p.Kind {
 			return fmt.Errorf("expected result %q kind %q is unsupported for %q", expected.ID, expected.Kind, p.Kind)
 		}
+		if err := validateExpectedResultBinding(p, expected); err != nil {
+			return err
+		}
 	}
 	encoded, _ := json.Marshal(p)
 	var semantic any
 	_ = json.Unmarshal(encoded, &semantic)
 	if path, found := findSecret(semantic, "$"); found {
 		return fmt.Errorf("Setup Plan contains forbidden secret-shaped content at %s", path)
+	}
+	return nil
+}
+
+func validateExpectedResultBinding(plan Plan, expected ExpectedResult) error {
+	switch expected.Kind {
+	case "platform_readiness":
+		if expected.Expected != "ready" || expected.Subject != plan.Target.WorkflowHome {
+			return fmt.Errorf("platform readiness expected result %q is not bound to its target", expected.ID)
+		}
+	case "repository_admission":
+		for _, effect := range plan.Effects {
+			if effect.Kind == "repository_admission" && effect.Subject == expected.Subject && effect.Parameters["manifest_digest"] == expected.Expected {
+				return nil
+			}
+		}
+		return fmt.Errorf("repository admission expected result %q is not bound to its verification effect", expected.ID)
+	default:
+		return fmt.Errorf("unknown expected result kind %q", expected.Kind)
 	}
 	return nil
 }
@@ -273,10 +330,7 @@ func validatePlatformEffectPins(effects []Effect) error {
 		}
 	}
 	if !found {
-		// install_file is retained solely for the schema-v1 cross-language
-		// golden and legacy adapter tests. Every production platform effect is
-		// release-bound above.
-		return nil
+		return errors.New("Platform Bootstrap plan has no release-bound platform effect")
 	}
 	return nil
 }

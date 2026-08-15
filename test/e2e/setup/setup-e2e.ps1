@@ -129,17 +129,30 @@ try {
 	$scenarioToken = $env:GH_TOKEN
 	$env:GH_TOKEN = $cleanupToken
     $cleanupAfter = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
-    if ($LASTEXITCODE -ne 0) { $cleanupErrors.Add("Cleanup credential cannot enumerate repositories after qualification") }
+    $listExit = $LASTEXITCODE
+    if ($listExit -ne 0) { $cleanupErrors.Add("Cleanup credential cannot enumerate repositories after qualification (exit $listExit)") }
     foreach ($repository in @($cleanupAfter | Where-Object { $_ -notin $cleanupBaseline })) {
         if ($repository -notin $repositories) { $repositories.Add([string]$repository) }
     }
     foreach ($repository in $repositories) {
-        try { gh repo delete $repository --yes } catch { $cleanupErrors.Add($_.Exception.Message) }
+        try {
+            gh repo delete $repository --yes
+            $deleteExit = $LASTEXITCODE
+            if ($deleteExit -ne 0) { $cleanupErrors.Add("Cannot delete disposable repository $repository (exit $deleteExit)") }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
     }
 	$env:GH_TOKEN = $scenarioToken
     try {
         $containers = @(docker ps -aq --filter "label=workflow.setup_e2e=$runID")
-        foreach ($container in $containers) { if ($container) { docker rm -f $container | Out-Null } }
+        $dockerListExit = $LASTEXITCODE
+        if ($dockerListExit -ne 0) { $cleanupErrors.Add("Cannot enumerate disposable containers (exit $dockerListExit)") }
+        foreach ($container in $containers) {
+            if ($container) {
+                docker rm -f $container | Out-Null
+                $dockerRemoveExit = $LASTEXITCODE
+                if ($dockerRemoveExit -ne 0) { $cleanupErrors.Add("Cannot remove disposable container $container (exit $dockerRemoveExit)") }
+            }
+        }
     } catch { $cleanupErrors.Add($_.Exception.Message) }
     foreach ($name in $prior.Keys) {
 		if ($null -eq $prior[$name]) { Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue }

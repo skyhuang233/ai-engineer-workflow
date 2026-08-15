@@ -72,6 +72,8 @@ type platformInspection struct {
 		Version                     string `json:"version,omitempty"`
 		ReleaseManifestDigest       string `json:"release_manifest_digest,omitempty"`
 		PlatformSetupContractDigest string `json:"platform_setup_contract_digest,omitempty"`
+		WorkflowCLISHA256           string `json:"workflow_cli_sha256,omitempty"`
+		ControlPlanePlanDigest      string `json:"control_plane_plan_digest_sha256,omitempty"`
 	} `json:"platform"`
 	WorkflowCLI struct {
 		Verified bool `json:"verified"`
@@ -119,6 +121,8 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 		facts.Platform.Version = installation.PlatformVersion
 		facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
 		facts.Platform.PlatformSetupContractDigest = installation.PlatformSetupContractDigestSHA256
+		facts.Platform.WorkflowCLISHA256 = installation.WorkflowCLISHA256
+		facts.Platform.ControlPlanePlanDigest = installation.ControlPlanePlanDigestSHA256
 	}
 	contractRaw, contractErr := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
 	_, contractDigest, canonicalErr := setupcontract.Canonicalize(contractRaw)

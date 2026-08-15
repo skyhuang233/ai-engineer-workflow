@@ -15,4 +15,4 @@ workflow runtime-configure --source (git rev-parse --show-toplevel) --root <plan
 
 This is automatically performed Workflow bookkeeping, not a user step or approval. Run it only after the Plan Root and its ticket graph have been published successfully. If binding fails, report the Plan Root operation as incomplete and do not claim that execution has started.
 
-The Workflow CLI resolves the current ChatGPT authentication source from the redacted machine-readable `codex doctor --json` report and confirms it with `codex login status`; this command must not ask the user to locate a private Codex file.
+The Workflow CLI resolves the current ChatGPT authentication source from the redacted machine-readable `codex doctor --json` report and confirms it with `codex login status`; it parses the required `ok` checks even when unrelated doctor checks make the command exit nonzero. This command must not ask the user to locate a private Codex file.

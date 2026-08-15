@@ -25,6 +25,22 @@ func TestResolverUsesMachineReadableCodexDoctorAuthenticationPath(t *testing.T) 
 	}
 }
 
+func TestResolverAcceptsRequiredDoctorChecksWhenCommandReportsOtherFailures(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codex")
+	source := filepath.Join(home, FileName)
+	writeChatGPTCache(t, source)
+	resolver := Resolver{
+		LookupEnvironment: func(string) string { return "" },
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, home, source, "true", "chatgpt"), errors.New("exit status 1")
+		},
+		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT\n"), nil },
+	}
+	if got, err := resolver.ResolveChatGPT(context.Background()); err != nil || got != source {
+		t.Fatalf("valid required checks from nonzero doctor = %q, %v", got, err)
+	}
+}
+
 func TestResolverSupportsExplicitWorkflowIntegrationSource(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "supported-login.json")
 	writeChatGPTCache(t, source)

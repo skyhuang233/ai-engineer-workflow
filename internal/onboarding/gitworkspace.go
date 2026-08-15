@@ -28,6 +28,10 @@ func (w GitWorkspace) Cleanup() error {
 }
 
 func PrepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential) (GitWorkspace, error) {
+	return prepareOnboardingBranch(ctx, repository, sourceURL, baseCommit, temporaryRoot, planDigest, files, credential, os.RemoveAll)
+}
+
+func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential, removeAll func(string) error) (_ GitWorkspace, resultErr error) {
 	if sourceURL == "" || !fullSHA.MatchString(baseCommit) || len(planDigest) < 12 || len(files) == 0 {
 		return GitWorkspace{}, errors.New("onboarding workspace inputs are incomplete")
 	}
@@ -47,7 +51,9 @@ func PrepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	failed := true
 	defer func() {
 		if failed {
-			_ = os.RemoveAll(root)
+			if cleanupErr := removeAll(root); cleanupErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("cleanup temporary onboarding workspace: %w", cleanupErr))
+			}
 		}
 	}()
 	env := gitCredentialEnvironment(credential)

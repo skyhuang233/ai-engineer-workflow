@@ -17,8 +17,6 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/admission"
 	"github.com/skyhuang233/workflow/internal/controlplane"
-	"github.com/skyhuang233/workflow/internal/credential"
-	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -154,10 +152,6 @@ func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) (
 	if err != nil || verification.Status != "verified" {
 		return fail(errors.Join(errors.New("Control Plane PAT verification is unavailable"), err))
 	}
-	token, err := credential.NewFileStore(layout.CredentialFile).Get(ctx, credential.GatewayTarget)
-	if err != nil || credential.Fingerprint(token) != verification.FingerprintSHA256 {
-		return fail(errors.Join(errors.New("Control Plane PAT differs from its verified record"), err))
-	}
 	contractRaw, err := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
 	if err != nil {
 		return fail(err)
@@ -169,8 +163,7 @@ func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) (
 	if err := contract.Validate(); err != nil {
 		return fail(err)
 	}
-	client := github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
-	admissions := admission.Service{Store: database, Verifier: admission.GitHubVerifier{Client: client, Contract: contract}}
+	admissions := admission.Service{Store: database, Verifier: admission.DynamicGitHubVerifier{Store: database, Contract: contract}}
 	// Complete one verification pass before advertising health. Individual
 	// repository drift is durably suspended and does not fail unrelated repos.
 	if err := admissions.VerifyAll(ctx); err != nil {

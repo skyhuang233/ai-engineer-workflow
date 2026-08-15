@@ -145,7 +145,8 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 	if err := db.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: plan.PlanID, Kind: string(plan.Kind), SchemaVersion: 1, Target: layout.Root, DigestSHA256: digest, CanonicalJSON: string(canonical), Projection: "inspection", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, PlatformSetupContractDigestSHA256: contractDigest, WorkflowCLISHA256: cliDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
+	cpDigest := strings.Repeat("e", 64)
+	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, PlatformSetupContractDigestSHA256: contractDigest, WorkflowCLISHA256: cliDigest, ControlPlanePlanDigestSHA256: cpDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -159,7 +160,7 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 		Status string             `json:"status"`
 		Result platformInspection `json:"result"`
 	}
-	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "ready" || !response.Result.GitHubCredential.Verified || strings.Join(response.Result.GitHubCredential.Scopes, ",") != "repo,workflow" || !response.Result.WorkflowCLI.Verified {
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "ready" || response.Result.Platform.WorkflowCLISHA256 != cliDigest || response.Result.Platform.ControlPlanePlanDigest != cpDigest || !response.Result.GitHubCredential.Verified || strings.Join(response.Result.GitHubCredential.Scopes, ",") != "repo,workflow" || !response.Result.WorkflowCLI.Verified {
 		t.Fatalf("inspection=%s err=%v", output.String(), err)
 	}
 	if err := os.WriteFile(filepath.Join(layout.Bin, workflowhome.ExecutableName), []byte("drifted-cli"), 0o700); err != nil {

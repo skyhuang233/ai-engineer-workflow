@@ -102,15 +102,16 @@ func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
 }
 
 type WorkerCodexSessionCheck struct {
-	Executor Executor
-	Image    string
-	AuthFile string
-	Nonce    string
+	Executor  Executor
+	Image     string
+	AuthFile  string
+	Nonce     string
+	RemoveAll func(string) error
 }
 
 func (WorkerCodexSessionCheck) Name() string { return "Worker Codex authentication and session resume" }
 
-func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
+func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	if c.Executor == nil || strings.TrimSpace(c.Image) == "" || strings.TrimSpace(c.AuthFile) == "" {
 		return Result{Status: Fail, Summary: "Worker Codex authentication check is incomplete"}
 	}
@@ -118,7 +119,26 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	defer os.RemoveAll(root)
+	removeAll := c.RemoveAll
+	if removeAll == nil {
+		removeAll = os.RemoveAll
+	}
+	defer func() {
+		if cleanupErr := removeAll(root); cleanupErr != nil {
+			primaryErr := result.Err
+			if primaryErr == nil && result.Status == Fail && result.Summary != "" {
+				primaryErr = errors.New(result.Summary)
+			}
+			cleanupSummary := fmt.Sprintf("remove temporary Worker Codex authentication directory %q: %v", root, cleanupErr)
+			if result.Summary == "" {
+				result.Summary = cleanupSummary
+			} else {
+				result.Summary += "; " + cleanupSummary
+			}
+			result.Status = Fail
+			result.Err = errors.Join(primaryErr, cleanupErr)
+		}
+	}()
 	workspace := filepath.Join(root, "workspace")
 	codexState := filepath.Join(root, "codex-state")
 	if err := os.MkdirAll(workspace, 0o700); err != nil {
@@ -164,10 +184,10 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) Result {
 	if err != nil {
 		return Result{Status: Fail, Summary: "Worker Codex resume schema probe returned an invalid structured response"}
 	}
-	var result struct {
+	var candidate struct {
 		Summary string `json:"summary"`
 	}
-	if json.Unmarshal(structured, &result) != nil || result.Summary != nonce {
+	if json.Unmarshal(structured, &candidate) != nil || candidate.Summary != nonce {
 		return Result{Status: Fail, Summary: "resumed Worker Codex session did not recall prior-turn context"}
 	}
 	return Result{Status: Pass, Summary: "pinned Worker accepted the Candidate schema, authenticated, and resumed persisted context"}
