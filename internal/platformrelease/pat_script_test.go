@@ -36,6 +36,19 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 			_, _ = w.Write([]byte(`{"login":"alice","id":7}`))
 		case "/orgs/acme/memberships/alice":
 			_, _ = w.Write([]byte(`{"state":"active","role":"admin"}`))
+		case "/repos/alice/repo", "/repos/acme/repo":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case "/repos/alice/published":
+			_, _ = w.Write([]byte(`{"full_name":"alice/published","private":true,"permissions":{"admin":true}}`))
+		case "/repos/alice/read-only":
+			_, _ = w.Write([]byte(`{"full_name":"alice/read-only","private":true,"permissions":{"admin":false}}`))
+		case "/orgs/acme":
+			_, _ = w.Write([]byte(`{"login":"acme"}`))
+		case "/orgs/acme/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled_repositories":"all","allowed_actions":"all"}`))
+		case "/orgs/acme/rulesets":
+			_, _ = w.Write([]byte(`[]`))
 		case "/orgs/sso-blocked/memberships/alice":
 			w.Header().Set("X-GitHub-SSO", "required; url=https://github.com/orgs/sso-blocked/sso")
 			w.WriteHeader(http.StatusForbidden)
@@ -46,13 +59,13 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 	defer server.Close()
 	_, current, _, _ := runtime.Caller(0)
 	script := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "verify-github-pat.ps1")
-	run := func(owner string) ([]byte, error) {
-		command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-APIBase", server.URL, "-Owner", owner)
+	run := func(owner, repository, publicationState string) ([]byte, error) {
+		command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-APIBase", server.URL, "-Owner", owner, "-RepositoryName", repository, "-Visibility", "private", "-PublicationState", publicationState)
 		command.Stdin = strings.NewReader(token)
 		return command.CombinedOutput()
 	}
 	for _, owner := range []string{"alice", "acme"} {
-		output, runErr := run(owner)
+		output, runErr := run(owner, "repo", "unpublished")
 		var result struct {
 			Login       string `json:"login"`
 			Owner       string `json:"owner"`
@@ -68,9 +81,16 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 			t.Fatalf("owner %s result=%#v", owner, result)
 		}
 	}
-	output, runErr := run("sso-blocked")
+	output, runErr := run("sso-blocked", "repo", "unpublished")
 	if runErr == nil || !strings.Contains(string(output), "SSO") {
 		t.Fatalf("SSO-blocked organization was not rejected: %q, %v", output, runErr)
+	}
+	if output, runErr = run("alice", "published", "published"); runErr != nil {
+		t.Fatalf("published repository with administration permission was rejected: %q, %v", output, runErr)
+	}
+	output, runErr = run("alice", "read-only", "published")
+	if runErr == nil || !strings.Contains(string(output), "repository administration") {
+		t.Fatalf("published repository without administration permission was not rejected: %q, %v", output, runErr)
 	}
 }
 
@@ -82,7 +102,7 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 		t.Fatal(err)
 	}
 	content := string(raw)
-	for _, required := range []string{"present its owner as the candidate", "With no `origin`, explicitly ask", "before Platform planning", "-Owner <owner>", "exact release identified by its durable version and manifest digest", "only when the user explicitly requested an upgrade", "-AllowUpgrade"} {
+	for _, required := range []string{"present its owner as the candidate together with its repository name", "With no `origin`, explicitly ask", "repository name and private/public visibility", "before any Platform mutation", "-Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>", "exact release identified by its durable version and manifest digest", "only when the user explicitly requested an upgrade", "-AllowUpgrade"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks owner/release decision contract %q", required)
 		}

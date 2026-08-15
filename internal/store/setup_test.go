@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -105,12 +107,14 @@ func TestPlatformAndRuntimeObservationReadBack(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now().UTC()
-	platform := PlatformInstallation{PlatformVersion: "1.2.3", ReleaseManifestDigestSHA256: repeatHex('e'), PlatformSetupContractDigestSHA256: repeatHex('c'), WorkflowCLISHA256: repeatHex('d'), WorkflowHome: `C:\Workflow`, InstalledAt: now, VerifiedAt: now}
+	bundleJSON := `[{"path":"bin/workflow.exe","sha256":"` + repeatHex('d') + `"}]`
+	bundleSum := sha256.Sum256([]byte(bundleJSON))
+	platform := PlatformInstallation{PlatformVersion: "1.2.3", ReleaseManifestDigestSHA256: repeatHex('e'), PlatformSetupContractDigestSHA256: repeatHex('c'), WorkflowCLISHA256: repeatHex('d'), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: hex.EncodeToString(bundleSum[:]), WorkflowHome: `C:\Workflow`, InstalledAt: now, VerifiedAt: now}
 	if err := db.RecordPlatformInstallation(ctx, platform); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.PlatformInstallation(ctx)
-	if err != nil || got.PlatformVersion != "1.2.3" || got.PlatformSetupContractDigestSHA256 != repeatHex('c') || got.WorkflowCLISHA256 != repeatHex('d') {
+	if err != nil || got.PlatformVersion != "1.2.3" || got.PlatformSetupContractDigestSHA256 != repeatHex('c') || got.WorkflowCLISHA256 != repeatHex('d') || got.ReleaseBundledFilesJSON != bundleJSON || got.ReleaseBundledFilesDigestSHA256 != platform.ReleaseBundledFilesDigestSHA256 {
 		t.Fatalf("platform = %#v, %v", got, err)
 	}
 	if err := db.AuthorizeControlPlane(ctx, platform, repeatHex('a')); err != nil {

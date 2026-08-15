@@ -147,11 +147,16 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	write(filepath.Join(skillsRoot, "implement", ".agent-workflow-owner.json"), ownerJSON)
 	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), ownerJSON)
 	contractDigest := parsed.Preconditions[1].Expected
+	bundledRaw, _ := json.Marshal(manifest.BundledFiles)
+	bundledCanonical, bundledDigest, err := setupcontract.Canonicalize(bundledRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	controlPlaneDigest := strings.Repeat("f", 64)
 	noOpState := map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
 		"workflow":          map[string]any{"installed": true, "owned": true, "path_reconciled": true, "version": manifest.Release.Version, "sha256": manifest.BundledFiles[0].SHA256},
-		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": manifest.BundledFiles[0].SHA256, "control_plane_plan_digest_sha256": controlPlaneDigest},
+		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": manifest.BundledFiles[0].SHA256, "release_bundled_files_json": string(bundledCanonical), "release_bundled_files_digest": bundledDigest, "control_plane_plan_digest_sha256": controlPlaneDigest},
 		"docker":            map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
 		"github_credential": map[string]any{"exists": true, "verified": true, "owner": "owner", "scopes": []string{"repo", "workflow"}, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
 		"control_plane":     map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}, "codex_skills_root": skillsRoot,
@@ -187,7 +192,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		}
 		decodeErr := json.Unmarshal([]byte(output), &repair)
 		_, _, _, parseErr := setupcontract.ParsePlan([]byte(repair.CanonicalJSON))
-		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 1 || repair.Plan.Effects[0].Kind != wantKind || repair.Plan.Effects[0].Action != wantAction || repair.Plan.Effects[0].Parameters["release_manifest_digest"] != hex.EncodeToString(manifestDigest[:]) || repair.Plan.Effects[0].Parameters["platform_setup_contract_digest"] != contractDigest || repair.Plan.Effects[0].Parameters["workflow_cli_sha256"] != manifest.BundledFiles[0].SHA256 {
+		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 1 || repair.Plan.Effects[0].Kind != wantKind || repair.Plan.Effects[0].Action != wantAction || repair.Plan.Effects[0].Parameters["release_manifest_digest"] != hex.EncodeToString(manifestDigest[:]) || repair.Plan.Effects[0].Parameters["platform_setup_contract_digest"] != contractDigest || repair.Plan.Effects[0].Parameters["workflow_cli_sha256"] != manifest.BundledFiles[0].SHA256 || repair.Plan.Effects[0].Parameters["release_bundled_files_digest"] != bundledDigest {
 			t.Fatalf("%s repair was not independently release-bound: %q, %v, %v, %v", name, output, runErr, decodeErr, parseErr)
 		}
 	}
@@ -207,7 +212,15 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
 	ownerFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, ownerFacts)
-	assertSingleRepair("wrong-owner PAT", "github_pat", "replace", "-GitHubOwner", "different-owner")
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "different-owner")
+	if err == nil || !strings.Contains(output, "already bound to GitHub owner") {
+		t.Fatalf("existing Workflow Home owner mismatch was not blocked: %q, %v", output, err)
+	}
+	noOpState["github_credential"].(map[string]any)["verified"] = false
+	sameOwnerInvalidFacts, _ := json.Marshal(noOpState)
+	write(hostFactsPath, sameOwnerInvalidFacts)
+	assertSingleRepair("same-owner PAT rotation", "github_pat", "replace", "-GitHubOwner", "owner")
+	noOpState["github_credential"].(map[string]any)["verified"] = true
 	assertInstallationReauthorization := func(name, wantControlPlaneAction string, extra ...string) {
 		t.Helper()
 		output, runErr := run(planScript, append([]string{"-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner"}, extra...)...)
@@ -239,6 +252,11 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	write(hostFactsPath, driftFacts)
 	assertInstallationReauthorization("CLI-pin drift", "replace")
 	platformState["workflow_cli_sha256"] = manifest.BundledFiles[0].SHA256
+	platformState["release_bundled_files_digest"] = strings.Repeat("5", 64)
+	driftFacts, _ = json.Marshal(noOpState)
+	write(hostFactsPath, driftFacts)
+	assertInstallationReauthorization("signed bundle inventory pin drift", "replace")
+	platformState["release_bundled_files_digest"] = bundledDigest
 	platformState["control_plane_plan_digest_sha256"] = strings.Repeat("3", 64)
 	driftFacts, _ = json.Marshal(noOpState)
 	write(hostFactsPath, driftFacts)

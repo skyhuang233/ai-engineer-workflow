@@ -35,6 +35,7 @@ type RepositoryPolicy struct {
 	AllowSquashMerge, AllowMergeCommit, AllowRebaseMerge bool
 	RequiredHumanReviews, MergeQueue                     bool
 	ActionsAllowed                                       string
+	GitHubOwnedActionsAllowed                            bool
 	RequiredChecks                                       []string
 	AllowFeatureEnable                                   bool
 }

@@ -43,7 +43,7 @@ type setupResponse struct {
 
 var (
 	verifyPlatformReadyForSetup     = verifyPlatformReady
-	verifyRecordedAdmissionForSetup = verifyRecordedAdmission
+	verifyRecordedAdmissionForSetup = verifyRecordedAdmissionReadOnly
 	setupInspectionAPIBase          = ""
 	setupInspectionHTTPClient       *http.Client
 )
@@ -73,6 +73,8 @@ type platformInspection struct {
 		ReleaseManifestDigest       string `json:"release_manifest_digest,omitempty"`
 		PlatformSetupContractDigest string `json:"platform_setup_contract_digest,omitempty"`
 		WorkflowCLISHA256           string `json:"workflow_cli_sha256,omitempty"`
+		ReleaseBundledFilesJSON     string `json:"release_bundled_files_json,omitempty"`
+		ReleaseBundledFilesDigest   string `json:"release_bundled_files_digest,omitempty"`
 		ControlPlanePlanDigest      string `json:"control_plane_plan_digest_sha256,omitempty"`
 	} `json:"platform"`
 	WorkflowCLI struct {
@@ -116,12 +118,14 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	installation, installationErr := database.PlatformInstallation(ctx)
 	var pins platformPins
 	if installationErr == nil {
-		pins = platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256}
+		pins = platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256, ReleaseBundledFilesDigest: installation.ReleaseBundledFilesDigestSHA256}
 		facts.Platform.InstallationRecorded = true
 		facts.Platform.Version = installation.PlatformVersion
 		facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
 		facts.Platform.PlatformSetupContractDigest = installation.PlatformSetupContractDigestSHA256
 		facts.Platform.WorkflowCLISHA256 = installation.WorkflowCLISHA256
+		facts.Platform.ReleaseBundledFilesJSON = installation.ReleaseBundledFilesJSON
+		facts.Platform.ReleaseBundledFilesDigest = installation.ReleaseBundledFilesDigestSHA256
 		facts.Platform.ControlPlanePlanDigest = installation.ControlPlanePlanDigestSHA256
 	}
 	contractRaw, contractErr := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
@@ -155,8 +159,13 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	if contractErr != nil || canonicalErr != nil || contractDigest != pins.PlatformSetupContractDigest {
 		combined = errors.Join(combined, errors.New("installed Platform Setup Contract digest differs"))
 	}
-	if installationErr == nil && (pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "") {
+	if installationErr == nil && (pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "" || pins.ReleaseBundledFilesDigest == "" || installation.ReleaseBundledFilesJSON == "") {
 		combined = errors.Join(combined, errors.New("Platform Installation lacks durable verified release pins"))
+	}
+	if installationErr == nil {
+		if _, bundleErr := durableReleaseBundle(installation); bundleErr != nil {
+			combined = errors.Join(combined, bundleErr)
+		}
 	}
 	if !facts.WorkflowCLI.Verified {
 		combined = errors.Join(combined, errors.New("installed Workflow CLI ownership, version, or checksum differs"))
@@ -167,7 +176,7 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	return facts, combined
 }
 
-type platformPins struct{ Version, ReleaseManifestDigest, PlatformSetupContractDigest, WorkflowCLISHA256 string }
+type platformPins struct{ Version, ReleaseManifestDigest, PlatformSetupContractDigest, WorkflowCLISHA256, ReleaseBundledFilesDigest string }
 
 func runSetupPlan(args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("setup plan", flag.ContinueOnError)
@@ -400,7 +409,17 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 		adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 		adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
 	}
-	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}}
+	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, ExpectedResultVerifier: func(ctx context.Context, _ setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+		if expected.Kind != "platform_readiness" {
+			return nil
+		}
+		database, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+		if openErr != nil {
+			return openErr
+		}
+		defer database.Close()
+		return verifyPlatformReadyForSetup(ctx, database, layout)
+	}}
 	result, applyErr := engine.Apply(context.Background(), raw, *approved)
 	writeErr := writeSetupResponse(output, setupResponse{Status: string(result.Status), Result: result})
 	return errors.Join(applyErr, writeErr)
@@ -479,8 +498,8 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	if err != nil {
 		return err
 	}
-	pins := platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256}
-	if pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "" || installation.ControlPlanePlanDigestSHA256 == "" {
+	pins := platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256, ReleaseBundledFilesDigest: installation.ReleaseBundledFilesDigestSHA256}
+	if pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "" || pins.ReleaseBundledFilesDigest == "" || installation.ControlPlanePlanDigestSHA256 == "" {
 		return errors.New("Platform Installation lacks durable verified release or Control Plane authorization pins")
 	}
 	observation := (controlplane.Inspector{}).Inspect(ctx, &record)
@@ -521,7 +540,17 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 		return errors.New("USERPROFILE is required to verify the Workflow Skill Bundle")
 	}
 	skillsRoot := filepath.Join(userProfile, ".agents", "skills")
-	verified, err := (workflowhome.Installation{Layout: layout}).VerifyRecordedSkillBundle(skillsRoot, contract.SkillBundle.Version, contract.SkillBundle.ManagedSkills)
+	bundledFiles, err := durableReleaseBundle(installation)
+	if err != nil {
+		return err
+	}
+	skillFiles := make([]workflowhome.SkillBundleFile, 0)
+	for _, file := range bundledFiles {
+		if strings.HasPrefix(file.Path, "skills/") {
+			skillFiles = append(skillFiles, workflowhome.SkillBundleFile{Path: strings.TrimPrefix(file.Path, "skills/"), SHA256: file.SHA256})
+		}
+	}
+	verified, err := (workflowhome.Installation{Layout: layout}).VerifySkillBundle(workflowhome.SkillBundleSpec{Version: contract.SkillBundle.Version, DestinationRoot: skillsRoot, ManagedSkills: contract.SkillBundle.ManagedSkills, Files: skillFiles})
 	if err != nil || !verified {
 		return errors.Join(errors.New("Workflow Skill Bundle does not match the installed release"), err)
 	}
@@ -541,6 +570,34 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	return nil
 }
 
+func durableReleaseBundle(installation store.PlatformInstallation) ([]platformrelease.BundledFile, error) {
+	canonical, digest, err := setupcontract.Canonicalize([]byte(installation.ReleaseBundledFilesJSON))
+	if err != nil || string(canonical) != installation.ReleaseBundledFilesJSON || digest != installation.ReleaseBundledFilesDigestSHA256 {
+		return nil, errors.Join(errors.New("durable signed Platform Release bundled-file inventory differs"), err)
+	}
+	var files []platformrelease.BundledFile
+	if json.Unmarshal(canonical, &files) != nil || len(files) == 0 {
+		return nil, errors.New("durable signed Platform Release bundled-file inventory is invalid")
+	}
+	seen, cli := map[string]bool{}, 0
+	for _, file := range files {
+		if seen[file.Path] || file.Path == "" || filepath.IsAbs(file.Path) || len(file.SHA256) != 64 {
+			return nil, errors.New("durable signed Platform Release bundled-file inventory is invalid")
+		}
+		seen[file.Path] = true
+		if file.Path == "bin/workflow.exe" {
+			cli++
+			if file.SHA256 != installation.WorkflowCLISHA256 {
+				return nil, errors.New("durable signed Platform Release Workflow CLI checksum differs")
+			}
+		}
+	}
+	if cli != 1 {
+		return nil, errors.New("durable signed Platform Release bundled-file inventory lacks one Workflow CLI")
+	}
+	return files, nil
+}
+
 func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record controlplane.RuntimeRecord, installation store.PlatformInstallation) error {
 	archived, err := database.SetupPlanByDigest(ctx, record.ApprovedPlanDigestSHA256)
 	if err != nil {
@@ -551,7 +608,7 @@ func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record
 		return errors.New("Control Plane approved plan archive is invalid")
 	}
 	for _, effect := range plan.Effects {
-		if effect.Kind == "control_plane" && (effect.Action == "start" || effect.Action == "replace") && effect.Parameters["version"] == installation.PlatformVersion && effect.Parameters["release_manifest_digest"] == installation.ReleaseManifestDigestSHA256 && effect.Parameters["platform_setup_contract_digest"] == installation.PlatformSetupContractDigestSHA256 && effect.Parameters["workflow_cli_sha256"] == installation.WorkflowCLISHA256 {
+		if effect.Kind == "control_plane" && (effect.Action == "start" || effect.Action == "replace") && effect.Parameters["version"] == installation.PlatformVersion && effect.Parameters["release_manifest_digest"] == installation.ReleaseManifestDigestSHA256 && effect.Parameters["platform_setup_contract_digest"] == installation.PlatformSetupContractDigestSHA256 && effect.Parameters["workflow_cli_sha256"] == installation.WorkflowCLISHA256 && effect.Parameters["release_bundled_files_digest"] == installation.ReleaseBundledFilesDigestSHA256 {
 			return nil
 		}
 	}
@@ -580,6 +637,25 @@ func verifyRecordedAdmission(ctx context.Context, database *store.Store, layout 
 	value.VerifiedAt = time.Now().UTC()
 	value.SuspensionReason = ""
 	return database.RecordRepositoryAdmission(ctx, value)
+}
+
+func verifyRecordedAdmissionReadOnly(ctx context.Context, database *store.Store, layout workflowhome.Layout, client *github.Client, repository string) error {
+	value, err := database.RepositoryAdmission(ctx, repository)
+	if err != nil || !value.Eligible {
+		return errors.Join(errors.New("Repository Admission is not eligible"), err)
+	}
+	contractRaw, err := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
+	if err != nil {
+		return err
+	}
+	var contract platformrelease.PlatformSetupContract
+	if err := json.Unmarshal(contractRaw, &contract); err != nil {
+		return err
+	}
+	if err := contract.Validate(); err != nil {
+		return err
+	}
+	return (admission.GitHubVerifier{Client: client, Contract: contract}).Verify(ctx, value)
 }
 
 func suspendAdmission(ctx context.Context, database *store.Store, value store.RepositoryAdmission, reason error) error {

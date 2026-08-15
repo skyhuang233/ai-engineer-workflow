@@ -15,6 +15,9 @@ function Get-SHA256Hex([byte[]]$Bytes) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hasher.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
+function Get-SHA256File([string]$Path) {
+    return Get-SHA256Hex ([IO.File]::ReadAllBytes($Path))
+}
 $verificationArguments = @{
     ManifestPath = $ManifestPath
     SignaturePath = $SignaturePath
@@ -31,7 +34,7 @@ if ($facts.schema_version -ne 1) { throw "Unsupported host-facts schema" }
 if (-not $facts.supported_host) { throw "Agent Workflow setup supports Windows only" }
 
 $actions = [System.Collections.Generic.List[object]]::new()
-$manifestDigest = (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$manifestDigest = Get-SHA256File $ManifestPath
 if ($facts.platform.installation_recorded -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.release_manifest_digest) -and [string]$facts.platform.release_manifest_digest -ne $manifestDigest -and -not $AllowUpgrade) {
     throw "The installed Platform Release pin differs; reuse its exact manifest unless the user explicitly requested an upgrade"
 }
@@ -42,12 +45,17 @@ $contractInput = Join-Path $scratchRoot "contract.input.json"; $contractCanonica
 [IO.File]::WriteAllText($contractInput, ($manifest.platform_setup_contract | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
 $platformSetupContractDigest = (& $canonicalizer -InputPath $contractInput -OutputPath $contractCanonical | Select-Object -Last 1).Trim()
 $platformSetupContractJSON = [IO.File]::ReadAllText($contractCanonical, (New-Object Text.UTF8Encoding($false, $true)))
+$bundledFilesInput = Join-Path $scratchRoot "bundled-files.input.json"; $bundledFilesCanonical = Join-Path $scratchRoot "bundled-files.canonical.json"
+[IO.File]::WriteAllText($bundledFilesInput, (ConvertTo-Json -InputObject @($manifest.bundled_files) -Depth 10 -Compress), (New-Object Text.UTF8Encoding($false)))
+$releaseBundledFilesDigest = (& $canonicalizer -InputPath $bundledFilesInput -OutputPath $bundledFilesCanonical | Select-Object -Last 1).Trim()
+$releaseBundledFilesJSON = [IO.File]::ReadAllText($bundledFilesCanonical, (New-Object Text.UTF8Encoding($false, $true)))
 $workflowExecutable = @($manifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" } | Select-Object -First 1)
 if ($workflowExecutable.Count -ne 1) { throw "Verified Platform Release has no exact Workflow CLI checksum" }
 function Add-PlatformPins([Collections.IDictionary]$Parameters) {
     $Parameters.release_manifest_digest = $manifestDigest
     $Parameters.platform_setup_contract_digest = $platformSetupContractDigest
     $Parameters.workflow_cli_sha256 = [string]$workflowExecutable[0].sha256
+    $Parameters.release_bundled_files_digest = $releaseBundledFilesDigest
     return $Parameters
 }
 $workflowCurrent = ($facts.workflow.installed -and $facts.workflow.owned -and $facts.workflow.path_reconciled -and [string]$facts.workflow.version -eq [string]$manifest.release.version -and [string]$facts.workflow.sha256 -eq [string]$workflowExecutable[0].sha256)
@@ -84,7 +92,7 @@ foreach ($skill in $managedSkills) {
         $relativeWithinSkill = ([string]$file.path).Substring($skill.Length + 1).Replace('/', [IO.Path]::DirectorySeparatorChar)
         $path = Join-Path $skillRoot $relativeWithinSkill
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $bundleCurrent = $false; break }
-        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$file.sha256) { $bundleCurrent = $false; break }
+        if ((Get-SHA256File $path) -ne [string]$file.sha256) { $bundleCurrent = $false; break }
     }
 }
 if (-not $bundleCurrent) {
@@ -113,21 +121,24 @@ $effectiveGitHubOwner = $GitHubOwner
 $effectiveGitHubOwner = $effectiveGitHubOwner.Trim()
 if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner must be determined before Platform planning" }
 $credentialOwnerMatches = (-not [string]::IsNullOrWhiteSpace($effectiveGitHubOwner) -and [string]::Equals([string]$facts.github_credential.owner, $effectiveGitHubOwner, [StringComparison]::OrdinalIgnoreCase))
+if ($facts.github_credential.exists -and -not [string]::IsNullOrWhiteSpace([string]$facts.github_credential.owner) -and -not $credentialOwnerMatches) {
+    throw "Existing Workflow Home is already bound to GitHub owner '$([string]$facts.github_credential.owner)' and cannot be rebound to '$effectiveGitHubOwner'"
+}
 $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $observedScopes -contains "repo" -and $observedScopes -contains "workflow")
 if (-not $credentialCurrent) {
     if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
     $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner })) })
 }
-$platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256)
+$platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256 -and [string]$facts.platform.release_bundled_files_digest -eq $releaseBundledFilesDigest -and [string]$facts.platform.release_bundled_files_json -eq $releaseBundledFilesJSON)
 $controlPlaneAuthorizationCurrent = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.control_plane_plan_digest_sha256) -and [string]$facts.platform.control_plane_plan_digest_sha256 -eq [string]$facts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256)
 $controlPlaneReady = ($platformRecordCurrent -and $controlPlaneAuthorizationCurrent)
 if (-not $platformRecordCurrent) {
-    $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
+    $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256; release_bundled_files_json = $releaseBundledFilesJSON; release_bundled_files_digest = $releaseBundledFilesDigest } })
 }
 if (-not $controlPlaneReady) {
     $controlPlaneAction = $(if ([string]$facts.control_plane.state -eq "ready") { "replace" } else { "start" })
-    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = $controlPlaneAction; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
+    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = $controlPlaneAction; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256; release_bundled_files_digest = $releaseBundledFilesDigest } })
 }
 
 $identitySeed = [ordered]@{

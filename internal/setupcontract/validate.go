@@ -29,8 +29,8 @@ var effectContracts = map[string]effectContract{
 	"workflow_skill_bundle":  {PlatformBootstrap, []string{"install"}, []string{"version", "managed_skills_json", "files_json"}, nil},
 	"docker_desktop":         {PlatformBootstrap, []string{"install", "upgrade", "repair"}, []string{"version", "installer_url", "windows_amd64_sha256"}, nil},
 	"github_pat":             {PlatformBootstrap, []string{"persist", "replace"}, []string{"input", "owner"}, []string{"api_base"}},
-	"platform_installation":  {PlatformBootstrap, []string{"record"}, []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256"}, nil},
-	"control_plane":          {PlatformBootstrap, []string{"start", "replace"}, []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256"}, nil},
+	"platform_installation":  {PlatformBootstrap, []string{"record"}, []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest"}, nil},
+	"control_plane":          {PlatformBootstrap, []string{"start", "replace"}, []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest"}, nil},
 	"create_repository":      {RepositoryOnboarding, []string{"create"}, []string{"owner", "authenticated_login", "name", "private"}, nil},
 	"initial_baseline":       {RepositoryOnboarding, []string{"commit_and_push"}, []string{"branch", "files_json", "repository", "source_url"}, nil},
 	"publish_history":        {RepositoryOnboarding, []string{"push"}, []string{"branch", "head"}, nil},
@@ -222,7 +222,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 		return fmt.Errorf("action %q is unsupported for effect kind %q", effect.Action, effect.Kind)
 	}
 	if planKind == PlatformBootstrap && isPlatformMutationEffect(effect.Kind) && effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
-		schema.required = append(schema.required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256")
+		schema.required = append(schema.required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest")
 	}
 	allowed := map[string]bool{}
 	for _, key := range append(append([]string{}, schema.required...), schema.optional...) {
@@ -240,7 +240,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			return fmt.Errorf("parameter %q is required", key)
 		}
 	}
-	for _, key := range []string{"sha256", "windows_amd64_sha256", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "manifest_digest"} {
+	for _, key := range []string{"sha256", "windows_amd64_sha256", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest", "manifest_digest"} {
 		if value, exists := effect.Parameters[key]; exists && !sha256Pattern.MatchString(value) {
 			return fmt.Errorf("parameter %q must be a lowercase SHA-256", key)
 		}
@@ -268,7 +268,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			return errors.New("Actions policy is invalid")
 		}
 	}
-	for _, key := range []string{"managed_skills_json", "files_json", "before_files_json", "required_checks_json", "labels_json", "platform_setup_contract_json"} {
+	for _, key := range []string{"managed_skills_json", "files_json", "before_files_json", "required_checks_json", "labels_json", "platform_setup_contract_json", "release_bundled_files_json"} {
 		if value, exists := effect.Parameters[key]; exists && !json.Valid([]byte(value)) {
 			return fmt.Errorf("parameter %q must be valid JSON", key)
 		}
@@ -312,17 +312,17 @@ func isPlatformMutationEffect(kind string) bool {
 }
 
 func validatePlatformEffectPins(effects []Effect) error {
-	var releaseDigest, contractDigest, cliDigest string
+	var releaseDigest, contractDigest, cliDigest, bundleDigest string
 	found := false
 	for _, effect := range effects {
 		if !isPlatformMutationEffect(effect.Kind) {
 			continue
 		}
-		pins := []string{effect.Parameters["release_manifest_digest"], effect.Parameters["platform_setup_contract_digest"], effect.Parameters["workflow_cli_sha256"]}
+		pins := []string{effect.Parameters["release_manifest_digest"], effect.Parameters["platform_setup_contract_digest"], effect.Parameters["workflow_cli_sha256"], effect.Parameters["release_bundled_files_digest"]}
 		if !found {
-			releaseDigest, contractDigest, cliDigest = pins[0], pins[1], pins[2]
+			releaseDigest, contractDigest, cliDigest, bundleDigest = pins[0], pins[1], pins[2], pins[3]
 			found = true
-		} else if pins[0] != releaseDigest || pins[1] != contractDigest || pins[2] != cliDigest {
+		} else if pins[0] != releaseDigest || pins[1] != contractDigest || pins[2] != cliDigest || pins[3] != bundleDigest {
 			return errors.New("Platform Bootstrap effects have inconsistent release pins")
 		}
 		if effect.Kind == "platform_cli" && effect.Parameters["sha256"] != pins[2] {

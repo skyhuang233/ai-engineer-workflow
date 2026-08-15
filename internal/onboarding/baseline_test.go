@@ -103,3 +103,70 @@ func TestInitialBaselineBindsAndRechecksExactFileBytes(t *testing.T) {
 		t.Fatalf("replacement bytes accepted: %v", err)
 	}
 }
+
+func TestInitialBaselineBindsGitModeFromSnapshotThroughApply(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	path := filepath.Join(repo, "script.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blob := testGitOutput(t, repo, "hash-object", "-w", "script.sh")
+	git(t, repo, "update-index", "--add", "--cacheinfo", "100755,"+blob+",script.sh")
+	snapshot, err := BaselineSnapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].Mode != "100755" {
+		t.Fatalf("baseline mode snapshot = %#v", snapshot)
+	}
+	git(t, repo, "update-index", "--cacheinfo", "100644,"+blob+",script.sh")
+	if _, err := CreateInitialBaseline(context.Background(), repo, "main", snapshot, "baseline"); err == nil || !strings.Contains(err.Error(), "mode drifted") {
+		t.Fatalf("git mode replacement accepted: %v", err)
+	}
+	git(t, repo, "update-index", "--cacheinfo", "100755,"+blob+",script.sh")
+	commit, err := CreateInitialBaseline(context.Background(), repo, "main", snapshot, "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := strings.Fields(testGitOutput(t, repo, "ls-tree", commit, "--", "script.sh"))[0]; mode != "100755" {
+		t.Fatalf("baseline tree mode = %q", mode)
+	}
+}
+
+func TestInitialBaselineBindsSymlinkModeAndTargetBlob(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	path := filepath.Join(repo, "current")
+	if err := os.WriteFile(path, []byte("target-a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blob := testGitOutput(t, repo, "hash-object", "-w", "current")
+	git(t, repo, "update-index", "--add", "--cacheinfo", "120000,"+blob+",current")
+	snapshot, err := BaselineSnapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].Mode != "120000" {
+		t.Fatalf("symlink snapshot = %#v", snapshot)
+	}
+	if err := os.WriteFile(path, []byte("target-b"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateInitialBaseline(context.Background(), repo, "main", snapshot, "baseline"); err == nil || !strings.Contains(err.Error(), "content drifted") {
+		t.Fatalf("symlink target replacement accepted: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("target-a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := CreateInitialBaseline(context.Background(), repo, "main", snapshot, "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := testGitOutput(t, repo, "ls-tree", commit, "--", "current"); !strings.HasPrefix(entry, "120000 ") {
+		t.Fatalf("symlink tree entry = %q", entry)
+	}
+	if target := testGitOutput(t, repo, "show", commit+":current"); target != "target-a" {
+		t.Fatalf("symlink blob = %q", target)
+	}
+}

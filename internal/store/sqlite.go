@@ -21,7 +21,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 59
+	latestSchemaVersion = 60
 )
 
 var (
@@ -1676,6 +1676,26 @@ FROM repository_admissions r`,
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (59, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 60 {
+		columns := []struct{ name, statement string }{
+			{"release_bundled_files_json", `ALTER TABLE platform_installation ADD COLUMN release_bundled_files_json TEXT NOT NULL DEFAULT ''`},
+			{"release_bundled_files_digest", `ALTER TABLE platform_installation ADD COLUMN release_bundled_files_digest TEXT NOT NULL DEFAULT ''`},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "platform_installation", column.name)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, column.statement); err != nil {
+					return fmt.Errorf("migration 60: %w", err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (60, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

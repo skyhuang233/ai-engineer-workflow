@@ -89,7 +89,7 @@ func TestParsePlanRejectsKindSpecificEffectParameterDrift(t *testing.T) {
 }
 
 func TestParsePlanRejectsUnknownSemanticCombinations(t *testing.T) {
-	base := Plan{SchemaVersion: 1, PlanID: "semantic-registry", Kind: PlatformBootstrap, Target: Target{WorkflowHome: `C:\Workflow`}, Preconditions: []Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "user"}}, Effects: []Effect{{ID: "cli", Kind: "platform_cli", Subject: `C:\Workflow\bin\workflow.exe`, Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": strings.Repeat("c", 64), "release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_digest": strings.Repeat("b", 64), "workflow_cli_sha256": strings.Repeat("c", 64)}}}, ExpectedResults: []ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: `C:\Workflow`, Expected: "ready"}}}
+	base := Plan{SchemaVersion: 1, PlanID: "semantic-registry", Kind: PlatformBootstrap, Target: Target{WorkflowHome: `C:\Workflow`}, Preconditions: []Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "user"}}, Effects: []Effect{{ID: "cli", Kind: "platform_cli", Subject: `C:\Workflow\bin\workflow.exe`, Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": strings.Repeat("c", 64), "release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_digest": strings.Repeat("b", 64), "workflow_cli_sha256": strings.Repeat("c", 64), "release_bundled_files_digest": strings.Repeat("d", 64)}}}, ExpectedResults: []ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: `C:\Workflow`, Expected: "ready"}}}
 	tests := map[string]func(*Plan){
 		"unknown precondition":        func(p *Plan) { p.Preconditions[0].Kind = "surprise" },
 		"wrong precondition for plan": func(p *Plan) { p.Preconditions[0].Kind = "git_head" },
@@ -124,7 +124,7 @@ func TestPlanValidationFailsClosed(t *testing.T) {
 		"unknown kind":  func(s string) string { return strings.Replace(s, `"platform_bootstrap"`, `"mystery"`, 1) },
 		"relative home": func(s string) string { return strings.Replace(s, `C:\\Users\\Ada\\AgentWorkflow`, `relative\\home`, 1) },
 		"duplicate effect": func(s string) string {
-			return strings.Replace(s, `  ] ,"expected_results"`, `    ,{"id":"install-cli","kind":"platform_cli","subject":"workflow.exe","action":"install","parameters":{"version":"1.0.0","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform_setup_contract_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_cli_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
+			return strings.Replace(s, `  ] ,"expected_results"`, `    ,{"id":"install-cli","kind":"platform_cli","subject":"workflow.exe","action":"install","parameters":{"version":"1.0.0","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform_setup_contract_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_cli_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_bundled_files_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
   ] ,"expected_results"`, 1)
 		},
 		"secret field": func(s string) string { return strings.Replace(s, `"sha256":`, `"github_token":`, 1) },
@@ -156,7 +156,7 @@ func validPlatformPlanJSON() []byte {
     {"id":"windows-user","kind":"host_identity","subject":"current-user","expected":"S-1-5-21"}
   ],
   "effects": [
-    {"id":"install-cli","kind":"platform_cli","subject":"workflow.exe","action":"install","parameters":{"version":"1.0.0","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform_setup_contract_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_cli_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}
+    {"id":"install-cli","kind":"platform_cli","subject":"workflow.exe","action":"install","parameters":{"version":"1.0.0","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform_setup_contract_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_cli_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_bundled_files_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
   ] ,"expected_results": [
     {"id":"platform-ready","kind":"platform_readiness","subject":"C:\\Users\\Ada\\AgentWorkflow","expected":"ready"}
   ]

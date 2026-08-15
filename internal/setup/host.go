@@ -40,6 +40,7 @@ type HostAdapter struct {
 	DockerDesktopHost          hostsetup.DockerDesktopHost
 	CurrentUserPATHReconciled  func(string) (bool, error)
 	OnboardingMergeHeads       map[string]string
+	OnboardingCheckDiagnostics map[string][]string
 	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
 }
 
@@ -704,7 +705,11 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &requiredChecks); err != nil || len(requiredChecks) == 0 {
 		return errors.New("Onboarding Pull Request lacks approved required checks")
 	}
-	if err := waitForOnboardingChecks(ctx, a.GitHub, effect.Subject, workspace.Head, requiredChecks, 10*time.Minute); err != nil {
+	checkDiagnostics, err := waitForOnboardingChecks(ctx, a.GitHub, effect.Subject, workspace.Head, requiredChecks, 10*time.Minute)
+	if a.OnboardingCheckDiagnostics != nil {
+		a.OnboardingCheckDiagnostics[effect.ID] = checkDiagnostics
+	}
+	if err != nil {
 		return err
 	}
 	current, err := a.GitHub.OnboardingPullRequest(ctx, effect.Subject, pull.Number)
@@ -794,7 +799,7 @@ func (a HostAdapter) requireOnboardingBase(ctx context.Context, repository, bran
 	return nil
 }
 
-func waitForOnboardingChecks(ctx context.Context, client *github.Client, repository, head string, required []string, timeout time.Duration) error {
+func waitForOnboardingChecks(ctx context.Context, client *github.Client, repository, head string, required []string, timeout time.Duration) ([]string, error) {
 	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(5 * time.Second)
@@ -802,19 +807,28 @@ func waitForOnboardingChecks(ctx context.Context, client *github.Client, reposit
 	for {
 		checks, err := client.PullRequestChecks(deadline, repository, head)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		requiredSet := make(map[string]bool, len(required))
+		for _, name := range required {
+			requiredSet[name] = true
 		}
 		passed := map[string]bool{}
-		pending := false
+		diagnostics := make([]string, 0, len(checks))
+		requiredObserved := map[string]string{}
 		for _, check := range checks {
+			if !requiredSet[check.Name] {
+				diagnostics = append(diagnostics, fmt.Sprintf("optional check %q: status=%s conclusion=%s", check.Name, check.Status, check.Conclusion))
+				continue
+			}
+			requiredObserved[check.Name] = "status=" + check.Status + " conclusion=" + check.Conclusion
 			if check.Status != "completed" {
-				pending = true
 				continue
 			}
 			switch check.Conclusion {
 			case "success", "neutral", "skipped":
 			default:
-				return fmt.Errorf("pull request check %q concluded %q", check.Name, check.Conclusion)
+				return diagnostics, fmt.Errorf("required pull request check %q concluded %q", check.Name, check.Conclusion)
 			}
 			if check.Conclusion == "success" {
 				passed[check.Name] = true
@@ -827,12 +841,20 @@ func waitForOnboardingChecks(ctx context.Context, client *github.Client, reposit
 				break
 			}
 		}
-		if allRequired && !pending {
-			return nil
+		if allRequired {
+			return diagnostics, nil
 		}
 		select {
 		case <-deadline.Done():
-			return fmt.Errorf("wait for onboarding checks: %w", deadline.Err())
+			states := make([]string, 0, len(required))
+			for _, name := range required {
+				state := requiredObserved[name]
+				if state == "" {
+					state = "not observed"
+				}
+				states = append(states, name+" ("+state+")")
+			}
+			return diagnostics, fmt.Errorf("wait for onboarding checks: %w; required check states: %s", deadline.Err(), strings.Join(states, ", "))
 		case <-ticker.C:
 		}
 	}

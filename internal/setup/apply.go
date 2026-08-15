@@ -54,11 +54,13 @@ type PreconditionChecker interface {
 type EffectResultRestorer interface {
 	RestoreEffectResults([]setupcontract.EffectResult) error
 }
+type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
 type Engine struct {
-	Adapter          EffectAdapter
-	SecretInput      *SecretInput
-	Now              func() time.Time
-	ResolveCodexAuth func(context.Context) (string, error)
+	Adapter                EffectAdapter
+	SecretInput            *SecretInput
+	Now                    func() time.Time
+	ResolveCodexAuth       func(context.Context) (string, error)
+	ExpectedResultVerifier ExpectedResultVerifier
 }
 
 func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (setupcontract.ExecutionResult, error) {
@@ -289,6 +291,22 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			err = expectedErr
 		}
 	}
+	if err == nil {
+		for _, expected := range plan.ExpectedResults {
+			if expected.Kind != "platform_readiness" {
+				continue
+			}
+			if e.ExpectedResultVerifier == nil {
+				err = errors.New("Platform Ready verifier is required")
+			} else {
+				err = e.ExpectedResultVerifier(ctx, plan, expected)
+			}
+			if err != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				break
+			}
+		}
+	}
 	result.FinishedAt = time.Now().UTC()
 	if e.Now != nil {
 		result.FinishedAt = e.Now().UTC()
@@ -439,10 +457,10 @@ func readPlatformInstallation(ctx context.Context, database *store.Store, effect
 	if value.PlatformVersion != effect.Parameters["version"] || value.ReleaseManifestDigestSHA256 != effect.Parameters["release_manifest_digest"] {
 		return setupcontract.EffectConflicting, "Platform Installation differs from the approved release", nil
 	}
-	if value.PlatformSetupContractDigestSHA256 == "" || value.WorkflowCLISHA256 == "" {
+	if value.PlatformSetupContractDigestSHA256 == "" || value.WorkflowCLISHA256 == "" || value.ReleaseBundledFilesDigestSHA256 == "" || value.ReleaseBundledFilesJSON == "" {
 		return setupcontract.EffectRequired, "Platform Installation lacks durable verified release pins", nil
 	}
-	if value.PlatformSetupContractDigestSHA256 != effect.Parameters["platform_setup_contract_digest"] || value.WorkflowCLISHA256 != effect.Parameters["workflow_cli_sha256"] {
+	if value.PlatformSetupContractDigestSHA256 != effect.Parameters["platform_setup_contract_digest"] || value.WorkflowCLISHA256 != effect.Parameters["workflow_cli_sha256"] || value.ReleaseBundledFilesDigestSHA256 != effect.Parameters["release_bundled_files_digest"] || value.ReleaseBundledFilesJSON != effect.Parameters["release_bundled_files_json"] {
 		return setupcontract.EffectConflicting, "Platform Installation durable release pins differ", nil
 	}
 	contractPath := filepath.Join(value.WorkflowHome, "config", "platform-setup-contract.json")
@@ -468,15 +486,21 @@ func recordPlatformInstallation(ctx context.Context, database *store.Store, layo
 	if len(contractRaw) == 0 || canonicalErr != nil || string(canonicalContract) != string(contractRaw) || contractDigest != effect.Parameters["platform_setup_contract_digest"] || json.Unmarshal(contractRaw, &contract) != nil || contract.Validate() != nil {
 		return errors.New("platform installation effect lacks a valid release-declared Platform Setup Contract")
 	}
+	bundledFilesRaw := []byte(effect.Parameters["release_bundled_files_json"])
+	canonicalBundledFiles, bundledFilesDigest, bundledFilesErr := setupcontract.Canonicalize(bundledFilesRaw)
+	var bundledFiles []platformrelease.BundledFile
+	if len(bundledFilesRaw) == 0 || bundledFilesErr != nil || string(canonicalBundledFiles) != string(bundledFilesRaw) || bundledFilesDigest != effect.Parameters["release_bundled_files_digest"] || json.Unmarshal(bundledFilesRaw, &bundledFiles) != nil || len(bundledFiles) == 0 {
+		return errors.New("platform installation effect lacks the signed release bundled-file inventory")
+	}
 	contractPath := filepath.Join(layout.Config, "platform-setup-contract.json")
 	if err := writeAtomic(contractPath, contractRaw); err != nil {
 		return err
 	}
-	return database.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"], WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now})
+	return database.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"], ReleaseBundledFilesJSON: string(canonicalBundledFiles), ReleaseBundledFilesDigestSHA256: bundledFilesDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now})
 }
 
 func authorizeControlPlane(ctx context.Context, database *store.Store, effect setupcontract.Effect, planDigest string) error {
-	return database.AuthorizeControlPlane(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"]}, planDigest)
+	return database.AuthorizeControlPlane(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"], ReleaseBundledFilesDigestSHA256: effect.Parameters["release_bundled_files_digest"]}, planDigest)
 }
 
 func writeAtomic(path string, data []byte) error {

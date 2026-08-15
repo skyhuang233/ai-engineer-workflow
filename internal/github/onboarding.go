@@ -70,6 +70,9 @@ type ActionsPermissions struct {
 	Enabled        bool   `json:"enabled"`
 	AllowedActions string `json:"allowed_actions"`
 }
+type SelectedActionsPermissions struct {
+	GitHubOwnedAllowed bool `json:"github_owned_allowed"`
+}
 type BranchProtection struct {
 	RequiredStatusChecks *struct {
 		Contexts []string `json:"contexts"`
@@ -113,7 +116,19 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 		return result, err
 	}
 	switch actions.AllowedActions {
-	case "all", "local_only", "selected":
+	case "all":
+		result.GitHubOwnedActionsAllowed = true
+	case "selected":
+		var selected SelectedActionsPermissions
+		if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/actions/permissions/selected-actions", nil, &selected); err != nil {
+			return result, fmt.Errorf("discover selected GitHub Actions policy: %w", err)
+		}
+		if !selected.GitHubOwnedAllowed {
+			return result, errors.New("GitHub Actions policy does not allow the GitHub-owned checkout action")
+		}
+		result.GitHubOwnedActionsAllowed = true
+	case "local_only":
+		return result, errors.New("GitHub Actions local_only policy does not allow the GitHub-owned checkout action")
 	default:
 		return result, errors.New("GitHub Actions allowed_actions policy is unavailable or unsupported")
 	}
@@ -281,7 +296,19 @@ func (c *Client) PreflightCreateRepository(ctx context.Context, owner, authentic
 	if actions.EnabledRepositories != "all" {
 		return errors.New("organization Actions policy does not prove a new repository will be enabled")
 	}
-	if actions.AllowedActions != "all" {
+	switch actions.AllowedActions {
+	case "all":
+	case "selected":
+		var selected SelectedActionsPermissions
+		if err := c.RequestJSON(ctx, http.MethodGet, "/orgs/"+url.PathEscape(owner)+"/actions/permissions/selected-actions", nil, &selected); err != nil {
+			return fmt.Errorf("discover organization selected Actions policy: %w", err)
+		}
+		if !selected.GitHubOwnedAllowed {
+			return errors.New("organization Actions policy does not prove required onboarding actions include GitHub-owned checkout")
+		}
+	case "local_only":
+		return errors.New("organization Actions policy does not prove required onboarding actions include GitHub-owned checkout")
+	default:
 		return errors.New("organization Actions policy does not prove required onboarding actions are allowed")
 	}
 	var rulesets []RepositoryRuleset

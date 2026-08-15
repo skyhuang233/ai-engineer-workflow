@@ -45,6 +45,41 @@ func TestVerifierClassifiesMissingScopeWithoutLeakingToken(t *testing.T) {
 	}
 }
 
+func TestVerifierRequiresActiveOrganizationAdminMembership(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		membership string
+		wantErr    bool
+	}{
+		{name: "active admin", membership: `{"state":"active","role":"admin"}`},
+		{name: "active member", membership: `{"state":"active","role":"member"}`, wantErr: true},
+		{name: "inactive admin", membership: `{"state":"pending","role":"admin"}`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/user":
+					w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+					_, _ = w.Write([]byte(`{"login":"member","id":42}`))
+				case "/orgs/acme/memberships/member":
+					_, _ = w.Write([]byte(test.membership))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			_, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), "secret", "acme")
+			if test.wantErr && !errors.Is(err, ErrOwnerMismatch) {
+				t.Fatalf("membership %s error = %v", test.membership, err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func contains(value, part string) bool {
 	for i := 0; i+len(part) <= len(value); i++ {
 		if value[i:i+len(part)] == part {

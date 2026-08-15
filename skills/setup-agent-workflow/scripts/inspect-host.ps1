@@ -6,6 +6,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+function Get-SHA256File([string]$Path) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+}
 $repoPath = [System.IO.Path]::GetFullPath($Repository)
 if (-not (Test-Path -LiteralPath $repoPath -PathType Container)) {
     throw "Repository directory does not exist: $repoPath"
@@ -80,7 +84,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
     $workflow.installed = $true
     $workflow.version = $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { [string]$installedVersion.output })
-    $workflow.sha256 = (Get-FileHash -LiteralPath $installedWorkflow -Algorithm SHA256).Hash.ToLowerInvariant()
+    $workflow.sha256 = Get-SHA256File $installedWorkflow
     $inspection = Invoke-ObservedCommand $installedWorkflow @("setup", "inspect-platform", "--workflow-home", $WorkflowHome)
     if ($inspection.exit_code -eq 0) {
         try {

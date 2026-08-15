@@ -26,6 +26,7 @@ $evidenceRoot = Join-Path $qualificationRoot "evidence"
 $githubConfig = Join-Path $qualificationRoot "gh"
 $repositories = [Collections.Generic.List[string]]::new()
 $cleanupErrors = [Collections.Generic.List[string]]::new()
+$qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
@@ -125,12 +126,17 @@ try {
       if ($ClassicPATRejectedRepository.Split('/')[0] -ine $GitHubOwner) { throw "ClassicPATRejectedRepository must belong to GitHubOwner so owner mismatch cannot mask organization policy" }
       Invoke-Scenario "organization-rejects-classic-pat" { param($target); Initialize-PublishedFixture $target $ClassicPATRejectedRepository }
     }
+} catch {
+    $qualificationError = $_.Exception
 } finally {
 	$scenarioToken = $env:GH_TOKEN
 	$env:GH_TOKEN = $cleanupToken
-    $cleanupAfter = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
-    $listExit = $LASTEXITCODE
-    if ($listExit -ne 0) { $cleanupErrors.Add("Cleanup credential cannot enumerate repositories after qualification (exit $listExit)") }
+    $cleanupAfter = @()
+    try {
+        $cleanupAfter = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
+        $listExit = $LASTEXITCODE
+        if ($listExit -ne 0) { $cleanupErrors.Add("Cleanup credential cannot enumerate repositories after qualification (exit $listExit)") }
+    } catch { $cleanupErrors.Add($_.Exception.Message) }
     foreach ($repository in @($cleanupAfter | Where-Object { $_ -notin $cleanupBaseline })) {
         if ($repository -notin $repositories) { $repositories.Add([string]$repository) }
     }
@@ -155,13 +161,18 @@ try {
         }
     } catch { $cleanupErrors.Add($_.Exception.Message) }
     foreach ($name in $prior.Keys) {
-		if ($null -eq $prior[$name]) { Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue }
-		else { Set-Item -Path ("Env:" + $name) -Value $prior[$name] }
+		try {
+            if ($null -eq $prior[$name]) { Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue }
+		    else { Set-Item -Path ("Env:" + $name) -Value $prior[$name] }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
 	}
     $resolvedRoot = [IO.Path]::GetFullPath($qualificationRoot)
     $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    if ($cleanupErrors.Count -eq 0 -and $resolvedRoot.StartsWith($resolvedTemp) -and [IO.Path]::GetFileName($resolvedRoot).StartsWith("workflow-setup-e2e-")) {
-        Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
+    if ($resolvedRoot.StartsWith($resolvedTemp) -and [IO.Path]::GetFileName($resolvedRoot).StartsWith("workflow-setup-e2e-")) {
+        try { Remove-Item -LiteralPath $resolvedRoot -Recurse -Force } catch { $cleanupErrors.Add($_.Exception.Message) }
     }
 }
-if ($cleanupErrors.Count -gt 0) { throw ("Qualification cleanup failed: " + ($cleanupErrors -join "; ")) }
+$failures = [Collections.Generic.List[string]]::new()
+if ($null -ne $qualificationError) { $failures.Add("Qualification failed: " + $qualificationError.Message) }
+foreach ($cleanupError in $cleanupErrors) { $failures.Add("Cleanup failed: " + $cleanupError) }
+if ($failures.Count -gt 0) { throw ($failures -join "; ") }

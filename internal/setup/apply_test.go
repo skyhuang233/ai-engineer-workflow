@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
@@ -65,7 +66,7 @@ func TestEngineAppliesRequiredEffectsAndRetriesSatisfiedOnes(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}, fail: "second"}
-	engine := Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("secret\n")}}
+	engine := Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("secret\n")}, ExpectedResultVerifier: passingExpectedResultVerifier}
 	first, err := engine.Apply(context.Background(), raw, digest)
 	if err == nil || first.Status != setupcontract.ExecutionIncomplete {
 		t.Fatalf("first=%#v err=%v", first, err)
@@ -80,6 +81,33 @@ func TestEngineAppliesRequiredEffectsAndRetriesSatisfiedOnes(t *testing.T) {
 	}
 }
 
+func TestEngineFailsClosedUntilPlatformReadyExpectedResultIsVerified(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	plan := testPlan(home)
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}}
+	result, err := (&Engine{Adapter: adapter}).Apply(context.Background(), raw, digest)
+	if err == nil || result.Status != setupcontract.ExecutionIncomplete || !strings.Contains(err.Error(), "Platform Ready verifier") {
+		t.Fatalf("missing verifier result=%#v err=%v", result, err)
+	}
+	verified := false
+	result, err = (&Engine{Adapter: adapter, ExpectedResultVerifier: func(_ context.Context, got setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+		verified = got.PlanID == plan.PlanID && expected.Kind == "platform_readiness" && expected.Subject == home
+		return nil
+	}}).Apply(context.Background(), raw, digest)
+	if err != nil || result.Status != setupcontract.ExecutionSucceeded || !verified {
+		t.Fatalf("verified result=%#v err=%v called=%t", result, err, verified)
+	}
+}
+
+func passingExpectedResultVerifier(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error {
+	return nil
+}
+
 func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
@@ -90,7 +118,7 @@ func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	}
 	mergeHead := repeat("a", 40)
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}, evidence: map[string]string{"first": onboardingMergeHeadEvidence + mergeHead}}
-	engine := Engine{Adapter: adapter}
+	engine := Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier}
 	if result, err := engine.Apply(context.Background(), raw, digest); err != nil || result.Status != setupcontract.ExecutionSucceeded {
 		t.Fatalf("first result=%#v err=%v", result, err)
 	}
@@ -200,7 +228,7 @@ func TestEngineChecksPlatformReleasePreconditionBeforeMutation(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
 	plan.Preconditions = []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "platform-v1.0.0", Expected: repeat("a", 64)}}
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record", Kind: "platform_installation", Subject: home, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("b", 64), "platform_setup_contract_json": `{}`, "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}})
+	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record", Kind: "platform_installation", Subject: home, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("b", 64), "platform_setup_contract_json": `{}`, "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64), "release_bundled_files_json": `[]`, "release_bundled_files_digest": repeat("e", 64)}})
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
@@ -245,7 +273,7 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 }
 
 func testPlan(home string) setupcontract.Plan {
-	pins := map[string]string{"version": "1.0.0", "sha256": repeat("d", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}
+	pins := map[string]string{"version": "1.0.0", "sha256": repeat("d", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64), "release_bundled_files_digest": repeat("e", 64)}
 	copyPins := func() map[string]string {
 		value := map[string]string{}
 		for key, item := range pins {

@@ -81,6 +81,15 @@ func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
 	}
 }
 
+func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	for _, required := range []string{"$qualificationError = $null", "$qualificationError = $_.Exception", "$failures.Add(\"Qualification failed:", "$failures.Add(\"Cleanup failed:", "foreach ($repository in $repositories)", "docker ps -aq", "foreach ($name in $prior.Keys)", "Remove-Item -LiteralPath $resolvedRoot"} {
+		if !strings.Contains(harness, required) {
+			t.Fatalf("setup harness does not preserve primary failure while completing cleanup: missing %q", required)
+		}
+	}
+}
+
 func TestPowerShellHarnessAndDriverParse(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {

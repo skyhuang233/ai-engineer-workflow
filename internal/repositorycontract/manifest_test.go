@@ -58,6 +58,17 @@ func TestVerifyRemoteAllowsUserOwnedAgentsBytesButRejectsManagedDrift(t *testing
 	}
 }
 
+func TestVerifyRemoteRejectsDuplicateManagedBlockMarkers(t *testing.T) {
+	files, _, digest, err := Render("", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files["AGENTS.md"] = append(files["AGENTS.md"], []byte(BlockStart+"\n")...)
+	if _, err := VerifyRemote(func(path string) ([]byte, error) { return files[path], nil }, "owner/repo", "main", digest); err == nil {
+		t.Fatal("duplicate managed block marker accepted")
+	}
+}
+
 func TestRenderMultiContextChangesOnlyDeclaredDomainConfiguration(t *testing.T) {
 	files, manifest, _, err := Render("multi-context", nil, "owner/repo", "main")
 	if err != nil {
@@ -87,5 +98,18 @@ func TestRenderedAgentsBlockMatchesPublishedRepositoryContractTemplate(t *testin
 	}
 	if !strings.Contains(string(managed), "`$agent-workflow`") {
 		t.Fatal("rendered managed block does not automatically load the Workflow Skill Bundle")
+	}
+}
+
+func TestRenderedWorkflowVerifiesExactManagedAgentsBlockDigest(t *testing.T) {
+	files, _, _, err := Render("single-context", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(files[".github/workflows/workflow-contract.yml"])
+	for _, required := range []string{"managed_block_sha256", "hashlib.sha256", "data.count(start_marker) != 1", "agent-workflow:start", "agent-workflow:end"} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow does not verify exact AGENTS block digest: missing %q", required)
+		}
 	}
 }

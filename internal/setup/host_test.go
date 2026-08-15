@@ -247,6 +247,35 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 	}
 }
 
+func TestOnboardingCheckWaiterIgnoresOptionalFailuresAndPendingRuns(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/check-runs") {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success"},{"name":"optional-lint","status":"completed","conclusion":"failure"},{"name":"optional-preview","status":"in_progress","conclusion":""}]}`))
+	}))
+	defer server.Close()
+	diagnostics, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []string{"workflow-contract"}, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("optional checks blocked onboarding: %v", err)
+	}
+	joined := strings.Join(diagnostics, "\n")
+	if !strings.Contains(joined, "optional-lint") || !strings.Contains(joined, "failure") || !strings.Contains(joined, "optional-preview") || !strings.Contains(joined, "in_progress") {
+		t.Fatalf("optional check diagnostics = %#v", diagnostics)
+	}
+}
+
+func TestOnboardingCheckWaiterTimeoutReportsRequiredObservedState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"in_progress","conclusion":""}]}`))
+	}))
+	defer server.Close()
+	_, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []string{"workflow-contract", "build"}, 10*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "workflow-contract (status=in_progress") || !strings.Contains(err.Error(), "build (not observed)") {
+		t.Fatalf("required-check timeout diagnostics = %v", err)
+	}
+}
+
 func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "source")
 	hostGit(t, "", "init", "-b", "main", source)
@@ -421,7 +450,7 @@ func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 		return nil
 	}}
 	digest := sha256.Sum256([]byte("workflow executable"))
-	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(digest[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(digest[:])}}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(digest[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(digest[:]), "release_bundled_files_digest": repeat("e", 64)}}
 	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +471,7 @@ func TestHostAdapterReadbackRequiresExactOwnedCLIVersionAndChecksum(t *testing.T
 	}
 	sum := sha256.Sum256(contents)
 	adapter := HostAdapter{Layout: layout, Executable: source, PersistUserPATH: func(string) error { return nil }, CurrentUserPATHReconciled: func(string) (bool, error) { return true, nil }}
-	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(sum[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(sum[:])}}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(sum[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(sum[:]), "release_bundled_files_digest": repeat("e", 64)}}
 	if err := adapter.Apply(context.Background(), effect, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +499,7 @@ func TestHostAdapterDockerReadbackRequiresExactDesktopAndLinuxAMD64Engine(t *tes
 	}
 	host := &setupDockerHost{version: "4.44.0", engineErr: errors.New("Docker engine is windows/amd64")}
 	adapter := HostAdapter{Layout: layout, DockerDesktopHost: host}
-	effect := setupcontract.Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: map[string]string{"version": "4.45.0", "installer_url": "https://example.test/docker.exe", "windows_amd64_sha256": repeat("a", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}}
+	effect := setupcontract.Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: map[string]string{"version": "4.45.0", "installer_url": "https://example.test/docker.exe", "windows_amd64_sha256": repeat("a", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64), "release_bundled_files_digest": repeat("e", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("wrong version readback=%s %v", status, err)
@@ -516,7 +545,7 @@ func TestHostAdapterStartsAndReadsBackDigestBoundControlPlane(t *testing.T) {
 			return controlplane.Observation{State: controlplane.StateReady, Record: &record}
 		},
 	}
-	effect := setupcontract.Effect{ID: "serve", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}
+	effect := setupcontract.Effect{ID: "serve", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("initial readback = %s, %v", status, err)
@@ -548,7 +577,7 @@ func TestHostAdapterInstallsExactWorkflowSkillBundle(t *testing.T) {
 	skills, _ := json.Marshal([]string{"agent-workflow"})
 	effect := setupcontract.Effect{
 		ID: "skills", Kind: "workflow_skill_bundle", Subject: filepath.Join(t.TempDir(), "codex-skills"), Action: "install",
-		Parameters: map[string]string{"version": "1.0.0", "managed_skills_json": string(skills), "files_json": string(files), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)},
+		Parameters: map[string]string{"version": "1.0.0", "managed_skills_json": string(skills), "files_json": string(files), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)},
 	}
 	adapter := HostAdapter{Layout: layout, SkillBundleSource: source}
 	status, _, err := adapter.Readback(context.Background(), effect)
@@ -573,7 +602,7 @@ func TestHostAdapterPersistsPATOnlyThroughSecretInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := HostAdapter{Layout: layout}
-	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}
+	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("initial=%s %v", status, err)
@@ -602,13 +631,13 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_secret")}}
+	engine := Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_secret")}, ExpectedResultVerifier: passingExpectedResultVerifier}
 	result, err := engine.Apply(context.Background(), raw, digest)
 	if err != nil {
 		t.Fatal(err)
@@ -648,13 +677,13 @@ func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
 	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}}).Apply(context.Background(), raw, digest)
+	result, err := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}, ExpectedResultVerifier: passingExpectedResultVerifier}).Apply(context.Background(), raw, digest)
 	if err != nil || result.Status != setupcontract.ExecutionSucceeded {
 		t.Fatalf("replacement result=%#v err=%v", result, err)
 	}

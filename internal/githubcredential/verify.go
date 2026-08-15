@@ -106,8 +106,9 @@ func (v Verifier) Verify(ctx context.Context, token, owner string) (Verification
 		}
 		var state struct {
 			State string `json:"state"`
+			Role  string `json:"role"`
 		}
-		if json.NewDecoder(membershipResp.Body).Decode(&state) != nil || state.State != "active" {
+		if json.NewDecoder(membershipResp.Body).Decode(&state) != nil || state.State != "active" || state.Role != "admin" {
 			return Verification{}, ErrOwnerMismatch
 		}
 	}

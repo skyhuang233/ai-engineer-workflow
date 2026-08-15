@@ -18,6 +18,8 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 			_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","has_issues":false,"permissions":{"admin":true},"allow_squash_merge":true}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions":
 			_, _ = w.Write([]byte(`{"enabled":false,"allowed_actions":"selected"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions/selected-actions":
+			_, _ = w.Write([]byte(`{"github_owned_allowed":true,"verified_allowed":false,"patterns_allowed":[]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/branches/main/protection":
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"message":"not found"}`))
@@ -37,7 +39,7 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 	defer server.Close()
 	client := NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner")
 	policy, err := client.DiscoverPolicy(context.Background(), "owner/repo", "main")
-	if err != nil || policy.ActionsAllowed != "selected" {
+	if err != nil || policy.ActionsAllowed != "selected" || !policy.GitHubOwnedActionsAllowed {
 		t.Fatalf("policy=%#v err=%v", policy, err)
 	}
 	if err := client.UpdateRepositoryFeatures(context.Background(), "owner/repo", true, true, policy.ActionsAllowed); err != nil {
@@ -45,6 +47,36 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 	}
 	if update["allowed_actions"] != "selected" {
 		t.Fatalf("Actions update = %#v", update)
+	}
+}
+
+func TestActionsPolicyDiscoveryRejectsPoliciesThatCannotRunGitHubCheckout(t *testing.T) {
+	for _, test := range []struct {
+		name, allowed, selected string
+	}{
+		{name: "local only", allowed: "local_only"},
+		{name: "selected without GitHub owned actions", allowed: "selected", selected: `{"github_owned_allowed":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/repos/owner/repo":
+					_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","has_issues":true,"permissions":{"admin":true},"allow_squash_merge":true}`))
+				case "/repos/owner/repo/actions/permissions":
+					_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"` + test.allowed + `"}`))
+				case "/repos/owner/repo/actions/permissions/selected-actions":
+					_, _ = w.Write([]byte(test.selected))
+				default:
+					t.Fatalf("policy discovery continued to %s", r.URL.String())
+				}
+			}))
+			defer server.Close()
+			_, err := NewClient(server.URL, "token", server.Client()).DiscoverPolicy(context.Background(), "owner/repo", "main")
+			if err == nil || !strings.Contains(err.Error(), "checkout") {
+				t.Fatalf("Actions policy accepted without checkout: %v", err)
+			}
+		})
 	}
 }
 
@@ -106,6 +138,8 @@ func TestOrganizationPublicationPreflightRequiresProvableActionsAndMergePolicy(t
 				case "/orgs/acme/actions/permissions":
 					w.WriteHeader(test.actionsCode)
 					_, _ = w.Write([]byte(test.actions))
+				case "/orgs/acme/actions/permissions/selected-actions":
+					_, _ = w.Write([]byte(`{"github_owned_allowed":false}`))
 				case "/orgs/acme/rulesets":
 					_, _ = w.Write([]byte(test.rulesets))
 				default:

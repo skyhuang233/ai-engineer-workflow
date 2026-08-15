@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$APIBase = "https://api.github.com",
-    [Parameter(Mandatory = $true)][string]$Owner
+    [Parameter(Mandatory = $true)][string]$Owner,
+    [Parameter(Mandatory = $true)][string]$RepositoryName,
+    [Parameter(Mandatory = $true)][ValidateSet("private", "public")][string]$Visibility,
+    [Parameter(Mandatory = $true)][ValidateSet("published", "unpublished")][string]$PublicationState
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +38,57 @@ if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringCompariso
     $membership = $membershipResponse.Content | ConvertFrom-Json
     if ([string]$membership.state -ne "active" -or [string]$membership.role -ne "admin") { throw "The classic PAT identity must be an active organization owner" }
 }
+$repositoryNameValue = $RepositoryName.Trim()
+if ([string]::IsNullOrWhiteSpace($repositoryNameValue) -or $repositoryNameValue.Contains('/')) { throw "The GitHub repository name is invalid" }
+$repositoryID = $boundOwner + "/" + $repositoryNameValue
+$repositoryExists = $false
+try {
+    $repositoryResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue)) -Headers @{
+        Authorization = "Bearer $token"
+        Accept = "application/vnd.github+json"
+        "X-GitHub-Api-Version" = "2022-11-28"
+    } -UseBasicParsing
+    $repositoryExists = $true
+} catch {
+    $statusCode = 0
+    if ($null -ne $_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+    if ($statusCode -ne 404) { throw "GitHub repository intent cannot be proved or requires SSO authorization" }
+}
+if ($PublicationState -eq "published") {
+    if (-not $repositoryExists) { throw "The confirmed published GitHub repository is unavailable" }
+    $repository = $repositoryResponse.Content | ConvertFrom-Json
+    if (-not [string]::Equals([string]$repository.full_name, $repositoryID, [StringComparison]::OrdinalIgnoreCase)) { throw "GitHub returned a different repository owner or name" }
+    if ([bool]$repository.private -ne ($Visibility -eq "private")) { throw "GitHub repository visibility differs from the confirmed intent" }
+    if (-not [bool]$repository.permissions.admin) { throw "The classic PAT identity lacks repository administration" }
+} else {
+    if ($repositoryExists) { throw "The confirmed unpublished GitHub repository already exists" }
+    if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringComparison]::OrdinalIgnoreCase)) {
+        try {
+            $organizationResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner)) -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $organization = $organizationResponse.Content | ConvertFrom-Json
+            if (-not [string]::Equals([string]$organization.login, $boundOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Organization policy returned a different owner" }
+            $actionsResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $actions = $actionsResponse.Content | ConvertFrom-Json
+            if ([string]$actions.enabled_repositories -ne "all") { throw "Organization Actions policy does not prove new-repository enablement" }
+            if ([string]$actions.allowed_actions -eq "local_only") { throw "Organization Actions policy forbids the GitHub-owned checkout action" }
+            if ([string]$actions.allowed_actions -eq "selected") {
+                $selectedResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+                $selected = $selectedResponse.Content | ConvertFrom-Json
+                if (-not [bool]$selected.github_owned_allowed) { throw "Organization Actions policy does not allow the GitHub-owned checkout action" }
+            } elseif ([string]$actions.allowed_actions -ne "all") { throw "Organization Actions policy is unavailable" }
+            $rulesetResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            foreach ($ruleset in @($rulesetResponse.Content | ConvertFrom-Json)) {
+                if ([string]$ruleset.enforcement -ne "active") { continue }
+                foreach ($rule in @($ruleset.rules)) {
+                    if ([string]$rule.type -eq "merge_queue") { throw "Organization policy requires an unsupported merge queue" }
+                    if ([string]$rule.type -eq "pull_request" -and [int]$rule.parameters.required_approving_review_count -gt 0) { throw "Organization policy requires human review" }
+                }
+            }
+        } catch {
+            throw "Unpublished organization repository policy cannot be proved before Platform mutation: $($_.Exception.Message)"
+        }
+    }
+}
 $hasher = [Security.Cryptography.SHA256]::Create()
 try { $digest = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($token)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
-[ordered]@{ login = [string]$identity.login; user_id = [long]$identity.id; owner = $boundOwner; scopes = $scopes; fingerprint_sha256 = $digest } | ConvertTo-Json -Depth 4
+[ordered]@{ login = [string]$identity.login; user_id = [long]$identity.id; owner = $boundOwner; repository = $repositoryID; private = ($Visibility -eq "private"); publication_state = $PublicationState; scopes = $scopes; fingerprint_sha256 = $digest } | ConvertTo-Json -Depth 4

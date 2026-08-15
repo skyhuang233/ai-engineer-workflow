@@ -85,6 +85,36 @@ func TestSetupPlanReportsBootstrapBlockerWithoutMutatingRepository(t *testing.T)
 	}
 }
 
+func TestSetupPlanAdmissionInspectionDoesNotRefreshOrSuspendStoredAdmission(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	verifiedAt := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+	want := store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: strings.Repeat("a", 64), ContractVersion: "1", ManifestDigestSHA256: strings.Repeat("b", 64), Eligible: true, VerifiedAt: verifiedAt}
+	if err := database.RecordRepositoryAdmission(context.Background(), want); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRecordedAdmissionReadOnly(context.Background(), database, layout, nil, want.Repository); err == nil {
+		t.Fatal("missing installed contract unexpectedly verified")
+	}
+	got, err := database.RepositoryAdmission(context.Background(), want.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Eligible || got.SuspensionReason != "" || !got.VerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("setup plan mutated admission: %#v", got)
+	}
+}
+
 func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer ghp_persisted" {
@@ -133,9 +163,10 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 		t.Fatal(err)
 	}
 	releaseDigest := strings.Repeat("a", 64)
+	bundleJSON, bundleDigest := testReleaseBundle(cliDigest)
 	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "platform-inspection", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "platform-v1.0.0", Expected: releaseDigest}}, Effects: []setupcontract.Effect{
-		{ID: "cli", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": cliDigest, "release_manifest_digest": releaseDigest, "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest}},
-		{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": releaseDigest, "platform_setup_contract_json": `{}`, "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest}},
+		{ID: "cli", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": cliDigest, "release_manifest_digest": releaseDigest, "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
+		{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": releaseDigest, "platform_setup_contract_json": `{}`, "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": bundleJSON, "release_bundled_files_digest": bundleDigest}},
 	}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, canonical, digest, err := setupcontract.ParsePlan(raw)
@@ -146,7 +177,7 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 		t.Fatal(err)
 	}
 	cpDigest := strings.Repeat("e", 64)
-	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, PlatformSetupContractDigestSHA256: contractDigest, WorkflowCLISHA256: cliDigest, ControlPlanePlanDigestSHA256: cpDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
+	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, PlatformSetupContractDigestSHA256: contractDigest, WorkflowCLISHA256: cliDigest, ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: cpDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -173,6 +204,12 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "blocked" || response.Result.WorkflowCLI.Verified {
 		t.Fatalf("drifted CLI inspection=%s err=%v", output.String(), err)
 	}
+}
+
+func testReleaseBundle(cliDigest string) (string, string) {
+	raw, _ := json.Marshal([]map[string]string{{"path": "bin/workflow.exe", "sha256": cliDigest}})
+	canonical, digest, _ := setupcontract.Canonicalize(raw)
+	return string(canonical), digest
 }
 
 func TestReadyShortcutRequiresFullPlatformAndAdmissionVerification(t *testing.T) {

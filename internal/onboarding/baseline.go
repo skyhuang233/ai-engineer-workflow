@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +22,7 @@ var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 type BaselineFile struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
+	Mode   string `json:"mode"`
 }
 
 func BaselineFiles(ctx context.Context, repository string) ([]string, error) {
@@ -58,9 +60,34 @@ func BaselineSnapshot(ctx context.Context, repository string) ([]BaselineFile, e
 			return nil, fmt.Errorf("read Initial Repository Baseline path %q: %w", relative, err)
 		}
 		sum := sha256.Sum256(data)
-		result = append(result, BaselineFile{Path: relative, SHA256: hex.EncodeToString(sum[:])})
+		mode, err := baselineGitMode(ctx, repository, relative)
+		if err != nil {
+			return nil, fmt.Errorf("read Initial Repository Baseline mode %q: %w", relative, err)
+		}
+		result = append(result, BaselineFile{Path: relative, SHA256: hex.EncodeToString(sum[:]), Mode: mode})
 	}
 	return result, nil
+}
+
+func baselineGitMode(ctx context.Context, repository, relative string) (string, error) {
+	staged, err := gitBytes(ctx, repository, "ls-files", "--stage", "--", relative)
+	if err != nil {
+		return "", err
+	}
+	if fields := strings.Fields(string(staged)); len(fields) > 0 {
+		return fields[0], nil
+	}
+	info, err := os.Lstat(filepath.Join(repository, filepath.FromSlash(relative)))
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "120000", nil
+	}
+	if info.Mode()&0o111 != 0 {
+		return "100755", nil
+	}
+	return "100644", nil
 }
 
 func baselineWorkingBytes(repository, relative string) ([]byte, error) {
@@ -83,10 +110,10 @@ func baselineWorkingBytes(repository, relative string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-func verifyBaselineSnapshot(repository string, approved []BaselineFile) error {
+func verifyBaselineSnapshot(ctx context.Context, repository string, approved []BaselineFile) error {
 	seen := map[string]bool{}
 	for _, file := range approved {
-		if seen[file.Path] || !sha256Pattern.MatchString(file.SHA256) {
+		if seen[file.Path] || !sha256Pattern.MatchString(file.SHA256) || !validBaselineMode(file.Mode) {
 			return errors.New("Initial Repository Baseline snapshot is invalid")
 		}
 		seen[file.Path] = true
@@ -98,8 +125,16 @@ func verifyBaselineSnapshot(repository string, approved []BaselineFile) error {
 		if hex.EncodeToString(sum[:]) != file.SHA256 {
 			return fmt.Errorf("Initial Repository Baseline content drifted: %s", file.Path)
 		}
+		mode, err := baselineGitMode(ctx, repository, file.Path)
+		if err != nil || mode != file.Mode {
+			return fmt.Errorf("Initial Repository Baseline mode drifted: %s", file.Path)
+		}
 	}
 	return nil
+}
+
+func validBaselineMode(mode string) bool {
+	return mode == "100644" || mode == "100755" || mode == "120000"
 }
 
 func VerifyInitialBaseline(ctx context.Context, repository, commit string, approved []BaselineFile) error {
@@ -133,22 +168,25 @@ func VerifyInitialBaseline(ctx context.Context, repository, commit string, appro
 		if hex.EncodeToString(sum[:]) != file.SHA256 {
 			return fmt.Errorf("Initial Repository Baseline tree content differs: %s", file.Path)
 		}
+		treeEntry, err := gitBytes(ctx, repository, "ls-tree", commit, "--", file.Path)
+		if err != nil {
+			return err
+		}
+		fields := strings.Fields(string(treeEntry))
+		if len(fields) == 0 || !validBaselineMode(file.Mode) || fields[0] != file.Mode {
+			return fmt.Errorf("Initial Repository Baseline tree mode differs: %s", file.Path)
+		}
 	}
 	return nil
 }
 func ScanCredentialMaterial(repository string, files []string) []string {
 	var findings []string
 	for _, relative := range files {
-		path := filepath.Join(repository, filepath.FromSlash(relative))
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 2<<20 {
+		data, err := baselineWorkingBytes(repository, relative)
+		if err != nil || len(data) > 2<<20 {
 			continue
 		}
-		file, err := os.Open(path)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
+		scanner := bufio.NewScanner(bytes.NewReader(data))
 		line := 0
 		for scanner.Scan() {
 			line++
@@ -157,7 +195,6 @@ func ScanCredentialMaterial(repository string, files []string) []string {
 				break
 			}
 		}
-		file.Close()
 	}
 	return findings
 }
@@ -179,7 +216,7 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	if strings.Join(current, "\x00") != strings.Join(approvedPaths, "\x00") {
 		return "", errors.New("Initial Repository Baseline file list drifted from the approved plan")
 	}
-	if err := verifyBaselineSnapshot(repository, approved); err != nil {
+	if err := verifyBaselineSnapshot(ctx, repository, approved); err != nil {
 		return "", err
 	}
 	if findings := ScanCredentialMaterial(repository, approvedPaths); len(findings) > 0 {
@@ -240,17 +277,7 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 			if err != nil {
 				return "", err
 			}
-			info, err := os.Lstat(filepath.Join(repository, filepath.FromSlash(file.Path)))
-			if err != nil {
-				return "", err
-			}
-			mode := "100644"
-			if info.Mode()&os.ModeSymlink != 0 {
-				mode = "120000"
-			} else if info.Mode()&0o111 != 0 {
-				mode = "100755"
-			}
-			if _, err := run("", "update-index", "--add", "--cacheinfo", mode, blob, file.Path); err != nil {
+			if _, err := run("", "update-index", "--add", "--cacheinfo", file.Mode, blob, file.Path); err != nil {
 				return "", err
 			}
 		}
@@ -264,6 +291,14 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 			sum := sha256.Sum256(data)
 			if hex.EncodeToString(sum[:]) != file.SHA256 {
 				return "", fmt.Errorf("Initial Repository Baseline staged content drifted: %s", file.Path)
+			}
+			entry, err := run("", "ls-files", "--stage", "--", file.Path)
+			if err != nil {
+				return "", err
+			}
+			fields := strings.Fields(entry)
+			if len(fields) == 0 || fields[0] != file.Mode {
+				return "", fmt.Errorf("Initial Repository Baseline staged mode drifted: %s", file.Path)
 			}
 		}
 	}

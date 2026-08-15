@@ -3,6 +3,8 @@ package admission
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +95,42 @@ func TestCredentialReplacementSuspendsEachRepositoryWithoutStoppingAdmissionPass
 		if value.Eligible || !strings.Contains(value.SuspensionReason, "fingerprint") || strings.Contains(value.SuspensionReason, replacement) {
 			t.Fatalf("%s admission after replacement = %#v", repository, value)
 		}
+	}
+}
+
+func TestOrganizationAdminDowngradeSuspendsAdmissionOnContinuousVerification(t *testing.T) {
+	token := "github_pat_org_admin_downgraded"
+	stored := store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "member", UserID: 7, Owner: "acme", Scopes: []string{"repo", "workflow"}, CredentialPath: `C:\Workflow\state\credentials\github.pat`, Status: "verified", VerifiedAt: time.Now().UTC()}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+			_, _ = w.Write([]byte(`{"login":"member","id":7}`))
+		case "/orgs/acme/memberships/member":
+			_, _ = w.Write([]byte(`{"state":"active","role":"member"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	values := map[string]store.RepositoryAdmission{"acme/repo": {Repository: "acme/repo", Eligible: true}}
+	service := Service{
+		Store: &memoryStore{values: values},
+		Verifier: DynamicGitHubVerifier{
+			Store:      patVerificationStore{value: stored},
+			APIBase:    server.URL,
+			HTTPClient: server.Client(),
+			ReadPAT:    func(context.Context, string) (string, error) { return token, nil },
+			VerifyRepository: func(context.Context, string, string, store.RepositoryAdmission, platformrelease.PlatformSetupContract) error {
+				return nil
+			},
+		},
+	}
+	if err := service.VerifyAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if values["acme/repo"].Eligible || !strings.Contains(values["acme/repo"].SuspensionReason, "owner binding") {
+		t.Fatalf("downgraded owner admission = %#v", values["acme/repo"])
 	}
 }

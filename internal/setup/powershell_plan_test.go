@@ -48,7 +48,7 @@ func TestPowerShellCanonicalPlatformPlanParsesAndAppliesThroughGo(t *testing.T) 
 		t.Fatalf("PowerShell/Go authority mismatch: %s %s", output, canonical)
 	}
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}
-	result, err := (&Engine{Adapter: adapter}).Apply(t.Context(), canonical, digest)
+	result, err := (&Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier}).Apply(t.Context(), canonical, digest)
 	if err != nil || result.Status != setupcontract.ExecutionSucceeded || len(adapter.applied) != len(plan.Effects) {
 		t.Fatalf("PowerShell plan apply result=%#v err=%v applied=%v", result, err, adapter.applied)
 	}
