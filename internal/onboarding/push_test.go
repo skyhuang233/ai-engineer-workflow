@@ -17,11 +17,27 @@ func TestPublishDefaultBranchScopesPATToCanonicalPushOnly(t *testing.T) {
 	git(t, "", "clone", "--bare", repo, bare)
 	canonicalURL := "https://github.com/owner/repo.git"
 	capture := installCapturedGitForPushTest(t, canonicalURL, bare)
+	hookCapture := filepath.Join(t.TempDir(), "pre-push-environment")
+	hook := filepath.Join(repo, ".git", "hooks", "pre-push")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nenv > \"$WORKFLOW_TEST_PRE_PUSH_CAPTURE\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helperCapture := filepath.Join(t.TempDir(), "credential-helper-environment")
+	git(t, repo, "config", "credential.helper", "!env > \"$WORKFLOW_TEST_CREDENTIAL_HELPER_CAPTURE\"")
+	t.Setenv("WORKFLOW_TEST_PRE_PUSH_CAPTURE", hookCapture)
+	t.Setenv("WORKFLOW_TEST_CREDENTIAL_HELPER_CAPTURE", helperCapture)
 	credential := GitCredential{Username: "publisher", Token: "github_pat_publish_scope_secret"}
 	if err := PublishDefaultBranch(context.Background(), repo, canonicalURL, "main", credential); err != nil {
 		t.Fatal(err)
 	}
 	assertScopedNetworkCredential(t, capture, "push", canonicalURL, credential)
+	for name, path := range map[string]string{"pre-push hook": hookCapture, "credential helper": helperCapture} {
+		if data, err := os.ReadFile(path); err == nil {
+			t.Fatalf("untrusted %s executed with authenticated push environment: %s", name, data)
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestSafeFastForwardScopesPATToCanonicalFetchOnly(t *testing.T) {

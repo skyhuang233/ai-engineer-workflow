@@ -51,7 +51,9 @@ try {
     foreach ($effect in $platformEffects) {
         switch ([string]$effect.kind) {
             "platform_cli" {
-                if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.sha256 -ne [string]$workflowExecutablePins[0].sha256) { throw "Approved Setup Plan Platform CLI effect differs from the verified manifest" }
+                $actualParameterNames = @($effect.parameters.PSObject.Properties.Name | Sort-Object)
+                $expectedParameterNames = @("platform_setup_contract_digest", "release_bundled_files_digest", "release_manifest_digest", "sha256", "version", "workflow_cli_sha256" | Sort-Object)
+                if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.sha256 -ne [string]$workflowExecutablePins[0].sha256 -or ($actualParameterNames -join "`n") -cne ($expectedParameterNames -join "`n")) { throw "Approved Setup Plan Platform CLI effect differs from the verified manifest" }
             }
             "workflow_skill_bundle" {
                 if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { throw "Approved Setup Plan Workflow Skill Bundle effect differs from the verified manifest" }
@@ -109,13 +111,25 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }
     $workflowHome = [IO.Path]::GetFullPath([string]$approvedPlan.target.workflow_home)
     if (-not [IO.Path]::IsPathRooted($workflowHome) -or $workflowHome.StartsWith("\\")) { throw "Approved Setup Plan Workflow Home is not an absolute local path" }
+    $inspectionOutput = (& $executable.FullName setup inspect-platform --workflow-home $workflowHome | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "post-apply Platform Installation readback failed with exit code $LASTEXITCODE" }
+    try { $inspection = $inspectionOutput | ConvertFrom-Json } catch { throw "post-apply Platform Installation readback is invalid JSON" }
+    $installedPlatform = $inspection.result.platform
+    if ([string]$inspection.status -ne "ready" -or $null -eq $installedPlatform -or -not [bool]$inspection.result.workflow_cli.verified) { throw "post-apply Platform Installation readback is not verified" }
+    if (-not [bool]$installedPlatform.installation_recorded -or [string]$installedPlatform.version -cne [string]$manifest.release.version -or [string]$installedPlatform.release_manifest_digest -cne $manifestDigest -or [string]$installedPlatform.platform_setup_contract_digest -cne $contractDigest -or [string]$installedPlatform.workflow_cli_sha256 -cne [string]$workflowExecutablePins[0].sha256 -or [string]$installedPlatform.release_bundled_files_json -cne $releaseBundledFilesJSON -or [string]$installedPlatform.release_bundled_files_digest -cne $releaseBundledFilesDigest) { throw "post-apply Platform Installation differs from the verified release" }
+    $controlPlaneAuthorizationDigest = [string]$installedPlatform.control_plane_plan_digest_sha256
+    if ($controlPlaneAuthorizationDigest -notmatch '^[0-9a-f]{64}$') { throw "post-apply Platform Installation lacks a Control Plane authorization digest" }
+    $statusOutput = (& $executable.FullName status --workflow-home $workflowHome | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "post-apply Control Plane readback failed with exit code $LASTEXITCODE" }
+    try { $liveControlPlane = $statusOutput | ConvertFrom-Json } catch { throw "post-apply Control Plane readback is invalid JSON" }
+    if ([string]$liveControlPlane.state -ne "ready" -or [string]$liveControlPlane.runtime.platform_version -cne [string]$manifest.release.version -or [string]$liveControlPlane.runtime.approved_platform_bootstrap_plan_digest_sha256 -cne $controlPlaneAuthorizationDigest) { throw "post-apply live Control Plane differs from its durable Platform Installation authorization" }
+    $controlPlaneEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "control_plane" })
+    if ($controlPlaneEffects.Count -gt 1 -or ($controlPlaneEffects.Count -eq 1 -and $controlPlaneAuthorizationDigest -cne $ApprovedDigest)) { throw "post-apply Control Plane authorization differs from the approved replacement" }
     $pinDirectory = Join-Path $workflowHome "config"
     New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
     $pinPath = Join-Path $pinDirectory "bootstrap-platform-release-pin.json"
     $pinTemporaryPath = $pinPath + ".tmp-" + [Guid]::NewGuid().ToString("N")
-    $controlPlaneAuthorizationDigest = $ApprovedDigest
-    $cliRepairEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "platform_cli" -and [string]$_.parameters.control_plane_plan_digest_sha256 -match '^[0-9a-f]{64}$' })
-    if ($cliRepairEffects.Count -eq 1) { $controlPlaneAuthorizationDigest = [string]$cliRepairEffects[0].parameters.control_plane_plan_digest_sha256 }
+    $pinBackupPath = $pinPath + ".bak-" + [Guid]::NewGuid().ToString("N")
     $pin = [ordered]@{
         schema_version = 1
         release_version = [string]$manifest.release.version
@@ -131,12 +145,13 @@ try {
     try {
         [IO.File]::WriteAllText($pinTemporaryPath, ($pin | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
         if (Test-Path -LiteralPath $pinPath -PathType Leaf) {
-            [IO.File]::Replace($pinTemporaryPath, $pinPath, $null)
+            [IO.File]::Replace($pinTemporaryPath, $pinPath, $pinBackupPath)
         } else {
             [IO.File]::Move($pinTemporaryPath, $pinPath)
         }
     } finally {
         Remove-Item -LiteralPath $pinTemporaryPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pinBackupPath -Force -ErrorAction SilentlyContinue
     }
 } finally {
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue

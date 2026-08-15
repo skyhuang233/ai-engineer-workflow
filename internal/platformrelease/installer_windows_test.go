@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
 
 func TestFreshBootstrapInstallerForwardsPATOnStdinWithoutLeakingItOnWindowsPowerShell51(t *testing.T) {
@@ -31,8 +33,16 @@ func TestFreshBootstrapInstallerForwardsPATOnStdinWithoutLeakingItOnWindowsPower
 	fakeSource := filepath.Join(directory, "fake-workflow.go")
 	fakeExecutable := filepath.Join(directory, "workflow.exe")
 	fakeProgram := `package main
-import ("io"; "os"; "strings")
-func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_STDIN"), input, 0600); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_ARGS"), []byte(strings.Join(os.Args[1:], "\n")), 0600) }
+import ("encoding/json"; "io"; "os"; "strings")
+func main() {
+ args := strings.Join(os.Args[1:], " ")
+ calls, _ := os.OpenFile(os.Getenv("WORKFLOW_TEST_CALLS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); if calls != nil { _, _ = calls.WriteString(args+"\n"); _ = calls.Close() }
+ if strings.HasPrefix(args, "setup apply ") { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_STDIN"), input, 0600); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_ARGS"), []byte(strings.Join(os.Args[1:], "\n")), 0600); return }
+ digest := os.Getenv("WORKFLOW_TEST_CP_DIGEST")
+ if strings.HasPrefix(args, "setup inspect-platform ") { _ = json.NewEncoder(os.Stdout).Encode(map[string]any{"status":"ready", "result":map[string]any{"platform":map[string]any{"installation_recorded":true,"version":os.Getenv("WORKFLOW_TEST_RELEASE_VERSION"),"release_manifest_digest":os.Getenv("WORKFLOW_TEST_MANIFEST_DIGEST"),"platform_setup_contract_digest":os.Getenv("WORKFLOW_TEST_CONTRACT_DIGEST"),"workflow_cli_sha256":os.Getenv("WORKFLOW_TEST_CLI_DIGEST"),"release_bundled_files_json":os.Getenv("WORKFLOW_TEST_BUNDLE_JSON"),"release_bundled_files_digest":os.Getenv("WORKFLOW_TEST_BUNDLE_DIGEST"),"control_plane_plan_digest_sha256":digest},"workflow_cli":map[string]any{"verified":true}}}); return }
+ if strings.HasPrefix(args, "status ") { _ = json.NewEncoder(os.Stdout).Encode(map[string]any{"state":"ready", "runtime":map[string]any{"platform_version":os.Getenv("WORKFLOW_TEST_RELEASE_VERSION"),"approved_platform_bootstrap_plan_digest_sha256":digest}}); return }
+ os.Exit(2)
+}
 `
 	if err := os.WriteFile(fakeSource, []byte(fakeProgram), 0o600); err != nil {
 		t.Fatal(err)
@@ -133,12 +143,37 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 		t.Fatalf("fresh plan on powershell.exe: %v (%s)", err, planOutput)
 	}
 	var envelope struct {
-		Digest string `json:"digest_sha256"`
+		Digest        string `json:"digest_sha256"`
+		CanonicalJSON string `json:"canonical_json"`
 	}
 	if err := json.Unmarshal(planOutput, &envelope); err != nil || envelope.Digest == "" {
 		t.Fatalf("decode plan: %v (%s)", err, planOutput)
 	}
-	stdinCapture, argsCapture := filepath.Join(directory, "stdin.txt"), filepath.Join(directory, "args.txt")
+	var approvedPlan struct {
+		Preconditions []struct {
+			Kind     string `json:"kind"`
+			Expected string `json:"expected"`
+		} `json:"preconditions"`
+	}
+	if err := json.Unmarshal([]byte(envelope.CanonicalJSON), &approvedPlan); err != nil {
+		t.Fatal(err)
+	}
+	contractDigest := ""
+	for _, precondition := range approvedPlan.Preconditions {
+		if precondition.Kind == "platform_setup_contract" {
+			contractDigest = precondition.Expected
+		}
+	}
+	bundledRaw, err := json.Marshal(manifest.BundledFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundledCanonical, bundledDigest, err := setupcontract.Canonicalize(bundledRaw)
+	if err != nil || contractDigest == "" {
+		t.Fatalf("derive fake post-apply platform readback: %v", err)
+	}
+	manifestSum := sha256.Sum256(raw)
+	stdinCapture, argsCapture, callsCapture := filepath.Join(directory, "stdin.txt"), filepath.Join(directory, "args.txt"), filepath.Join(directory, "calls.txt")
 	token := "ghp_fresh_bootstrap_must_not_leak"
 	pinPath := filepath.Join(workflowHome, "config", "bootstrap-platform-release-pin.json")
 	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
@@ -153,7 +188,7 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
 	installCommand.Stdin = bytes.NewBufferString(token + "\n")
-	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_PUBLIC_KEY="+publicKeyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture)
+	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_PUBLIC_KEY="+publicKeyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
 	installOutput, err := installCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh install on powershell.exe: %v (%s)", err, installOutput)
@@ -168,6 +203,43 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	args, err := os.ReadFile(argsCapture)
 	if err != nil || strings.Contains(string(args), token) || !strings.Contains(string(args), "setup\napply\n--plan") || !strings.Contains(string(args), "--approved-digest\n"+envelope.Digest) {
 		t.Fatalf("workflow setup apply args=%q err=%v", args, err)
+	}
+	calls, err := os.ReadFile(callsCapture)
+	if err != nil || !strings.Contains(string(calls), "setup inspect-platform --workflow-home ") || !strings.Contains(string(calls), "status --workflow-home ") {
+		t.Fatalf("installer did not verify durable and live Control Plane authorization after apply: calls=%q err=%v", calls, err)
+	}
+	var cliRepairPlan setupcontract.Plan
+	if err := json.Unmarshal([]byte(envelope.CanonicalJSON), &cliRepairPlan); err != nil {
+		t.Fatal(err)
+	}
+	approvedEffects := append([]setupcontract.Effect(nil), cliRepairPlan.Effects...)
+	cliRepairPlan.Effects = nil
+	for _, effect := range approvedEffects {
+		if effect.Kind == "platform_cli" {
+			cliRepairPlan.Effects = append(cliRepairPlan.Effects, effect)
+		}
+	}
+	cliRepairRaw, err := json.Marshal(cliRepairPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cliRepairCanonical, cliRepairDigest, err := setupcontract.ParsePlan(cliRepairRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliRepairEnvelope, _ := json.Marshal(map[string]any{"status": "plan_required", "digest_sha256": cliRepairDigest, "canonical_json": string(cliRepairCanonical), "plan": cliRepairPlan, "projection": "CLI-only repair"})
+	cliRepairPlanPath := filepath.Join(directory, "cli-repair-plan.json")
+	write(cliRepairPlanPath, cliRepairEnvelope)
+	priorControlPlaneDigest := strings.Repeat("7", 64)
+	cliRepairCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
+	cliRepairCommand.Env = replaceTestEnvironment(installCommand.Env, map[string]string{"WORKFLOW_TEST_PLAN": cliRepairPlanPath, "WORKFLOW_TEST_DIGEST": cliRepairDigest, "WORKFLOW_TEST_CP_DIGEST": priorControlPlaneDigest})
+	if output, err := cliRepairCommand.CombinedOutput(); err != nil {
+		t.Fatalf("CLI-only repair on powershell.exe: %v (%s)", err, output)
+	}
+	cliRepairPin, err := os.ReadFile(pinPath)
+	var cliRepairPinDocument map[string]any
+	if err != nil || json.Unmarshal(cliRepairPin, &cliRepairPinDocument) != nil || cliRepairPinDocument["control_plane_plan_digest_sha256"] != priorControlPlaneDigest || cliRepairPinDocument["control_plane_plan_digest_sha256"] == cliRepairDigest {
+		t.Fatalf("CLI-only repair did not preserve the exact post-apply verified prior Control Plane authorization: pin=%s err=%v", cliRepairPin, err)
 	}
 	if _, err := os.Stat(pinPath); err != nil {
 		t.Fatalf("bootstrap did not durably pin the approved release: %v", err)
@@ -279,7 +351,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	if json.Unmarshal(pin, &pinDocument) != nil {
 		t.Fatal("bootstrap release pin is not JSON")
 	}
-	if pinDocument["release_bundled_files_json"] == "" || pinDocument["release_bundled_files_digest_sha256"] == "" || pinDocument["control_plane_plan_digest_sha256"] != envelope.Digest {
+	if pinDocument["release_bundled_files_json"] == "" || pinDocument["release_bundled_files_digest_sha256"] == "" || pinDocument["control_plane_plan_digest_sha256"] != priorControlPlaneDigest {
 		t.Fatalf("bootstrap release pin omitted signed bundle inventory or Control Plane authorization fence: %#v", pinDocument)
 	}
 	pinDocument["unexpected_future_authority"] = "not-approved"
@@ -302,6 +374,24 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
 		t.Fatalf("inspect-host executed workflow.exe after a bootstrap pin conflict: %v", err)
 	}
+}
+
+func replaceTestEnvironment(environment []string, replacements map[string]string) []string {
+	result := append([]string(nil), environment...)
+	for key, value := range replacements {
+		prefix := key + "="
+		replaced := false
+		for index, entry := range result {
+			if strings.HasPrefix(entry, prefix) {
+				result[index] = prefix + value
+				replaced = true
+			}
+		}
+		if !replaced {
+			result = append(result, prefix+value)
+		}
+	}
+	return result
 }
 
 func TestFreshHostInspectionResolvesCodexDoctorAuthBeforeWorkflowCLIExistsOnPowerShell51(t *testing.T) {

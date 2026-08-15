@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -214,9 +215,11 @@ func sqliteColumns(db *sql.DB, table string) ([]string, error) {
 func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
 
 func (s *scanner) rejectNeedles(location string, body []byte, allowMainFingerprint bool) error {
+	basicCredential := []byte("x-access-token:" + s.token)
 	for label, needle := range map[string]string{
 		"exact PAT":             s.token,
 		"exact PAT fingerprint": s.fingerprint,
+		"Git Basic credential":  base64.StdEncoding.EncodeToString(basicCredential),
 	} {
 		if allowMainFingerprint && label == "exact PAT fingerprint" {
 			continue
@@ -225,7 +228,8 @@ func (s *scanner) rejectNeedles(location string, body []byte, allowMainFingerpri
 			return fmt.Errorf("credential leak in %s: %s", location, label)
 		}
 	}
-	if bytes.Contains(bytes.ToLower(body), []byte("authorization: bearer")) {
+	lower := bytes.ToLower(body)
+	if bytes.Contains(lower, []byte("authorization: bearer")) || bytes.Contains(lower, []byte("authorization: basic")) {
 		return fmt.Errorf("credential leak in %s: Authorization header", location)
 	}
 	return nil

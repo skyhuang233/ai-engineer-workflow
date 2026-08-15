@@ -26,14 +26,27 @@ type BaselineFile struct {
 }
 
 func BaselineFiles(ctx context.Context, repository string) ([]string, error) {
-	output, err := gitBytes(ctx, repository, "ls-files", "--cached", "--others", "--exclude-standard")
+	output, err := baselineGitBytes(ctx, repository, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
 	if err != nil {
 		return nil, err
 	}
+	return parseNULTerminatedGitPaths(output)
+}
+
+func parseNULTerminatedGitPaths(output []byte) ([]string, error) {
+	if len(output) == 0 {
+		return []string{}, nil
+	}
+	if output[len(output)-1] != 0 {
+		return nil, errors.New("Git path list is not NUL terminated")
+	}
 	seen := map[string]struct{}{}
-	for _, line := range strings.Split(string(output), "\n") {
-		path := filepath.ToSlash(strings.TrimSpace(line))
-		if path != "" && !strings.HasPrefix(path, ".git/") {
+	for _, raw := range bytes.Split(output[:len(output)-1], []byte{0}) {
+		path := string(raw)
+		if path == "" {
+			return nil, errors.New("Git path list contains an empty record")
+		}
+		if !strings.HasPrefix(path, ".git/") {
 			seen[path] = struct{}{}
 		}
 	}
@@ -70,7 +83,7 @@ func BaselineSnapshot(ctx context.Context, repository string) ([]BaselineFile, e
 }
 
 func baselineGitMode(ctx context.Context, repository, relative string) (string, error) {
-	staged, err := gitBytes(ctx, repository, "ls-files", "--stage", "--", relative)
+	staged, err := baselineGitBytes(ctx, repository, "ls-files", "--stage", "--", relative)
 	if err != nil {
 		return "", err
 	}
@@ -141,7 +154,7 @@ func VerifyInitialBaseline(ctx context.Context, repository, commit string, appro
 	if !fullSHA.MatchString(commit) {
 		return errors.New("Initial Repository Baseline commit is invalid")
 	}
-	paths, err := gitBytes(ctx, repository, "ls-tree", "-r", "--name-only", commit)
+	paths, err := baselineGitBytes(ctx, repository, "ls-tree", "-r", "-z", "--name-only", commit)
 	if err != nil {
 		return err
 	}
@@ -150,17 +163,15 @@ func VerifyInitialBaseline(ctx context.Context, repository, commit string, appro
 		wantPaths = append(wantPaths, file.Path)
 	}
 	sort.Strings(wantPaths)
-	gotPaths := []string{}
-	for _, path := range strings.Split(strings.TrimSuffix(strings.ReplaceAll(string(paths), "\r\n", "\n"), "\n"), "\n") {
-		if path != "" {
-			gotPaths = append(gotPaths, path)
-		}
+	gotPaths, err := parseNULTerminatedGitPaths(paths)
+	if err != nil {
+		return err
 	}
 	if strings.Join(gotPaths, "\x00") != strings.Join(wantPaths, "\x00") {
 		return errors.New("Initial Repository Baseline tree paths differ")
 	}
 	for _, file := range approved {
-		data, err := gitBytes(ctx, repository, "show", commit+":"+file.Path)
+		data, err := baselineGitBytes(ctx, repository, "show", commit+":"+file.Path)
 		if err != nil {
 			return err
 		}
@@ -168,7 +179,7 @@ func VerifyInitialBaseline(ctx context.Context, repository, commit string, appro
 		if hex.EncodeToString(sum[:]) != file.SHA256 {
 			return fmt.Errorf("Initial Repository Baseline tree content differs: %s", file.Path)
 		}
-		treeEntry, err := gitBytes(ctx, repository, "ls-tree", commit, "--", file.Path)
+		treeEntry, err := baselineGitBytes(ctx, repository, "ls-tree", commit, "--", file.Path)
 		if err != nil {
 			return err
 		}
@@ -200,7 +211,7 @@ func ScanCredentialMaterial(repository string, files []string) []string {
 }
 
 func CreateInitialBaseline(ctx context.Context, repository, branch string, approvedFiles []BaselineFile, message string) (string, error) {
-	if _, err := gitOutput(ctx, repository, "rev-parse", "--verify", "HEAD"); err == nil {
+	if _, err := baselineGitOutput(ctx, repository, "rev-parse", "--verify", "HEAD"); err == nil {
 		return "", errors.New("Initial Repository Baseline requires zero commits")
 	}
 	current, err := BaselineFiles(ctx, repository)
@@ -222,7 +233,7 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	if findings := ScanCredentialMaterial(repository, approvedPaths); len(findings) > 0 {
 		return "", fmt.Errorf("credential material blocks baseline: %s", strings.Join(findings, ", "))
 	}
-	gitDir, err := gitOutput(ctx, repository, "rev-parse", "--git-dir")
+	gitDir, err := baselineGitOutput(ctx, repository, "rev-parse", "--git-dir")
 	if err != nil {
 		return "", err
 	}
@@ -238,9 +249,9 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	os.Remove(indexPath)
 	defer os.Remove(indexPath)
 	run := func(input string, args ...string) (string, error) {
-		command := exec.CommandContext(ctx, "git", args...)
+		command := exec.CommandContext(ctx, "git", baselineGitArgs(args...)...)
 		command.Dir = repository
-		command.Env = append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+		command.Env = isolatedGitEnvironment([]string{"GIT_INDEX_FILE=" + indexPath})
 		if input != "" {
 			command.Stdin = strings.NewReader(input)
 		}
@@ -251,9 +262,9 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 		return strings.TrimSpace(string(output)), nil
 	}
 	runBytes := func(args ...string) ([]byte, error) {
-		command := exec.CommandContext(ctx, "git", args...)
+		command := exec.CommandContext(ctx, "git", baselineGitArgs(args...)...)
 		command.Dir = repository
-		command.Env = append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+		command.Env = isolatedGitEnvironment([]string{"GIT_INDEX_FILE=" + indexPath})
 		output, err := command.Output()
 		if err != nil {
 			return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
@@ -309,18 +320,68 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	if strings.TrimSpace(message) == "" {
 		message = "Initial Repository Baseline"
 	}
-	commit, err := run(message, "-c", "user.name=Agent Workflow Setup", "-c", "user.email=workflow@localhost", "commit-tree", tree, "-F", "-")
-	if err != nil {
-		return "", err
+	commitEnvironment := []string{
+		"GIT_INDEX_FILE=" + indexPath,
+		"GIT_AUTHOR_NAME=Agent Workflow Setup",
+		"GIT_AUTHOR_EMAIL=workflow@localhost",
+		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+		"GIT_COMMITTER_NAME=Agent Workflow Setup",
+		"GIT_COMMITTER_EMAIL=workflow@localhost",
+		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
 	}
+	commitCommand := exec.CommandContext(ctx, "git", baselineGitArgs("commit-tree", tree, "-F", "-")...)
+	commitCommand.Dir = repository
+	commitCommand.Env = isolatedGitEnvironment(commitEnvironment)
+	commitCommand.Stdin = strings.NewReader(message)
+	commitOutput, commitErr := commitCommand.CombinedOutput()
+	if commitErr != nil {
+		return "", fmt.Errorf("git commit-tree: %w (%s)", commitErr, strings.TrimSpace(string(commitOutput)))
+	}
+	commit := strings.TrimSpace(string(commitOutput))
 	if !fullSHA.MatchString(commit) {
 		return "", errors.New("git commit-tree returned an invalid commit")
 	}
-	if _, err := gitOutput(ctx, repository, "update-ref", "refs/heads/"+branch, commit, strings.Repeat("0", 40)); err != nil {
+	if _, err := baselineGitOutput(ctx, repository, "update-ref", "refs/heads/"+branch, commit, strings.Repeat("0", 40)); err != nil {
 		return "", err
 	}
-	if _, err := gitOutput(ctx, repository, "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+	if _, err := baselineGitOutput(ctx, repository, "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
 		return "", err
 	}
 	return commit, nil
+}
+
+func baselineGitArgs(args ...string) []string {
+	prefix := []string{
+		"-c", "core.autocrlf=false",
+		"-c", "core.safecrlf=false",
+		"-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.attributesFile=" + os.DevNull,
+		"-c", "core.fsmonitor=false",
+		"-c", "commit.gpgSign=false",
+		"-c", "tag.gpgSign=false",
+		"-c", "user.name=Agent Workflow Setup",
+		"-c", "user.email=workflow@localhost",
+		"-c", "user.useConfigOnly=true",
+		"-c", "i18n.commitEncoding=UTF-8",
+		"-c", "i18n.logOutputEncoding=UTF-8",
+		"-c", "credential.helper=",
+		"-c", "credential.interactive=never",
+	}
+	return append(prefix, args...)
+}
+
+func baselineGitBytes(ctx context.Context, repository string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "git", baselineGitArgs(args...)...)
+	command.Dir = repository
+	command.Env = isolatedGitEnvironment(nil)
+	output, err := command.Output()
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func baselineGitOutput(ctx context.Context, repository string, args ...string) (string, error) {
+	output, err := baselineGitBytes(ctx, repository, args...)
+	return strings.TrimSpace(string(output)), err
 }

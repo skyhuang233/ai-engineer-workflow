@@ -151,6 +151,43 @@ func TestDiscoverRejectsNonGitHubOriginWrongBranchAndHeadDrift(t *testing.T) {
 	}
 }
 
+func TestGitHubOriginAcceptsOnlyCanonicalTransportForms(t *testing.T) {
+	for _, accepted := range []string{
+		"https://github.com/owner/repo",
+		"https://github.com/owner/repo.git",
+		"git@github.com:owner/repo",
+		"git@github.com:owner/repo.git",
+	} {
+		if got, err := ParseGitHubOrigin(accepted); err != nil || got != "owner/repo" {
+			t.Errorf("canonical origin %q parsed as %q, %v", accepted, got, err)
+		}
+	}
+	for _, rejected := range []string{
+		"http://github.com/owner/repo.git",
+		"https://user@github.com/owner/repo.git",
+		"https://github.com:443/owner/repo.git",
+		"https://github.com/owner/repo.git?token=secret",
+		"https://github.com/owner/repo.git#fragment",
+		"ssh://git@github.com/owner/repo.git",
+		"other@github.com:owner/repo.git",
+		"git@github.com:22/owner/repo.git",
+		"git@github.com:owner/repo/extra.git",
+		"git@github.com:owner/repo?token=x",
+		"git@github.com:owner/repo#fragment",
+		"git@github.com:owner/repo:alternate",
+		"git@github.com:owner/repo@attacker",
+		"git@github.com:owner/repo\\alternate",
+		"git@github.com:owner/re%70o",
+		"git@github.com:owner/..",
+		"git@github.com:./repo",
+		"git@github.com:owner/repo name",
+	} {
+		if got, err := ParseGitHubOrigin(rejected); err == nil {
+			t.Errorf("noncanonical origin %q accepted as %q", rejected, got)
+		}
+	}
+}
+
 func newRepo(t *testing.T) string {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")

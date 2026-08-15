@@ -31,7 +31,7 @@ type Descriptor struct {
 }
 
 var descriptors = []Descriptor{
-	{Kind: "platform_cli", PlanKind: PlatformBootstrap, Actions: []string{"install"}, Required: []string{"version", "sha256"}, Optional: []string{"control_plane_plan_digest_sha256"}, PlatformMutation: true, Engine: StandardEffect},
+	{Kind: "platform_cli", PlanKind: PlatformBootstrap, Actions: []string{"install"}, Required: []string{"version", "sha256"}, PlatformMutation: true, Engine: StandardEffect},
 	{Kind: "workflow_skill_bundle", PlanKind: PlatformBootstrap, Actions: []string{"install"}, Required: []string{"version", "managed_skills_json", "files_json"}, PlatformMutation: true, Engine: StandardEffect},
 	{Kind: "docker_desktop", PlanKind: PlatformBootstrap, Actions: []string{"install", "upgrade", "repair"}, Required: []string{"version", "installer_url", "windows_amd64_sha256"}, PlatformMutation: true, Engine: StandardEffect},
 	{Kind: "github_pat", PlanKind: PlatformBootstrap, Actions: []string{"persist", "replace"}, Required: []string{"input", "owner", "required_scopes"}, PlatformMutation: true, Engine: GitHubPATEffect},

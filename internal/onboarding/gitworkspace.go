@@ -93,6 +93,21 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 		return strings.TrimSpace(string(output)), nil
 	}
 	run := func(dir string, args ...string) (string, error) { return runWithEnvironment(dir, nil, args...) }
+	runInputWithEnvironment := func(dir string, input []byte, extraEnvironment []string, args ...string) (string, error) {
+		commandArgs := append(append([]string{}, fixedConfiguration...), args...)
+		command := exec.CommandContext(ctx, "git", commandArgs...)
+		command.Dir = dir
+		command.Env = isolatedGitEnvironment(extraEnvironment)
+		command.Stdin = strings.NewReader(string(input))
+		output, err := command.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	runInput := func(dir string, input []byte, args ...string) (string, error) {
+		return runInputWithEnvironment(dir, input, nil, args...)
+	}
 	runNetwork := func(dir string, args ...string) (string, error) {
 		return runWithEnvironment(dir, gitCredentialEnvironmentForURL(credential, cloneURL), args...)
 	}
@@ -114,13 +129,14 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 			return GitWorkspace{}, err
 		}
 	}
-	paths := make([]string, 0, len(files))
-	for path := range files {
-		paths = append(paths, path)
-	}
-	args := append([]string{"add", "--"}, paths...)
-	if _, err := run(clone, args...); err != nil {
-		return GitWorkspace{}, err
+	for relative, data := range files {
+		blob, err := runInput(clone, data, "hash-object", "-w", "--stdin", "--no-filters")
+		if err != nil {
+			return GitWorkspace{}, err
+		}
+		if _, err := run(clone, "update-index", "--add", "--cacheinfo", "100644", blob, relative); err != nil {
+			return GitWorkspace{}, err
+		}
 	}
 	commitDate, err := deterministicOnboardingCommitDate(planDigest)
 	if err != nil {
@@ -134,11 +150,19 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 		"GIT_COMMITTER_EMAIL=workflow@localhost",
 		"GIT_COMMITTER_DATE=" + commitDate,
 	}
-	if _, err := runWithEnvironment(clone, commitEnvironment, "commit", "-m", "Onboard Agent Workflow\n\nSetup-Plan-Digest: "+planDigest); err != nil {
+	tree, err := run(clone, "write-tree")
+	if err != nil {
 		return GitWorkspace{}, err
 	}
-	head, err := run(clone, "rev-parse", "HEAD")
+	message := []byte("Onboard Agent Workflow\n\nSetup-Plan-Digest: " + planDigest + "\n")
+	head, err := runInputWithEnvironment(clone, message, commitEnvironment, "commit-tree", tree, "-p", baseCommit, "-F", "-")
 	if err != nil {
+		return GitWorkspace{}, err
+	}
+	if !fullSHA.MatchString(head) {
+		return GitWorkspace{}, errors.New("git commit-tree returned an invalid onboarding commit")
+	}
+	if _, err := run(clone, "update-ref", "refs/heads/"+result.Branch, head, baseCommit); err != nil {
 		return GitWorkspace{}, err
 	}
 	if _, err := runNetwork(clone, "push", "origin", "HEAD:refs/heads/"+result.Branch); err != nil {

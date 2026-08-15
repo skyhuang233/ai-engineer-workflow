@@ -329,9 +329,10 @@ func TestRepositoryContractApplyRechecksApprovedPolicyImmediatelyBeforeMerge(t *
 		workspaceHead := func() string { return hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch) }
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
-			// The approved policy selected squash. This live policy drift to merge
-			// must be caught only after the second checks/reviews read and before PUT.
-			_, _ = w.Write([]byte(`{"default_branch":"main","allow_merge_commit":true}`))
+			// Issues were enabled by the approved repository-features transition.
+			// Disabling them after approval must be caught after the second
+			// checks/reviews read and before PUT.
+			_, _ = w.Write([]byte(`{"default_branch":"main","allow_squash_merge":true,"has_issues":false}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
 			_, _ = w.Write([]byte(`{"object":{"sha":"` + base + `"}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
@@ -366,7 +367,7 @@ func TestRepositoryContractApplyRechecksApprovedPolicyImmediatelyBeforeMerge(t *
 	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
 	adapter := HostAdapter{
 		GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"), PlanDigest: strings.Repeat("b", 64), TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{},
-		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true})},
+		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true, AllowFeatureEnable: true})},
 	}
 	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
 		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
@@ -374,6 +375,23 @@ func TestRepositoryContractApplyRechecksApprovedPolicyImmediatelyBeforeMerge(t *
 	err := adapter.applyRepositoryContract(context.Background(), effect)
 	if err == nil || !strings.Contains(err.Error(), "policy drifted") || merged || checks < 2 || reviews < 2 {
 		t.Fatalf("policy drift result err=%v merged=%t checks=%d reviews=%d", err, merged, checks, reviews)
+	}
+}
+
+func TestApprovedRepositoryPolicyComparisonDoesNotNormalizeLiveFeatureDrift(t *testing.T) {
+	approved := onboarding.RepositoryPolicy{
+		HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true,
+		AllowSquashMerge: true, AllowFeatureEnable: true,
+	}
+	actual := approved
+	actual.HasIssues = false
+	if err := compareApprovedRepositoryPolicy(actual, approved); err == nil {
+		t.Fatal("live issue disablement was normalized to the approved post-transition value")
+	}
+	actual = approved
+	actual.ActionsEnabled = false
+	if err := compareApprovedRepositoryPolicy(actual, approved); err == nil {
+		t.Fatal("live Actions disablement was normalized to the approved post-transition value")
 	}
 }
 

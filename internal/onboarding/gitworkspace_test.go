@@ -124,7 +124,7 @@ func capturedGitSubcommand(args []string) string {
 
 func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *testing.T) {
 	source := newRepo(t)
-	if err := os.WriteFile(filepath.Join(source, ".gitattributes"), []byte("managed.txt filter=malicious\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(source, ".gitattributes"), []byte("managed.txt filter=malicious\nAGENTS.md filter=malicious\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	git(t, source, "add", ".gitattributes")
@@ -166,6 +166,7 @@ func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *test
 	t.Setenv("WORKFLOW_TEST_GIT_CAPTURE", gitCapture)
 	t.Setenv("WORKFLOW_TEST_FILTER_CAPTURE", filterCapture)
 	t.Setenv("WORKFLOW_TEST_FILTER_EXE", filterShim)
+	t.Setenv("WORKFLOW_TEST_FILTER_REPLACEMENT", "attacker-controlled bytes\n")
 	t.Setenv("PATH", shimRoot+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if output, err := exec.Command(filterShim).CombinedOutput(); err != nil {
 		t.Fatalf("filter test process cannot start: %v (%s)", err, output)
@@ -175,7 +176,9 @@ func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *test
 	}
 
 	credential := GitCredential{Username: "setup-user", Token: "github_pat_round12_exact_secret"}
-	workspace, err := PrepareOnboardingBranch(context.Background(), "owner/repo", bare, base, t.TempDir(), repeatString("a", 64), map[string][]byte{"managed.txt": []byte("contract\n")}, credential)
+	agents := []byte("user instructions before\n" + ManagedBlockStart + "\nmanaged contract\n" + ManagedBlockEnd + "\nuser instructions after\n")
+	approvedFiles := map[string][]byte{"managed.txt": []byte("contract\n"), "AGENTS.md": agents}
+	workspace, err := PrepareOnboardingBranch(context.Background(), "owner/repo", bare, base, t.TempDir(), repeatString("a", 64), approvedFiles, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,24 +212,17 @@ func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *test
 			t.Fatalf("network operation %s was not observed", wanted)
 		}
 	}
-	if _, err := os.Stat(filterCapture); err != nil {
-		config, _ := os.ReadFile(filepath.Join(workspace.Root, ".git", "config"))
-		attributes, _ := os.ReadFile(filepath.Join(workspace.Root, ".gitattributes"))
-		check := exec.Command(realGit, "-C", workspace.Root, "check-attr", "filter", "--", "managed.txt")
-		checkOutput, checkErr := check.CombinedOutput()
-		t.Fatalf("malicious filter capture missing: %v\nconfig:\n%s\nattributes:\n%s\ncheck-attr: %v %s", err, config, attributes, checkErr, checkOutput)
-	}
-	filterCaptures := readCapturedProcesses(t, filterCapture)
-	if len(filterCaptures) == 0 {
-		t.Fatal("malicious repository filter did not execute")
-	}
-	for _, capture := range filterCaptures {
-		serialized := strings.Join(append(append([]string{}, capture.Args...), capture.Env...), "\n")
-		for _, forbidden := range []string{credential.Token, encodedCredential, "Authorization: Basic", "extraHeader"} {
-			if strings.Contains(serialized, forbidden) {
-				t.Fatalf("malicious filter captured credential material %q", forbidden)
-			}
+	for path, approved := range approvedFiles {
+		committed := exec.Command(realGit, "-C", workspace.Root, "show", workspace.Head+":"+path)
+		committedBytes, err := committed.Output()
+		if err != nil || string(committedBytes) != string(approved) {
+			t.Fatalf("approved bytes for %s were filtered: %q, %v", path, committedBytes, err)
 		}
+	}
+	if captures, err := os.ReadFile(filterCapture); err == nil && len(captures) > 0 {
+		t.Fatalf("repository-controlled clean filter executed while constructing approved commit: %s", captures)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
 	}
 	localConfig, err := os.ReadFile(filepath.Join(workspace.Root, ".git", "config"))
 	if err != nil {

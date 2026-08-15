@@ -54,7 +54,6 @@ function Add-PlatformPins([Collections.IDictionary]$Parameters) {
 $workflowCurrent = ($facts.workflow.installed -and $facts.workflow.owned -and $facts.workflow.path_reconciled -and [string]$facts.workflow.version -eq [string]$manifest.release.version -and [string]$facts.workflow.sha256 -eq [string]$workflowExecutable[0].sha256)
 if (-not $workflowCurrent) {
     $cliParameters = [ordered]@{ version = [string]$manifest.release.version; sha256 = [string]$workflowExecutable[0].sha256 }
-    if ([string]$facts.platform.control_plane_plan_digest_sha256 -match '^[0-9a-f]{64}$') { $cliParameters.control_plane_plan_digest_sha256 = [string]$facts.platform.control_plane_plan_digest_sha256 }
     $actions.Add([ordered]@{ id = "install-platform-cli"; kind = "platform_cli"; subject = (Join-Path $facts.workflow_home "bin\workflow.exe"); action = "install"; parameters = (Add-PlatformPins $cliParameters) })
 }
 $managedSkills = @($manifest.platform_setup_contract.workflow_skill_bundle.managed_skills | ForEach-Object { [string]$_ })
@@ -160,9 +159,9 @@ $controlPlaneReady = ($platformRecordCurrent -and $controlPlaneAuthorizationCurr
 if (-not $platformRecordCurrent) {
     $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256; release_bundled_files_json = $releaseBundledFilesJSON; release_bundled_files_digest = $releaseBundledFilesDigest } })
 }
-$cliOnlyTrustRepair = (-not $workflowCurrent -and $platformRecordCurrent)
-if (-not $controlPlaneReady -and -not $cliOnlyTrustRepair) {
-    $controlPlaneAction = $(if ([string]$facts.control_plane.state -eq "ready") { "replace" } else { "start" })
+$cliTrustRepairRequiresControlPlaneReadback = (-not $workflowCurrent -and $platformRecordCurrent)
+if (-not $controlPlaneReady) {
+    $controlPlaneAction = $(if ([string]$facts.control_plane.state -eq "ready" -or $cliTrustRepairRequiresControlPlaneReadback) { "replace" } else { "start" })
     $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = $controlPlaneAction; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256; release_bundled_files_digest = $releaseBundledFilesDigest } })
 }
 

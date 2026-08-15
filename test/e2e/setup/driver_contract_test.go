@@ -104,7 +104,7 @@ func TestHarnessScansSuccessfulSetupCredentialBoundariesWithOneDurableFingerprin
 		"Invoke-SetupCredentialLeakScan", "WORKFLOW_SETUP_E2E_PAT", "fingerprint",
 		"workflow-home", `filepath.WalkDir`, `filepath.Join(home, "state", "workflow.db")`, `[]string{home, evidence}`,
 		"processEnvironmentEvidence", "dockerInspectEvidence", "dockerContainerEvidence",
-		"github_pat_verifications.fingerprint_sha256", "authorization: bearer", "wal_checkpoint(TRUNCATE)", "VACUUM", "rawMainFingerprint",
+		"github_pat_verifications.fingerprint_sha256", "authorization: bearer", "authorization: basic", "x-access-token:", "wal_checkpoint(TRUNCATE)", "VACUUM", "rawMainFingerprint",
 	} {
 		if !strings.Contains(qualification, required) {
 			t.Fatalf("setup credential leak scan lacks required boundary/needle %q", required)

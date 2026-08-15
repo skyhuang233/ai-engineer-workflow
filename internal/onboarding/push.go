@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -38,6 +39,7 @@ func PublishDefaultBranch(ctx context.Context, repository, remoteURL, branch str
 		args = append(args, "-u")
 	}
 	args = append(args, pushTarget, "refs/heads/"+branch+":refs/heads/"+branch)
+	args = hardenedAuthenticatedGitArgs(args...)
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
@@ -63,7 +65,7 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	if err != nil {
 		return err
 	}
-	command := exec.CommandContext(ctx, "git", "fetch", remoteURL, expectedMergeHead)
+	command := exec.CommandContext(ctx, "git", hardenedAuthenticatedGitArgs("fetch", remoteURL, expectedMergeHead)...)
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, remoteURL))
 	if output, err := command.CombinedOutput(); err != nil {
@@ -92,4 +94,14 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 		return errors.New("local default branch did not reach the persisted onboarding merge HEAD")
 	}
 	return nil
+}
+
+func hardenedAuthenticatedGitArgs(args ...string) []string {
+	prefix := []string{
+		"-c", "core.hooksPath=" + os.DevNull,
+		"-c", "credential.helper=",
+		"-c", "credential.interactive=never",
+		"-c", "core.fsmonitor=false",
+	}
+	return append(prefix, args...)
 }

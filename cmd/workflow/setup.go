@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -503,15 +502,7 @@ func (r onboardingGitHubRemote) Resolve(ctx context.Context, origin string) (str
 	return revision.Name, revision.Head, err
 }
 func parseOriginRepository(origin string) (string, error) {
-	value := strings.TrimSpace(origin)
-	if strings.HasPrefix(value, "git@github.com:") {
-		return strings.TrimSuffix(strings.TrimPrefix(value, "git@github.com:"), ".git"), nil
-	}
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return "", err
-	}
-	return strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/"), nil
+	return onboarding.ParseGitHubOrigin(origin)
 }
 func mustPlatformDigest(ctx context.Context, database *store.Store) string {
 	value, err := database.PlatformInstallation(ctx)

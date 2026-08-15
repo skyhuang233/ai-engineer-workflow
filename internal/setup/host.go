@@ -1111,9 +1111,13 @@ func (a HostAdapter) recheckApprovedGitHubPolicy(ctx context.Context, repository
 	if err != nil {
 		return fmt.Errorf("re-read approved GitHub repository policy before merge: %w", err)
 	}
-	if approved.AllowFeatureEnable {
-		actual.HasIssues, actual.ActionsEnabled = approved.HasIssues, approved.ActionsEnabled
-	}
+	return compareApprovedRepositoryPolicy(actual, approved)
+}
+
+func compareApprovedRepositoryPolicy(actual, approved onboarding.RepositoryPolicy) error {
+	// AllowFeatureEnable records the already-approved mutation authority. It is
+	// not an observable GitHub setting, so bind it from the approval while
+	// comparing every live post-transition policy value byte-for-byte.
 	actual.AllowFeatureEnable = approved.AllowFeatureEnable
 	want, _ := json.Marshal(approved)
 	got, _ := json.Marshal(actual)

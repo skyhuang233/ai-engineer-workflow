@@ -18,6 +18,7 @@ const ManagedBlockStart = "<!-- agent-workflow:start -->"
 const ManagedBlockEnd = "<!-- agent-workflow:end -->"
 
 var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var githubPathSegment = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type RemoteHead interface {
 	Resolve(context.Context, string) (defaultBranch, head string, err error)
@@ -174,26 +175,39 @@ func extractManagedBlock(value string) (string, bool) {
 	return value[start:end], true
 }
 
-func parseGitHubOrigin(value string) (string, error) {
-	value = strings.TrimSpace(value)
+func ParseGitHubOrigin(value string) (string, error) {
+	if value != strings.TrimSpace(value) {
+		return "", errors.New("origin must identify a canonical GitHub HTTPS or SSH repository")
+	}
 	if strings.HasPrefix(value, "git@github.com:") {
 		path := strings.TrimSuffix(strings.TrimPrefix(value, "git@github.com:"), ".git")
-		if validRepo(path) {
+		if validRepo(path) && (value == "git@github.com:"+path || value == "git@github.com:"+path+".git") {
 			return path, nil
 		}
 	}
 	parsed, err := url.Parse(value)
-	if err == nil && strings.EqualFold(parsed.Host, "github.com") {
-		path := strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/")
-		if validRepo(path) {
+	if err == nil && parsed.Scheme == "https" && parsed.Host == "github.com" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.RawPath == "" {
+		path := strings.TrimPrefix(parsed.Path, "/")
+		path = strings.TrimSuffix(path, ".git")
+		if validRepo(path) && (parsed.Path == "/"+path || parsed.Path == "/"+path+".git") {
 			return path, nil
 		}
 	}
 	return "", errors.New("origin must identify a canonical GitHub HTTPS or SSH repository")
 }
+
+func parseGitHubOrigin(value string) (string, error) { return ParseGitHubOrigin(value) }
 func validRepo(value string) bool {
 	parts := strings.Split(value, "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !githubPathSegment.MatchString(part) || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // GitHubHTTPSURL derives the credential-safe transport endpoint from a

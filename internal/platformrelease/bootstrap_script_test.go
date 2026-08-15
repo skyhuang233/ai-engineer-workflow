@@ -236,7 +236,25 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	noOpState["control_plane"] = map[string]any{"state": "stopped", "diagnostic": "installed Workflow CLI trust repair prevents live status inspection", "runtime": nil}
 	cliOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cliOnlyFacts)
-	assertSingleRepair("CLI-only", "platform_cli", "install", "-GitHubOwner", "owner")
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
+	var cliAndControlPlaneRepair struct {
+		CanonicalJSON string `json:"canonical_json"`
+		Plan          struct {
+			Effects []struct {
+				Kind       string            `json:"kind"`
+				Action     string            `json:"action"`
+				Parameters map[string]string `json:"parameters"`
+			} `json:"effects"`
+		} `json:"plan"`
+	}
+	decodeErr := json.Unmarshal([]byte(output), &cliAndControlPlaneRepair)
+	_, _, _, parseErr = setupcontract.ParsePlan([]byte(cliAndControlPlaneRepair.CanonicalJSON))
+	if err != nil || decodeErr != nil || parseErr != nil || len(cliAndControlPlaneRepair.Plan.Effects) != 2 || cliAndControlPlaneRepair.Plan.Effects[0].Kind != "platform_cli" || cliAndControlPlaneRepair.Plan.Effects[0].Action != "install" || cliAndControlPlaneRepair.Plan.Effects[1].Kind != "control_plane" || cliAndControlPlaneRepair.Plan.Effects[1].Action != "replace" {
+		t.Fatalf("untrusted CLI repair did not disclose the same-apply Control Plane replacement: %q, %v, %v, %v", output, err, decodeErr, parseErr)
+	}
+	if _, found := cliAndControlPlaneRepair.Plan.Effects[0].Parameters["control_plane_plan_digest_sha256"]; found {
+		t.Fatalf("untrusted CLI repair smuggled Control Plane authority through an optional CLI parameter: %q", output)
+	}
 	noOpState["workflow"].(map[string]any)["sha256"] = manifest.BundledFiles[0].SHA256
 	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}
 	cpOnlyFacts, _ := json.Marshal(noOpState)

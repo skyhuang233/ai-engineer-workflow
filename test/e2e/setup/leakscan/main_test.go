@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -55,18 +56,24 @@ func TestScannerVacuumRemovesDeletedFingerprintPagesBeforeRawScan(t *testing.T) 
 
 func TestScannerDoesNotExemptWALOrSHMBytes(t *testing.T) {
 	for _, suffix := range []string{"-wal", "-shm"} {
-		t.Run(suffix, func(t *testing.T) {
-			s, home, _ := newScannerFixture(t)
-			if err := s.compactMainDatabase(); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(s.mainDatabase+suffix, []byte("Authorization: Bearer "+s.token), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := s.scanRoot(home); err == nil || !strings.Contains(err.Error(), suffix) {
-				t.Fatalf("credential-bearing SQLite sidecar accepted: %v", err)
-			}
-		})
+		for _, representation := range []string{"Authorization: Bearer ", "Authorization: Basic "} {
+			t.Run(suffix+representation, func(t *testing.T) {
+				s, home, _ := newScannerFixture(t)
+				if err := s.compactMainDatabase(); err != nil {
+					t.Fatal(err)
+				}
+				credential := s.token
+				if strings.Contains(representation, "Basic") {
+					credential = base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.token))
+				}
+				if err := os.WriteFile(s.mainDatabase+suffix, []byte(representation+credential), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.scanRoot(home); err == nil || !strings.Contains(err.Error(), suffix) {
+					t.Fatalf("credential-bearing SQLite sidecar accepted: %v", err)
+				}
+			})
+		}
 	}
 }
 
@@ -81,10 +88,13 @@ func TestScannerRejectsCredentialMaterialAcrossQualificationBoundaries(t *testin
 		{name: "process environment fingerprint", relative: `evidence/process-environment.txt`, content: "fingerprint"},
 		{name: "docker inspect token", relative: `evidence/docker-inspect.json`, content: "token"},
 		{name: "worker container fingerprint", relative: `evidence/docker-containers.json`, content: "fingerprint"},
+		{name: "workflow log Git Basic auth", relative: `home/logs/git.log`, content: "basic"},
+		{name: "process environment Git Basic auth", relative: `evidence/process-environment.txt`, content: "GIT_AUTH_HEADER=Basic basic"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s, home, evidence := newScannerFixture(t)
-			content := strings.NewReplacer("token", s.token, "fingerprint", s.fingerprint).Replace(test.content)
+			basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.token))
+			content := strings.NewReplacer("token", s.token, "fingerprint", s.fingerprint, "basic", basic).Replace(test.content)
 			parts := strings.SplitN(test.relative, "/", 2)
 			root := home
 			if parts[0] == "evidence" {

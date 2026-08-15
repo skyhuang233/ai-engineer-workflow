@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -60,6 +61,17 @@ func TestInitialBaselineUsesTemporaryIndexAndExactApprovedFiles(t *testing.T) {
 	}
 	if author := testGitOutput(t, repo, "show", "-s", "--format=%an <%ae>", "HEAD"); author != "Agent Workflow Setup <workflow@localhost>" {
 		t.Fatalf("baseline author = %q", author)
+	}
+}
+
+func TestBaselineFilesPreservesWhitespaceAndNewlinesFromNULTerminatedGitPaths(t *testing.T) {
+	want := []string{" leading.txt", "line\nbreak.txt", "trailing .txt"}
+	got, err := parseNULTerminatedGitPaths([]byte("trailing .txt\x00line\nbreak.txt\x00 leading.txt\x00"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("baseline paths = %#v, want %#v", got, want)
 	}
 }
 func TestInitialBaselineRejectsCredentialMaterialAndPlanDrift(t *testing.T) {
@@ -168,5 +180,70 @@ func TestInitialBaselineBindsSymlinkModeAndTargetBlob(t *testing.T) {
 	}
 	if target := testGitOutput(t, repo, "show", commit+":current"); target != "target-a" {
 		t.Fatalf("symlink blob = %q", target)
+	}
+}
+
+func TestInitialBaselineGitPlumbingIsDeterministicUnderHostileGitEnvironment(t *testing.T) {
+	create := func() string {
+		repo := filepath.Join(t.TempDir(), "repo")
+		git(t, "", "init", "-b", "main", repo)
+		if err := os.WriteFile(filepath.Join(repo, "approved.txt"), []byte("approved bytes\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return repo
+	}
+	firstRepo := create()
+	firstSnapshot, err := BaselineSnapshot(context.Background(), firstRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := CreateInitialBaseline(context.Background(), firstRepo, "main", firstSnapshot, "Initial repository baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondRepo := create()
+	globalHooks := filepath.Join(t.TempDir(), "hooks")
+	if err := os.Mkdir(globalHooks, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hookCapture := filepath.Join(t.TempDir(), "reference-hook-ran")
+	if err := os.WriteFile(filepath.Join(globalHooks, "reference-transaction"), []byte("#!/bin/sh\nprintf invoked > \"$WORKFLOW_BASELINE_HOOK_CAPTURE\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	globalConfig := filepath.Join(t.TempDir(), "hostile.gitconfig")
+	config := "[user]\n\tname = Hostile\n\temail = hostile@example.invalid\n[core]\n\thooksPath = " + filepath.ToSlash(globalHooks) + "\n[commit]\n\tgpgSign = true\n[i18n]\n\tcommitEncoding = ISO-8859-1\n"
+	if err := os.WriteFile(globalConfig, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "0")
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(t.TempDir(), "hostile-index"))
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(t.TempDir(), "hostile-objects"))
+	t.Setenv("GIT_AUTHOR_NAME", "Hostile Environment")
+	t.Setenv("GIT_AUTHOR_DATE", "2037-01-01T00:00:00Z")
+	t.Setenv("GIT_COMMITTER_DATE", "2038-01-01T00:00:00Z")
+	t.Setenv("WORKFLOW_BASELINE_HOOK_CAPTURE", hookCapture)
+	secondSnapshot, err := BaselineSnapshot(context.Background(), secondRepo)
+	if err != nil {
+		t.Fatalf("snapshot inherited hostile Git environment: %v", err)
+	}
+	second, err := CreateInitialBaseline(context.Background(), secondRepo, "main", secondSnapshot, "Initial repository baseline")
+	if err != nil {
+		t.Fatalf("baseline inherited hostile Git environment: %v", err)
+	}
+	if first != second {
+		t.Fatalf("same approved tree/message produced %s then %s", first, second)
+	}
+	if _, err := os.Stat(hookCapture); !os.IsNotExist(err) {
+		t.Fatalf("baseline executed hostile Git hook: %v", err)
+	}
+	for _, repo := range []string{firstRepo, secondRepo} {
+		command := exec.Command("git", "-C", repo, "show-ref", "--head")
+		command.Env = isolatedGitEnvironment(nil)
+		output, err := command.Output()
+		if err != nil || string(output) != first+" HEAD\n"+first+" refs/heads/main\n" {
+			t.Fatalf("baseline refs for %s = %q, %v", repo, output, err)
+		}
 	}
 }

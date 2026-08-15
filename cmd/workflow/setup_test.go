@@ -509,3 +509,25 @@ func TestSetupCommandsRequireAbsoluteRepository(t *testing.T) {
 		}
 	}
 }
+
+func TestSetupRemoteAcceptsOnlyCanonicalGitHubOrigin(t *testing.T) {
+	for _, accepted := range []string{"https://github.com/owner/repo", "https://github.com/owner/repo.git", "git@github.com:owner/repo", "git@github.com:owner/repo.git"} {
+		if got, err := parseOriginRepository(accepted); err != nil || got != "owner/repo" {
+			t.Errorf("canonical origin %q parsed as %q, %v", accepted, got, err)
+		}
+	}
+	for _, rejected := range []string{
+		"http://github.com/owner/repo.git",
+		"https://user@github.com/owner/repo.git",
+		"https://github.com:443/owner/repo.git",
+		"https://github.com/owner/repo.git?token=secret",
+		"https://github.com/owner/repo.git#fragment",
+		"ssh://git@github.com/owner/repo.git",
+		"other@github.com:owner/repo.git",
+		"git@github.com:22/owner/repo.git",
+	} {
+		if got, err := parseOriginRepository(rejected); err == nil {
+			t.Errorf("noncanonical origin %q accepted as %q", rejected, got)
+		}
+	}
+}
