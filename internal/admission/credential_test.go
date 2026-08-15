@@ -100,12 +100,12 @@ func TestCredentialReplacementSuspendsEachRepositoryWithoutStoppingAdmissionPass
 
 func TestOrganizationAdminDowngradeSuspendsAdmissionOnContinuousVerification(t *testing.T) {
 	token := "github_pat_org_admin_downgraded"
-	stored := store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "member", UserID: 7, Owner: "acme", Scopes: []string{"repo", "workflow"}, CredentialPath: `C:\Workflow\state\credentials\github.pat`, Status: "verified", VerifiedAt: time.Now().UTC()}
+	stored := store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "member", UserID: 7, Owner: "acme", Scopes: []string{"repo", "workflow", "admin:org"}, CredentialPath: `C:\Workflow\state\credentials\github.pat`, Status: "verified", VerifiedAt: time.Now().UTC()}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/user":
-			w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+			w.Header().Set("X-OAuth-Scopes", "repo, workflow, admin:org")
 			_, _ = w.Write([]byte(`{"login":"member","id":7}`))
 		case "/orgs/acme/memberships/member":
 			_, _ = w.Write([]byte(`{"state":"active","role":"member"}`))
