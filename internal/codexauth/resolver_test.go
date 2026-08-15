@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestResolverUsesSupportedCodexHomeAfterChatGPTStatus(t *testing.T) {
+func TestResolverRejectsImplicitCodexHomeAfterChatGPTStatus(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codex")
 	writeChatGPTCache(t, filepath.Join(home, FileName))
 	resolver := Resolver{
@@ -20,9 +20,8 @@ func TestResolverUsesSupportedCodexHomeAfterChatGPTStatus(t *testing.T) {
 		},
 		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT\n"), nil },
 	}
-	got, err := resolver.ResolveChatGPT(context.Background())
-	if err != nil || got != filepath.Join(home, FileName) {
-		t.Fatalf("resolved source = %q, %v", got, err)
+	if got, err := resolver.ResolveChatGPT(context.Background()); err == nil {
+		t.Fatalf("implicitly resolved private source %q", got)
 	}
 }
 
@@ -41,6 +40,24 @@ func TestResolverSupportsExplicitWorkflowIntegrationSource(t *testing.T) {
 	got, err := resolver.ResolveChatGPT(context.Background())
 	if err != nil || got != source {
 		t.Fatalf("resolved source = %q, %v", got, err)
+	}
+}
+
+func TestResolverRejectsRelativeIntegrationSource(t *testing.T) {
+	working := t.TempDir()
+	writeChatGPTCache(t, filepath.Join(working, "private-auth.json"))
+	t.Chdir(working)
+	resolver := Resolver{
+		LookupEnvironment: func(name string) string {
+			if name == SourceOverrideEnvironment {
+				return "private-auth.json"
+			}
+			return ""
+		},
+		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT"), nil },
+	}
+	if got, err := resolver.ResolveChatGPT(context.Background()); err == nil {
+		t.Fatalf("relative private source was resolved as %q", got)
 	}
 }
 

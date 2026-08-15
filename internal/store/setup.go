@@ -93,6 +93,17 @@ func (s *Store) LatestSetupPlan(ctx context.Context, kind string) (SetupPlanReco
 	return plan, err
 }
 
+func (s *Store) SetupPlanByDigest(ctx context.Context, digest string) (SetupPlanRecord, error) {
+	if !fingerprintPattern.MatchString(digest) {
+		return SetupPlanRecord{}, errors.New("Setup Plan digest is invalid")
+	}
+	plan, err := scanSetupPlan(s.db.QueryRowContext(ctx, `SELECT plan_id,kind,schema_version,target,digest_sha256,canonical_json,projection,created_at FROM setup_plans WHERE digest_sha256=?`, digest))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SetupPlanRecord{}, ErrNotFound
+	}
+	return plan, err
+}
+
 func scanSetupPlan(row *sql.Row) (SetupPlanRecord, error) {
 	var p SetupPlanRecord
 	var created string

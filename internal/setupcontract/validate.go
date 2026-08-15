@@ -78,13 +78,22 @@ func (p Plan) Validate() error {
 		return err
 	}
 	for _, precondition := range p.Preconditions {
-		if strings.TrimSpace(precondition.Kind) == "" || strings.TrimSpace(precondition.Subject) == "" || strings.TrimSpace(precondition.Expected) == "" {
+		allowEmptyExpected := precondition.Kind == "git_head"
+		if strings.TrimSpace(precondition.Kind) == "" || strings.TrimSpace(precondition.Subject) == "" || (!allowEmptyExpected && strings.TrimSpace(precondition.Expected) == "") {
 			return fmt.Errorf("precondition %q is incomplete", precondition.ID)
 		}
 	}
 	for _, effect := range p.Effects {
 		if strings.TrimSpace(effect.Kind) == "" || strings.TrimSpace(effect.Subject) == "" || strings.TrimSpace(effect.Action) == "" || effect.Parameters == nil {
 			return fmt.Errorf("effect %q is incomplete", effect.ID)
+		}
+		if err := validateEffect(p.Kind, effect); err != nil {
+			return fmt.Errorf("effect %q: %w", effect.ID, err)
+		}
+	}
+	if p.Kind == PlatformBootstrap {
+		if err := validatePlatformEffectPins(p.Effects); err != nil {
+			return err
 		}
 	}
 	for _, expected := range p.ExpectedResults {
@@ -97,6 +106,122 @@ func (p Plan) Validate() error {
 	_ = json.Unmarshal(encoded, &semantic)
 	if path, found := findSecret(semantic, "$"); found {
 		return fmt.Errorf("Setup Plan contains forbidden secret-shaped content at %s", path)
+	}
+	return nil
+}
+
+func validateEffect(planKind PlanKind, effect Effect) error {
+	type contract struct{ required, optional []string }
+	contracts := map[string]contract{
+		// install_file is retained only for the schema-v1 cross-language golden
+		// document. Production adapters do not implement it.
+		"install_file":           {required: []string{"sha256"}},
+		"platform_cli":           {required: []string{"version", "sha256"}},
+		"workflow_skill_bundle":  {required: []string{"version", "managed_skills_json", "files_json"}},
+		"docker_desktop":         {required: []string{"version", "installer_url", "windows_amd64_sha256"}},
+		"github_pat":             {required: []string{"input", "owner"}, optional: []string{"api_base"}},
+		"platform_installation":  {required: []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256"}},
+		"control_plane":          {required: []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256"}},
+		"create_repository":      {required: []string{"owner", "authenticated_login", "name", "private"}},
+		"initial_baseline":       {required: []string{"branch", "files_json", "repository", "source_url"}},
+		"publish_history":        {required: []string{"branch", "head"}},
+		"github_label":           {required: []string{"name", "color", "description"}},
+		"repository_features":    {required: []string{"issues", "actions", "allowed_actions"}},
+		"repository_contract_pr": {required: []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}},
+		"repository_admission":   {required: []string{"default_branch", "manifest_digest", "contract_version"}, optional: []string{"labels_json", "actions_allowed"}},
+		"local_fast_forward":     {required: []string{"repository", "branch", "pre_merge_head"}},
+	}
+	schema, ok := contracts[effect.Kind]
+	if !ok {
+		return fmt.Errorf("unknown effect kind %q", effect.Kind)
+	}
+	if planKind == PlatformBootstrap && isPlatformMutationEffect(effect.Kind) && effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
+		schema.required = append(schema.required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256")
+	}
+	allowed := map[string]bool{}
+	for _, key := range append(append([]string{}, schema.required...), schema.optional...) {
+		allowed[key] = true
+	}
+	for key := range effect.Parameters {
+		if !allowed[key] {
+			return fmt.Errorf("unknown parameter %q", key)
+		}
+	}
+	for _, key := range schema.required {
+		value, exists := effect.Parameters[key]
+		allowEmpty := (effect.Kind == "repository_contract_pr" && key == "base_head") || (effect.Kind == "local_fast_forward" && key == "pre_merge_head")
+		if !exists || (!allowEmpty && strings.TrimSpace(value) == "") {
+			return fmt.Errorf("parameter %q is required", key)
+		}
+	}
+	for _, key := range []string{"sha256", "windows_amd64_sha256", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "manifest_digest"} {
+		if value, exists := effect.Parameters[key]; exists && !sha256Pattern.MatchString(value) {
+			return fmt.Errorf("parameter %q must be a lowercase SHA-256", key)
+		}
+	}
+	for _, key := range []string{"head", "base_head", "pre_merge_head"} {
+		if value, exists := effect.Parameters[key]; exists && value != "" && !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(value) {
+			return fmt.Errorf("parameter %q must be a Git commit", key)
+		}
+	}
+	for _, key := range []string{"private", "issues", "actions"} {
+		if value, exists := effect.Parameters[key]; exists && value != "true" && value != "false" {
+			return fmt.Errorf("parameter %q must be true or false", key)
+		}
+	}
+	if effect.Kind == "github_pat" && effect.Parameters["input"] != "stdin" {
+		return errors.New("GitHub PAT input must be stdin")
+	}
+	if effect.Kind == "docker_desktop" && !strings.HasPrefix(effect.Parameters["installer_url"], "https://") {
+		return errors.New("Docker installer URL must use HTTPS")
+	}
+	if effect.Kind == "repository_features" {
+		switch effect.Parameters["allowed_actions"] {
+		case "all", "local_only", "selected":
+		default:
+			return errors.New("Actions policy is invalid")
+		}
+	}
+	for _, key := range []string{"managed_skills_json", "files_json", "before_files_json", "required_checks_json", "labels_json", "platform_setup_contract_json"} {
+		if value, exists := effect.Parameters[key]; exists && !json.Valid([]byte(value)) {
+			return fmt.Errorf("parameter %q must be valid JSON", key)
+		}
+	}
+	return nil
+}
+
+func isPlatformMutationEffect(kind string) bool {
+	switch kind {
+	case "platform_cli", "workflow_skill_bundle", "docker_desktop", "github_pat", "platform_installation", "control_plane":
+		return true
+	default:
+		return false
+	}
+}
+
+func validatePlatformEffectPins(effects []Effect) error {
+	var releaseDigest, contractDigest, cliDigest string
+	found := false
+	for _, effect := range effects {
+		if !isPlatformMutationEffect(effect.Kind) {
+			continue
+		}
+		pins := []string{effect.Parameters["release_manifest_digest"], effect.Parameters["platform_setup_contract_digest"], effect.Parameters["workflow_cli_sha256"]}
+		if !found {
+			releaseDigest, contractDigest, cliDigest = pins[0], pins[1], pins[2]
+			found = true
+		} else if pins[0] != releaseDigest || pins[1] != contractDigest || pins[2] != cliDigest {
+			return errors.New("Platform Bootstrap effects have inconsistent release pins")
+		}
+		if effect.Kind == "platform_cli" && effect.Parameters["sha256"] != pins[2] {
+			return errors.New("Platform CLI checksum does not match the pinned Workflow CLI checksum")
+		}
+	}
+	if !found {
+		// install_file is retained solely for the schema-v1 cross-language
+		// golden and legacy adapter tests. Every production platform effect is
+		// release-bound above.
+		return nil
 	}
 	return nil
 }

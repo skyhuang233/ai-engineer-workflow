@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/admission"
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/hostsetup"
@@ -38,9 +42,16 @@ type setupResponse struct {
 	Projection         string `json:"projection,omitempty"`
 }
 
+var (
+	verifyPlatformReadyForSetup     = verifyPlatformReady
+	verifyRecordedAdmissionForSetup = verifyRecordedAdmission
+	setupInspectionAPIBase          = ""
+	setupInspectionHTTPClient       *http.Client
+)
+
 func setupCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("setup requires plan, apply, or verify")
+		return errors.New("setup requires plan, apply, inspect-platform, or verify")
 	}
 	switch args[0] {
 	case "plan":
@@ -49,9 +60,140 @@ func setupCommand(args []string) error {
 		return runSetupApply(args[1:], os.Stdin, os.Stdout)
 	case "verify":
 		return runSetupVerify(args[1:], os.Stdout)
+	case "inspect-platform":
+		return runSetupInspectPlatform(args[1:], os.Stdout)
 	default:
 		return fmt.Errorf("unknown setup command %q", args[0])
 	}
+}
+
+type platformInspection struct {
+	Platform struct {
+		InstallationRecorded        bool   `json:"installation_recorded"`
+		Version                     string `json:"version,omitempty"`
+		ReleaseManifestDigest       string `json:"release_manifest_digest,omitempty"`
+		PlatformSetupContractDigest string `json:"platform_setup_contract_digest,omitempty"`
+	} `json:"platform"`
+	WorkflowCLI struct {
+		Verified bool `json:"verified"`
+	} `json:"workflow_cli"`
+	GitHubCredential struct {
+		Exists     bool     `json:"exists"`
+		Verified   bool     `json:"verified"`
+		Owner      string   `json:"owner,omitempty"`
+		Scopes     []string `json:"scopes,omitempty"`
+		Diagnostic string   `json:"diagnostic,omitempty"`
+	} `json:"github_credential"`
+}
+
+func runSetupInspectPlatform(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("setup inspect-platform", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	homeOverride := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	layout, err := workflowhome.Resolve(*homeOverride)
+	if err != nil {
+		return err
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
+	}
+	defer database.Close()
+	facts, inspectErr := inspectPlatform(context.Background(), database, layout)
+	status, blocker := "ready", ""
+	if inspectErr != nil {
+		status, blocker = "blocked", inspectErr.Error()
+	}
+	return writeSetupResponse(output, setupResponse{Status: status, Blocker: blocker, Result: facts})
+}
+
+func inspectPlatform(ctx context.Context, database *store.Store, layout workflowhome.Layout) (platformInspection, error) {
+	var facts platformInspection
+	installation, installationErr := database.PlatformInstallation(ctx)
+	plan, planErr := database.LatestSetupPlan(ctx, string(setupcontract.PlatformBootstrap))
+	pins, pinsErr := readPlatformPins(plan)
+	if installationErr == nil {
+		facts.Platform.InstallationRecorded = true
+		facts.Platform.Version = installation.PlatformVersion
+		facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
+	}
+	contractRaw, contractErr := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
+	_, contractDigest, canonicalErr := setupcontract.Canonicalize(contractRaw)
+	if contractErr == nil && canonicalErr == nil {
+		facts.Platform.PlatformSetupContractDigest = contractDigest
+	}
+	if pinsErr == nil {
+		facts.WorkflowCLI.Verified, _ = (workflowhome.Installation{Layout: layout}).VerifyVersion(pins.Version, pins.WorkflowCLISHA256)
+	}
+	verification, verificationErr := database.GitHubPATVerification(ctx)
+	token, tokenErr := credential.NewFileStore(layout.CredentialFile).Get(ctx, credential.GatewayTarget)
+	facts.GitHubCredential.Exists = tokenErr == nil
+	if verificationErr == nil {
+		facts.GitHubCredential.Owner = verification.Owner
+	}
+	if tokenErr == nil && verificationErr == nil {
+		pin := doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}
+		result := (doctor.GitHubPATCheck{Pin: pin, Token: token, Verification: verification, APIBase: setupInspectionAPIBase, Client: setupInspectionHTTPClient}).Run(ctx)
+		facts.GitHubCredential.Verified = result.Status == doctor.Pass
+		if facts.GitHubCredential.Verified {
+			facts.GitHubCredential.Scopes = append([]string(nil), verification.Scopes...)
+		}
+		if !facts.GitHubCredential.Verified {
+			facts.GitHubCredential.Diagnostic = result.Summary
+		}
+	} else {
+		facts.GitHubCredential.Diagnostic = errors.Join(tokenErr, verificationErr).Error()
+	}
+	var combined error
+	if installationErr != nil {
+		combined = errors.Join(combined, installationErr)
+	}
+	if planErr != nil {
+		combined = errors.Join(combined, planErr)
+	}
+	if pinsErr != nil {
+		combined = errors.Join(combined, pinsErr)
+	}
+	if contractErr != nil || canonicalErr != nil || contractDigest != pins.PlatformSetupContractDigest {
+		combined = errors.Join(combined, errors.New("installed Platform Setup Contract digest differs"))
+	}
+	if installationErr == nil && (installation.PlatformVersion != pins.Version || installation.ReleaseManifestDigestSHA256 != pins.ReleaseManifestDigest) {
+		combined = errors.Join(combined, errors.New("Platform Installation differs from its approved plan"))
+	}
+	if !facts.WorkflowCLI.Verified {
+		combined = errors.Join(combined, errors.New("installed Workflow CLI ownership, version, or checksum differs"))
+	}
+	if !facts.GitHubCredential.Verified {
+		combined = errors.Join(combined, errors.New("Control Plane PAT live verification failed"))
+	}
+	return facts, combined
+}
+
+type platformPins struct{ Version, ReleaseManifestDigest, PlatformSetupContractDigest, WorkflowCLISHA256 string }
+
+func readPlatformPins(record store.SetupPlanRecord) (platformPins, error) {
+	plan, canonical, digest, err := setupcontract.ParsePlan([]byte(record.CanonicalJSON))
+	if err != nil || plan.Kind != setupcontract.PlatformBootstrap || digest != record.DigestSHA256 || string(canonical) != record.CanonicalJSON {
+		return platformPins{}, errors.New("approved Platform Bootstrap Plan archive is invalid")
+	}
+	var pins platformPins
+	for _, effect := range plan.Effects {
+		if effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
+			continue
+		}
+		candidate := platformPins{Version: effect.Parameters["version"], ReleaseManifestDigest: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigest: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"]}
+		if pins.Version != "" && pins != candidate {
+			return platformPins{}, errors.New("approved Platform Bootstrap Plan has inconsistent final platform pins")
+		}
+		pins = candidate
+	}
+	if pins.Version == "" {
+		return platformPins{}, errors.New("approved Platform Bootstrap Plan lacks final platform pins")
+	}
+	return pins, nil
 }
 
 func runSetupPlan(args []string, output io.Writer) error {
@@ -97,6 +239,10 @@ func runSetupPlan(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	platformReady, err := requirePlatformReadyForOnboarding(context.Background(), database, layout, output)
+	if err != nil || !platformReady {
+		return err
+	}
 	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
 	token, err := verifiedClassicPAT(context.Background(), database, config)
 	if err != nil {
@@ -105,7 +251,7 @@ func runSetupPlan(args []string, output io.Writer) error {
 	client := github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 	discovery, discoveryErr := onboarding.Discover(context.Background(), *repository, onboardingGitHubRemote{Client: client})
 	if discoveryErr == nil && discovery.Repository != "" {
-		if verifyErr := verifyRecordedAdmission(context.Background(), database, layout, client, discovery.Repository); verifyErr == nil {
+		if verifyErr := verifyRecordedAdmissionForSetup(context.Background(), database, layout, client, discovery.Repository); verifyErr == nil {
 			return writeSetupResponse(output, setupResponse{Status: "ready", PlatformReady: true, RepositoryAdmitted: true})
 		}
 	}
@@ -121,7 +267,7 @@ func runSetupPlan(args []string, output io.Writer) error {
 	for _, label := range platformContract.RepositoryContract.Labels {
 		labels = append(labels, onboarding.Label{Name: label.Name, Color: label.Color, Description: label.Description})
 	}
-	plan, err := onboarding.Plan(context.Background(), onboarding.PlanOptions{RepositoryPath: *repository, WorkflowHome: layout.Root, Owner: verification.Owner, AuthenticatedLogin: verification.Login, RepositoryName: *repositoryName, Private: &private, Remote: onboardingGitHubRemote{Client: client}, PlatformReleaseDigest: mustPlatformDigest(context.Background(), database), Labels: labels, Policy: client, DomainLayout: *domainLayout})
+	plan, err := onboarding.Plan(context.Background(), onboarding.PlanOptions{RepositoryPath: *repository, WorkflowHome: layout.Root, Owner: verification.Owner, AuthenticatedLogin: verification.Login, RepositoryName: *repositoryName, Private: &private, Remote: onboardingGitHubRemote{Client: client}, PlatformReleaseDigest: mustPlatformDigest(context.Background(), database), Labels: labels, Policy: client, Publication: client, State: onboardingCurrentState{Client: client, Store: database}, DomainLayout: *domainLayout})
 	if err != nil {
 		return writeSetupResponse(output, setupResponse{Status: "blocked", PlatformReady: true, Blocker: err.Error()})
 	}
@@ -148,7 +294,55 @@ func runSetupPlan(args []string, output io.Writer) error {
 	return writeSetupResponse(output, setupResponse{Status: "plan_required", PlatformReady: true, PlanPath: planPath, DigestSHA256: digest, Projection: setupengine.Project(plan, digest)})
 }
 
+func requirePlatformReadyForOnboarding(ctx context.Context, database *store.Store, layout workflowhome.Layout, output io.Writer) (bool, error) {
+	if err := verifyPlatformReadyForSetup(ctx, database, layout); err != nil {
+		return false, writeSetupResponse(output, setupResponse{Status: "blocked", PlatformReady: false, Blocker: "Platform Ready: " + err.Error()})
+	}
+	return true, nil
+}
+
+func verifySetupReady(ctx context.Context, database *store.Store, layout workflowhome.Layout, client *github.Client, repository string) error {
+	platformErr := verifyPlatformReadyForSetup(ctx, database, layout)
+	admissionErr := verifyRecordedAdmissionForSetup(ctx, database, layout, client, repository)
+	return errors.Join(platformErr, admissionErr)
+}
+
 type onboardingGitHubRemote struct{ Client *github.Client }
+
+type onboardingCurrentState struct {
+	Client *github.Client
+	Store  *store.Store
+}
+
+func (d onboardingCurrentState) DiscoverOnboardingState(ctx context.Context, repository, branch, manifestDigest string, labels []onboarding.Label) (onboarding.OnboardingState, error) {
+	if d.Client == nil || d.Store == nil {
+		return onboarding.OnboardingState{}, errors.New("onboarding state discovery is incomplete")
+	}
+	result := onboarding.OnboardingState{SatisfiedLabels: map[string]bool{}}
+	for _, expected := range labels {
+		actual, err := d.Client.Label(ctx, repository, expected.Name)
+		if github.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return result, err
+		}
+		result.SatisfiedLabels[expected.Name] = strings.EqualFold(actual.Color, expected.Color) && actual.Description == expected.Description
+	}
+	manifest, err := d.Client.RepositoryFile(ctx, repository, ".workflow/repository.json", branch)
+	if err == nil {
+		sum := sha256.Sum256(manifest)
+		result.ContractSatisfied = hex.EncodeToString(sum[:]) == manifestDigest
+	} else if !github.IsNotFound(err) {
+		return result, err
+	}
+	if admissionValue, err := d.Store.RepositoryAdmission(ctx, repository); err == nil {
+		result.AdmissionSatisfied = result.ContractSatisfied && admissionValue.Eligible && admissionValue.ManifestDigestSHA256 == manifestDigest && admissionValue.ContractVersion == "1"
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return result, err
+	}
+	return result, nil
+}
 
 func (r onboardingGitHubRemote) Resolve(ctx context.Context, origin string) (string, string, error) {
 	repository, err := parseOriginRepository(origin)
@@ -208,7 +402,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest}
+	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
 	if plan.Kind == setupcontract.RepositoryOnboarding {
 		database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
 		if openErr != nil {
@@ -311,12 +505,23 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	if err != nil {
 		return err
 	}
+	pins, err := readPlatformPins(plan)
+	if err != nil {
+		return err
+	}
+	if installation.PlatformVersion != pins.Version || installation.ReleaseManifestDigestSHA256 != pins.ReleaseManifestDigest {
+		return errors.New("Platform Installation differs from its approved release pins")
+	}
 	observation := (controlplane.Inspector{}).Inspect(ctx, &record)
-	if observation.State != controlplane.StateReady || record.PlatformVersion != installation.PlatformVersion || record.ApprovedPlanDigestSHA256 != plan.DigestSHA256 {
+	if observation.State != controlplane.StateReady || record.PlatformVersion != installation.PlatformVersion {
 		return errors.New("Control Plane process identity, health, version, or approved plan digest differs")
 	}
-	if _, err := os.Stat(filepath.Join(layout.Bin, workflowhome.ExecutableName)); err != nil {
+	if err := verifyRuntimePlanBinding(ctx, database, record, installation.PlatformVersion); err != nil {
 		return err
+	}
+	cliVerified, err := (workflowhome.Installation{Layout: layout}).VerifyVersion(pins.Version, pins.WorkflowCLISHA256)
+	if err != nil || !cliVerified {
+		return errors.Join(errors.New("installed Workflow CLI ownership, version, or checksum differs"), err)
 	}
 	pathReady, err := workflowhome.CurrentUserPathIsReconciled(layout.Bin)
 	if err != nil || !pathReady {
@@ -332,6 +537,10 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	}
 	if err := contract.Validate(); err != nil {
 		return err
+	}
+	_, contractDigest, err := setupcontract.Canonicalize(contractRaw)
+	if err != nil || contractDigest != pins.PlatformSetupContractDigest {
+		return errors.Join(errors.New("installed Platform Setup Contract digest differs from approved plan"), err)
 	}
 	userProfile := os.Getenv("USERPROFILE")
 	if userProfile == "" {
@@ -356,6 +565,23 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 		return errors.New(result.Summary)
 	}
 	return nil
+}
+
+func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record controlplane.RuntimeRecord, platformVersion string) error {
+	archived, err := database.SetupPlanByDigest(ctx, record.ApprovedPlanDigestSHA256)
+	if err != nil {
+		return errors.Join(errors.New("Control Plane approved plan is not archived"), err)
+	}
+	plan, canonical, digest, err := setupcontract.ParsePlan([]byte(archived.CanonicalJSON))
+	if err != nil || plan.Kind != setupcontract.PlatformBootstrap || digest != archived.DigestSHA256 || string(canonical) != archived.CanonicalJSON {
+		return errors.New("Control Plane approved plan archive is invalid")
+	}
+	for _, effect := range plan.Effects {
+		if effect.Kind == "control_plane" && effect.Action == "start" && effect.Parameters["version"] == platformVersion {
+			return nil
+		}
+	}
+	return errors.New("Control Plane runtime is not bound to an approved start effect")
 }
 
 func verifyRecordedAdmission(ctx context.Context, database *store.Store, layout workflowhome.Layout, client *github.Client, repository string) error {

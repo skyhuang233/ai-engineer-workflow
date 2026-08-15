@@ -41,14 +41,7 @@ const (
 )
 
 func defaultCodexAuthFile() string {
-	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
-		return filepath.Join(home, codexauth.FileName)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".codex", codexauth.FileName)
+	return strings.TrimSpace(os.Getenv(codexauth.SourceOverrideEnvironment))
 }
 
 func controlPlaneContainerID(databasePath string) string {

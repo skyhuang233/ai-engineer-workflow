@@ -107,6 +107,7 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	source := flags.String("source", "", "absolute local repository path")
 	defaultBranch := flags.String("default-branch", "", "canonical default branch")
 	maxParallel := flags.Int("max-parallel-runs", 0, "optional maximum parallel Worker Runs")
+	codexAuthFile := flags.String("codex-auth-file", "", "absolute Codex authentication source supplied by the invoking integration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -159,6 +160,19 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	}
 	if *maxParallel > 0 {
 		config.MaxParallelRuns = *maxParallel
+	}
+	if *codexAuthFile != "" {
+		if !filepath.IsAbs(*codexAuthFile) {
+			return errors.New("explicit Codex authentication source must be absolute")
+		}
+		absoluteAuth, authErr := filepath.Abs(*codexAuthFile)
+		if authErr != nil {
+			return fmt.Errorf("resolve explicit Codex authentication source: %w", authErr)
+		}
+		config.CodexAuthFile = filepath.Clean(absoluteAuth)
+		if authErr := codexauth.ValidateChatGPT(config.CodexAuthFile); authErr != nil {
+			return fmt.Errorf("validate explicit Codex authentication source: %w", authErr)
+		}
 	}
 	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(config.Repository))
 	if config.WorkspaceRoot == "" {

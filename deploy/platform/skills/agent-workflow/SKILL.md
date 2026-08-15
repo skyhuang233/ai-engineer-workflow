@@ -10,7 +10,9 @@ Use the repository's managed Agent instructions and `.workflow/repository.json` 
 When a workflow skill creates or activates a Delivery Plan Root, immediately bind that root to the admitted repository before reporting success:
 
 ```powershell
-workflow runtime-configure --source (git rev-parse --show-toplevel) --root <plan-root-issue-number>
+workflow runtime-configure --source (git rev-parse --show-toplevel) --root <plan-root-issue-number> --codex-auth-file $env:WORKFLOW_CODEX_AUTH_FILE
 ```
 
 This is automatically performed Workflow bookkeeping, not a user step or approval. Run it only after the Plan Root and its ticket graph have been published successfully. If binding fails, report the Plan Root operation as incomplete and do not claim that execution has started.
+
+`WORKFLOW_CODEX_AUTH_FILE` is the explicit Codex integration contract. It must be an absolute path supplied by the invoking Codex environment; never infer a private Codex credential path from `CODEX_HOME` or the user profile.

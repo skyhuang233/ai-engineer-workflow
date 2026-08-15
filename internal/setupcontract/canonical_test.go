@@ -1,6 +1,7 @@
 package setupcontract
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,28 @@ func TestParseValidateAndRoundTripPlan(t *testing.T) {
 	}
 	if loaded.PlanID != plan.PlanID || string(canonicalAgain) != string(canonical) || digestAgain != digest {
 		t.Fatal("validated plan did not survive serialize/load/hash")
+	}
+}
+
+func TestParsePlanRejectsKindSpecificEffectParameterDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		effect Effect
+	}{
+		{"platform CLI missing checksum", Effect{ID: "cli", Kind: "platform_cli", Subject: `C:\Workflow\bin\workflow.exe`, Action: "install", Parameters: map[string]string{"version": "1.0.0"}}},
+		{"Docker unknown parameter", Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "install", Parameters: map[string]string{"version": "4.45.0", "installer_url": "https://example.test/docker.exe", "windows_amd64_sha256": strings.Repeat("a", 64), "surprise": "true"}}},
+		{"PAT invalid input contract", Effect{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "argument", "owner": "owner"}}},
+		{"platform record lacks contract digest", Effect{ID: "record", Kind: "platform_installation", Subject: `C:\Workflow`, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_json": `{}`, "workflow_cli_sha256": strings.Repeat("b", 64)}}},
+		{"unknown effect kind", Effect{ID: "unknown", Kind: "surprise", Subject: "target", Action: "mutate", Parameters: map[string]string{}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := Plan{SchemaVersion: 1, PlanID: "validate-effects", Kind: PlatformBootstrap, Target: Target{WorkflowHome: `C:\Workflow`}, Preconditions: []Precondition{{ID: "release", Kind: "platform_release", Subject: "platform-v1.0.0", Expected: strings.Repeat("a", 64)}}, Effects: []Effect{test.effect}, ExpectedResults: []ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: `C:\Workflow`, Expected: "ready"}}}
+			raw, _ := json.Marshal(plan)
+			if _, _, _, err := ParsePlan(raw); err == nil {
+				t.Fatalf("accepted effect parameter drift: %#v", test.effect)
+			}
+		})
 	}
 }
 

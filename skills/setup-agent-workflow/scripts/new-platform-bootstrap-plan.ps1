@@ -30,11 +30,24 @@ if (-not $facts.supported_host) { throw "Agent Workflow setup supports Windows o
 
 $actions = [System.Collections.Generic.List[object]]::new()
 $manifestDigest = (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$canonicalizer = Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1"
+$scratchRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-plan-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $scratchRoot | Out-Null
+$contractInput = Join-Path $scratchRoot "contract.input.json"; $contractCanonical = Join-Path $scratchRoot "contract.canonical.json"
+[IO.File]::WriteAllText($contractInput, ($manifest.platform_setup_contract | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
+$platformSetupContractDigest = (& $canonicalizer -InputPath $contractInput -OutputPath $contractCanonical | Select-Object -Last 1).Trim()
+$platformSetupContractJSON = [IO.File]::ReadAllText($contractCanonical, (New-Object Text.UTF8Encoding($false, $true)))
 $workflowExecutable = @($manifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" } | Select-Object -First 1)
 if ($workflowExecutable.Count -ne 1) { throw "Verified Platform Release has no exact Workflow CLI checksum" }
-$workflowCurrent = ($facts.workflow.installed -and $facts.workflow.path_reconciled -and [string]$facts.workflow.version -eq [string]$manifest.release.version -and [string]$facts.workflow.sha256 -eq [string]$workflowExecutable[0].sha256)
+function Add-PlatformPins([Collections.IDictionary]$Parameters) {
+    $Parameters.release_manifest_digest = $manifestDigest
+    $Parameters.platform_setup_contract_digest = $platformSetupContractDigest
+    $Parameters.workflow_cli_sha256 = [string]$workflowExecutable[0].sha256
+    return $Parameters
+}
+$workflowCurrent = ($facts.workflow.installed -and $facts.workflow.owned -and $facts.workflow.path_reconciled -and [string]$facts.workflow.version -eq [string]$manifest.release.version -and [string]$facts.workflow.sha256 -eq [string]$workflowExecutable[0].sha256)
 if (-not $workflowCurrent) {
-    $actions.Add([ordered]@{ id = "install-platform-cli"; kind = "platform_cli"; subject = (Join-Path $facts.workflow_home "bin\workflow.exe"); action = "install"; parameters = [ordered]@{ version = [string]$manifest.release.version; sha256 = [string]$workflowExecutable[0].sha256 } })
+    $actions.Add([ordered]@{ id = "install-platform-cli"; kind = "platform_cli"; subject = (Join-Path $facts.workflow_home "bin\workflow.exe"); action = "install"; parameters = (Add-PlatformPins ([ordered]@{ version = [string]$manifest.release.version; sha256 = [string]$workflowExecutable[0].sha256 })) })
 }
 $managedSkills = @($manifest.platform_setup_contract.workflow_skill_bundle.managed_skills | ForEach-Object { [string]$_ })
 $skillFiles = @($manifest.bundled_files | Where-Object { ([string]$_.path).StartsWith("skills/") } | ForEach-Object {
@@ -77,42 +90,49 @@ if (-not $bundleCurrent) {
         kind = "workflow_skill_bundle"
         subject = [IO.Path]::GetFullPath([string]$facts.codex_skills_root)
         action = "install"
-        parameters = [ordered]@{
+        parameters = (Add-PlatformPins ([ordered]@{
             version = [string]$manifest.platform_setup_contract.workflow_skill_bundle.version
             managed_skills_json = $managedSkillsJSON
             files_json = $skillFilesJSON
-        }
+        }))
     })
 }
 $dockerVersionMatches = ($facts.docker.installed -and [string]$facts.docker.desktop_version -eq [string]$manifest.platform_setup_contract.docker_desktop.version)
 $dockerEngineMatches = ([string]$facts.docker.engine_os -eq "linux" -and @("amd64", "x86_64") -contains [string]$facts.docker.engine_arch)
 if (-not $dockerVersionMatches -or -not $dockerEngineMatches) {
     $dockerAction = $(if (-not $facts.docker.installed) { "install" } elseif (-not $dockerVersionMatches) { "upgrade" } else { "repair" })
-    $actions.Add([ordered]@{ id = "install-docker-desktop"; kind = "docker_desktop"; subject = "current-host"; action = $dockerAction; parameters = [ordered]@{ version = [string]$manifest.platform_setup_contract.docker_desktop.version; installer_url = [string]$manifest.platform_setup_contract.docker_desktop.installer_url; windows_amd64_sha256 = [string]$manifest.platform_setup_contract.docker_desktop.windows_amd64_sha256 } })
+    $actions.Add([ordered]@{ id = "install-docker-desktop"; kind = "docker_desktop"; subject = "current-host"; action = $dockerAction; parameters = (Add-PlatformPins ([ordered]@{ version = [string]$manifest.platform_setup_contract.docker_desktop.version; installer_url = [string]$manifest.platform_setup_contract.docker_desktop.installer_url; windows_amd64_sha256 = [string]$manifest.platform_setup_contract.docker_desktop.windows_amd64_sha256 })) })
 }
-if (-not $facts.github_credential.exists -or -not $facts.github_credential.verified) {
-    if ([string]::IsNullOrWhiteSpace($GitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
+$observedScopes = @($facts.github_credential.scopes | ForEach-Object { [string]$_ })
+$effectiveGitHubOwner = $GitHubOwner
+if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner) -and $facts.github_credential.verified) { $effectiveGitHubOwner = [string]$facts.github_credential.owner }
+$credentialOwnerMatches = (-not [string]::IsNullOrWhiteSpace($effectiveGitHubOwner) -and [string]::Equals([string]$facts.github_credential.owner, $effectiveGitHubOwner, [StringComparison]::OrdinalIgnoreCase))
+$credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $observedScopes -contains "repo" -and $observedScopes -contains "workflow")
+if (-not $credentialCurrent) {
+    if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
-    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = [ordered]@{ input = "stdin"; owner = $GitHubOwner } })
+    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner })) })
 }
-$platformSetupContractJSON = ConvertTo-Json -InputObject $manifest.platform_setup_contract -Depth 10 -Compress
-$actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = $manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON } })
+$platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest)
 $controlPlaneReady = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version)
+if (-not $platformRecordCurrent) {
+    $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
+}
 if (-not $controlPlaneReady) {
-    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = "start"; parameters = [ordered]@{ version = $manifest.release.version } })
+    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = "start"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
 }
 
 $identitySeed = [ordered]@{
     kind = "platform_bootstrap"
     schema_version = 1
     target = [ordered]@{ workflow_home = $facts.workflow_home; repository_path = ""; github_repository = "" }
-    preconditions = @([ordered]@{ id = "platform-release"; kind = "platform_release"; subject = [string]$manifest.release.tag; expected = $manifestDigest })
+    preconditions = @(
+        [ordered]@{ id = "platform-release"; kind = "platform_release"; subject = [string]$manifest.release.tag; expected = $manifestDigest }
+        [ordered]@{ id = "platform-setup-contract"; kind = "platform_setup_contract"; subject = [string]$manifest.release.tag; expected = $platformSetupContractDigest }
+    )
     effects = @($actions)
     expected_results = @([ordered]@{ id = "platform-ready"; kind = "platform_readiness"; subject = $facts.workflow_home; expected = "ready" })
 }
-$canonicalizer = Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1"
-$scratchRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-plan-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $scratchRoot | Out-Null
 $identityInput = Join-Path $scratchRoot "identity.input.json"; $identityCanonical = Join-Path $scratchRoot "identity.canonical.json"
 [IO.File]::WriteAllText($identityInput, ($identitySeed | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
 $identityDigest = (& $canonicalizer -InputPath $identityInput -OutputPath $identityCanonical | Select-Object -Last 1).Trim()
@@ -129,7 +149,32 @@ $planInput = Join-Path $scratchRoot "plan.input.json"; $planCanonical = Join-Pat
 [IO.File]::WriteAllText($planInput, ($seed | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
 $digest = (& $canonicalizer -InputPath $planInput -OutputPath $planCanonical | Select-Object -Last 1).Trim()
 $canonical = [IO.File]::ReadAllText($planCanonical, (New-Object Text.UTF8Encoding($false, $true)))
-$envelope = [ordered]@{ status = $(if ($actions.Count -eq 0) { "ready" } else { "plan_required" }); digest_sha256 = $digest; canonical_json = $canonical; plan = $seed; projection = ($seed | ConvertTo-Json -Depth 10) }
+function Format-PlatformProjection($Plan, [string]$Digest) {
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add("Platform Bootstrap Plan $($Plan.plan_id)")
+    $lines.Add("Target: $($Plan.target.workflow_home)")
+    $lines.Add("Digest (SHA-256): $Digest")
+    $lines.Add("")
+    $lines.Add("Preconditions:")
+    foreach ($precondition in $Plan.preconditions) { $lines.Add("- $($precondition.id): $($precondition.subject) ($($precondition.kind)) = $($precondition.expected)") }
+    $lines.Add("")
+    $lines.Add("Authorized effects:")
+    if (@($Plan.effects).Count -eq 0) { $lines.Add("- none; the installed platform already matches the verified release") }
+    foreach ($effect in $Plan.effects) {
+        $lines.Add("- $($effect.id): $($effect.action) $($effect.subject) ($($effect.kind))")
+        foreach ($parameter in $effect.parameters.PSObject.Properties | Sort-Object Name) {
+            $value = [string]$parameter.Value
+            if ($parameter.Name -eq "input") { $value = "<standard input; not stored in plan>" }
+            $lines.Add("  $($parameter.Name): $value")
+        }
+    }
+    $lines.Add("")
+    $lines.Add("Expected results:")
+    foreach ($result in $Plan.expected_results) { $lines.Add("- $($result.id): $($result.subject) ($($result.kind)) = $($result.expected)") }
+    return ($lines -join [Environment]::NewLine)
+}
+$projection = Format-PlatformProjection $seed $digest
+$envelope = [ordered]@{ status = $(if ($actions.Count -eq 0) { "ready" } else { "plan_required" }); digest_sha256 = $digest; canonical_json = $canonical; plan = $seed; projection = $projection }
 $directory = Split-Path -Parent ([System.IO.Path]::GetFullPath($OutputPath))
 if ($directory) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
 $temporary = Join-Path $directory ("." + [System.IO.Path]::GetFileName($OutputPath) + "." + [Guid]::NewGuid().ToString("N") + ".tmp")

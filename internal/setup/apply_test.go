@@ -15,10 +15,12 @@ import (
 )
 
 type fakeAdapter struct {
-	states  map[string]setupcontract.EffectStatus
-	applied []string
-	read    []string
-	fail    string
+	states   map[string]setupcontract.EffectStatus
+	evidence map[string]string
+	applied  []string
+	read     []string
+	restored []setupcontract.EffectResult
+	fail     string
 }
 
 func (f *fakeAdapter) Readback(_ context.Context, e setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -27,7 +29,16 @@ func (f *fakeAdapter) Readback(_ context.Context, e setupcontract.Effect) (setup
 	if state == "" {
 		state = setupcontract.EffectRequired
 	}
-	return state, string(state), nil
+	evidence := string(state)
+	if f.evidence[e.ID] != "" {
+		evidence = f.evidence[e.ID]
+	}
+	return state, evidence, nil
+}
+
+func (f *fakeAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
+	f.restored = append(f.restored, results...)
+	return nil
 }
 
 func (f *fakeAdapter) CheckPrecondition(_ context.Context, p setupcontract.Precondition) error {
@@ -66,6 +77,35 @@ func TestEngineAppliesRequiredEffectsAndRetriesSatisfiedOnes(t *testing.T) {
 	}
 	if len(adapter.applied) != 2 || adapter.applied[0] != "first" || adapter.applied[1] != "second" {
 		t.Fatalf("applied=%v", adapter.applied)
+	}
+}
+
+func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	plan := testPlan(home)
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergeHead := repeat("a", 40)
+	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}, evidence: map[string]string{"first": onboardingMergeHeadEvidence + mergeHead}}
+	engine := Engine{Adapter: adapter}
+	if result, err := engine.Apply(context.Background(), raw, digest); err != nil || result.Status != setupcontract.ExecutionSucceeded {
+		t.Fatalf("first result=%#v err=%v", result, err)
+	}
+	adapter.restored = nil
+	if result, err := engine.Apply(context.Background(), raw, digest); err != nil || result.Status != setupcontract.ExecutionSucceeded {
+		t.Fatalf("retry result=%#v err=%v", result, err)
+	}
+	found := false
+	for _, result := range adapter.restored {
+		if result.EffectID == "first" && result.Evidence == onboardingMergeHeadEvidence+mergeHead {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("retry did not restore merge evidence: %#v", adapter.restored)
 	}
 }
 
@@ -160,7 +200,7 @@ func TestEngineChecksPlatformReleasePreconditionBeforeMutation(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
 	plan.Preconditions = []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "platform-v1.0.0", Expected: repeat("a", 64)}}
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record", Kind: "platform_installation", Subject: home, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("b", 64), "platform_setup_contract_json": `{}`}})
+	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record", Kind: "platform_installation", Subject: home, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("b", 64), "platform_setup_contract_json": `{}`, "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}})
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
@@ -181,7 +221,7 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 	}
 	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "incomplete-onboarding", Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"}, Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: "ok"}}, Effects: []setupcontract.Effect{
 		{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
-		{ID: "later", Kind: "test", Subject: "later", Action: "apply", Parameters: map[string]string{}},
+		{ID: "later", Kind: "install_file", Subject: "later", Action: "install", Parameters: map[string]string{"sha256": repeat("c", 64)}},
 	}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("b", 64)}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
@@ -205,7 +245,7 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 }
 
 func testPlan(home string) setupcontract.Plan {
-	return setupcontract.Plan{SchemaVersion: 1, PlanID: "plan-test", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: home}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "first", Kind: "test", Subject: "one", Action: "create", Parameters: map[string]string{}}, {ID: "second", Kind: "test", Subject: "two", Action: "create", Parameters: map[string]string{}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: home, Expected: "ready"}}}
+	return setupcontract.Plan{SchemaVersion: 1, PlanID: "plan-test", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: home}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "first", Kind: "install_file", Subject: "one", Action: "install", Parameters: map[string]string{"sha256": repeat("a", 64)}}, {ID: "second", Kind: "install_file", Subject: "two", Action: "install", Parameters: map[string]string{"sha256": repeat("b", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: home, Expected: "ready"}}}
 }
 func repeat(value string, count int) string {
 	var b bytes.Buffer

@@ -69,13 +69,58 @@ func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *tes
 	effect := setupcontract.Effect{Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{
 		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `["workflow-contract"]`,
 	}}
-	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: strings.Repeat("a", 64), TemporaryRoot: t.TempDir()}
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: strings.Repeat("a", 64), TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{}}
 	err := adapter.applyRepositoryContract(context.Background(), effect)
 	if err == nil || !strings.Contains(err.Error(), "base drifted") {
 		t.Fatalf("default-head drift accepted: %v", err)
 	}
 	if created {
 		t.Fatal("pull request was created after the approved base drifted")
+	}
+}
+
+func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t *testing.T) {
+	digest := strings.Repeat("d", 64)
+	mergedHead := strings.Repeat("a", 40)
+	defaultHead := mergedHead
+	manifest := []byte(`{"schema_version":1}`)
+	manifestSum := sha256.Sum256(manifest)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/.workflow/repository.json":
+			_, _ = w.Write([]byte(`{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString(manifest) + `"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			if r.URL.Query().Get("state") != "all" {
+				t.Fatalf("pull request readback state = %q", r.URL.Query().Get("state"))
+			}
+			_, _ = w.Write([]byte(`[{"number":7,"body":"Approved Setup Plan SHA-256: ` + digest + `","merged_at":"2026-08-15T00:00:00Z","merge_commit_sha":"` + mergedHead + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"workflow/onboarding-` + digest[:12] + `"},"base":{"sha":"` + strings.Repeat("c", 40) + `","ref":"main"}}]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + defaultHead + `"}}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
+	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "manifest_digest": hex.EncodeToString(manifestSum[:])}}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("merged readback = %s, %v", status, err)
+	}
+	if adapter.OnboardingMergeHeads[effect.ID] != mergedHead {
+		t.Fatalf("durable merge binding = %#v", adapter.OnboardingMergeHeads)
+	}
+	restored := HostAdapter{OnboardingMergeHeads: map[string]string{}}
+	if err := restored.RestoreEffectResults([]setupcontract.EffectResult{{EffectID: effect.ID, Evidence: onboardingMergeHeadEvidence + mergedHead}}); err != nil || restored.OnboardingMergeHeads[effect.ID] != mergedHead {
+		t.Fatalf("restored merge binding = %#v, %v", restored.OnboardingMergeHeads, err)
+	}
+	defaultHead = strings.Repeat("e", 40)
+	status, evidence, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectConflicting || !strings.Contains(evidence, "advanced") {
+		t.Fatalf("post-merge extra commit readback = %s, %q, %v", status, evidence, err)
 	}
 }
 
@@ -295,7 +340,7 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "ok"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {
@@ -341,7 +386,7 @@ func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
 	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "verified"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "verified"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
 	if err != nil {

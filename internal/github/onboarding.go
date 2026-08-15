@@ -42,7 +42,10 @@ type PullRequestCreate struct {
 }
 type OnboardingPullRequest struct {
 	Number         int64  `json:"number"`
+	State          string `json:"state"`
 	Body           string `json:"body"`
+	MergedAt       string `json:"merged_at"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
 	Mergeable      *bool  `json:"mergeable"`
 	MergeableState string `json:"mergeable_state"`
 	Head           struct {
@@ -221,6 +224,85 @@ func (c *Client) CreateRepository(ctx context.Context, owner, authenticatedLogin
 	}
 	return result, nil
 }
+
+// PreflightCreateRepository proves the approved owner/name is absent and, for
+// an organization, that the authenticated member may create the requested
+// visibility. It is deliberately read-only and fails closed on omitted policy.
+func (c *Client) PreflightCreateRepository(ctx context.Context, owner, authenticatedLogin, name string, private bool) error {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(authenticatedLogin) == "" || strings.TrimSpace(name) == "" || strings.Contains(name, "/") {
+		return errors.New("repository publication preflight identity is incomplete")
+	}
+	if _, err := c.RepositoryForOnboarding(ctx, owner+"/"+name); err == nil {
+		return errors.New("approved GitHub repository name already exists")
+	} else if !IsNotFound(err) {
+		return fmt.Errorf("preflight approved GitHub repository absence: %w", err)
+	}
+	if strings.EqualFold(owner, authenticatedLogin) {
+		return nil
+	}
+	var organization struct {
+		Login                               string `json:"login"`
+		MembersCanCreateRepositories        bool   `json:"members_can_create_repositories"`
+		MembersCanCreatePrivateRepositories bool   `json:"members_can_create_private_repositories"`
+		MembersCanCreatePublicRepositories  bool   `json:"members_can_create_public_repositories"`
+	}
+	if err := c.RequestJSON(ctx, http.MethodGet, "/orgs/"+url.PathEscape(owner), nil, &organization); err != nil {
+		return fmt.Errorf("discover organization repository-creation policy: %w", err)
+	}
+	if !strings.EqualFold(organization.Login, owner) {
+		return errors.New("organization preflight returned a different owner")
+	}
+	var membership struct {
+		State string `json:"state"`
+		Role  string `json:"role"`
+	}
+	if err := c.RequestJSON(ctx, http.MethodGet, "/user/memberships/orgs/"+url.PathEscape(owner), nil, &membership); err != nil {
+		return fmt.Errorf("discover authenticated organization membership: %w", err)
+	}
+	if membership.State != "active" {
+		return errors.New("authenticated organization membership is not active")
+	}
+	if membership.Role != "admin" && (membership.Role != "member" || !organization.MembersCanCreateRepositories) {
+		return errors.New("organization policy forbids member repository creation")
+	}
+	if membership.Role != "admin" && private && !organization.MembersCanCreatePrivateRepositories {
+		return errors.New("organization policy forbids member private repository creation")
+	}
+	if membership.Role != "admin" && !private && !organization.MembersCanCreatePublicRepositories {
+		return errors.New("organization policy forbids member public repository creation")
+	}
+	var actions struct {
+		EnabledRepositories string `json:"enabled_repositories"`
+		AllowedActions      string `json:"allowed_actions"`
+	}
+	if err := c.RequestJSON(ctx, http.MethodGet, "/orgs/"+url.PathEscape(owner)+"/actions/permissions", nil, &actions); err != nil {
+		return fmt.Errorf("discover organization Actions policy: %w", err)
+	}
+	if actions.EnabledRepositories != "all" {
+		return errors.New("organization Actions policy does not prove a new repository will be enabled")
+	}
+	if actions.AllowedActions != "all" {
+		return errors.New("organization Actions policy does not prove required onboarding actions are allowed")
+	}
+	var rulesets []RepositoryRuleset
+	if err := c.RequestJSON(ctx, http.MethodGet, "/orgs/"+url.PathEscape(owner)+"/rulesets?includes_parents=true", nil, &rulesets); err != nil {
+		return fmt.Errorf("discover organization review and merge-queue policy: %w", err)
+	}
+	for _, ruleset := range rulesets {
+		if ruleset.Enforcement != "active" {
+			continue
+		}
+		for _, rule := range ruleset.Rules {
+			if rule.Type == "merge_queue" {
+				return errors.New("organization ruleset may require an unsupported merge queue")
+			}
+			if rule.Type == "pull_request" && rule.Parameters.RequiredApprovingReviewCount > 0 {
+				return errors.New("organization ruleset may require human review of the Onboarding Pull Request")
+			}
+		}
+	}
+	return nil
+}
 func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string, issues, actions bool, allowedActions string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return err
@@ -269,7 +351,7 @@ func (c *Client) FindOnboardingPullRequest(ctx context.Context, repository, owne
 	if err := ValidateRepository(repository); err != nil {
 		return OnboardingPullRequest{}, false, err
 	}
-	endpoint := "/repos/" + repository + "/pulls?state=open&head=" + url.QueryEscape(owner+":"+branch) + "&base=" + url.QueryEscape(base) + "&per_page=100"
+	endpoint := "/repos/" + repository + "/pulls?state=all&head=" + url.QueryEscape(owner+":"+branch) + "&base=" + url.QueryEscape(base) + "&per_page=100"
 	if err := c.RequestJSON(ctx, http.MethodGet, endpoint, nil, &result); err != nil {
 		return OnboardingPullRequest{}, false, err
 	}

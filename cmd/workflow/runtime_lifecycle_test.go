@@ -84,16 +84,19 @@ func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := filepath.Join(t.TempDir(), "repo")
-	authFile := filepath.Join(t.TempDir(), "auth.json")
-	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: source, CodexAuthFile: authFile, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}); err != nil {
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: source, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
+	authFile := filepath.Join(t.TempDir(), "supported-auth-source.json")
+	if err := os.WriteFile(authFile, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","account_id":"account","id_token":"id","refresh_token":"refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var output bytes.Buffer
-	if err := runtimeConfigureCommand([]string{"--workflow-home", layout.Root, "--source", source, "--root", "42", "--max-parallel-runs", "2"}, &output); err != nil {
+	if err := runtimeConfigureCommand([]string{"--workflow-home", layout.Root, "--source", source, "--root", "42", "--max-parallel-runs", "2", "--codex-auth-file", authFile}, &output); err != nil {
 		t.Fatal(err)
 	}
 	database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))

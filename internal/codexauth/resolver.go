@@ -12,12 +12,11 @@ import (
 
 const SourceOverrideEnvironment = "WORKFLOW_CODEX_AUTH_FILE"
 
-// Resolver locates the invoking Codex ChatGPT login through Codex's supported
-// login status command and configuration home. The source override is owned by
-// Agent Workflow for hosts that expose the supported login cache elsewhere.
+// Resolver validates the invoking Codex ChatGPT login through Codex's supported
+// status command and an explicit source supplied by the Codex integration.
+// Codex does not expose a supported command for discovering its private source.
 type Resolver struct {
 	LookupEnvironment func(string) string
-	UserHomeDirectory func() (string, error)
 	LoginStatus       func(context.Context) ([]byte, error)
 }
 
@@ -50,19 +49,10 @@ func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 
 	source := strings.TrimSpace(lookup(SourceOverrideEnvironment))
 	if source == "" {
-		codexHome := strings.TrimSpace(lookup("CODEX_HOME"))
-		if codexHome == "" {
-			userHome := r.UserHomeDirectory
-			if userHome == nil {
-				userHome = os.UserHomeDir
-			}
-			resolved, err := userHome()
-			if err != nil {
-				return "", fmt.Errorf("resolve Codex configuration home: %w", err)
-			}
-			codexHome = filepath.Join(resolved, ".codex")
-		}
-		source = filepath.Join(codexHome, FileName)
+		return "", fmt.Errorf("Codex does not expose its credential source through a supported CLI interface; set %s to the absolute ChatGPT authentication source supplied by the invoking Codex integration", SourceOverrideEnvironment)
+	}
+	if !filepath.IsAbs(source) {
+		return "", fmt.Errorf("%s must be an absolute path supplied by the invoking Codex integration", SourceOverrideEnvironment)
 	}
 	source, err = filepath.Abs(source)
 	if err != nil {

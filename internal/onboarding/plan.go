@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,8 @@ type PlanOptions struct {
 	PlatformReleaseDigest string
 	Labels                []Label
 	Policy                PolicyDiscovery
+	Publication           PublicationPreflight
+	State                 StateDiscovery
 	DomainLayout          string
 }
 type Label struct{ Name, Color, Description string }
@@ -37,6 +40,20 @@ type RepositoryPolicy struct {
 }
 type PolicyDiscovery interface {
 	DiscoverPolicy(context.Context, string, string) (RepositoryPolicy, error)
+}
+
+type PublicationPreflight interface {
+	PreflightCreateRepository(context.Context, string, string, string, bool) error
+}
+
+type OnboardingState struct {
+	SatisfiedLabels    map[string]bool
+	ContractSatisfied  bool
+	AdmissionSatisfied bool
+}
+
+type StateDiscovery interface {
+	DiscoverOnboardingState(context.Context, string, string, string, []Label) (OnboardingState, error)
 }
 
 func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) {
@@ -85,6 +102,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	encodedBeforeFiles, _ := json.Marshal(beforePayload)
 	plan := setupcontract.Plan{SchemaVersion: 1, Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: options.WorkflowHome, RepositoryPath: discovery.Root, GitHubRepository: repositoryID}, Preconditions: []setupcontract.Precondition{{ID: "platform-release", Kind: "platform_release", Subject: options.WorkflowHome, Expected: options.PlatformReleaseDigest}, {ID: "local-head", Kind: "git_head", Subject: discovery.Root, Expected: discovery.Head}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "repository-admitted", Kind: "repository_admission", Subject: repositoryID, Expected: manifestDigest}}}
 	policy := RepositoryPolicy{}
+	state := OnboardingState{}
 	if discovery.Published && options.Policy != nil {
 		policy, err = options.Policy.DiscoverPolicy(ctx, repositoryID, discovery.DefaultBranch)
 		if err != nil {
@@ -116,8 +134,23 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	if discovery.Published {
 		remoteJSON, _ := json.Marshal(map[string]string{"branch": discovery.DefaultBranch, "head": discovery.RemoteHead, "manifest_digest": manifestDigest})
 		plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "github-default-head", Kind: "github_default_head", Subject: repositoryID, Expected: string(remoteJSON)})
+		if options.State != nil {
+			state, err = options.State.DiscoverOnboardingState(ctx, repositoryID, discovery.DefaultBranch, manifestDigest, options.Labels)
+			if err != nil {
+				return setupcontract.Plan{}, fmt.Errorf("discover current onboarding state: %w", err)
+			}
+		}
 	}
 	if !discovery.Published {
+		isOrganization := !strings.EqualFold(options.Owner, options.AuthenticatedLogin)
+		if options.Publication == nil && isOrganization {
+			return setupcontract.Plan{}, errors.New("unpublished organization repository requires a read-only creation preflight")
+		}
+		if options.Publication != nil {
+			if err := options.Publication.PreflightCreateRepository(ctx, options.Owner, options.AuthenticatedLogin, repositoryName, defaultPrivate(options)); err != nil {
+				return setupcontract.Plan{}, fmt.Errorf("preflight GitHub repository publication: %w", err)
+			}
+		}
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: repositoryID, Action: "create", Parameters: map[string]string{"owner": options.Owner, "authenticated_login": options.AuthenticatedLogin, "name": repositoryName, "private": boolString(defaultPrivate(options))}})
 		if !discovery.HasCommits {
 			baselineFiles, filesErr := BaselineFiles(ctx, discovery.Root)
@@ -138,6 +171,9 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		}
 	}
 	for index, label := range options.Labels {
+		if state.SatisfiedLabels[label.Name] {
+			continue
+		}
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "label-" + integer(index), Kind: "github_label", Subject: repositoryID + "#" + label.Name, Action: "reconcile", Parameters: map[string]string{"name": label.Name, "color": label.Color, "description": label.Description}})
 	}
 	labelsJSON, _ := json.Marshal(options.Labels)
@@ -147,9 +183,15 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	}
 	requiredChecks := uniqueStrings(append([]string{"workflow-contract"}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head}})
+	if !state.ContractSatisfied {
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
+	}
+	if !state.AdmissionSatisfied {
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
+	}
+	if !state.ContractSatisfied {
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head}})
+	}
 	identityJSON, _ := json.Marshal(plan)
 	identity := sha256.Sum256(identityJSON)
 	plan.PlanID = "onboard-" + hex.EncodeToString(identity[:12])

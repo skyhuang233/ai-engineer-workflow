@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,18 @@ type policyDiscoveryFunc func(context.Context, string, string) (RepositoryPolicy
 
 func (f policyDiscoveryFunc) DiscoverPolicy(ctx context.Context, repository, branch string) (RepositoryPolicy, error) {
 	return f(ctx, repository, branch)
+}
+
+type publicationPreflightFunc func(context.Context, string, string, string, bool) error
+
+func (f publicationPreflightFunc) PreflightCreateRepository(ctx context.Context, owner, login, name string, private bool) error {
+	return f(ctx, owner, login, name, private)
+}
+
+type onboardingStateFunc func(context.Context, string, string, string, []Label) (OnboardingState, error)
+
+func (f onboardingStateFunc) DiscoverOnboardingState(ctx context.Context, repository, branch, manifestDigest string, labels []Label) (OnboardingState, error) {
+	return f(ctx, repository, branch, manifestDigest, labels)
 }
 
 func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
@@ -61,6 +74,10 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	}
 	if !kinds["create_repository"] || !kinds["initial_baseline"] || !kinds["repository_contract_pr"] {
 		t.Fatalf("effects=%#v", plan.Effects)
+	}
+	raw, _ := json.Marshal(plan)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
+		t.Fatalf("zero-commit Onboarding Plan is not executable: %v", err)
 	}
 }
 
@@ -200,5 +217,41 @@ func TestPlanRejectsPublishedRepositoryUnderDifferentOwner(t *testing.T) {
 	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "different-owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("f", 64)})
 	if err == nil || !strings.Contains(err.Error(), "owner differs") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPlanPreflightsUnpublishedOrganizationBeforeAuthorizingFirstMutation(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "org-repo")
+	git(t, "", "init", "-b", "main", repo)
+	called := false
+	preflight := publicationPreflightFunc(func(_ context.Context, owner, login, name string, private bool) error {
+		called = owner == "acme" && login == "alice" && name == "org-repo" && private
+		return errors.New("organization repository creation is forbidden")
+	})
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "acme", AuthenticatedLogin: "alice", PlatformReleaseDigest: repeatString("a", 64), Publication: preflight})
+	if err == nil || !called || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("organization preflight result: called=%v err=%v", called, err)
+	}
+}
+
+func TestPlanContainsOnlyUnsatisfiedOnboardingDeltas(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	labels := []Label{{Name: "workflow:plan", Color: "123456", Description: "plan"}, {Name: "workflow:ticket", Color: "abcdef", Description: "ticket"}}
+	state := onboardingStateFunc(func(_ context.Context, repository, branch, manifest string, desired []Label) (OnboardingState, error) {
+		if repository != "owner/repo" || branch != "main" || manifest == "" || len(desired) != 2 {
+			t.Fatalf("state discovery inputs repository=%q branch=%q manifest=%q labels=%#v", repository, branch, manifest, desired)
+		}
+		return OnboardingState{SatisfiedLabels: map[string]bool{"workflow:plan": true}, ContractSatisfied: true, AdmissionSatisfied: true}, nil
+	})
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "selected", AllowSquashMerge: true}, nil
+	})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("b", 64), Labels: labels, Policy: policy, State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Effects) != 1 || plan.Effects[0].Kind != "github_label" || plan.Effects[0].Parameters["name"] != "workflow:ticket" {
+		t.Fatalf("non-delta effects = %#v", plan.Effects)
 	}
 }

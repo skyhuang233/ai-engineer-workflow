@@ -14,6 +14,8 @@ if ($env:WORKFLOW_SETUP_E2E -ne "1") { throw "Set WORKFLOW_SETUP_E2E=1 to author
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") { throw "Workflow Setup qualification requires Windows" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN)) { throw "WORKFLOW_SETUP_E2E_CLEANUP_TOKEN with repository listing and deletion capability is required" }
+if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_CODEX_AUTH_FILE)) { throw "Explicit WORKFLOW_CODEX_AUTH_FILE from the invoking Codex integration is required" }
+if (-not ([IO.Path]::IsPathFullyQualified($env:WORKFLOW_CODEX_AUTH_FILE)) -or -not (Test-Path -LiteralPath $env:WORKFLOW_CODEX_AUTH_FILE -PathType Leaf)) { throw "WORKFLOW_CODEX_AUTH_FILE must name an existing absolute file" }
 if (-not (Test-Path -LiteralPath $DriverScript -PathType Leaf)) { throw "DriverScript does not exist" }
 if ($EntrySkillSpec -notmatch '@(platform-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "EntrySkillSpec must pin an exact published release tag or commit" }
 if ($QualificationMode -eq "standard" -and [string]::IsNullOrWhiteSpace($DifferentOwnerRepository)) { throw "DifferentOwnerRepository is required for the standard qualification" }
@@ -44,11 +46,9 @@ $prior = @{
 	WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC = $env:WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC
 	WORKFLOW_SETUP_E2E_PLATFORM_VERSION = $env:WORKFLOW_SETUP_E2E_PLATFORM_VERSION
 	WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = $cleanupToken
+	WORKFLOW_CODEX_AUTH_FILE = $env:WORKFLOW_CODEX_AUTH_FILE
 }
-$sourceCodexHome = $prior.CODEX_HOME
-if ([string]::IsNullOrWhiteSpace($sourceCodexHome)) { $sourceCodexHome = Join-Path $prior.USERPROFILE ".codex" }
-$sourceCodexAuth = Join-Path $sourceCodexHome "auth.json"
-if (-not (Test-Path -LiteralPath $sourceCodexAuth -PathType Leaf)) { throw "Existing Codex ChatGPT auth.json is required" }
+$sourceCodexAuth = [IO.Path]::GetFullPath($env:WORKFLOW_CODEX_AUTH_FILE)
 
 function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     $target = Join-Path $qualificationRoot ("workflow-setup-e2e-" + $runID + "-" + $Name)
@@ -88,6 +88,7 @@ try {
     $env:CODEX_HOME = Join-Path $profileRoot ".codex"
 	New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
 	Copy-Item -LiteralPath $sourceCodexAuth -Destination (Join-Path $env:CODEX_HOME "auth.json")
+	$env:WORKFLOW_CODEX_AUTH_FILE = Join-Path $env:CODEX_HOME "auth.json"
     $env:WORKFLOW_HOME = $workflowHome; $env:GH_CONFIG_DIR = $githubConfig
     $env:GH_TOKEN = $env:WORKFLOW_SETUP_E2E_PAT
     $env:WORKFLOW_SETUP_E2E_RUN_ID = $runID

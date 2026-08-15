@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
@@ -374,13 +375,18 @@ func TestRestoreFencedGatewayDrainsAndReopensPublishedDatabase(t *testing.T) {
 	}
 }
 
-func TestDefaultCodexAuthFileFollowsCodexHome(t *testing.T) {
+func TestDefaultCodexAuthFileRequiresExplicitWorkflowIntegrationSource(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codex-home")
 	t.Setenv("CODEX_HOME", home)
-	if got, want := defaultCodexAuthFile(), filepath.Join(home, "auth.json"); got != want {
+	t.Setenv(codexauth.SourceOverrideEnvironment, "")
+	if got := defaultCodexAuthFile(); got != "" {
+		t.Fatalf("defaultCodexAuthFile() guessed private source %q", got)
+	}
+	want := filepath.Join(t.TempDir(), "supported-source.json")
+	t.Setenv(codexauth.SourceOverrideEnvironment, want)
+	if got := defaultCodexAuthFile(); got != want {
 		t.Fatalf("defaultCodexAuthFile() = %q, want %q", got, want)
 	}
-	t.Logf("workflow commands defaulted --codex-auth-file to %s", filepath.Join(home, "auth.json"))
 }
 
 func TestDoctorVerificationBudgetAllowsColdWorkerPullAndCodexResume(t *testing.T) {

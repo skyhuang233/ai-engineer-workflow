@@ -38,6 +38,34 @@ type HostAdapter struct {
 	InspectControlPlane       func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation
 	DockerDesktopHost         hostsetup.DockerDesktopHost
 	CurrentUserPATHReconciled func(string) (bool, error)
+	OnboardingMergeHeads      map[string]string
+}
+
+const onboardingMergeHeadEvidence = "onboarding_merge_head="
+
+func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
+	if a.OnboardingMergeHeads == nil {
+		return nil
+	}
+	for _, result := range results {
+		index := strings.Index(result.Evidence, onboardingMergeHeadEvidence)
+		if index < 0 {
+			continue
+		}
+		value := result.Evidence[index+len(onboardingMergeHeadEvidence):]
+		if len(value) < 40 {
+			return errors.New("persisted Onboarding Pull Request merge HEAD is invalid")
+		}
+		head := value[:40]
+		if !fullSetupCommitID(head) {
+			return errors.New("persisted Onboarding Pull Request merge HEAD is invalid")
+		}
+		if existing := a.OnboardingMergeHeads[result.EffectID]; existing != "" && existing != head {
+			return errors.New("persisted Onboarding Pull Request merge HEAD conflicts across retries")
+		}
+		a.OnboardingMergeHeads[result.EffectID] = head
+	}
+	return nil
 }
 
 func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -221,6 +249,9 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 		if a.GitHub == nil {
 			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
 		}
+		if a.OnboardingMergeHeads == nil {
+			return setupcontract.EffectFailed, "", errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
+		}
 		content, err := a.GitHub.RepositoryFile(ctx, effect.Subject, repositorycontract.ManifestPath, effect.Parameters["base_branch"])
 		if github.IsNotFound(err) {
 			return setupcontract.EffectRequired, "Repository Contract Manifest is absent", nil
@@ -232,7 +263,31 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 		if hex.EncodeToString(sum[:]) != effect.Parameters["manifest_digest"] {
 			return setupcontract.EffectRequired, "Repository Contract Manifest differs", nil
 		}
-		return setupcontract.EffectSatisfied, "Repository Contract Manifest is merged", nil
+		if len(a.PlanDigest) < 12 {
+			return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
+		}
+		owner := strings.SplitN(effect.Subject, "/", 2)[0]
+		branch := "workflow/onboarding-" + a.PlanDigest[:12]
+		pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
+		if err != nil {
+			return setupcontract.EffectFailed, "", err
+		}
+		body := "Approved Setup Plan SHA-256: " + a.PlanDigest
+		if !found || pull.Body != body || pull.MergedAt == "" || !fullSetupCommitID(pull.MergeCommitSHA) {
+			return setupcontract.EffectConflicting, "merged Onboarding Pull Request is not bound to the approved plan", nil
+		}
+		if persisted := a.OnboardingMergeHeads[effect.ID]; persisted != "" && persisted != pull.MergeCommitSHA {
+			return setupcontract.EffectConflicting, "merged Onboarding Pull Request HEAD differs from persisted Setup evidence", nil
+		}
+		a.OnboardingMergeHeads[effect.ID] = pull.MergeCommitSHA
+		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
+		if err != nil {
+			return setupcontract.EffectFailed, "", err
+		}
+		if remote.Name != effect.Parameters["base_branch"] || remote.Head != pull.MergeCommitSHA {
+			return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + pull.MergeCommitSHA + "; default branch advanced after the approved Onboarding Pull Request merge", nil
+		}
+		return setupcontract.EffectSatisfied, onboardingMergeHeadEvidence + pull.MergeCommitSHA, nil
 	case "repository_admission":
 		if a.GitHub == nil {
 			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
@@ -522,6 +577,9 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	if a.GitHub == nil || a.PlanDigest == "" {
 		return errors.New("GitHub client and approved plan digest are required")
 	}
+	if a.OnboardingMergeHeads == nil {
+		return errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
+	}
 	var encoded map[string]string
 	if err := json.Unmarshal([]byte(effect.Parameters["files_json"]), &encoded); err != nil {
 		return err
@@ -624,10 +682,34 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
 		return err
 	}
-	if _, err := a.GitHub.MergeOnboardingPullRequest(ctx, effect.Subject, pull.Number, workspace.Head, method); err != nil {
+	merge, err := a.GitHub.MergeOnboardingPullRequest(ctx, effect.Subject, pull.Number, workspace.Head, method)
+	if err != nil {
 		return err
 	}
+	if !fullSetupCommitID(merge.SHA) {
+		return errors.New("GitHub merge response lacks the actual default-branch HEAD")
+	}
+	a.OnboardingMergeHeads[effect.ID] = merge.SHA
+	mergedDefault, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
+	if err != nil {
+		return err
+	}
+	if mergedDefault.Name != effect.Parameters["base_branch"] || mergedDefault.Head != merge.SHA {
+		return fmt.Errorf("%s%s; GitHub default branch advanced before the approved merge HEAD could be bound", onboardingMergeHeadEvidence, merge.SHA)
+	}
 	return nil
+}
+
+func fullSetupCommitID(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (a HostAdapter) requireOnboardingBase(ctx context.Context, repository, branch, head string) error {

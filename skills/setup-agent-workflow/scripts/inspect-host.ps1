@@ -72,13 +72,29 @@ $currentUserPath = ""
 try { $currentUserPath = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name Path -ErrorAction Stop).Path } catch { }
 $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI is unavailable" }
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
-$workflow = [ordered]@{ installed = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
+$workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
+$platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
+$githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; owner = ""; scopes = @() }
 if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     $installedVersion = Invoke-ObservedCommand $installedWorkflow @("--version")
     $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
     $workflow.installed = $true
     $workflow.version = $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { [string]$installedVersion.output })
     $workflow.sha256 = (Get-FileHash -LiteralPath $installedWorkflow -Algorithm SHA256).Hash.ToLowerInvariant()
+    $inspection = Invoke-ObservedCommand $installedWorkflow @("setup", "inspect-platform", "--workflow-home", $WorkflowHome)
+    if ($inspection.exit_code -eq 0) {
+        try {
+            $inspectionJSON = $inspection.output | ConvertFrom-Json
+            if ($null -ne $inspectionJSON.result) {
+                $platform = $inspectionJSON.result.platform
+                $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
+                $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
+                $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified
+                $githubCredential.owner = [string]$inspectionJSON.result.github_credential.owner
+                $githubCredential.scopes = @($inspectionJSON.result.github_credential.scopes | ForEach-Object { [string]$_ })
+            }
+        } catch { }
+    }
     $status = Invoke-ObservedCommand $installedWorkflow @("status", "--workflow-home", $WorkflowHome)
     if ($status.exit_code -eq 0) {
         try {
@@ -103,6 +119,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     codex = $codex
     codex_skills_root = $codexSkillsRoot
     workflow = $workflow
+    platform = $platform
     control_plane = $controlPlane
-    github_credential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false }
+    github_credential = $githubCredential
 } | ConvertTo-Json -Depth 8

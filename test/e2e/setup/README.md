@@ -21,6 +21,7 @@ Run only against disposable repositories:
 $env:WORKFLOW_SETUP_E2E = "1"
 $env:WORKFLOW_SETUP_E2E_PAT = "<classic PAT>"
 $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = "<separate cleanup credential with list/delete capability>"
+$env:WORKFLOW_CODEX_AUTH_FILE = "<absolute source supplied by the invoking Codex integration>"
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <disposable-owner> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
@@ -31,9 +32,11 @@ pwsh ./test/e2e/setup/setup-e2e.ps1 `
 
 `EntrySkillSpec` is an interface boundary, not a floating source: the release
 pipeline must pin it to the exact produced Platform Release tag or source commit,
-never a development checkout or an unpinned branch. The harness
-copies the operator's existing Codex `auth.json` into the disposable profile;
-the driver never captures or reports its contents. It also discovers newly
+never a development checkout or an unpinned branch. The harness requires
+`WORKFLOW_CODEX_AUTH_FILE` to be an absolute source explicitly supplied by the
+invoking Codex integration. It copies that source into the disposable profile
+and propagates the disposable path; the driver never captures or reports its
+contents. It also discovers newly
 created `workflow-setup-e2e-*` repositories independently of the agent's final
 response so cleanup remains possible after an interaction failure.
 

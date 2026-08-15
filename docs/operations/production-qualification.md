@@ -33,8 +33,10 @@ or complete diffs into it.
 
 ## 1. Admit the host and supply chain
 
-1. Confirm Docker Desktop uses a Linux `amd64` engine and `codex login status`
-   reports the configured ChatGPT identity.
+1. Confirm Docker Desktop uses a Linux `amd64` engine, `codex login status`
+   reports the configured ChatGPT identity, and the invoking Codex integration
+   provides its absolute source as `WORKFLOW_CODEX_AUTH_FILE`. Do not infer a
+   private credential path from `CODEX_HOME` or the user profile.
 2. Read the target repository metadata and fail the attempt unless its
    canonical owner matches the verified Control Plane GitHub Credential owner and
    `private` is `true`.

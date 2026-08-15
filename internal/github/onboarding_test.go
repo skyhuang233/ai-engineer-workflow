@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +55,72 @@ func TestActionsEnablementRejectsUnplannedAllowedActions(t *testing.T) {
 	}
 }
 
+func TestOrganizationPublicationPreflightFailsClosed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/acme/repo":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case "/orgs/acme":
+			_, _ = w.Write([]byte(`{"login":"acme","members_can_create_repositories":true,"members_can_create_private_repositories":false}`))
+		case "/user/memberships/orgs/acme":
+			_, _ = w.Write([]byte(`{"state":"active","role":"member"}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	err := NewClient(server.URL, "token", server.Client()).PreflightCreateRepository(context.Background(), "acme", "alice", "repo", true)
+	if err == nil || !strings.Contains(err.Error(), "private") {
+		t.Fatalf("private organization publication preflight = %v", err)
+	}
+}
+
+func TestOrganizationPublicationPreflightRequiresProvableActionsAndMergePolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		actionsCode int
+		actions     string
+		rulesets    string
+		want        string
+	}{
+		{name: "Actions discovery missing", actionsCode: http.StatusForbidden, actions: `{"message":"forbidden"}`, rulesets: `[]`, want: "Actions policy"},
+		{name: "new repositories excluded", actionsCode: http.StatusOK, actions: `{"enabled_repositories":"selected","allowed_actions":"all"}`, rulesets: `[]`, want: "new repository"},
+		{name: "required actions not provable", actionsCode: http.StatusOK, actions: `{"enabled_repositories":"all","allowed_actions":"selected"}`, rulesets: `[]`, want: "required onboarding actions"},
+		{name: "review required", actionsCode: http.StatusOK, actions: `{"enabled_repositories":"all","allowed_actions":"all"}`, rulesets: `[{"enforcement":"active","rules":[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]}]`, want: "human review"},
+		{name: "merge queue required", actionsCode: http.StatusOK, actions: `{"enabled_repositories":"all","allowed_actions":"all"}`, rulesets: `[{"enforcement":"active","rules":[{"type":"merge_queue"}]}]`, want: "merge queue"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/repos/acme/repo":
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(`{"message":"not found"}`))
+				case "/orgs/acme":
+					_, _ = w.Write([]byte(`{"login":"acme","members_can_create_repositories":true,"members_can_create_private_repositories":true}`))
+				case "/user/memberships/orgs/acme":
+					_, _ = w.Write([]byte(`{"state":"active","role":"admin"}`))
+				case "/orgs/acme/actions/permissions":
+					w.WriteHeader(test.actionsCode)
+					_, _ = w.Write([]byte(test.actions))
+				case "/orgs/acme/rulesets":
+					_, _ = w.Write([]byte(test.rulesets))
+				default:
+					t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+			err := NewClient(server.URL, "token", server.Client()).PreflightCreateRepository(context.Background(), "acme", "alice", "repo", true)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("preflight error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +162,7 @@ func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 
 func TestFindOnboardingPullRequestUsesDigestBoundBranchIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/pulls" || r.URL.Query().Get("head") != "owner:workflow/onboarding-digest" || r.URL.Query().Get("base") != "main" {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/pulls" || r.URL.Query().Get("state") != "all" || r.URL.Query().Get("head") != "owner:workflow/onboarding-digest" || r.URL.Query().Get("base") != "main" {
 			t.Fatalf("request=%s %s", r.Method, r.URL.String())
 		}
 		_, _ = w.Write([]byte(`[{"number":7,"body":"Approved Setup Plan SHA-256: digest","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"workflow/onboarding-digest"}}]`))

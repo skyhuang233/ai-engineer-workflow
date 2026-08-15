@@ -1,6 +1,7 @@
 package repositorycontract
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,5 +65,27 @@ func TestRenderMultiContextChangesOnlyDeclaredDomainConfiguration(t *testing.T) 
 	}
 	if manifest.DomainLayout != "multi-context" || !strings.Contains(string(files["docs/agents/domain.md"]), "CONTEXT-MAP.md") {
 		t.Fatalf("manifest=%#v domain=%q", manifest, files["docs/agents/domain.md"])
+	}
+}
+
+func TestRenderedAgentsBlockMatchesPublishedRepositoryContractTemplate(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("..", "..", "deploy", "platform", "repository-contract", "AGENTS.block.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _, _, err := Render("single-context", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, ok := extractBlock(files["AGENTS.md"])
+	if !ok {
+		t.Fatal("rendered AGENTS.md has no managed block")
+	}
+	template = bytes.ReplaceAll(template, []byte("\r\n"), []byte("\n"))
+	if string(managed) != string(template) {
+		t.Fatalf("rendered managed block diverged from release template:\n--- rendered\n%s--- template\n%s", managed, template)
+	}
+	if !strings.Contains(string(managed), "`$agent-workflow`") {
+		t.Fatal("rendered managed block does not automatically load the Workflow Skill Bundle")
 	}
 }
