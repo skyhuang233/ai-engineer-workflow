@@ -231,7 +231,7 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
 			_, _ = w.Write([]byte(`{"number":7}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/check-runs"):
-			_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success"}]}`))
+			_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success","head_sha":"` + workspaceHead() + `","app":{"id":15368}}]}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
 			_, _ = w.Write([]byte(`{"number":7,"mergeable":true,"head":{"sha":"` + workspaceHead() + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
