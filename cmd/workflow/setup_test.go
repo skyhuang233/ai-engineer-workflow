@@ -22,6 +22,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/onboarding"
+	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -449,6 +450,49 @@ func TestReadyShortcutRequiresFullPlatformAndAdmissionVerification(t *testing.T)
 	err := verifySetupReady(context.Background(), nil, workflowhome.Layout{}, nil, "owner/repo")
 	if err == nil || !strings.Contains(err.Error(), "Docker probe failed") || platformCalls != 1 || admissionCalls != 1 {
 		t.Fatalf("ready verification err=%v platform=%d admission=%d", err, platformCalls, admissionCalls)
+	}
+}
+
+type readOnlyDockerStatusHost struct {
+	version                     string
+	engineErr                   error
+	downloads, installs, starts int
+}
+
+func (h *readOnlyDockerStatusHost) InstalledVersion(context.Context) (string, error) {
+	return h.version, nil
+}
+func (h *readOnlyDockerStatusHost) Download(context.Context, string, string) error {
+	h.downloads++
+	return nil
+}
+func (h *readOnlyDockerStatusHost) InstallElevated(context.Context, string) error {
+	h.installs++
+	return nil
+}
+func (h *readOnlyDockerStatusHost) Start(context.Context) error {
+	h.starts++
+	return nil
+}
+func (h *readOnlyDockerStatusHost) EngineReady(context.Context) error { return h.engineErr }
+
+func TestPlatformReadyReadbackChecksDockerStatusWithoutMutation(t *testing.T) {
+	host := &readOnlyDockerStatusHost{version: "4.44.0"}
+	contract := platformrelease.DockerDependency{Version: "4.44.0"}
+	if err := verifyDockerDesktopStatus(context.Background(), contract, host); err != nil {
+		t.Fatal(err)
+	}
+	if host.downloads != 0 || host.installs != 0 || host.starts != 0 {
+		t.Fatalf("read-only Docker status mutated host: %#v", host)
+	}
+	host.version = "4.43.0"
+	if err := verifyDockerDesktopStatus(context.Background(), contract, host); err == nil {
+		t.Fatal("accepted drifted Docker Desktop version")
+	}
+	host.version = contract.Version
+	host.engineErr = errors.New("engine stopped")
+	if err := verifyDockerDesktopStatus(context.Background(), contract, host); err == nil {
+		t.Fatal("accepted stopped Docker engine")
 	}
 }
 

@@ -32,6 +32,7 @@ type HostAdapter struct {
 	SkillBundleSource          string
 	PersistUserPATH            func(string) error
 	GitHub                     *github.Client
+	CleanupGitHub              *github.Client
 	GitCredential              onboarding.GitCredential
 	RepositoryPath             string
 	PlanDigest                 string
@@ -102,17 +103,88 @@ func (a HostAdapter) CleanupObligations(effect setupcontract.Effect, digest stri
 	}, nil
 }
 
+func (a HostAdapter) ValidateCleanupObligation(plan setupcontract.Plan, obligation store.SetupCleanupObligation) error {
+	if plan.PlanID != obligation.PlanID || !strings.EqualFold(filepath.Clean(plan.Target.WorkflowHome), filepath.Clean(a.Layout.Root)) {
+		return errors.New("cleanup obligation is not bound to this Workflow Home and Setup Plan")
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		return err
+	}
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil || digest != obligation.PlanDigestSHA256 || len(digest) < 12 {
+		return errors.New("cleanup obligation Plan digest is invalid")
+	}
+	if obligation.Kind == "remote_onboarding_branch" || obligation.Kind == "temporary_clone" {
+		for _, effect := range plan.Effects {
+			if effect.ID != obligation.EffectID || effect.Kind != "repository_contract_pr" {
+				continue
+			}
+			expected, expectedErr := a.CleanupObligations(effect, digest)
+			if expectedErr != nil {
+				return expectedErr
+			}
+			for _, candidate := range expected {
+				if candidate.ObligationID == obligation.ObligationID && candidate.Kind == obligation.Kind && candidate.Resource == obligation.Resource {
+					return nil
+				}
+			}
+		}
+		return errors.New("repository cleanup target differs from its approved deterministic identity")
+	}
+	if plan.Kind != setupcontract.PlatformBootstrap || !platformCleanupEffectID(plan, obligation.EffectID) {
+		return errors.New("probe cleanup lacks Platform Ready authorization")
+	}
+	prefix := digest[:12]
+	expected := map[string]struct {
+		kind  string
+		value string
+	}{
+		obligation.EffectID + ":docker-state-probe":      {"docker_state_probe", filepath.Join(a.Layout.State, ".setup-readiness-"+prefix)},
+		obligation.EffectID + ":docker-workspace-probe":  {"docker_workspace_probe", filepath.Join(a.Layout.Workspaces, ".setup-readiness-"+prefix)},
+		obligation.EffectID + ":docker-container":        {"docker_container", "workflow-setup-docker-" + prefix},
+		obligation.EffectID + ":codex-temp-dir":          {"codex_temp_dir", filepath.Join(os.TempDir(), "workflow-doctor-codex-"+prefix)},
+		obligation.EffectID + ":codex-container-initial": {"codex_container", "workflow-doctor-codex-" + prefix + "-initial"},
+		obligation.EffectID + ":codex-container-resume":  {"codex_container", "workflow-doctor-codex-" + prefix + "-resume"},
+	}
+	candidate, ok := expected[obligation.ObligationID]
+	if !ok || candidate.kind != obligation.Kind {
+		return errors.New("probe cleanup identity differs from its deterministic identity")
+	}
+	var resource probeCleanupResource
+	if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Value != candidate.value {
+		return errors.New("probe cleanup target differs from its deterministic target")
+	}
+	return nil
+}
+
+func platformCleanupEffectID(plan setupcontract.Plan, effectID string) bool {
+	if effectID == "platform-verify" {
+		return true
+	}
+	for _, expected := range plan.ExpectedResults {
+		if expected.ID == effectID && expected.Kind == "platform_readiness" {
+			return true
+		}
+	}
+	return false
+}
+
 func (a HostAdapter) ReconcileCleanupObligation(ctx context.Context, obligation store.SetupCleanupObligation) error {
 	switch obligation.Kind {
 	case "remote_onboarding_branch":
-		if a.GitHub == nil {
+		client := a.CleanupGitHub
+		if client == nil {
+			client = a.GitHub
+		}
+		if client == nil {
 			return errors.New("GitHub client is required to clean the onboarding branch")
 		}
 		var resource remoteBranchCleanupResource
 		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository == "" || !strings.HasPrefix(resource.Branch, "workflow/onboarding-") {
 			return errors.New("remote onboarding branch cleanup resource is invalid")
 		}
-		err := a.GitHub.DeleteBranch(ctx, resource.Repository, resource.Branch)
+		err := client.DeleteBranch(ctx, resource.Repository, resource.Branch)
 		if github.IsNotFound(err) {
 			return nil
 		}
@@ -562,6 +634,26 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if err != nil {
 				return setupcontract.EffectFailed, "", err
 			}
+			if len(a.PlanDigest) < 12 {
+				return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
+			}
+			owner := strings.SplitN(effect.Subject, "/", 2)[0]
+			branch := "workflow/onboarding-" + a.PlanDigest[:12]
+			body := "Approved Setup Plan SHA-256: " + a.PlanDigest
+			pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			pullState, err := classifyOnboardingPullRequest(pull, found, body, branch, effect.Parameters["base_branch"], baseHead)
+			if err != nil {
+				return setupcontract.EffectConflicting, err.Error(), nil
+			}
+			switch pullState {
+			case onboardingPullOpen:
+				return setupcontract.EffectRequired, "exact Onboarding Pull Request is open and not merged", nil
+			case onboardingPullClosed:
+				return setupcontract.EffectRequired, "exact Onboarding Pull Request was closed without merge; the same approved digest requires a replacement", nil
+			}
 			var fetchErr error
 			_, err = repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
 				content, fileErr := a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["base_branch"])
@@ -576,21 +668,8 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if err != nil {
 				return setupcontract.EffectRequired, err.Error(), nil
 			}
-			if len(a.PlanDigest) < 12 {
-				return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
-			}
-			owner := strings.SplitN(effect.Subject, "/", 2)[0]
-			branch := "workflow/onboarding-" + a.PlanDigest[:12]
-			pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
-			if err != nil {
-				return setupcontract.EffectFailed, "", err
-			}
-			body := "Approved Setup Plan SHA-256: " + a.PlanDigest
-			if !found || pull.Body != body || pull.MergedAt == "" || !fullSetupCommitID(pull.MergeCommitSHA) {
+			if pullState != onboardingPullMerged || !fullSetupCommitID(pull.MergeCommitSHA) {
 				return setupcontract.EffectConflicting, "merged Onboarding Pull Request is not bound to the approved plan", nil
-			}
-			if pull.Base.Ref != effect.Parameters["base_branch"] || pull.Base.SHA != baseHead {
-				return setupcontract.EffectConflicting, "merged Onboarding Pull Request base differs from the approved plan", nil
 			}
 			if persisted := a.OnboardingMergeHeads[effect.ID]; persisted != "" && persisted != pull.MergeCommitSHA {
 				return setupcontract.EffectConflicting, "merged Onboarding Pull Request HEAD differs from persisted Setup evidence", nil
@@ -1056,8 +1135,43 @@ func onboardingGitBranch(ctx context.Context, repository string) (string, error)
 	return strings.TrimSpace(string(output)), err
 }
 
+type onboardingPullState int
+
+const (
+	onboardingPullAbsent onboardingPullState = iota
+	onboardingPullOpen
+	onboardingPullClosed
+	onboardingPullMerged
+)
+
+func classifyOnboardingPullRequest(pull github.OnboardingPullRequest, found bool, body, branch, baseBranch, baseHead string) (onboardingPullState, error) {
+	if !found {
+		return onboardingPullAbsent, nil
+	}
+	if pull.Body != body || pull.Head.Ref != branch {
+		return onboardingPullAbsent, errors.New("existing Onboarding Pull Request differs from the approved plan")
+	}
+	if pull.Base.Ref != baseBranch || pull.Base.SHA != baseHead {
+		return onboardingPullAbsent, errors.New("existing Onboarding Pull Request base differs from the approved plan")
+	}
+	if pull.MergedAt != "" {
+		if pull.State != "" && !strings.EqualFold(pull.State, "closed") {
+			return onboardingPullAbsent, errors.New("merged Onboarding Pull Request has an invalid state")
+		}
+		return onboardingPullMerged, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(pull.State)) {
+	case "open":
+		return onboardingPullOpen, nil
+	case "closed":
+		return onboardingPullClosed, nil
+	default:
+		return onboardingPullAbsent, errors.New("existing Onboarding Pull Request has an unknown state")
+	}
+}
+
 func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupcontract.Effect) (resultErr error) {
-	if a.GitHub == nil || a.PlanDigest == "" {
+	if a.GitHub == nil || len(a.PlanDigest) < 12 {
 		return errors.New("GitHub client and approved plan digest are required")
 	}
 	if a.OnboardingMergeHeads == nil {
@@ -1081,6 +1195,25 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	}
 	if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
 		return err
+	}
+	body := "Approved Setup Plan SHA-256: " + a.PlanDigest
+	owner := strings.SplitN(effect.Subject, "/", 2)[0]
+	branch := "workflow/onboarding-" + a.PlanDigest[:12]
+	priorPull, priorFound, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
+	if err != nil {
+		return err
+	}
+	priorState, err := classifyOnboardingPullRequest(priorPull, priorFound, body, branch, effect.Parameters["base_branch"], baseHead)
+	if err != nil {
+		return err
+	}
+	switch priorState {
+	case onboardingPullMerged:
+		return errors.New("exact Onboarding Pull Request is already merged; readback must bind it before apply")
+	case onboardingPullClosed:
+		if err := a.GitHub.DeleteBranch(ctx, effect.Subject, branch); err != nil && !github.IsNotFound(err) {
+			return fmt.Errorf("clean closed Onboarding Pull Request branch before replacement: %w", err)
+		}
 	}
 	temporary := a.TemporaryRoot
 	if temporary == "" {
@@ -1108,23 +1241,42 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 		}
 		resultErr = errors.Join(resultErr, branchErr, workspaceErr)
 	}()
-	body := "Approved Setup Plan SHA-256: " + a.PlanDigest
-	owner := strings.SplitN(effect.Subject, "/", 2)[0]
-	pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, workspace.Branch, effect.Parameters["base_branch"])
-	if err != nil {
-		return err
-	}
-	if found {
-		if pull.Head.SHA != workspace.Head || pull.Body != body || pull.Base.Ref != "" && (pull.Base.Ref != effect.Parameters["base_branch"] || pull.Base.SHA != baseHead) {
-			return errors.New("existing Onboarding Pull Request differs from the approved plan")
-		}
-	} else {
+	var pull github.OnboardingPullRequest
+	if priorState == onboardingPullClosed {
 		if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
 			return err
 		}
 		pull, err = a.GitHub.CreateOnboardingPullRequest(ctx, effect.Subject, github.PullRequestCreate{Title: "Onboard Agent Workflow", Head: workspace.Branch, Base: effect.Parameters["base_branch"], Body: body})
 		if err != nil {
 			return err
+		}
+	} else {
+		var found bool
+		pull, found, err = a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, workspace.Branch, effect.Parameters["base_branch"])
+		if err != nil {
+			return err
+		}
+		state, classifyErr := classifyOnboardingPullRequest(pull, found, body, workspace.Branch, effect.Parameters["base_branch"], baseHead)
+		if classifyErr != nil {
+			return classifyErr
+		}
+		switch state {
+		case onboardingPullOpen:
+			if pull.Head.SHA != workspace.Head {
+				return errors.New("existing Onboarding Pull Request differs from the approved plan")
+			}
+		case onboardingPullClosed:
+			return errors.New("exact Onboarding Pull Request closed during apply; retry the same approved digest to replace it")
+		case onboardingPullMerged:
+			return errors.New("exact Onboarding Pull Request merged during apply; readback must bind it before retry")
+		case onboardingPullAbsent:
+			if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
+				return err
+			}
+			pull, err = a.GitHub.CreateOnboardingPullRequest(ctx, effect.Subject, github.PullRequestCreate{Title: "Onboard Agent Workflow", Head: workspace.Branch, Base: effect.Parameters["base_branch"], Body: body})
+			if err != nil {
+				return err
+			}
 		}
 	}
 	var requiredChecks []onboarding.RequiredCheck

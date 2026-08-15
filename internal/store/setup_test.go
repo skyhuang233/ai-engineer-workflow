@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,6 +239,34 @@ func TestSetupCleanupObligationsRemainPendingUntilExactCleanupCompletes(t *testi
 	pending, err = db.PendingSetupCleanupObligations(ctx, plan.PlanID)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("reopened cleanup obligation = %#v, %v", pending, err)
+	}
+}
+
+func TestPendingSetupCleanupObligationsReturnsEveryPlanInStableOrder(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 15, 2, 3, 4, 0, time.UTC)
+	for _, plan := range []SetupPlanRecord{
+		{PlanID: "plan-b", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\\Workflow`, DigestSHA256: strings.Repeat("b", 64), CanonicalJSON: `{}`, Projection: "b", CreatedAt: now},
+		{PlanID: "plan-a", Kind: "repository_onboarding", SchemaVersion: 1, Target: "owner/repo", DigestSHA256: strings.Repeat("a", 64), CanonicalJSON: `{}`, Projection: "a", CreatedAt: now},
+	} {
+		if err := db.RecordSetupPlan(ctx, plan); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordSetupCleanupObligation(ctx, SetupCleanupObligation{PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "cleanup", ObligationID: "cleanup:temporary", Kind: "temporary_clone", Resource: `{"root":"C:/tmp","path":"C:/tmp/workflow-onboarding-aaaaaaaaaaaa"}`, Status: CleanupPending, UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	values, err := db.PendingSetupCleanupObligationsAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].PlanID != "plan-a" || values[1].PlanID != "plan-b" {
+		t.Fatalf("pending=%#v", values)
 	}
 }
 

@@ -55,6 +55,10 @@ func (a *cleanupRetryAdapter) ReconcileCleanupObligation(context.Context, store.
 	return nil
 }
 
+func (a *cleanupRetryAdapter) ValidateCleanupObligation(setupcontract.Plan, store.SetupCleanupObligation) error {
+	return nil
+}
+
 type repositoryCreateAttemptAdapter struct {
 	*fakeAdapter
 	databasePath string
@@ -196,6 +200,58 @@ func TestEngineRetriesPendingCleanupBeforeSatisfiedEffectReadback(t *testing.T) 
 	}
 }
 
+func TestReplacementPlanDrainsPendingCleanupFromEarlierTrustedPlan(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	layout, err := workflowhome.Resolve(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	planA := testPlan(home)
+	planA.PlanID = "plan-a"
+	rawA, _ := json.Marshal(planA)
+	_, canonicalA, digestA, err := setupcontract.ParsePlan(rawA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordSetupPlan(context.Background(), store.SetupPlanRecord{PlanID: planA.PlanID, Kind: string(planA.Kind), SchemaVersion: planA.SchemaVersion, Target: home, DigestSHA256: digestA, CanonicalJSON: string(canonicalA), Projection: Project(planA, digestA), CreatedAt: testTime()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordSetupCleanupObligation(context.Background(), store.SetupCleanupObligation{PlanID: planA.PlanID, PlanDigestSHA256: digestA, EffectID: "first", ObligationID: "first:temporary", Kind: "temporary_clone", Resource: `{"root":"C:/tmp","path":"C:/tmp/workflow-onboarding-aaaaaaaaaaaa"}`, Status: store.CleanupPending, UpdatedAt: testTime()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	planB := testPlan(home)
+	planB.PlanID = "plan-b"
+	rawB, _ := json.Marshal(planB)
+	_, _, digestB, err := setupcontract.ParsePlan(rawB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &cleanupRetryAdapter{fakeAdapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}}}
+	result, err := (&Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(context.Background(), rawB, digestB)
+	if err != nil || result.Status != setupcontract.ExecutionSucceeded || adapter.reconciles != 1 {
+		t.Fatalf("result=%#v err=%v reconciles=%d", result, err, adapter.reconciles)
+	}
+	db, err = store.OpenReadOnly(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pending, err := db.PendingSetupCleanupObligationsAll(context.Background())
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+}
+
 func TestEngineFailsClosedUntilPlatformReadyExpectedResultIsVerified(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
@@ -216,6 +272,32 @@ func TestEngineFailsClosedUntilPlatformReadyExpectedResultIsVerified(t *testing.
 	}}).Apply(context.Background(), raw, digest)
 	if err != nil || result.Status != setupcontract.ExecutionSucceeded || !verified {
 		t.Fatalf("verified result=%#v err=%v called=%t", result, err, verified)
+	}
+}
+
+func TestEngineFinalGateRejectsCleanupCreatedDuringExpectedResultVerification(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	plan := testPlan(home)
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &cleanupRetryAdapter{fakeAdapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}}}
+	result, err := (&Engine{Adapter: adapter, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier, ExpectedResultVerifier: func(ctx context.Context, got setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+		layout, resolveErr := workflowhome.Resolve(got.Target.WorkflowHome)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		db, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+		if openErr != nil {
+			return openErr
+		}
+		defer db.Close()
+		return db.RecordSetupCleanupObligation(ctx, store.SetupCleanupObligation{PlanID: got.PlanID, PlanDigestSHA256: digest, EffectID: expected.ID, ObligationID: expected.ID + ":docker-container", Kind: "docker_container", Resource: `{"value":"workflow-setup-docker-aaaaaaaaaaaa"}`, Status: store.CleanupPending, UpdatedAt: testTime()})
+	}}).Apply(context.Background(), raw, digest)
+	if err == nil || result.Status != setupcontract.ExecutionIncomplete || !strings.Contains(err.Error(), "remain pending") {
+		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
 

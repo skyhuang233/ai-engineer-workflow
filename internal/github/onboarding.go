@@ -410,10 +410,28 @@ func (c *Client) FindOnboardingPullRequest(ctx context.Context, repository, owne
 	if len(result) == 0 {
 		return OnboardingPullRequest{}, false, nil
 	}
-	if len(result) != 1 {
-		return OnboardingPullRequest{}, false, errors.New("multiple Onboarding Pull Requests match the approved branch")
+	if len(result) == 1 {
+		return result[0], true, nil
 	}
-	return result[0], true, nil
+	var open []OnboardingPullRequest
+	for _, pull := range result {
+		if strings.EqualFold(pull.State, "open") {
+			open = append(open, pull)
+		}
+	}
+	if len(open) == 1 {
+		return open[0], true, nil
+	}
+	if len(open) > 1 {
+		return OnboardingPullRequest{}, false, errors.New("multiple open Onboarding Pull Requests match the approved branch")
+	}
+	latest := result[0]
+	for _, pull := range result[1:] {
+		if pull.Number > latest.Number {
+			latest = pull
+		}
+	}
+	return latest, true, nil
 }
 func (c *Client) OnboardingPullRequest(ctx context.Context, repository string, number int64) (OnboardingPullRequest, error) {
 	var result OnboardingPullRequest

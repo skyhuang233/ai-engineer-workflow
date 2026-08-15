@@ -257,3 +257,18 @@ func TestFindOnboardingPullRequestUsesDigestBoundBranchIdentity(t *testing.T) {
 		t.Fatalf("pull=%#v found=%t err=%v", pull, found, err)
 	}
 }
+
+func TestFindOnboardingPullRequestSelectsCurrentAttemptOverClosedHistory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/pulls" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"number":6,"state":"closed"},{"number":7,"state":"open"}]`))
+	}))
+	defer server.Close()
+	pull, found, err := NewClient(server.URL, "token", server.Client()).FindOnboardingPullRequest(context.Background(), "owner/repo", "owner", "workflow/onboarding-digest", "main")
+	if err != nil || !found || pull.Number != 7 || pull.State != "open" {
+		t.Fatalf("selected pull = %#v, found=%t, err=%v", pull, found, err)
+	}
+}

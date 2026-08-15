@@ -34,7 +34,13 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    $resolvedRelease = & scripts/resolve-platform-release.ps1 @releaseArguments | ConvertFrom-Json
    ```
 
-   Omit `Version` for a fresh latest-stable installation and omit both entries for an exact repair. The resolver restores the exact durable pin for repairs; it verifies the packaged trust policy, pinned public key, immutable fixed GitHub Release assets, source commit, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
+   Branch on the inspected pin state without inventing release authority:
+
+   - For a true fresh installation, omit `Version` only when the user selected latest stable.
+   - When either verified durable pin is available, the verified backup pin automatically supplies exact repair authority if the primary is missing; omit `Version` for that exact pin repair. The resolver selects the pinned release and the later approved apply recreates the missing primary or backup.
+   - When both verified pins are missing while the Workflow CLI exists, ask the user to confirm the exact installed version. Add `$releaseArguments.Version = <confirmed-exact-installed-version>` and do not add `AllowUpgrade`; never use latest-stable selection for a pinless existing installation.
+
+   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they verify and preview the exact repair but do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver verifies the packaged trust policy, pinned public key, immutable fixed GitHub Release assets, source commit, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
 
    Produce the Platform Plan only from the resolver output:
 

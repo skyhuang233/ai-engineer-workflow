@@ -108,6 +108,11 @@ func TestRepositoryContractReadbackRequiresRepairForManagedContentDrift(t *testi
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`[]`))
+					return
+				}
 				if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/repos/owner/repo/contents/") {
 					t.Fatalf("managed drift readback continued to %s %s", r.Method, r.URL.String())
 				}
@@ -787,6 +792,117 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	}
 }
 
+func TestRepositoryContractReadbackDistinguishesExactOpenClosedAndExternalConflict(t *testing.T) {
+	digest := strings.Repeat("d", 64)
+	base := strings.Repeat("c", 40)
+	branch := "workflow/onboarding-" + digest[:12]
+	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"base_branch": "main", "base_head": base, "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": strings.Repeat("a", 64), "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
+	}}
+	for _, test := range []struct {
+		name       string
+		state      string
+		bodyDigest string
+		wantStatus setupcontract.EffectStatus
+		wantText   string
+	}{
+		{name: "open same plan", state: "open", bodyDigest: digest, wantStatus: setupcontract.EffectRequired, wantText: "open"},
+		{name: "closed same plan", state: "closed", bodyDigest: digest, wantStatus: setupcontract.EffectRequired, wantText: "replacement"},
+		{name: "closed external conflict", state: "closed", bodyDigest: strings.Repeat("e", 64), wantStatus: setupcontract.EffectConflicting, wantText: "differs"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/repos/owner/repo/pulls" {
+					t.Fatalf("readback continued past pull request classification to %s %s", r.Method, r.URL.String())
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[{"number":7,"state":"` + test.state + `","body":"Approved Setup Plan SHA-256: ` + test.bodyDigest + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
+			}))
+			defer server.Close()
+			adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
+			status, evidence, err := adapter.Readback(context.Background(), effect)
+			if err != nil || status != test.wantStatus || !strings.Contains(strings.ToLower(evidence), test.wantText) {
+				t.Fatalf("readback = %s, %q, %v; want %s containing %q", status, evidence, err, test.wantStatus, test.wantText)
+			}
+		})
+	}
+}
+
+func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+	digest := strings.Repeat("a", 64)
+	branch := "workflow/onboarding-" + digest[:12]
+	mergeHead := strings.Repeat("c", 40)
+	deleted, created, merged := false, false, false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		workspaceHead := func() string { return hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch) }
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[{"number":6,"state":"closed","body":"Approved Setup Plan SHA-256: ` + digest + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/git/refs/heads/"):
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			if !deleted {
+				t.Fatal("replacement PR created before closed branch cleanup")
+			}
+			created = true
+			_, _ = w.Write([]byte(`{"number":7,"state":"open"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main","allow_squash_merge":true,"has_issues":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			head := base
+			if merged {
+				head = mergeHead
+			}
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + head + `"}}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/check-runs"):
+			_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success","head_sha":"` + workspaceHead() + `","app":{"id":15368}}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
+			_, _ = w.Write([]byte(`{"number":7,"state":"open","mergeable":true,"head":{"sha":"` + workspaceHead() + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/rulesets":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
+			merged = true
+			_, _ = w.Write([]byte(`{"merged":true,"sha":"` + mergeHead + `"}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	adapter := HostAdapter{
+		GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"), PlanDigest: digest, TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{},
+		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true, AllowFeatureEnable: true})},
+	}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
+	if err := adapter.applyRepositoryContract(context.Background(), effect); err != nil {
+		t.Fatal(err)
+	}
+	if !deleted || !created || !merged {
+		t.Fatalf("replacement lifecycle delete=%t create=%t merge=%t", deleted, created, merged)
+	}
+}
+
 func TestDefaultHeadPreconditionRejectsMatchingManifestWithoutPersistedMergeEvidence(t *testing.T) {
 	manifest := []byte(`{"schema_version":1}`)
 	manifestDigest := sha256.Sum256(manifest)
@@ -916,6 +1032,106 @@ func TestHostAdapterReconcilesPersistedProbeCleanupResources(t *testing.T) {
 	bad := store.SetupCleanupObligation{Kind: "docker_container", Resource: resource("unowned")}
 	if err := adapter.ReconcileCleanupObligation(context.Background(), bad); err == nil {
 		t.Fatal("unowned container cleanup accepted")
+	}
+}
+
+func TestGlobalCleanupDrainRejectsDatabaseInjectedTargetsBeforeDeletion(t *testing.T) {
+	cases := []struct {
+		name, kind, effectID, obligationID, resource string
+	}{
+		{"branch", "remote_onboarding_branch", "first", "first:remote-branch", `{"repository":"owner/repo","branch":"workflow/onboarding-aaaaaaaaaaaa"}`},
+		{"temporary clone", "temporary_clone", "first", "first:temporary-clone", `{"root":"C:/","path":"C:/workflow-onboarding-aaaaaaaaaaaa"}`},
+		{"Docker", "docker_container", "ready", "ready:docker-container", `{"value":"workflow-setup-docker-aaaaaaaaaaaa"}`},
+		{"Codex", "codex_temp_dir", "ready", "ready:codex-temp-dir", `{"value":"C:/Windows/workflow-doctor-codex-aaaaaaaaaaaa"}`},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := layout.Ensure(); err != nil {
+				t.Fatal(err)
+			}
+			plan := testPlan(layout.Root)
+			raw, _ := json.Marshal(plan)
+			_, canonical, digest, err := setupcontract.ParsePlan(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.RecordSetupPlan(context.Background(), store.SetupPlanRecord{PlanID: plan.PlanID, Kind: string(plan.Kind), SchemaVersion: plan.SchemaVersion, Target: layout.Root, DigestSHA256: digest, CanonicalJSON: string(canonical), Projection: Project(plan, digest), CreatedAt: testTime()}); err != nil {
+				t.Fatal(err)
+			}
+			obligation := store.SetupCleanupObligation{PlanID: plan.PlanID, PlanDigestSHA256: digest, EffectID: test.effectID, ObligationID: test.obligationID, Kind: test.kind, Resource: test.resource, Status: store.CleanupPending, UpdatedAt: testTime()}
+			if err := db.RecordSetupCleanupObligation(context.Background(), obligation); err != nil {
+				t.Fatal(err)
+			}
+			deleted := 0
+			adapter := HostAdapter{Layout: layout, RemoveCleanupPath: func(string) error { deleted++; return nil }, RemoveCleanupContainer: func(context.Context, string) error { deleted++; return nil }}
+			if err := DrainPendingCleanupObligations(context.Background(), db, adapter, testTime()); err == nil || deleted != 0 {
+				t.Fatalf("err=%v deleted=%d", err, deleted)
+			}
+			pending, err := db.PendingSetupCleanupObligationsAll(context.Background())
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("pending=%#v err=%v", pending, err)
+			}
+		})
+	}
+}
+
+func TestHostAdapterAcceptsOnlyExactDeterministicCleanupTargets(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := HostAdapter{Layout: layout}
+	platformPlan := testPlan(layout.Root)
+	platformRaw, _ := json.Marshal(platformPlan)
+	_, _, platformDigest, err := setupcontract.ParsePlan(platformRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := func(item string) string { raw, _ := json.Marshal(map[string]string{"value": item}); return string(raw) }
+	for _, obligation := range []store.SetupCleanupObligation{
+		{PlanID: platformPlan.PlanID, PlanDigestSHA256: platformDigest, EffectID: "ready", ObligationID: "ready:docker-state-probe", Kind: "docker_state_probe", Resource: value(filepath.Join(layout.State, ".setup-readiness-"+platformDigest[:12]))},
+		{PlanID: platformPlan.PlanID, PlanDigestSHA256: platformDigest, EffectID: "ready", ObligationID: "ready:docker-workspace-probe", Kind: "docker_workspace_probe", Resource: value(filepath.Join(layout.Workspaces, ".setup-readiness-"+platformDigest[:12]))},
+		{PlanID: platformPlan.PlanID, PlanDigestSHA256: platformDigest, EffectID: "ready", ObligationID: "ready:docker-container", Kind: "docker_container", Resource: value("workflow-setup-docker-" + platformDigest[:12])},
+		{PlanID: platformPlan.PlanID, PlanDigestSHA256: platformDigest, EffectID: "ready", ObligationID: "ready:codex-temp-dir", Kind: "codex_temp_dir", Resource: value(filepath.Join(os.TempDir(), "workflow-doctor-codex-"+platformDigest[:12]))},
+		{PlanID: platformPlan.PlanID, PlanDigestSHA256: platformDigest, EffectID: "ready", ObligationID: "ready:codex-container-initial", Kind: "codex_container", Resource: value("workflow-doctor-codex-" + platformDigest[:12] + "-initial")},
+	} {
+		if err := adapter.ValidateCleanupObligation(platformPlan, obligation); err != nil {
+			t.Fatalf("valid obligation %#v: %v", obligation, err)
+		}
+	}
+	repoPlan := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "repository-cleanup", Kind: setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: strings.Repeat("a", 40)}},
+		Effects: []setupcontract.Effect{
+			{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("a", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": `{}`, "files_json": `{}`, "manifest_digest": strings.Repeat("b", 64), "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}},
+			{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": strings.Repeat("b", 64), "contract_version": "1"}},
+		},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: strings.Repeat("b", 64)}},
+	}
+	repoRaw, _ := json.Marshal(repoPlan)
+	_, _, repoDigest, err := setupcontract.ParsePlan(repoRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryObligations, err := adapter.CleanupObligations(repoPlan.Effects[0], repoDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, obligation := range repositoryObligations {
+		obligation.PlanID, obligation.PlanDigestSHA256, obligation.EffectID = repoPlan.PlanID, repoDigest, "contract"
+		if err := adapter.ValidateCleanupObligation(repoPlan, obligation); err != nil {
+			t.Fatalf("valid repository obligation %#v: %v", obligation, err)
+		}
 	}
 }
 

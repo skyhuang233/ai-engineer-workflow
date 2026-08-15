@@ -105,3 +105,32 @@ func TestApprovalSnapshotBindsPublishedOriginAndMergeToExactEffectEvidence(t *te
 		t.Fatalf("unrelated dirty file changed: %q %v", data, err)
 	}
 }
+
+func TestApprovalSnapshotBindsRedactedHostProxyWithoutCredentials(t *testing.T) {
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("HTTPS_PROXY", "http://proxy-user:proxy-password@proxy.example:8443")
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "README.md")
+	git(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+	discovery, err := Discover(context.Background(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := CaptureApprovalSnapshot(context.Background(), discovery, "owner/repo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(snapshot, "proxy-user") || strings.Contains(snapshot, "proxy-password") || !strings.Contains(snapshot, "http://proxy.example:8443") {
+		t.Fatalf("proxy snapshot was not safely redacted: %s", snapshot)
+	}
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:9443")
+	if err := VerifyApprovalSnapshot(context.Background(), snapshot); err == nil || !strings.Contains(err.Error(), "proxy") {
+		t.Fatalf("proxy drift accepted: %v", err)
+	}
+}

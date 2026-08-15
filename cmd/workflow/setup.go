@@ -96,7 +96,7 @@ func setupVerificationBlocked(err error, repairHint string, secrets ...string) s
 }
 
 var (
-	verifyPlatformReadyForSetup         = verifyPlatformReady
+	verifyPlatformReadyForSetup         = verifyPlatformReadyReadOnly
 	verifyPlatformPreconditionsForSetup = verifySatisfiedPlatformComponents
 	verifyRecordedAdmissionForSetup     = verifyRecordedAdmissionReadOnly
 	resolveCodexAuthForSetup            = codexauth.ResolveChatGPT
@@ -168,7 +168,24 @@ func runSetupInspectPlatform(args []string, output io.Writer) error {
 	if err != nil {
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
 	}
+	if err := database.Close(); err != nil {
+		return err
+	}
+	database, err = store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
+	}
 	defer database.Close()
+	var cleanupClient *github.Client
+	if verification, verificationErr := database.GitHubPATVerification(context.Background()); verificationErr == nil {
+		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
+		if token, tokenErr := verifiedClassicPAT(context.Background(), database, config); tokenErr == nil {
+			cleanupClient = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+		}
+	}
+	if err := setupengine.DrainPendingCleanupObligations(context.Background(), database, setupengine.HostAdapter{Layout: layout, GitHub: cleanupClient}, time.Now().UTC()); err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "pending Setup cleanup: " + err.Error()})
+	}
 	facts, inspectErr := inspectPlatform(context.Background(), database, layout)
 	status, blocker := "ready", ""
 	if inspectErr != nil {
@@ -307,27 +324,41 @@ func runSetupPlan(args []string, output io.Writer) error {
 	if err != nil {
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
 	}
-	defer database.Close()
 	if _, err := database.PlatformInstallation(context.Background()); err != nil {
+		database.Close()
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "Platform Bootstrap must be completed by the entry skill"})
 	}
 	if _, err := database.GitHubPATVerification(context.Background()); err != nil {
+		database.Close()
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "Control Plane GitHub PAT verification is incomplete; rerun the approved Platform Bootstrap Plan"})
 	}
 	verification, err := database.GitHubPATVerification(context.Background())
 	if err != nil {
+		database.Close()
 		return err
 	}
-	platformReady, err := requirePlatformReadyForOnboarding(context.Background(), database, layout, output)
-	if err != nil || !platformReady {
+	if err := database.Close(); err != nil {
 		return err
 	}
+	database, err = store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return err
+	}
+	defer database.Close()
 	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
 	token, err := verifiedClassicPAT(context.Background(), database, config)
 	if err != nil {
 		return err
 	}
 	client := github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+	cleanupAdapter := setupengine.HostAdapter{Layout: layout, GitHub: client}
+	if err := setupengine.DrainPendingCleanupObligations(context.Background(), database, cleanupAdapter, time.Now().UTC()); err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "pending Setup cleanup: " + err.Error()})
+	}
+	platformReady, err := requirePlatformReadyForOnboarding(context.Background(), database, layout, output)
+	if err != nil || !platformReady {
+		return err
+	}
 	discovery, discoveryErr := onboarding.Discover(context.Background(), *repository, onboardingGitHubRemote{Client: client})
 	if discoveryErr == nil && discovery.Repository != "" {
 		if verifyErr := verifyRecordedAdmissionForSetup(context.Background(), database, layout, client, discovery.Repository); verifyErr == nil {
@@ -555,23 +586,33 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 				adapter.ApprovedGitHubPolicies[precondition.Subject] = precondition.Expected
 			}
 		}
-		database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
-		if openErr != nil {
-			return openErr
-		}
-		verification, readErr := database.GitHubPATVerification(context.Background())
-		if readErr != nil {
-			database.Close()
-			return readErr
-		}
+	}
+	database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if openErr != nil {
+		return openErr
+	}
+	verification, readErr := database.GitHubPATVerification(context.Background())
+	if readErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
 		token, tokenErr := verifiedClassicPAT(context.Background(), database, config)
 		database.Close()
 		if tokenErr != nil {
-			return tokenErr
+			if plan.Kind == setupcontract.RepositoryOnboarding {
+				return tokenErr
+			}
+		} else if plan.Kind == setupcontract.RepositoryOnboarding {
+			adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
+			adapter.CleanupGitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+			adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
+		} else {
+			adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+			adapter.CleanupGitHub = adapter.GitHub
 		}
-		adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
-		adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
+	} else {
+		database.Close()
+		if plan.Kind == setupcontract.RepositoryOnboarding {
+			return readErr
+		}
 	}
 	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
 		database, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
@@ -788,10 +829,23 @@ func runSetupVerify(args []string, output io.Writer) error {
 		return err
 	}
 	defer database.Close()
-	tracker, trackerErr := durablePlatformCleanupTracker(context.Background(), database)
-	platformErr := trackerErr
+	ctx := context.Background()
+	verification, credentialErr := database.GitHubPATVerification(ctx)
+	token := ""
+	var tokenErr error
+	var cleanupClient *github.Client
+	if credentialErr == nil {
+		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
+		token, tokenErr = verifiedClassicPAT(ctx, database, config)
+		if tokenErr == nil {
+			cleanupClient = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+		}
+	}
+	cleanupErr := setupengine.DrainPendingCleanupObligations(ctx, database, setupengine.HostAdapter{Layout: layout, GitHub: cleanupClient}, time.Now().UTC())
+	tracker, trackerErr := durablePlatformCleanupTracker(ctx, database)
+	platformErr := errors.Join(credentialErr, tokenErr, cleanupErr, trackerErr)
 	if platformErr == nil {
-		platformErr = verifyPlatformReadyTracked(context.Background(), database, layout, tracker)
+		platformErr = verifyPlatformReadyTracked(ctx, database, layout, tracker)
 	}
 	platformReady := platformErr == nil
 	report := &setupVerificationReport{}
@@ -801,16 +855,16 @@ func runSetupVerify(args []string, output io.Writer) error {
 	} else {
 		report.Readiness.setupVerificationCheck = setupVerificationBlocked(platformErr, "rerun the approved Platform Bootstrap repair plan")
 	}
-	verification, credentialErr := database.GitHubPATVerification(context.Background())
 	report.Credential.Login, report.Credential.UserID, report.Credential.Owner = verification.Login, verification.UserID, verification.Owner
 	report.Credential.Scopes = append([]string(nil), verification.Scopes...)
 	report.Credential.FingerprintSHA256 = verification.FingerprintSHA256
 	repositoryReady := false
-	token := ""
 	if credentialErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		var tokenErr error
-		if token, tokenErr = verifiedClassicPAT(context.Background(), database, config); tokenErr == nil {
+		if token == "" && tokenErr == nil {
+			token, tokenErr = verifiedClassicPAT(context.Background(), database, config)
+		}
+		if tokenErr == nil {
 			report.Credential.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "persisted PAT fingerprint, login, user ID, owner, scopes, and credential path match the live credential"}
 			client := github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 			if discovery, discoveryErr := onboarding.Discover(context.Background(), *repository, onboardingGitHubRemote{Client: client}); discoveryErr == nil && discovery.Repository != "" {
@@ -864,7 +918,11 @@ func runSetupVerify(args []string, output io.Writer) error {
 }
 
 func verifyPlatformReady(ctx context.Context, database *store.Store, layout workflowhome.Layout) error {
-	return verifyPlatformReadyTracked(ctx, database, layout, nil)
+	return verifyPlatformReadyReadOnly(ctx, database, layout)
+}
+
+func verifyPlatformReadyReadOnly(ctx context.Context, database *store.Store, layout workflowhome.Layout) error {
+	return verifyPlatformReadyMode(ctx, database, layout, nil, false)
 }
 
 type platformCleanupTracker struct {
@@ -908,6 +966,13 @@ func (t *platformCleanupTracker) complete(id string) error {
 }
 
 func verifyPlatformReadyTracked(ctx context.Context, database *store.Store, layout workflowhome.Layout, tracker *platformCleanupTracker) error {
+	if tracker == nil {
+		return errors.New("tracked Platform Ready verification requires durable cleanup tracking")
+	}
+	return verifyPlatformReadyMode(ctx, database, layout, tracker, true)
+}
+
+func verifyPlatformReadyMode(ctx context.Context, database *store.Store, layout workflowhome.Layout, tracker *platformCleanupTracker, entityProbes bool) error {
 	installation, err := database.PlatformInstallation(ctx)
 	if err != nil {
 		return err
@@ -985,6 +1050,12 @@ func verifyPlatformReadyTracked(ctx context.Context, database *store.Store, layo
 	if err != nil || !verified {
 		return errors.Join(errors.New("Workflow Skill Bundle does not match the installed release"), err)
 	}
+	if err := verifyDockerDesktopStatus(ctx, contract.Docker, hostsetup.WindowsDockerDesktopHost{}); err != nil {
+		return err
+	}
+	if !entityProbes {
+		return setupengine.RequireNoPendingCleanupObligations(ctx, database)
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	dockerVerifier := hostsetup.DockerWorkerVerifier{ProbeID: digestPrefix(tracker), BeginCleanup: cleanupBegin(tracker), CompleteCleanup: cleanupComplete(tracker)}
@@ -998,6 +1069,20 @@ func verifyPlatformReadyTracked(ctx context.Context, database *store.Store, layo
 	result := (doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: contract.Worker.Image, AuthFile: authFile, ProbeID: digestPrefix(tracker), BeginCleanup: cleanupBegin(tracker), CompleteCleanup: cleanupComplete(tracker)}).Run(probeCtx)
 	if result.Status != doctor.Pass {
 		return errors.New(result.Summary)
+	}
+	return setupengine.RequireNoPendingCleanupObligations(ctx, database)
+}
+
+func verifyDockerDesktopStatus(ctx context.Context, contract platformrelease.DockerDependency, host hostsetup.DockerDesktopHost) error {
+	if host == nil {
+		return errors.New("Docker Desktop status reader is required")
+	}
+	version, err := host.InstalledVersion(ctx)
+	if err != nil || version != contract.Version {
+		return errors.Join(fmt.Errorf("Docker Desktop version %q differs from approved %q", version, contract.Version), err)
+	}
+	if err := host.EngineReady(ctx); err != nil {
+		return fmt.Errorf("Docker Desktop Linux amd64 engine is not ready: %w", err)
 	}
 	return nil
 }

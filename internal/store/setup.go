@@ -133,6 +133,18 @@ func (s *Store) PendingSetupCleanupObligations(ctx context.Context, planID strin
 	if err != nil {
 		return nil, err
 	}
+	return scanPendingSetupCleanupObligations(rows)
+}
+
+func (s *Store) PendingSetupCleanupObligationsAll(ctx context.Context) ([]SetupCleanupObligation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT plan_id,plan_digest_sha256,effect_id,obligation_id,kind,resource_json,status,updated_at FROM setup_cleanup_obligations WHERE status='pending' ORDER BY plan_id,obligation_id`)
+	if err != nil {
+		return nil, err
+	}
+	return scanPendingSetupCleanupObligations(rows)
+}
+
+func scanPendingSetupCleanupObligations(rows *sql.Rows) ([]SetupCleanupObligation, error) {
 	defer rows.Close()
 	var values []SetupCleanupObligation
 	for rows.Next() {
@@ -141,8 +153,9 @@ func (s *Store) PendingSetupCleanupObligations(ctx context.Context, planID strin
 		if err := rows.Scan(&value.PlanID, &value.PlanDigestSHA256, &value.EffectID, &value.ObligationID, &value.Kind, &value.Resource, &value.Status, &updated); err != nil {
 			return nil, err
 		}
-		value.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
-		if err != nil || value.Status != CleanupPending || !setupCleanupKinds[value.Kind] || !json.Valid([]byte(value.Resource)) {
+		parsed, parseErr := time.Parse(time.RFC3339Nano, updated)
+		value.UpdatedAt = parsed
+		if parseErr != nil || value.Status != CleanupPending || !setupCleanupKinds[value.Kind] || !json.Valid([]byte(value.Resource)) {
 			return nil, errors.New("persisted Setup cleanup obligation is invalid")
 		}
 		values = append(values, value)
@@ -286,6 +299,17 @@ func (s *Store) SetupPlanByDigest(ctx context.Context, digest string) (SetupPlan
 		return SetupPlanRecord{}, errors.New("Setup Plan digest is invalid")
 	}
 	plan, err := scanSetupPlan(s.db.QueryRowContext(ctx, `SELECT plan_id,kind,schema_version,target,digest_sha256,canonical_json,projection,created_at FROM setup_plans WHERE digest_sha256=?`, digest))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SetupPlanRecord{}, ErrNotFound
+	}
+	return plan, err
+}
+
+func (s *Store) SetupPlan(ctx context.Context, planID string) (SetupPlanRecord, error) {
+	if planID == "" {
+		return SetupPlanRecord{}, errors.New("Setup Plan identity is required")
+	}
+	plan, err := scanSetupPlan(s.db.QueryRowContext(ctx, `SELECT plan_id,kind,schema_version,target,digest_sha256,canonical_json,projection,created_at FROM setup_plans WHERE plan_id=?`, planID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return SetupPlanRecord{}, ErrNotFound
 	}

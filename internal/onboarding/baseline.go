@@ -26,6 +26,9 @@ type BaselineFile struct {
 }
 
 func BaselineFiles(ctx context.Context, repository string) ([]string, error) {
+	if err := validateLocalGitReadConfiguration(ctx, repository); err != nil {
+		return nil, err
+	}
 	binding, err := resolveGlobalExcludes(ctx, repository)
 	if err != nil {
 		return nil, err
@@ -48,45 +51,69 @@ type globalExcludesBinding struct {
 }
 
 func resolveGlobalExcludes(ctx context.Context, repository string) (globalExcludesBinding, error) {
-	command := exec.CommandContext(ctx, "git", "config", "--global", "--path", "--get", "core.excludesFile")
-	command.Dir = repository
-	command.Env = hostGlobalGitEnvironment()
-	output, err := command.Output()
-	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
-			path := defaultGlobalExcludesPath()
-			if path == "" {
-				return globalExcludesBinding{}, nil
-			}
-			if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
-				return globalExcludesBinding{}, nil
-			} else if statErr != nil {
-				return globalExcludesBinding{}, fmt.Errorf("inspect default global Git excludesFile %q: %w", path, statErr)
-			}
-			return bindGlobalExcludes(path)
-		}
-		return globalExcludesBinding{}, fmt.Errorf("read global Git excludesFile: %w", err)
-	}
-	path := strings.TrimSpace(string(output))
-	if path == "" {
-		return globalExcludesBinding{}, nil
-	}
-	if !filepath.IsAbs(path) {
-		home := globalGitHome()
-		if home == "" {
-			return globalExcludesBinding{}, errors.New("relative global Git excludesFile lacks a trusted home directory")
-		}
-		path, err = filepath.Abs(filepath.Join(home, path))
+	for _, scope := range []string{"local", "global", "system"} {
+		paths, err := scopedExcludesPaths(ctx, repository, scope)
 		if err != nil {
 			return globalExcludesBinding{}, err
 		}
+		if len(paths) == 0 {
+			continue
+		}
+		if len(paths) != 1 || strings.TrimSpace(paths[0]) == "" {
+			return globalExcludesBinding{}, fmt.Errorf("%s Git scope has an unsupported core.excludesFile definition", scope)
+		}
+		path := paths[0]
+		if !filepath.IsAbs(path) {
+			base := repository
+			if scope == "global" {
+				base = globalGitHome()
+			}
+			if scope == "system" || base == "" {
+				return globalExcludesBinding{}, fmt.Errorf("relative %s core.excludesFile is unsupported", scope)
+			}
+			path, err = filepath.Abs(filepath.Join(base, path))
+			if err != nil {
+				return globalExcludesBinding{}, err
+			}
+		}
+		return bindGlobalExcludes(path)
+	}
+	path := defaultGlobalExcludesPath()
+	if path == "" {
+		return globalExcludesBinding{}, nil
 	}
 	return bindGlobalExcludes(path)
+}
+
+func scopedExcludesPaths(ctx context.Context, repository, scope string) ([]string, error) {
+	command := exec.CommandContext(ctx, "git", "config", "--"+scope, "--no-includes", "--path", "--get-all", "core.excludesFile")
+	command.Dir = repository
+	if scope == "local" {
+		command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
+	} else {
+		command.Env = hostScopedGitEnvironment(scope == "system")
+	}
+	output, err := command.Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s Git core.excludesFile: %w", scope, err)
+	}
+	text := strings.TrimRight(string(output), "\r\n")
+	if text == "" {
+		return []string{""}, nil
+	}
+	return strings.FieldsFunc(text, func(r rune) bool { return r == '\r' || r == '\n' }), nil
 }
 
 func bindGlobalExcludes(path string) (globalExcludesBinding, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			sum := sha256.Sum256([]byte("absent"))
+			return globalExcludesBinding{Path: filepath.Clean(path), SHA256: hex.EncodeToString(sum[:])}, nil
+		}
 		return globalExcludesBinding{}, fmt.Errorf("read global Git excludesFile %q: %w", path, err)
 	}
 	sum := sha256.Sum256(data)
@@ -111,6 +138,10 @@ func defaultGlobalExcludesPath() string {
 }
 
 func hostGlobalGitEnvironment() []string {
+	return hostScopedGitEnvironment(false)
+}
+
+func hostScopedGitEnvironment(allowSystem bool) []string {
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -119,7 +150,10 @@ func hostGlobalGitEnvironment() []string {
 		}
 		environment = append(environment, entry)
 	}
-	return append(environment, "GIT_CONFIG_NOSYSTEM=1")
+	if !allowSystem {
+		environment = append(environment, "GIT_CONFIG_NOSYSTEM=1")
+	}
+	return append(environment, "GIT_OPTIONAL_LOCKS=0")
 }
 
 func parseNULTerminatedGitPaths(output []byte) ([]string, error) {

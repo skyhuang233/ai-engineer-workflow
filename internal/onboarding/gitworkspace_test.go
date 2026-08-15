@@ -36,6 +36,12 @@ func runCapturedGit() int {
 		return 125
 	}
 	args := append([]string{}, os.Args[1:]...)
+	if required := os.Getenv("WORKFLOW_TEST_REQUIRE_HTTPS_PROXY"); required != "" {
+		subcommand := capturedGitSubcommand(args)
+		if (subcommand == "clone" || subcommand == "push" || subcommand == "fetch") && os.Getenv("HTTPS_PROXY") != required {
+			return 126
+		}
+	}
 	canonicalURL := os.Getenv("WORKFLOW_TEST_CANONICAL_URL")
 	replacedTransport := false
 	for index := range args {
@@ -71,7 +77,7 @@ func runCapturedGit() int {
 			}
 		}
 	}
-	if capturedGitSubcommand(args) == "clone" {
+	if capturedGitSubcommand(args) == "clone" && os.Getenv("WORKFLOW_TEST_INJECT_LOCAL_FILTER") == "1" {
 		cloneRoot := args[len(args)-1]
 		filterCommand := `"` + filepath.ToSlash(os.Getenv("WORKFLOW_TEST_FILTER_EXE")) + `"`
 		for _, filterType := range []string{"clean", "smudge"} {
@@ -135,6 +141,11 @@ func capturedGitSubcommand(args []string) string {
 }
 
 func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:8443")
+	t.Setenv("WORKFLOW_TEST_REQUIRE_HTTPS_PROXY", "http://proxy.example:8443")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("NO_PROXY", "")
 	source := newRepo(t)
 	if err := os.WriteFile(filepath.Join(source, ".gitattributes"), []byte("managed.txt filter=malicious\nAGENTS.md filter=malicious\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -224,6 +235,13 @@ func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *test
 			t.Fatalf("network operation %s was not observed", wanted)
 		}
 	}
+	for _, capture := range captures {
+		if subcommand := capturedGitSubcommand(capture.Args); subcommand == "clone" || subcommand == "push" {
+			if !containsEnvironmentEntry(capture.Env, "HTTPS_PROXY=http://proxy.example:8443") {
+				t.Fatalf("%s did not preserve the approved host proxy", subcommand)
+			}
+		}
+	}
 	for path, approved := range approvedFiles {
 		committed := exec.Command(realGit, "-C", workspace.Root, "show", workspace.Head+":"+path)
 		committedBytes, err := committed.Output()
@@ -245,6 +263,15 @@ func TestPrepareOnboardingBranchRestrictsPATToCanonicalNetworkOperations(t *test
 			t.Fatalf("local repository config persisted credential material %q", forbidden)
 		}
 	}
+}
+
+func containsEnvironmentEntry(environment []string, wanted string) bool {
+	for _, entry := range environment {
+		if entry == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func readCapturedProcesses(t *testing.T, path string) []capturedGitProcess {

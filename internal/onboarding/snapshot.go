@@ -14,18 +14,21 @@ import (
 // ApprovalSnapshot binds every local discovery fact that authorizes an
 // Onboarding Plan. Remote HEAD and policy remain separately live preconditions.
 type ApprovalSnapshot struct {
-	Root                  string         `json:"root"`
-	Branch                string         `json:"branch"`
-	Head                  string         `json:"head"`
-	HasCommits            bool           `json:"has_commits"`
-	Origin                string         `json:"origin"`
-	Repository            string         `json:"repository"`
-	AuthenticatedCloneURL string         `json:"authenticated_clone_url"`
-	StatusSHA256          string         `json:"status_sha256"`
-	ManagedBoundarySHA256 string         `json:"managed_boundary_sha256"`
-	ZeroBaseline          []BaselineFile `json:"zero_baseline,omitempty"`
-	GlobalExcludesPath    string         `json:"global_excludes_path,omitempty"`
-	GlobalExcludesSHA256  string         `json:"global_excludes_sha256,omitempty"`
+	Root                   string         `json:"root"`
+	Branch                 string         `json:"branch"`
+	Head                   string         `json:"head"`
+	HasCommits             bool           `json:"has_commits"`
+	Origin                 string         `json:"origin"`
+	Repository             string         `json:"repository"`
+	AuthenticatedCloneURL  string         `json:"authenticated_clone_url"`
+	StatusSHA256           string         `json:"status_sha256"`
+	ManagedBoundarySHA256  string         `json:"managed_boundary_sha256"`
+	ZeroBaseline           []BaselineFile `json:"zero_baseline,omitempty"`
+	GlobalExcludesPath     string         `json:"global_excludes_path,omitempty"`
+	GlobalExcludesSHA256   string         `json:"global_excludes_sha256,omitempty"`
+	ProxyEnvironmentSHA256 string         `json:"proxy_environment_sha256"`
+	ProxyEndpoints         []string       `json:"proxy_endpoints,omitempty"`
+	NoProxyConfigured      bool           `json:"no_proxy_configured,omitempty"`
 }
 
 // ApprovalTransitions contains only effect results durably recorded for this
@@ -58,6 +61,11 @@ func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedR
 		Origin: discovery.Origin, Repository: discovery.Repository, AuthenticatedCloneURL: cloneURL,
 		StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: zeroBaseline,
 	}
+	proxy, _, proxyErr := currentHostProxyEnvironment()
+	if proxyErr != nil {
+		return "", proxyErr
+	}
+	snapshot.ProxyEnvironmentSHA256, snapshot.ProxyEndpoints, snapshot.NoProxyConfigured = proxy.DigestSHA256, proxy.RedactedEndpoints, proxy.NoProxyConfigured
 	if !discovery.HasCommits {
 		binding, bindingErr := resolveGlobalExcludes(ctx, discovery.Root)
 		if bindingErr != nil {
@@ -75,7 +83,7 @@ func VerifyApprovalSnapshot(ctx context.Context, encoded string) error {
 
 func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, transitions ApprovalTransitions) error {
 	var expected ApprovalSnapshot
-	if err := json.Unmarshal([]byte(encoded), &expected); err != nil || expected.Root == "" || expected.Branch == "" || expected.StatusSHA256 == "" || expected.ManagedBoundarySHA256 == "" {
+	if err := json.Unmarshal([]byte(encoded), &expected); err != nil || expected.Root == "" || expected.Branch == "" || expected.StatusSHA256 == "" || expected.ManagedBoundarySHA256 == "" || expected.ProxyEnvironmentSHA256 == "" {
 		return errors.New("approved onboarding discovery snapshot is invalid")
 	}
 	root, err := gitOutput(ctx, expected.Root, "rev-parse", "--show-toplevel")
@@ -121,8 +129,26 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 		}
 	}
 	actual := ApprovalSnapshot{Root: root, Branch: branch, Head: head, HasCommits: hasCommits, Origin: origin, Repository: repository, AuthenticatedCloneURL: cloneURL, StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: baseline}
+	proxy, _, proxyErr := currentHostProxyEnvironment()
+	if proxyErr != nil {
+		return proxyErr
+	}
+	actual.ProxyEnvironmentSHA256, actual.ProxyEndpoints, actual.NoProxyConfigured = proxy.DigestSHA256, proxy.RedactedEndpoints, proxy.NoProxyConfigured
 	if actual.Root != expected.Root || actual.Branch != expected.Branch {
 		return errors.New("onboarding discovery drifted from the approved snapshot")
+	}
+	actualProxy, _ := json.Marshal(struct {
+		Digest    string   `json:"digest"`
+		Endpoints []string `json:"endpoints"`
+		NoProxy   bool     `json:"no_proxy"`
+	}{actual.ProxyEnvironmentSHA256, actual.ProxyEndpoints, actual.NoProxyConfigured})
+	expectedProxy, _ := json.Marshal(struct {
+		Digest    string   `json:"digest"`
+		Endpoints []string `json:"endpoints"`
+		NoProxy   bool     `json:"no_proxy"`
+	}{expected.ProxyEnvironmentSHA256, expected.ProxyEndpoints, expected.NoProxyConfigured})
+	if string(actualProxy) != string(expectedProxy) {
+		return errors.New("host proxy environment drifted from the approved snapshot")
 	}
 	if !expected.HasCommits {
 		binding, bindingErr := resolveGlobalExcludes(ctx, root)

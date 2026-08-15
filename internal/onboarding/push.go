@@ -117,10 +117,7 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 func hardenedAuthenticatedGitArgs(canonicalURL string, args ...string) []string {
 	prefix := hardenedLocalGitArgs()
 	prefix = append(prefix,
-		"-c", "http.proxy=",
-		"-c", "https.proxy=",
 		"-c", "http.sslVerify=true",
-		"-c", "http."+canonicalURL+".proxy=",
 		"-c", "http."+canonicalURL+".sslVerify=true",
 		"-c", "protocol.allow=never",
 		"-c", "protocol.https.allow=always",

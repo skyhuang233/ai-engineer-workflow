@@ -38,6 +38,9 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	if sourceURL == "" || !fullSHA.MatchString(baseCommit) || len(planDigest) < 12 || len(files) == 0 {
 		return GitWorkspace{}, errors.New("onboarding workspace inputs are incomplete")
 	}
+	if _, _, err := currentHostProxyEnvironment(); err != nil {
+		return GitWorkspace{}, err
+	}
 	cloneURL := sourceURL
 	if credential.Token != "" {
 		var err error
@@ -116,7 +119,8 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 			}
 		}
 		if credential.Token == "" {
-			return runWithEnvironment(dir, nil, args...)
+			_, proxyEnvironment, _ := currentHostProxyEnvironment()
+			return runWithEnvironment(dir, proxyEnvironment, args...)
 		}
 		return runWithEnvironment(dir, gitCredentialEnvironmentForURL(credential, cloneURL), hardenedAuthenticatedGitArgs(cloneURL, args...)...)
 	}
@@ -217,13 +221,14 @@ func deterministicOnboardingCommitDate(planDigest string) (string, error) {
 	return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(seconds) * time.Second).Format(time.RFC3339), nil
 }
 func gitCredentialEnvironmentForURL(value GitCredential, canonicalURL string) []string {
+	_, environment, _ := currentHostProxyEnvironment()
 	if value.Token == "" {
-		return nil
+		return environment
 	}
 	username := value.Username
 	if username == "" {
 		username = "x-access-token"
 	}
 	authorization := base64.StdEncoding.EncodeToString([]byte(username + ":" + value.Token))
-	return []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http." + canonicalURL + ".extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic " + authorization, "GIT_TERMINAL_PROMPT=0"}
+	return append(environment, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http."+canonicalURL+".extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+authorization, "GIT_TERMINAL_PROMPT=0")
 }

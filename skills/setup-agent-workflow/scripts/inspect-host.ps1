@@ -56,6 +56,39 @@ function Invoke-ObservedCommand([string]$Name, [string[]]$Arguments) {
     return [ordered]@{ installed = $true; output = $output.Trim(); exit_code = $exitCode }
 }
 
+function Read-RawLocalOrigin([string]$Path) {
+    $gitCommand = Get-Command "git" -ErrorAction Stop
+    $savedGitEnvironment = [ordered]@{}
+    $isolatedNames = @(
+        Get-ChildItem Env: |
+            Where-Object { $_.Name -match '^GIT_(CONFIG|DIR|WORK_TREE|COMMON_DIR|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|INDEX_FILE|NAMESPACE|OPTIONAL_LOCKS)(_|$)' } |
+            ForEach-Object { [string]$_.Name }
+    )
+    foreach ($name in $isolatedNames) {
+        $savedGitEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        [Environment]::SetEnvironmentVariable($name, $null, "Process")
+    }
+    [Environment]::SetEnvironmentVariable("GIT_OPTIONAL_LOCKS", "0", "Process")
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $values = @(& $gitCommand.Source -C $Path config --local --no-includes --get-all remote.origin.url 2>$null | ForEach-Object { [string]$_ })
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        [Environment]::SetEnvironmentVariable("GIT_OPTIONAL_LOCKS", $null, "Process")
+        foreach ($name in $savedGitEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable([string]$name, [string]$savedGitEnvironment[$name], "Process")
+        }
+    }
+    if ($exitCode -eq 1 -and $values.Count -eq 0) { return "" }
+    if ($exitCode -ne 0) { throw "Unable to read local remote.origin.url exactly" }
+    if ($values.Count -ne 1 -or [string]::IsNullOrWhiteSpace($values[0])) {
+        throw "A Git repository must have zero or exactly one local remote.origin.url"
+    }
+    return $values[0]
+}
+
 $git = Invoke-ObservedCommand "git" @("-C", $repoPath, "rev-parse", "--show-toplevel")
 $isRepository = $git.installed -and $git.exit_code -eq 0
 $gitFacts = [ordered]@{ installed = $git.installed; is_repository = $isRepository }
@@ -63,7 +96,7 @@ if ($isRepository) {
     $gitFacts.root = $git.output
     $gitFacts.branch = (& git -C $repoPath branch --show-current 2>$null | Out-String).Trim()
     $gitFacts.head = (& git -C $repoPath rev-parse --verify HEAD 2>$null | Out-String).Trim()
-    $gitFacts.origin = (& git -C $repoPath remote get-url origin 2>$null | Out-String).Trim()
+    $gitFacts.origin = Read-RawLocalOrigin $repoPath
     $previousOptionalLocks = $env:GIT_OPTIONAL_LOCKS
     try {
         $env:GIT_OPTIONAL_LOCKS = "0"

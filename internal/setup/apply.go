@@ -95,6 +95,9 @@ type CleanupObligationPlanner interface {
 type CleanupObligationReconciler interface {
 	ReconcileCleanupObligation(context.Context, store.SetupCleanupObligation) error
 }
+type CleanupObligationValidator interface {
+	ValidateCleanupObligation(setupcontract.Plan, store.SetupCleanupObligation) error
+}
 type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
 type PlatformPreconditionVerifier func(context.Context, setupcontract.Plan) error
 type Engine struct {
@@ -164,17 +167,17 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	if e.Now != nil {
 		now = e.Now().UTC()
 	}
+	// Cleanup from any previously trusted Setup Plan precedes recording or
+	// verifying the replacement plan, so a new plan can never strand Plan A.
+	if err := DrainPendingCleanupObligations(ctx, database, e.Adapter, now); err != nil {
+		return setupcontract.ExecutionResult{}, err
+	}
 	if err := database.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: plan.PlanID, Kind: string(plan.Kind), SchemaVersion: plan.SchemaVersion, Target: targetName(plan), DigestSHA256: digest, CanonicalJSON: string(canonical), Projection: projection, CreatedAt: now}); err != nil {
 		return setupcontract.ExecutionResult{}, err
 	}
 	prior, err := database.SetupExecutionResults(ctx, plan.PlanID)
 	if err != nil {
 		return setupcontract.ExecutionResult{}, err
-	}
-	if plan.Kind == setupcontract.RepositoryOnboarding {
-		if err := verifyOnboardingIdentityFence(ctx, database, layout, plan); err != nil {
-			return setupcontract.ExecutionResult{}, err
-		}
 	}
 	attempt := len(prior) + 1
 	result := setupcontract.ExecutionResult{SchemaVersion: 1, PlanID: plan.PlanID, PlanDigest: digest, AttemptID: "attempt-" + strconv.Itoa(attempt), StartedAt: now, Status: setupcontract.ExecutionSucceeded}
@@ -203,16 +206,10 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			}
 		}
 	}
-	// Cleanup belongs to an already-approved mutation and must not be stranded
-	// by later host or repository drift. Reconcile it after restoring exact
-	// same-plan evidence, before evaluating unrelated preconditions.
-	if err := reconcilePendingCleanupObligations(ctx, database, e.Adapter, plan.PlanID, now); err != nil {
-		result.Status = setupcontract.ExecutionIncomplete
-		result.Blocker = err.Error()
-		result.FinishedAt = time.Now().UTC()
-		encoded, _ := json.Marshal(result.Effects)
-		recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
-		return result, errors.Join(err, recordErr)
+	if plan.Kind == setupcontract.RepositoryOnboarding {
+		if err := verifyOnboardingIdentityFence(ctx, database, layout, plan); err != nil {
+			return setupcontract.ExecutionResult{}, err
+		}
 	}
 	for _, precondition := range plan.Preconditions {
 		var checkErr error
@@ -310,7 +307,7 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			err = applyErr
 			break
 		}
-		if cleanupErr := reconcilePendingCleanupObligations(ctx, database, e.Adapter, plan.PlanID, now); cleanupErr != nil {
+		if cleanupErr := DrainPendingCleanupObligations(ctx, database, e.Adapter, now); cleanupErr != nil {
 			result.Status = setupcontract.ExecutionIncomplete
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: cleanupErr.Error()})
 			err = cleanupErr
@@ -373,6 +370,12 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			}
 		}
 	}
+	if err == nil {
+		err = RequireNoPendingCleanupObligations(ctx, database)
+		if err != nil {
+			result.Status = setupcontract.ExecutionIncomplete
+		}
+	}
 	result.FinishedAt = time.Now().UTC()
 	if e.Now != nil {
 		result.FinishedAt = e.Now().UTC()
@@ -404,8 +407,8 @@ func recordEffectCleanupObligations(ctx context.Context, database *store.Store, 
 	return nil
 }
 
-func reconcilePendingCleanupObligations(ctx context.Context, database *store.Store, adapter EffectAdapter, planID string, now time.Time) error {
-	pending, err := database.PendingSetupCleanupObligations(ctx, planID)
+func DrainPendingCleanupObligations(ctx context.Context, database *store.Store, adapter EffectAdapter, now time.Time) error {
+	pending, err := database.PendingSetupCleanupObligationsAll(ctx)
 	if err != nil {
 		return err
 	}
@@ -416,13 +419,39 @@ func reconcilePendingCleanupObligations(ctx context.Context, database *store.Sto
 	if !ok {
 		return errors.New("Setup adapter cannot reconcile pending cleanup obligations")
 	}
+	validator, ok := adapter.(CleanupObligationValidator)
+	if !ok {
+		return errors.New("Setup adapter cannot validate pending cleanup obligations")
+	}
 	for _, obligation := range pending {
+		archived, err := database.SetupPlan(ctx, obligation.PlanID)
+		if err != nil {
+			return fmt.Errorf("cleanup obligation %q lacks its archived Setup Plan: %w", obligation.ObligationID, err)
+		}
+		plan, canonical, digest, err := setupcontract.ParsePlan([]byte(archived.CanonicalJSON))
+		if err != nil || digest != archived.DigestSHA256 || digest != obligation.PlanDigestSHA256 || string(canonical) != archived.CanonicalJSON || plan.PlanID != archived.PlanID {
+			return fmt.Errorf("cleanup obligation %q has an untrusted Setup Plan binding", obligation.ObligationID)
+		}
+		if err := validator.ValidateCleanupObligation(plan, obligation); err != nil {
+			return fmt.Errorf("cleanup obligation %q target is not authorized: %w", obligation.ObligationID, err)
+		}
 		if err := reconciler.ReconcileCleanupObligation(ctx, obligation); err != nil {
 			return fmt.Errorf("cleanup obligation %q remains pending: %w", obligation.ObligationID, err)
 		}
-		if err := database.CompleteSetupCleanupObligation(ctx, planID, obligation.ObligationID, now); err != nil {
+		if err := database.CompleteSetupCleanupObligation(ctx, obligation.PlanID, obligation.ObligationID, now); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func RequireNoPendingCleanupObligations(ctx context.Context, database *store.Store) error {
+	pending, err := database.PendingSetupCleanupObligationsAll(ctx)
+	if err != nil {
+		return err
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("%d Setup cleanup obligation(s) remain pending", len(pending))
 	}
 	return nil
 }

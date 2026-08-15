@@ -178,6 +178,24 @@ func TestDiscoverRejectsAmbiguousRepositoryLocalOrigin(t *testing.T) {
 	}
 }
 
+func TestDiscoverRejectsExecutableLocalGitConfigurationWithoutExecutingIt(t *testing.T) {
+	for _, key := range []string{"include.path", "core.fsmonitor", "filter.evil.process", "diff.evil.textconv", "merge.evil.driver", "credential.helper", "http.proxy"} {
+		t.Run(key, func(t *testing.T) {
+			repo := newRepo(t)
+			sideEffect := filepath.Join(t.TempDir(), "executed")
+			git(t, repo, "config", key, "malicious-command "+sideEffect)
+			called := false
+			_, err := Discover(context.Background(), repo, remoteHeadFunc(func(context.Context, string) (string, string, error) { called = true; return "", "", nil }))
+			if err == nil || called {
+				t.Fatalf("unsafe %s reached discovery: called=%t err=%v", key, called, err)
+			}
+			if _, statErr := os.Stat(sideEffect); !os.IsNotExist(statErr) {
+				t.Fatalf("unsafe %s executed: %v", key, statErr)
+			}
+		})
+	}
+}
+
 func TestGitHubOriginAcceptsOnlyCanonicalTransportForms(t *testing.T) {
 	for _, accepted := range []string{
 		"https://github.com/owner/repo",

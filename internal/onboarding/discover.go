@@ -35,6 +35,9 @@ type Discovery struct {
 }
 
 func Discover(ctx context.Context, repository string, resolver RemoteHead) (Discovery, error) {
+	if _, _, err := currentHostProxyEnvironment(); err != nil {
+		return Discovery{}, err
+	}
 	root, err := gitOutput(ctx, repository, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return Discovery{}, errors.New("current directory is not a Git repository")
@@ -226,11 +229,12 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return strings.TrimSpace(string(data)), err
 }
 func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = dir
-	if len(args) > 0 && args[0] == "status" {
-		command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	if err := validateLocalGitReadConfiguration(ctx, dir); err != nil {
+		return nil, err
 	}
+	command := exec.CommandContext(ctx, "git", hardenedLocalGitArgs(args...)...)
+	command.Dir = dir
+	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	output, err := command.Output()
 	if err != nil {
 		return nil, err
@@ -245,7 +249,11 @@ func (LSRemoteHead) Resolve(ctx context.Context, origin string) (string, string,
 		return "", "", err
 	}
 	command := exec.CommandContext(ctx, "git", hardenedAuthenticatedGitArgs(origin, "ls-remote", "--symref", origin, "HEAD")...)
-	command.Env = isolatedGitEnvironment(nil)
+	_, proxyEnvironment, proxyErr := currentHostProxyEnvironment()
+	if proxyErr != nil {
+		return "", "", proxyErr
+	}
+	command.Env = isolatedGitEnvironment(proxyEnvironment)
 	output, err := command.Output()
 	if err != nil {
 		return "", "", err
