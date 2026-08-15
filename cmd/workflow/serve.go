@@ -49,6 +49,10 @@ func serveCommand(args []string, output io.Writer) error {
 		database.Close()
 		return fmt.Errorf("read Platform Installation: %w", err)
 	}
+	if err := requireInstalledWorkflowVersion(installation.PlatformVersion); err != nil {
+		database.Close()
+		return err
+	}
 	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
 	if digest == "" {
 		digest = installation.ControlPlanePlanDigestSHA256
@@ -78,16 +82,36 @@ func serveChildCommand(args []string) error {
 	flags.SetOutput(io.Discard)
 	homeOverride := flags.String("workflow-home", "", "absolute Workflow Home")
 	listenAddress := flags.String("listen", "127.0.0.1:0", "loopback health endpoint")
-	platformVersion := flags.String("platform-version", "", "installed platform version")
 	approvedDigest := flags.String("approved-plan-digest", "", "approved Platform Bootstrap Plan digest")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *homeOverride == "" || *platformVersion == "" || *approvedDigest == "" {
+	if flags.NArg() != 0 || *homeOverride == "" || *approvedDigest == "" {
 		return errors.New("invalid internal Control Plane child invocation")
 	}
 	layout, err := workflowhome.Resolve(*homeOverride)
 	if err != nil {
+		return err
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return err
+	}
+	installation, err := database.PlatformInstallation(context.Background())
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("read Platform Installation: %w", err)
+	}
+	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
+	if err := requireInstalledWorkflowVersion(installation.PlatformVersion); err != nil {
+		database.Close()
+		return err
+	}
+	if digest == "" || digest != installation.ControlPlanePlanDigestSHA256 {
+		database.Close()
+		return errors.New("Control Plane child launch digest is not the durable Platform Installation authorization")
+	}
+	if err := database.Close(); err != nil {
 		return err
 	}
 	if err := layout.Ensure(); err != nil {
@@ -117,11 +141,11 @@ func serveChildCommand(args []string) error {
 		return fmt.Errorf("resolve Control Plane process start identity: %w", err)
 	}
 	baseURL := "http://" + listener.Addr().String()
-	record := controlplane.RuntimeRecord{PID: os.Getpid(), PlatformVersion: *platformVersion, ProcessStartedAt: started, Endpoints: controlplane.Endpoints{Health: baseURL + "/health", Shutdown: baseURL + "/shutdown"}, ApprovedPlanDigestSHA256: strings.ToLower(*approvedDigest)}
+	record := controlplane.RuntimeRecord{PID: os.Getpid(), PlatformVersion: Version, ProcessStartedAt: started, Endpoints: controlplane.Endpoints{Health: baseURL + "/health", Shutdown: baseURL + "/shutdown"}, ApprovedPlanDigestSHA256: digest}
 	if err := controlplane.WriteRuntimeRecord(layout, record); err != nil {
 		return err
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	database, err = store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
 	if err != nil {
 		return err
 	}
@@ -137,6 +161,13 @@ func serveChildCommand(args []string) error {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	return (controlplane.Service{Listener: listener, Identity: record.Identity(), Loops: loops}).Run(ctx)
+}
+
+func requireInstalledWorkflowVersion(installed string) error {
+	if strings.TrimSpace(installed) == "" || Version != strings.TrimSpace(installed) {
+		return fmt.Errorf("Workflow CLI published version %q differs from durable Platform Installation version %q", Version, installed)
+	}
+	return nil
 }
 
 func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) ([]controlplane.Loop, func() error, error) {

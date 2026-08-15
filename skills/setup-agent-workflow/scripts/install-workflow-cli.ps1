@@ -99,6 +99,8 @@ try {
     if ($workflowExecutableEntries.Count -ne 1 -or -not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or -not [string]::Equals([IO.Path]::GetFullPath($workflowExecutableEntries[0].FullName), [IO.Path]::GetFullPath($expectedExecutablePath), [StringComparison]::OrdinalIgnoreCase)) { throw "Workflow CLI archive must contain only exact bin/workflow.exe" }
     $executable = Get-Item -LiteralPath $expectedExecutablePath
     if ((Get-SHA256File $executable.FullName) -cne [string]$workflowExecutablePins[0].sha256) { throw "Workflow CLI executable checksum differs from the signed workflow_cli_sha256" }
+    $publishedVersion = (& $executable.FullName version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $publishedVersion -cne ("workflow " + [string]$manifest.release.version)) { throw "Workflow CLI published version differs from the signed Platform Release Manifest" }
     $patEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "github_pat" })
     if ($patEffects.Count -gt 1) { throw "Approved Setup Plan contains multiple GitHub PAT effects" }
     if ($patEffects.Count -eq 1) {

@@ -50,6 +50,20 @@ func TestPowerShellHostInspectionRequiresExactlyOneRawLocalOrigin(t *testing.T) 
 		}
 	})
 
+	t.Run("fresh directory is not a repository", func(t *testing.T) {
+		t.Parallel()
+		output, err := run(t, t.TempDir())
+		if err != nil {
+			t.Fatalf("inspect fresh directory: %v\n%s", err, output)
+		}
+		var facts struct {
+			IsRepository bool `json:"is_repository"`
+		}
+		if err := json.Unmarshal(output, &facts); err != nil || facts.IsRepository {
+			t.Fatalf("fresh directory facts = %#v, %v, output=%s", facts, err, output)
+		}
+	})
+
 	t.Run("unborn repository", func(t *testing.T) {
 		t.Parallel()
 		repo := filepath.Join(t.TempDir(), "unborn")
@@ -146,20 +160,23 @@ func TestPowerShellHostInspectionRequiresExactlyOneRawLocalOrigin(t *testing.T) 
 		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "true")
 		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "")
 		output, err := run(t, repo)
-		if err == nil || !strings.Contains(string(output), "expected zero or exactly one extensions.worktreeConfig value") {
+		if err == nil || !strings.Contains(string(output), "extensions.worktreeConfig must be exactly true or false") {
 			t.Fatalf("multiple worktree config declarations were not blocked: %v\n%s", err, output)
 		}
 	})
 
-	t.Run("noncanonical worktree config declaration blocks", func(t *testing.T) {
-		t.Parallel()
-		repo := newRepo(t)
-		git(t, repo, "config", "--local", "extensions.worktreeConfig", "yes")
-		output, err := run(t, repo)
-		if err == nil || !strings.Contains(string(output), "extensions.worktreeConfig must be true or false") {
-			t.Fatalf("noncanonical worktree config declaration was not blocked: %v\n%s", err, output)
-		}
-	})
+	for _, value := range []string{"yes", "on", "1", "TRUE", "False", " true "} {
+		value := value
+		t.Run("noncanonical worktree config "+value, func(t *testing.T) {
+			t.Parallel()
+			repo := newRepo(t)
+			git(t, repo, "config", "--local", "extensions.worktreeConfig", value)
+			output, err := run(t, repo)
+			if err == nil || !strings.Contains(string(output), "extensions.worktreeConfig must be exactly true or false") {
+				t.Fatalf("noncanonical worktree config %q was not blocked: %v\n%s", value, err, output)
+			}
+		})
+	}
 
 	for _, test := range []struct {
 		name, scope, key, value string
@@ -185,6 +202,51 @@ func TestPowerShellHostInspectionRequiresExactlyOneRawLocalOrigin(t *testing.T) 
 				t.Fatalf("dangerous %s config was not blocked: %v\n%s", test.scope, err, output)
 			}
 		})
+	}
+}
+
+func TestPowerShellGitProbeClassifiesNonRepositoryWithoutReadingLocalizedStderr(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell 5.1 is the supported bootstrap shell")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	directory := t.TempDir()
+	shimSource := filepath.Join(directory, "git-shim.go")
+	shimPath := filepath.Join(directory, "git.exe")
+	if err := os.WriteFile(shimSource, []byte(`package main
+import ("fmt"; "os")
+func main() { fmt.Fprintln(os.Stderr, "fatal: kein Git-Repository (lokalisierte Diagnose)"); os.Exit(128) }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", shimPath, shimSource)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build localized git shim: %v\n%s", err, output)
+	}
+	_, currentFile, _, _ := runtime.Caller(0)
+	script := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1"))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Repository", directory, "-GitProbeOnly")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(entry), "PATH=") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("localized non-repository probe: %v\n%s", err, output)
+	}
+	var facts struct {
+		Installed    bool `json:"installed"`
+		IsRepository bool `json:"is_repository"`
+	}
+	if err := json.Unmarshal(output, &facts); err != nil || !facts.Installed || facts.IsRepository {
+		t.Fatalf("localized non-repository facts = %#v, %v, output=%s", facts, err, output)
 	}
 }
 

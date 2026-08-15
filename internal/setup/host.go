@@ -27,30 +27,31 @@ import (
 )
 
 type HostAdapter struct {
-	Layout                     workflowhome.Layout
-	Executable                 string
-	SkillBundleSource          string
-	PersistUserPATH            func(string) error
-	GitHub                     *github.Client
-	CleanupGitHub              *github.Client
-	GitCredential              onboarding.GitCredential
-	RepositoryPath             string
-	PlanDigest                 string
-	TemporaryRoot              string
-	StartControlPlane          func(context.Context, controlplane.StartOptions) (controlplane.RuntimeRecord, error)
-	InspectControlPlane        func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation
-	DockerDesktopHost          hostsetup.DockerDesktopHost
-	CurrentUserPATHReconciled  func(string) (bool, error)
-	OnboardingMergeHeads       map[string]string
-	CreatedRepositories        map[string]bool
-	InitialBaselineHeads       map[string]string
-	PublishedHistoryHeads      map[string]string
-	OnboardingCheckDiagnostics map[string][]string
-	ApprovedGitHubPolicies     map[string]string
-	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
-	RemoveCleanupPath          func(string) error
-	RemoveCleanupContainer     func(context.Context, string) error
-	RecordCleanupObligation    func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error
+	Layout                       workflowhome.Layout
+	Executable                   string
+	SkillBundleSource            string
+	PersistUserPATH              func(string) error
+	GitHub                       *github.Client
+	CleanupGitHub                *github.Client
+	GitCredential                onboarding.GitCredential
+	RepositoryPath               string
+	PlanDigest                   string
+	TemporaryRoot                string
+	StartControlPlane            func(context.Context, controlplane.StartOptions) (controlplane.RuntimeRecord, error)
+	InspectControlPlane          func(context.Context, *controlplane.RuntimeRecord) controlplane.Observation
+	DockerDesktopHost            hostsetup.DockerDesktopHost
+	CurrentUserPATHReconciled    func(string) (bool, error)
+	OnboardingMergeHeads         map[string]string
+	CreatedRepositories          map[string]bool
+	InitialBaselineHeads         map[string]string
+	PublishedHistoryHeads        map[string]string
+	OnboardingCheckDiagnostics   map[string][]string
+	ApprovedGitHubPolicies       map[string]string
+	CleanupOnboardingWorkspace   func(onboarding.GitWorkspace) error
+	RemoveCleanupPath            func(string) error
+	RemoveCleanupContainer       func(context.Context, string) error
+	DeleteCleanupBranchWithLease func(context.Context, string, string, string, onboarding.GitCredential) error
+	RecordCleanupObligation      func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
@@ -204,17 +205,14 @@ func (a HostAdapter) ReconcileCleanupObligation(ctx context.Context, obligation 
 		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository == "" || !strings.HasPrefix(resource.Branch, "workflow/onboarding-") || !fullSetupCommitID(resource.Head) {
 			return errors.New("remote onboarding branch cleanup resource is invalid")
 		}
-		liveHead, err := client.CleanupBranchHead(ctx, resource.Repository, resource.Branch)
-		if github.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
+		if err := github.ValidateOwnerGuardedRepositoryName(resource.Repository, client.RepositoryOwner); err != nil {
 			return err
 		}
-		if liveHead != resource.Head {
-			return errors.New("remote onboarding branch head differs from the approved deterministic cleanup head")
+		deleteWithLease := a.DeleteCleanupBranchWithLease
+		if deleteWithLease == nil {
+			deleteWithLease = onboarding.DeleteRemoteBranchWithLease
 		}
-		return client.DeleteCleanupBranch(ctx, resource.Repository, resource.Branch)
+		return deleteWithLease(ctx, resource.Repository, resource.Branch, resource.Head, onboarding.GitCredential{Username: "x-access-token", Token: client.Token})
 	case "temporary_clone":
 		var resource temporaryCloneCleanupResource
 		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || !filepath.IsAbs(resource.Root) || !filepath.IsAbs(resource.Path) {

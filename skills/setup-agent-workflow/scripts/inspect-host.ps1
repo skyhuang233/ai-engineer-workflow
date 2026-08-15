@@ -134,31 +134,28 @@ function Read-GitConfigNames([string]$Path, [string]$Scope) {
 }
 
 function Assert-SafeRepositoryGitConfiguration([string]$Path) {
+    $worktreeEnabled = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '-z', '--get-all', 'extensions.worktreeConfig')
+    $worktreeOutput = [string]$worktreeEnabled.output
+    $worktreeConfigured = -not ($worktreeEnabled.exit_code -eq 1 -and $worktreeOutput.Length -eq 0)
+    if ($worktreeConfigured -and $worktreeEnabled.exit_code -ne 0) {
+        throw "Unable to inspect repository worktree Git configuration: extensions.worktreeConfig must be exactly true or false: $($worktreeEnabled.error.Trim())"
+    }
+    $worktreeValue = 'false'
+    if ($worktreeConfigured) {
+        $worktreeValues = @($worktreeOutput -split "`0")
+        if ($worktreeValues.Count -ne 2 -or $worktreeValues[1].Length -ne 0 -or ($worktreeValues[0] -cne 'true' -and $worktreeValues[0] -cne 'false')) {
+            throw "Unable to inspect repository worktree Git configuration: extensions.worktreeConfig must be exactly true or false"
+        }
+        $worktreeValue = $worktreeValues[0]
+    }
     $localNames = @(Read-GitConfigNames $Path '--local')
     foreach ($name in $localNames) {
         if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
     }
-    $worktreeEnabled = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get-all', 'extensions.worktreeConfig')
-    $worktreeOutput = [string]$worktreeEnabled.output
-    if ($worktreeEnabled.exit_code -eq 1 -and $worktreeOutput.Length -eq 0) { return }
-    if ($worktreeEnabled.exit_code -ne 0) {
-        throw "Unable to inspect repository worktree Git configuration: $($worktreeEnabled.error.Trim())"
-    }
-    if ($worktreeOutput.EndsWith("`r`n")) {
-        $worktreeOutput = $worktreeOutput.Substring(0, $worktreeOutput.Length - 2)
-    } elseif ($worktreeOutput.EndsWith("`n")) {
-        $worktreeOutput = $worktreeOutput.Substring(0, $worktreeOutput.Length - 1)
-    }
-    $worktreeValues = @($worktreeOutput -split "`r?`n")
-    if ($worktreeValues.Count -ne 1) {
-        throw "Unable to inspect repository worktree Git configuration: expected zero or exactly one extensions.worktreeConfig value"
-    }
-    if ([string]::Equals($worktreeValues[0], 'true', [StringComparison]::OrdinalIgnoreCase)) {
+    if ($worktreeValue -ceq 'true') {
         foreach ($name in @(Read-GitConfigNames $Path '--worktree')) {
             if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
         }
-    } elseif (-not [string]::Equals($worktreeValues[0], 'false', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Unable to inspect repository worktree Git configuration: extensions.worktreeConfig must be true or false"
     }
 }
 
@@ -194,8 +191,25 @@ if ($git.installed) {
         $git.output = ([string]$rootResult.output).Trim()
         $git.exit_code = 0
         $isRepository = $true
-    } elseif (([string]$repositoryProbe.error) -match 'not a git repository') {
-        $git.exit_code = $repositoryProbe.exit_code
+    } elseif ($repositoryProbe.exit_code -eq 128) {
+        # Exit 128 is Git's structural "not a repository" result and does not
+        # require interpreting its localized diagnostic. A visible worktree
+        # marker means the command instead failed while parsing repository-owned
+        # configuration, which must remain a blocking inspection error.
+        $repositoryMarkerPresent = $false
+        $probeDirectory = Get-Item -LiteralPath $repoPath
+        while ($null -ne $probeDirectory) {
+            if (Test-Path -LiteralPath (Join-Path $probeDirectory.FullName '.git')) {
+                $repositoryMarkerPresent = $true
+                break
+            }
+            $probeDirectory = $probeDirectory.Parent
+        }
+        if ($repositoryMarkerPresent) {
+            Assert-SafeRepositoryGitConfiguration $repoPath
+            throw "Unable to inspect repository-local Git configuration: $($repositoryProbe.error.Trim())"
+        }
+        $git.exit_code = 128
     } else {
         throw "Unable to inspect repository-local Git configuration: $($repositoryProbe.error.Trim())"
     }

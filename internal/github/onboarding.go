@@ -481,41 +481,6 @@ func (c *Client) DeleteBranch(ctx context.Context, repository, branch string) er
 	return c.RequestJSON(ctx, http.MethodDelete, "/repos/"+repository+"/git/refs/heads/"+url.PathEscape(branch), nil, nil)
 }
 
-// CleanupBranchHead reads the exact head of a plan-owned temporary branch.
-// It is owner-scoped rather than onboarding-target-scoped because a newly
-// approved plan may drain residue left by an earlier trusted repository plan.
-func (c *Client) CleanupBranchHead(ctx context.Context, repository, branch string) (string, error) {
-	if err := ValidateOwnerGuardedRepositoryName(repository, c.RepositoryOwner); err != nil {
-		return "", err
-	}
-	if !strings.HasPrefix(branch, "workflow/onboarding-") {
-		return "", errors.New("cleanup branch is outside the onboarding namespace")
-	}
-	var result struct {
-		Object struct {
-			SHA string `json:"sha"`
-		} `json:"object"`
-	}
-	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/git/ref/heads/"+url.PathEscape(branch), nil, &result); err != nil {
-		return "", err
-	}
-	if !fullCommitID(result.Object.SHA) {
-		return "", errors.New("cleanup branch returned an invalid head")
-	}
-	return result.Object.SHA, nil
-}
-
-// DeleteCleanupBranch deletes only an owner-guarded temporary onboarding ref.
-// Callers must first compare CleanupBranchHead to durable approved evidence.
-func (c *Client) DeleteCleanupBranch(ctx context.Context, repository, branch string) error {
-	if err := ValidateOwnerGuardedRepositoryName(repository, c.RepositoryOwner); err != nil {
-		return err
-	}
-	if !strings.HasPrefix(branch, "workflow/onboarding-") {
-		return errors.New("cleanup branch is outside the onboarding namespace")
-	}
-	return c.RequestJSON(ctx, http.MethodDelete, "/repos/"+repository+"/git/refs/heads/"+url.PathEscape(branch), nil, nil)
-}
 func fullCommitID(value string) bool {
 	if len(value) != 40 {
 		return false

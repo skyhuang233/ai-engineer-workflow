@@ -40,6 +40,10 @@ const (
 	restoreIsolationTimeout     = 30 * time.Second
 )
 
+// Version is "dev" for source builds. Immutable Platform Release builds set
+// this exact variable with -ldflags "-X main.Version=<manifest-version>".
+var Version = "dev"
+
 func defaultCodexAuthFile() string {
 	return strings.TrimSpace(os.Getenv(codexauth.SourceOverrideEnvironment))
 }
@@ -76,7 +80,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "--version", "version":
-		fmt.Fprintln(os.Stdout, "workflow dev")
+		fmt.Fprintln(os.Stdout, "workflow "+Version)
 	case "setup":
 		if err := setupCommand(os.Args[2:]); err != nil {
 			fail(err)

@@ -112,7 +112,11 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 		"mutable worker pin":    func(m *Manifest) { m.PlatformSetup.Worker.Image = "ghcr.io/owner/worker:latest" },
 		"missing Docker URL":    func(m *Manifest) { m.PlatformSetup.Docker.InstallerURL = "" },
 		"missing bundle digest": func(m *Manifest) { m.BundledFiles[0].SHA256 = "" },
-		"provenance mismatch":   func(m *Manifest) { m.Provenance.SourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+		"development CLI version": func(m *Manifest) {
+			m.Release.Version = "dev"
+			m.Release.Tag = "platform-vdev"
+		},
+		"provenance mismatch": func(m *Manifest) { m.Provenance.SourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

@@ -37,6 +37,7 @@ import ("encoding/json"; "io"; "os"; "strings")
 func main() {
  args := strings.Join(os.Args[1:], " ")
  calls, _ := os.OpenFile(os.Getenv("WORKFLOW_TEST_CALLS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); if calls != nil { _, _ = calls.WriteString(args+"\n"); _ = calls.Close() }
+ if args == "version" { os.Stdout.WriteString("workflow "+os.Getenv("WORKFLOW_TEST_RELEASE_VERSION")+"\n"); return }
  if strings.HasPrefix(args, "setup apply ") { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_STDIN"), input, 0600); _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_ARGS"), []byte(strings.Join(os.Args[1:], "\n")), 0600); return }
  digest := os.Getenv("WORKFLOW_TEST_CP_DIGEST")
  if strings.HasPrefix(args, "setup inspect-platform ") { _ = json.NewEncoder(os.Stdout).Encode(map[string]any{"status":"ready", "result":map[string]any{"platform":map[string]any{"installation_recorded":true,"version":os.Getenv("WORKFLOW_TEST_RELEASE_VERSION"),"release_manifest_digest":os.Getenv("WORKFLOW_TEST_MANIFEST_DIGEST"),"platform_setup_contract_digest":os.Getenv("WORKFLOW_TEST_CONTRACT_DIGEST"),"workflow_cli_sha256":os.Getenv("WORKFLOW_TEST_CLI_DIGEST"),"release_bundled_files_json":os.Getenv("WORKFLOW_TEST_BUNDLE_JSON"),"release_bundled_files_digest":os.Getenv("WORKFLOW_TEST_BUNDLE_DIGEST"),"control_plane_plan_digest_sha256":digest},"workflow_cli":map[string]any{"verified":true}}}); return }
@@ -190,6 +191,16 @@ func main() {
 		t.Fatalf("failed download advanced the bootstrap release pin backup: %v", err)
 	}
 	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	versionMismatchCalls := filepath.Join(directory, "version-mismatch-calls.txt")
+	versionMismatch := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
+	versionMismatch.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION=0.9.0", "WORKFLOW_TEST_CALLS="+versionMismatchCalls)
+	versionMismatchOutput, versionMismatchErr := versionMismatch.CombinedOutput()
+	if versionMismatchErr == nil || !strings.Contains(string(versionMismatchOutput), "published version differs from the signed Platform Release Manifest") {
+		t.Fatalf("installer accepted a Workflow CLI whose published version differs from the signed manifest: err=%v output=%s", versionMismatchErr, versionMismatchOutput)
+	}
+	if calls, err := os.ReadFile(versionMismatchCalls); err != nil || strings.Contains(string(calls), "setup apply") {
+		t.Fatalf("version-mismatched Workflow CLI reached setup apply: calls=%q err=%v", calls, err)
+	}
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
 	installCommand.Stdin = bytes.NewBufferString(token + "\n")
 	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_PUBLIC_KEY="+publicKeyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
@@ -525,7 +536,7 @@ func TestBootstrapInstallerUsesOnlyExactPinnedArchiveExecutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(body)
-	for _, required := range []string{`Join-Path $expanded "bin\workflow.exe"`, "Workflow CLI archive must contain only exact bin/workflow.exe", "Workflow CLI executable checksum differs from the signed workflow_cli_sha256"} {
+	for _, required := range []string{`Join-Path $expanded "bin\workflow.exe"`, "Workflow CLI archive must contain only exact bin/workflow.exe", "Workflow CLI executable checksum differs from the signed workflow_cli_sha256", `& $executable.FullName version`, "Workflow CLI published version differs from the signed Platform Release Manifest"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap installer lacks exact archive executable contract %q", required)
 		}

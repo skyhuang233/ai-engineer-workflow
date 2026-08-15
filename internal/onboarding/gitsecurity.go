@@ -32,11 +32,11 @@ func ValidateAuthenticatedGitRepository(ctx context.Context, repository string) 
 // ValidateLocalGitReadConfiguration rejects repository-owned Git settings
 // that can execute code or redirect later reads away from repository.
 func ValidateLocalGitReadConfiguration(ctx context.Context, repository string) error {
-	if err := validateRepositoryGitConfigScope(ctx, repository, "local"); err != nil {
-		return err
-	}
 	enabled, err := repositoryWorktreeConfigEnabled(ctx, repository)
 	if err != nil {
+		return err
+	}
+	if err := validateRepositoryGitConfigScope(ctx, repository, "local"); err != nil {
 		return err
 	}
 	if !enabled {
@@ -46,7 +46,7 @@ func ValidateLocalGitReadConfiguration(ctx context.Context, repository string) e
 }
 
 func repositoryWorktreeConfigEnabled(ctx context.Context, repository string) (bool, error) {
-	command := exec.CommandContext(ctx, "git", "config", "--local", "--no-includes", "--bool", "--get", "extensions.worktreeConfig")
+	command := exec.CommandContext(ctx, "git", "config", "--local", "--no-includes", "-z", "--get-all", "extensions.worktreeConfig")
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	output, err := command.Output()
@@ -54,9 +54,13 @@ func repositoryWorktreeConfigEnabled(ctx context.Context, repository string) (bo
 		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
 			return false, nil
 		}
-		return false, fmt.Errorf("inspect repository-local worktree configuration extension: %w", err)
+		return false, fmt.Errorf("inspect repository-local worktree configuration extension (extensions.worktreeConfig must be exactly true or false): %w", err)
 	}
-	return strings.TrimSpace(string(output)) == "true", nil
+	values := strings.Split(string(output), "\x00")
+	if len(values) != 2 || values[1] != "" || (values[0] != "true" && values[0] != "false") {
+		return false, errors.New("extensions.worktreeConfig must be exactly true or false")
+	}
+	return values[0] == "true", nil
 }
 
 func validateRepositoryGitConfigScope(ctx context.Context, repository, scope string) error {

@@ -210,7 +210,7 @@ func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
 	if launch == nil {
 		launch = LaunchDetached
 	}
-	args := []string{"serve-child", "--workflow-home", options.Layout.Root, "--listen", listen, "--platform-version", options.PlatformVersion, "--approved-plan-digest", options.ApprovedPlanDigestSHA256}
+	args := []string{"serve-child", "--workflow-home", options.Layout.Root, "--listen", listen, "--approved-plan-digest", options.ApprovedPlanDigestSHA256}
 	pid, err := launch(options.Executable, args, stdout, stderr)
 	if err != nil {
 		return RuntimeRecord{}, err

@@ -243,6 +243,37 @@ func TestValidateLocalGitReadConfigurationRejectsWorktreeRedirectsInEveryReposit
 	}
 }
 
+func TestValidateLocalGitReadConfigurationRequiresCanonicalWorktreeExtension(t *testing.T) {
+	for _, value := range []string{"yes", "on", "1", "TRUE", "False", " true "} {
+		t.Run(value, func(t *testing.T) {
+			repo := newRepo(t)
+			git(t, repo, "config", "--local", "extensions.worktreeConfig", value)
+			if err := ValidateLocalGitReadConfiguration(context.Background(), repo); err == nil || !strings.Contains(err.Error(), "must be exactly true or false") {
+				t.Fatalf("noncanonical extensions.worktreeConfig %q was accepted: %v", value, err)
+			}
+		})
+	}
+
+	t.Run("multiple values", func(t *testing.T) {
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "true")
+		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "false")
+		if err := ValidateLocalGitReadConfiguration(context.Background(), repo); err == nil || !strings.Contains(err.Error(), "must be exactly true or false") {
+			t.Fatalf("multiple extensions.worktreeConfig values were accepted: %v", err)
+		}
+	})
+}
+
+func TestValidateLocalGitReadConfigurationSkipsWorktreeScopeOnlyForCanonicalFalse(t *testing.T) {
+	repo := newRepo(t)
+	git(t, repo, "config", "--local", "extensions.worktreeConfig", "true")
+	git(t, repo, "config", "--worktree", "credential.helper", "stale-helper")
+	git(t, repo, "config", "--local", "extensions.worktreeConfig", "false")
+	if err := ValidateLocalGitReadConfiguration(context.Background(), repo); err != nil {
+		t.Fatalf("canonical false inspected disabled worktree scope: %v", err)
+	}
+}
+
 func TestDiscoverRejectsCoreWorktreeBeforeRevParseCanEscapeRepository(t *testing.T) {
 	repo := newRepo(t)
 	externalWorktree := t.TempDir()

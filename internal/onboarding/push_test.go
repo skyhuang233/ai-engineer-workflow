@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestPublishDefaultBranchScopesPATToCanonicalPushOnly(t *testing.T) {
 	if err := PublishDefaultBranch(context.Background(), repo, canonicalURL, "main", credential); err != nil {
 		t.Fatal(err)
 	}
-	assertScopedNetworkCredential(t, capture, "push", canonicalURL, credential)
+	assertScopedNetworkCredential(t, capture, canonicalURL, credential, "push")
 	for name, path := range map[string]string{"pre-push hook": hookCapture} {
 		if data, err := os.ReadFile(path); err == nil {
 			t.Fatalf("untrusted %s executed with authenticated push environment: %s", name, data)
@@ -104,7 +105,41 @@ func TestSafeFastForwardScopesPATToCanonicalFetchOnly(t *testing.T) {
 	if err := SafeFastForward(context.Background(), repo, "owner/repo", "main", preMerge, mergeHead, credential); err != nil {
 		t.Fatal(err)
 	}
-	assertScopedNetworkCredential(t, capture, "fetch", canonicalURL, credential)
+	assertScopedNetworkCredential(t, capture, canonicalURL, credential, "fetch")
+}
+
+func TestDeleteRemoteBranchWithLeaseAtomicallyRejectsConcurrentAdvance(t *testing.T) {
+	repo := newRepo(t)
+	approvedHead := testGitOutput(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "commit", "--allow-empty", "-m", "external advance")
+	externalHead := testGitOutput(t, repo, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	git(t, "", "clone", "--bare", repo, bare)
+	branch := "workflow/onboarding-aaaaaaaaaaaa"
+	git(t, "", "--git-dir", bare, "update-ref", "refs/heads/"+branch, approvedHead)
+	canonicalURL := "https://github.com/owner/repo.git"
+	capture := installCapturedGitForPushTest(t, canonicalURL, bare)
+	t.Setenv("WORKFLOW_TEST_ADVANCE_REMOTE_REF", "refs/heads/"+branch)
+	t.Setenv("WORKFLOW_TEST_ADVANCE_REMOTE_SHA", externalHead)
+	credential := GitCredential{Username: "x-access-token", Token: "github_pat_cleanup_atomic_secret"}
+	err := DeleteRemoteBranchWithLease(context.Background(), "owner/repo", branch, approvedHead, credential)
+	if err == nil {
+		t.Fatal("concurrently advanced cleanup branch was deleted")
+	}
+	if got := testGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch); got != externalHead {
+		t.Fatalf("atomic cleanup changed concurrent head: got %s want %s", got, externalHead)
+	}
+	assertScopedNetworkCredential(t, capture, canonicalURL, credential, "ls-remote", "push")
+	wantedLease := "--force-with-lease=refs/heads/" + branch + ":" + approvedHead
+	seenLease := false
+	for _, process := range readCapturedProcesses(t, capture) {
+		if capturedGitSubcommand(process.Args) == "push" && slices.Contains(process.Args, wantedLease) && slices.Contains(process.Args, ":refs/heads/"+branch) {
+			seenLease = true
+		}
+	}
+	if !seenLease {
+		t.Fatalf("cleanup push did not carry exact expected-OID lease: %#v", readCapturedProcesses(t, capture))
+	}
 }
 
 func TestSafeFastForwardRejectsWorktreeChangeDuringFetch(t *testing.T) {
@@ -165,15 +200,15 @@ func installCapturedGitForPushTest(t *testing.T, canonicalURL, localRemote strin
 	return capture
 }
 
-func assertScopedNetworkCredential(t *testing.T, capturePath, networkSubcommand, canonicalURL string, credential GitCredential) {
+func assertScopedNetworkCredential(t *testing.T, capturePath, canonicalURL string, credential GitCredential, networkSubcommands ...string) {
 	t.Helper()
 	encodedCredential := base64.StdEncoding.EncodeToString([]byte(credential.Username + ":" + credential.Token))
-	seenNetwork := false
+	seenNetwork := make(map[string]bool, len(networkSubcommands))
 	for _, capture := range readCapturedProcesses(t, capturePath) {
 		subcommand := capturedGitSubcommand(capture.Args)
 		serialized := strings.Join(append(append([]string{}, capture.Args...), capture.Env...), "\n")
-		if subcommand == networkSubcommand {
-			seenNetwork = true
+		if slices.Contains(networkSubcommands, subcommand) {
+			seenNetwork[subcommand] = true
 			for _, wanted := range []string{
 				"GIT_CONFIG_KEY_0=http." + canonicalURL + ".extraHeader",
 				"GIT_CONFIG_VALUE_0=Authorization: Basic " + encodedCredential,
@@ -190,8 +225,10 @@ func assertScopedNetworkCredential(t *testing.T, capturePath, networkSubcommand,
 			}
 		}
 	}
-	if !seenNetwork {
-		t.Fatalf("network operation %s was not observed", networkSubcommand)
+	for _, subcommand := range networkSubcommands {
+		if !seenNetwork[subcommand] {
+			t.Fatalf("network operation %s was not observed", subcommand)
+		}
 	}
 }
 

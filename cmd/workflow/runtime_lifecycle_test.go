@@ -65,6 +65,41 @@ func TestForegroundChildCannotRecursivelyDetach(t *testing.T) {
 	}
 }
 
+func TestForegroundChildRejectsRuntimePlatformVersionOverride(t *testing.T) {
+	err := serveChildCommand([]string{"--workflow-home", filepath.Join(t.TempDir(), "home"), "--listen", "127.0.0.1:0", "--platform-version", "forged", "--approved-plan-digest", strings.Repeat("a", 64)})
+	if err == nil || !strings.Contains(err.Error(), "platform-version") {
+		t.Fatalf("hidden child accepted a runtime platform version override: %v", err)
+	}
+}
+
+func TestForegroundChildRejectsDurablePlatformVersionDifferentFromBuild(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	bundleJSON, bundleDigest := testReleaseBundle(strings.Repeat("d", 64))
+	installation := store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: strings.Repeat("b", 64), PlatformSetupContractDigestSHA256: strings.Repeat("c", 64), WorkflowCLISHA256: strings.Repeat("d", 64), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: digest, WorkflowHome: layout.Root, InstalledAt: time.Now().UTC(), VerifiedAt: time.Now().UTC()}
+	if err := database.RecordPlatformInstallation(context.Background(), installation); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = serveChildCommand([]string{"--workflow-home", layout.Root, "--listen", "127.0.0.1:0", "--approved-plan-digest", digest})
+	if err == nil || !strings.Contains(err.Error(), `published version "dev" differs`) {
+		t.Fatalf("development binary impersonated a published installation: %v", err)
+	}
+}
+
 func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
 	ctx := context.Background()
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
@@ -122,7 +157,7 @@ func TestWindowsDetachedServeSurvivesLauncherAndDoesNotRestartAfterStop(t *testi
 	}
 	directory := t.TempDir()
 	executable := filepath.Join(directory, "workflow.exe")
-	build := exec.Command("go", "build", "-o", executable, ".")
+	build := exec.Command("go", "build", "-ldflags", "-X main.Version=1.0.0", "-o", executable, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build workflow: %v\n%s", err, output)
 	}

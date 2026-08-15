@@ -48,9 +48,12 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0
+          PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:PLATFORM_VERSION)) { throw "WORKFLOW_PLATFORM_VERSION is required" }
           New-Item -ItemType Directory -Force build | Out-Null
-          go build -trimpath -ldflags "-buildid=" -o build/workflow.exe ./cmd/workflow
+          go build -trimpath -ldflags "-buildid= -X main.Version=$env:PLATFORM_VERSION" -o build/workflow.exe ./cmd/workflow
+          if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from WORKFLOW_PLATFORM_VERSION" }
           go build -trimpath -ldflags "-buildid=" -o build/platform-release.exe ./cmd/platform-release
           New-Item -ItemType Directory -Force build/payload/repository-contract | Out-Null
           New-Item -ItemType Directory -Force build/payload/skills | Out-Null

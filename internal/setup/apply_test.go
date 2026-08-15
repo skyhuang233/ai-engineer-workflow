@@ -21,6 +21,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
+	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -332,7 +333,13 @@ func TestApprovedPATReplacementPreflightsNewCredentialForEarlierRemoteCleanup(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := &HostAdapter{Layout: layout}
+	adapter := &HostAdapter{Layout: layout, DeleteCleanupBranchWithLease: func(_ context.Context, gotRepository, gotBranch, gotHead string, gotCredential onboarding.GitCredential) error {
+		if gotRepository != repository || gotBranch != branch || gotHead != head || gotCredential.Token != "ghp_replacement" {
+			t.Fatalf("cleanup was not bound to the approved replacement credential: repository=%q branch=%q head=%q credential=%#v", gotRepository, gotBranch, gotHead, gotCredential)
+		}
+		deletes++
+		return nil
+	}}
 	result, applyErr := (&Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}, GitHubCredentialVerifier: &githubcredential.Verifier{APIBase: server.URL, Client: server.Client()}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(context.Background(), canonicalB, digestB)
 	if applyErr != nil || result.Status != setupcontract.ExecutionSucceeded || deletes != 1 {
 		t.Fatalf("replacement result=%#v err=%v deletes=%d", result, applyErr, deletes)

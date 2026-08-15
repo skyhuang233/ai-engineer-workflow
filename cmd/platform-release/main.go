@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/json"
@@ -10,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 )
@@ -50,6 +53,9 @@ func run(arguments []string) error {
 	if *runID <= 0 {
 		return errors.New("-github-actions-run-id must be positive")
 	}
+	if err := verifyWorkflowExecutableVersion(*executable, *version); err != nil {
+		return err
+	}
 	manifest, err := loadTemplate(*templatePath)
 	if err != nil {
 		return err
@@ -70,6 +76,23 @@ func run(arguments []string) error {
 	}
 	_, err = platformrelease.Assemble(platformrelease.AssembleOptions{OutputDirectory: *output, WorkflowExecutable: *executable, PayloadDirectory: *payload, Manifest: manifest, SigningKey: key})
 	return err
+}
+
+func verifyWorkflowExecutableVersion(executable, expectedVersion string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, executable, "version").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("read Workflow CLI published version: %w", ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("read Workflow CLI published version: %w", err)
+	}
+	want := "workflow " + strings.TrimSpace(expectedVersion)
+	if got := strings.TrimSpace(string(output)); got != want {
+		return fmt.Errorf("Workflow CLI published version %q differs from Platform Release Manifest version %q", got, want)
+	}
+	return nil
 }
 
 func runTrustKey(arguments []string, output io.Writer) error {

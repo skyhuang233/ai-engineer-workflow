@@ -60,6 +60,14 @@ func runCapturedGit() int {
 	if replacedTransport {
 		args = append([]string{"-c", "protocol.file.allow=always"}, args...)
 	}
+	if capturedGitSubcommand(args) == "push" && os.Getenv("WORKFLOW_TEST_ADVANCE_REMOTE_REF") != "" {
+		advance := exec.Command(os.Getenv("WORKFLOW_TEST_REAL_GIT"), "--git-dir", os.Getenv("WORKFLOW_TEST_LOCAL_REMOTE"), "update-ref", os.Getenv("WORKFLOW_TEST_ADVANCE_REMOTE_REF"), os.Getenv("WORKFLOW_TEST_ADVANCE_REMOTE_SHA"))
+		advance.Stdout = os.Stdout
+		advance.Stderr = os.Stderr
+		if err := advance.Run(); err != nil {
+			return 125
+		}
+	}
 	command := exec.Command(os.Getenv("WORKFLOW_TEST_REAL_GIT"), args...)
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout

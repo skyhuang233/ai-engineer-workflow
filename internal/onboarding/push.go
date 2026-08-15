@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -110,6 +111,71 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	mergedHead, err := gitOutput(ctx, repository, "rev-parse", "--verify", "HEAD")
 	if err != nil || mergedHead != expectedMergeHead {
 		return errors.New("local default branch did not reach the persisted onboarding merge HEAD")
+	}
+	return nil
+}
+
+// DeleteRemoteBranchWithLease atomically deletes one deterministic onboarding
+// branch only while its live OID still equals the approved cleanup evidence.
+// The PAT is scoped to this one canonical HTTPS push and never enters argv,
+// repository configuration, or local Git commands.
+func DeleteRemoteBranchWithLease(ctx context.Context, repositoryID, branch, expectedHead string, credential GitCredential) (resultErr error) {
+	if !strings.HasPrefix(branch, "workflow/onboarding-") || len(strings.TrimPrefix(branch, "workflow/onboarding-")) != 12 {
+		return errors.New("cleanup branch is outside the deterministic onboarding namespace")
+	}
+	for _, character := range strings.TrimPrefix(branch, "workflow/onboarding-") {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return errors.New("cleanup branch has an invalid deterministic suffix")
+		}
+	}
+	if !fullSHA.MatchString(expectedHead) {
+		return errors.New("cleanup branch expected OID is invalid")
+	}
+	if credential.Token == "" || strings.ContainsAny(credential.Token, " \t\r\n") {
+		return errors.New("cleanup branch requires one approved GitHub credential")
+	}
+	canonicalURL, err := GitHubHTTPSURL(repositoryID)
+	if err != nil {
+		return err
+	}
+	root, err := os.MkdirTemp("", "workflow-branch-cleanup-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(root); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("cleanup atomic branch-delete repository: %w", cleanupErr))
+		}
+	}()
+	bare := filepath.Join(root, "repository.git")
+	initCommand := exec.CommandContext(ctx, "git", hardenedLocalGitArgs("init", "--bare", bare)...)
+	initCommand.Dir = root
+	initCommand.Env = isolatedGitEnvironment(nil)
+	if output, err := initCommand.CombinedOutput(); err != nil {
+		return fmt.Errorf("initialize atomic branch-delete repository: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	ref := "refs/heads/" + branch
+	readArgs := hardenedAuthenticatedGitArgs(canonicalURL, "ls-remote", "--refs", canonicalURL, ref)
+	readCommand := exec.CommandContext(ctx, "git", readArgs...)
+	readCommand.Dir = bare
+	readCommand.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
+	readOutput, err := readCommand.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("read approved onboarding branch before exact-OID delete: %w (%s)", err, strings.TrimSpace(string(readOutput)))
+	}
+	live := strings.TrimSpace(string(readOutput))
+	if live == "" {
+		return nil
+	}
+	if live != expectedHead+"\t"+ref {
+		return fmt.Errorf("cleanup branch drifted from approved OID %s: %q", expectedHead, live)
+	}
+	args := hardenedAuthenticatedGitArgs(canonicalURL, "push", "--porcelain", "--force-with-lease="+ref+":"+expectedHead, canonicalURL, ":"+ref)
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = bare
+	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
+	if output, err := command.CombinedOutput(); err != nil {
+		return fmt.Errorf("delete approved onboarding branch with exact OID lease: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

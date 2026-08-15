@@ -105,6 +105,11 @@ func TestStartLaunchesOnceAndReturnsExistingMatchingInstance(t *testing.T) {
 		if filepath.Dir(stdout) != layout.Logs || filepath.Dir(stderr) != layout.Logs || len(args) == 0 || args[0] != "serve-child" {
 			t.Fatalf("launch = args %#v stdout %q stderr %q", args, stdout, stderr)
 		}
+		for _, argument := range args {
+			if argument == "--platform-version" {
+				t.Fatalf("detached Control Plane launch exposes a runtime platform version override: %#v", args)
+			}
+		}
 		record := RuntimeRecord{PID: 321, PlatformVersion: "1.0.0", ProcessStartedAt: started, ApprovedPlanDigestSHA256: digest}
 		server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(writer).Encode(Health{Status: "ready", Identity: record.Identity()})
