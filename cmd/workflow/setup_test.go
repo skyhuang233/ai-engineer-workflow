@@ -21,6 +21,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -448,6 +449,38 @@ func TestReadyShortcutRequiresFullPlatformAndAdmissionVerification(t *testing.T)
 	err := verifySetupReady(context.Background(), nil, workflowhome.Layout{}, nil, "owner/repo")
 	if err == nil || !strings.Contains(err.Error(), "Docker probe failed") || platformCalls != 1 || admissionCalls != 1 {
 		t.Fatalf("ready verification err=%v platform=%d admission=%d", err, platformCalls, admissionCalls)
+	}
+}
+
+func TestReadyShortcutRejectsConfirmedRepositoryIntentDrift(t *testing.T) {
+	baseDiscovery := onboarding.Discovery{Repository: "owner/repo", Origin: "https://github.com/owner/repo.git", DefaultBranch: "main", Published: true}
+	basePolicy := onboarding.RepositoryPolicy{Private: true}
+	baseManifest := repositorycontract.Manifest{Repository: "owner/repo", DefaultBranch: "main", DomainLayout: "single-context"}
+	if err := validateConfirmedReadyIntent(baseDiscovery, basePolicy, baseManifest, "owner", "repo", true, "single-context"); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		discovery  onboarding.Discovery
+		policy     onboarding.RepositoryPolicy
+		manifest   repositorycontract.Manifest
+		repository string
+		private    bool
+		layout     string
+		want       string
+	}{
+		{name: "missing confirmed name", discovery: baseDiscovery, policy: basePolicy, manifest: baseManifest, private: true, layout: "single-context", want: "not confirmed"},
+		{name: "name", discovery: baseDiscovery, policy: basePolicy, manifest: baseManifest, repository: "other", private: true, layout: "single-context", want: "identity"},
+		{name: "origin", discovery: onboarding.Discovery{Repository: "owner/repo", Origin: "https://github.com/owner/repo", DefaultBranch: "main"}, policy: basePolicy, manifest: baseManifest, repository: "repo", private: true, layout: "single-context", want: "canonical"},
+		{name: "visibility", discovery: baseDiscovery, policy: onboarding.RepositoryPolicy{Private: false}, manifest: baseManifest, repository: "repo", private: true, layout: "single-context", want: "visibility"},
+		{name: "domain layout", discovery: baseDiscovery, policy: basePolicy, manifest: baseManifest, repository: "repo", private: true, layout: "multi-context", want: "domain layout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateConfirmedReadyIntent(test.discovery, test.policy, test.manifest, "owner", test.repository, test.private, test.layout)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), test.want) {
+				t.Fatalf("confirmed drift accepted: %v", err)
+			}
+		})
 	}
 }
 

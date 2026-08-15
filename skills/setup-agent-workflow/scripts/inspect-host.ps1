@@ -106,7 +106,10 @@ if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
     New-Item -ItemType Directory -Path $pinScratch | Out-Null
     try {
         $pin = Get-Content -LiteralPath $bootstrapPinPath -Raw | ConvertFrom-Json
-        if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "invalid pin metadata" }
+        $pinPropertyNames = @($pin.PSObject.Properties.Name | Sort-Object)
+        $expectedPinPropertyNames = @("schema_version", "release_version", "release_manifest_digest_sha256", "platform_setup_contract_digest_sha256", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest_sha256", "control_plane_plan_digest_sha256", "manifest_base64", "signature_base64" | Sort-Object)
+        if (($pinPropertyNames -join "`n") -cne ($expectedPinPropertyNames -join "`n")) { throw "pin contains missing or unknown fields" }
+        if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.release_bundled_files_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.control_plane_plan_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "invalid pin metadata" }
         $pinnedManifestPath = Join-Path $pinScratch "platform-release.json"
         $pinnedSignaturePath = Join-Path $pinScratch "platform-release.json.sig"
         [IO.File]::WriteAllBytes($pinnedManifestPath, [Convert]::FromBase64String([string]$pin.manifest_base64))
@@ -118,9 +121,14 @@ if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
         $contractCanonical = Join-Path $pinScratch "platform-contract.canonical.json"
         [IO.File]::WriteAllText($contractInput, ($pinnedManifest.platform_setup_contract | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
         $actualContractDigest = (& (Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1") -InputPath $contractInput -OutputPath $contractCanonical | Select-Object -Last 1).Trim()
+        $bundledFilesInput = Join-Path $pinScratch "bundled-files.input.json"
+        $bundledFilesCanonical = Join-Path $pinScratch "bundled-files.canonical.json"
+        [IO.File]::WriteAllText($bundledFilesInput, (ConvertTo-Json -InputObject @($pinnedManifest.bundled_files) -Depth 10 -Compress), (New-Object Text.UTF8Encoding($false)))
+        $actualBundledFilesDigest = (& (Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1") -InputPath $bundledFilesInput -OutputPath $bundledFilesCanonical | Select-Object -Last 1).Trim()
+        $actualBundledFilesJSON = [IO.File]::ReadAllText($bundledFilesCanonical, (New-Object Text.UTF8Encoding($false, $true)))
         $workflowPins = @($pinnedManifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" })
-        if ($actualPinnedDigest -cne [string]$pin.release_manifest_digest_sha256 -or [string]$pinnedManifest.release.version -cne [string]$pin.release_version -or $actualContractDigest -cne [string]$pin.platform_setup_contract_digest_sha256 -or $workflowPins.Count -ne 1 -or [string]$workflowPins[0].sha256 -cne [string]$pin.workflow_cli_sha256) { throw "pin identity differs from its verified manifest" }
-        $platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256 }
+        if ($actualPinnedDigest -cne [string]$pin.release_manifest_digest_sha256 -or [string]$pinnedManifest.release.version -cne [string]$pin.release_version -or $actualContractDigest -cne [string]$pin.platform_setup_contract_digest_sha256 -or $actualBundledFilesDigest -cne [string]$pin.release_bundled_files_digest_sha256 -or $actualBundledFilesJSON -cne [string]$pin.release_bundled_files_json -or $workflowPins.Count -ne 1 -or [string]$workflowPins[0].sha256 -cne [string]$pin.workflow_cli_sha256) { throw "pin identity differs from its verified manifest" }
+        $platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256; release_bundled_files_json = $actualBundledFilesJSON; release_bundled_files_digest = $actualBundledFilesDigest; control_plane_plan_digest_sha256 = [string]$pin.control_plane_plan_digest_sha256 }
         $bootstrapPinLoaded = $true
     } catch {
         $bootstrapPinConflictDiagnostic = "Bootstrap Platform Release pin conflict: $($_.Exception.Message)"

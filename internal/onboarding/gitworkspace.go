@@ -59,11 +59,33 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 			}
 		}
 	}()
-	env := gitCredentialEnvironment(credential)
+	clone := filepath.Join(root, "repository")
+	hooks := filepath.Join(root, "empty-hooks")
+	if err := os.Mkdir(hooks, 0o700); err != nil {
+		return GitWorkspace{}, err
+	}
+	fixedConfiguration := []string{
+		"-c", "core.autocrlf=false",
+		"-c", "core.safecrlf=false",
+		"-c", "core.fileMode=false",
+		"-c", "core.hooksPath=" + hooks,
+		"-c", "core.attributesFile=" + os.DevNull,
+		"-c", "core.fsmonitor=false",
+		"-c", "commit.gpgSign=false",
+		"-c", "tag.gpgSign=false",
+		"-c", "user.name=Agent Workflow Setup",
+		"-c", "user.email=workflow@localhost",
+		"-c", "user.useConfigOnly=true",
+		"-c", "i18n.commitEncoding=UTF-8",
+		"-c", "i18n.logOutputEncoding=UTF-8",
+		"-c", "credential.helper=",
+		"-c", "credential.interactive=never",
+	}
 	runWithEnvironment := func(dir string, extraEnvironment []string, args ...string) (string, error) {
-		command := exec.CommandContext(ctx, "git", args...)
+		commandArgs := append(append([]string{}, fixedConfiguration...), args...)
+		command := exec.CommandContext(ctx, "git", commandArgs...)
 		command.Dir = dir
-		command.Env = append(append(append([]string{}, os.Environ()...), env...), extraEnvironment...)
+		command.Env = isolatedGitEnvironment(extraEnvironment)
 		output, err := command.CombinedOutput()
 		if err != nil {
 			return "", fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
@@ -71,12 +93,10 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 		return strings.TrimSpace(string(output)), nil
 	}
 	run := func(dir string, args ...string) (string, error) { return runWithEnvironment(dir, nil, args...) }
-	clone := filepath.Join(root, "repository")
-	hooks := filepath.Join(root, "empty-hooks")
-	if err := os.Mkdir(hooks, 0o700); err != nil {
-		return GitWorkspace{}, err
+	runNetwork := func(dir string, args ...string) (string, error) {
+		return runWithEnvironment(dir, gitCredentialEnvironmentForURL(credential, cloneURL), args...)
 	}
-	if _, err := run(root, "clone", "--no-checkout", "--origin", "origin", cloneURL, clone); err != nil {
+	if _, err := runNetwork(root, "clone", "--no-checkout", "--origin", "origin", cloneURL, clone); err != nil {
 		return GitWorkspace{}, err
 	}
 	if _, err := run(clone, "checkout", "--detach", baseCommit); err != nil {
@@ -98,7 +118,7 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	for path := range files {
 		paths = append(paths, path)
 	}
-	args := append([]string{"-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "add", "--"}, paths...)
+	args := append([]string{"add", "--"}, paths...)
 	if _, err := run(clone, args...); err != nil {
 		return GitWorkspace{}, err
 	}
@@ -106,14 +126,22 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	if err != nil {
 		return GitWorkspace{}, err
 	}
-	if _, err := runWithEnvironment(clone, []string{"GIT_AUTHOR_DATE=" + commitDate, "GIT_COMMITTER_DATE=" + commitDate}, "-c", "user.name=Agent Workflow Setup", "-c", "user.email=workflow@localhost", "-c", "commit.gpgSign=false", "-c", "core.hooksPath="+hooks, "commit", "-m", "Onboard Agent Workflow\n\nSetup-Plan-Digest: "+planDigest); err != nil {
+	commitEnvironment := []string{
+		"GIT_AUTHOR_NAME=Agent Workflow Setup",
+		"GIT_AUTHOR_EMAIL=workflow@localhost",
+		"GIT_AUTHOR_DATE=" + commitDate,
+		"GIT_COMMITTER_NAME=Agent Workflow Setup",
+		"GIT_COMMITTER_EMAIL=workflow@localhost",
+		"GIT_COMMITTER_DATE=" + commitDate,
+	}
+	if _, err := runWithEnvironment(clone, commitEnvironment, "commit", "-m", "Onboard Agent Workflow\n\nSetup-Plan-Digest: "+planDigest); err != nil {
 		return GitWorkspace{}, err
 	}
 	head, err := run(clone, "rev-parse", "HEAD")
 	if err != nil {
 		return GitWorkspace{}, err
 	}
-	if _, err := run(clone, "push", "origin", "HEAD:refs/heads/"+result.Branch); err != nil {
+	if _, err := runNetwork(clone, "push", "origin", "HEAD:refs/heads/"+result.Branch); err != nil {
 		return GitWorkspace{}, err
 	}
 	result.Root = clone
@@ -121,6 +149,23 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	result.cleanupRoot = root
 	failed = false
 	return result, nil
+}
+
+func isolatedGitEnvironment(extra []string) []string {
+	environment := make([]string, 0, len(os.Environ())+len(extra)+3)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	environment = append(environment,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_ATTR_NOSYSTEM=1",
+	)
+	return append(environment, extra...)
 }
 
 func deterministicOnboardingCommitDate(planDigest string) (string, error) {
@@ -132,7 +177,7 @@ func deterministicOnboardingCommitDate(planDigest string) (string, error) {
 	seconds := binary.BigEndian.Uint64(decoded[:8]) % fiftyYears
 	return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(seconds) * time.Second).Format(time.RFC3339), nil
 }
-func gitCredentialEnvironment(value GitCredential) []string {
+func gitCredentialEnvironmentForURL(value GitCredential, canonicalURL string) []string {
 	if value.Token == "" {
 		return nil
 	}
@@ -141,5 +186,5 @@ func gitCredentialEnvironment(value GitCredential) []string {
 		username = "x-access-token"
 	}
 	authorization := base64.StdEncoding.EncodeToString([]byte(username + ":" + value.Token))
-	return []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic " + authorization, "GIT_TERMINAL_PROMPT=0"}
+	return []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http." + canonicalURL + ".extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic " + authorization, "GIT_TERMINAL_PROMPT=0"}
 }

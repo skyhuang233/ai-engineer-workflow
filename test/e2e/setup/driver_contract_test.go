@@ -104,11 +104,14 @@ func TestHarnessScansSuccessfulSetupCredentialBoundariesWithOneDurableFingerprin
 		"Invoke-SetupCredentialLeakScan", "WORKFLOW_SETUP_E2E_PAT", "fingerprint",
 		"workflow-home", `filepath.WalkDir`, `filepath.Join(home, "state", "workflow.db")`, `[]string{home, evidence}`,
 		"processEnvironmentEvidence", "dockerInspectEvidence", "dockerContainerEvidence",
-		"github_pat_verifications.fingerprint_sha256", "Authorization: Bearer",
+		"github_pat_verifications.fingerprint_sha256", "authorization: bearer", "wal_checkpoint(TRUNCATE)", "VACUUM", "rawMainFingerprint",
 	} {
 		if !strings.Contains(qualification, required) {
 			t.Fatalf("setup credential leak scan lacks required boundary/needle %q", required)
 		}
+	}
+	if !strings.Contains(harness, `stop --workflow-home $workflowHome`) {
+		t.Fatal("setup credential scan does not stop the Control Plane before SQLite compaction")
 	}
 	if !strings.Contains(harness, "Interrupted setup scenarios are intentionally excluded") {
 		t.Fatal("setup credential leak scan does not record the intentional interrupted-setup exclusion")

@@ -110,6 +110,10 @@ function Invoke-SetupCredentialLeakScan {
     $savedGitHubToken = $env:GH_TOKEN
     try {
         Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+		$workflowExecutable = Join-Path $workflowHome "bin\workflow.exe"
+		if (-not (Test-Path -LiteralPath $workflowExecutable -PathType Leaf)) { throw "Installed Workflow CLI is unavailable for the credential scan safe point" }
+		& $workflowExecutable stop --workflow-home $workflowHome --timeout 30s | Out-Null
+		if ($LASTEXITCODE -ne 0) { throw "Cannot stop the Control Plane before checkpointing credential evidence" }
         @(Get-ChildItem Env: | Sort-Object Name | ForEach-Object { $_.Name + "=" + $_.Value }) | Set-Content -LiteralPath $processEnvironmentEvidence -Encoding utf8
 
         $workerContainers = @(

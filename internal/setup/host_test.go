@@ -244,6 +244,13 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
 			_, _ = w.Write([]byte(`{"default_branch":"main","allow_squash_merge":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/rulesets":
+			_, _ = w.Write([]byte(`[]`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
 			head := base
 			if merged {
@@ -281,6 +288,9 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		PlanDigest:           strings.Repeat("a", 64),
 		TemporaryRoot:        t.TempDir(),
 		OnboardingMergeHeads: map[string]string{},
+		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{
+			ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true,
+		})},
 		CleanupOnboardingWorkspace: func(onboarding.GitWorkspace) error {
 			return errors.New("temporary clone cleanup failed")
 		},
@@ -296,6 +306,74 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		if !strings.Contains(err.Error(), wanted) {
 			t.Fatalf("cleanup error %q lacks %q", err, wanted)
 		}
+	}
+}
+
+func TestRepositoryContractApplyRechecksApprovedPolicyImmediatelyBeforeMerge(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+	branch := "workflow/onboarding-" + strings.Repeat("b", 12)
+	checks, reviews, merged := 0, 0, false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		workspaceHead := func() string { return hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch) }
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			// The approved policy selected squash. This live policy drift to merge
+			// must be caught only after the second checks/reviews read and before PUT.
+			_, _ = w.Write([]byte(`{"default_branch":"main","allow_merge_commit":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + base + `"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/check-runs"):
+			checks++
+			_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success","head_sha":"` + workspaceHead() + `","app":{"id":15368}}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7":
+			_, _ = w.Write([]byte(`{"number":7,"mergeable":true,"head":{"sha":"` + workspaceHead() + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
+			reviews++
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/rulesets":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
+			merged = true
+			_, _ = w.Write([]byte(`{"merged":true,"sha":"` + strings.Repeat("c", 40) + `"}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	adapter := HostAdapter{
+		GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"), PlanDigest: strings.Repeat("b", 64), TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{},
+		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true})},
+	}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
+	}}
+	err := adapter.applyRepositoryContract(context.Background(), effect)
+	if err == nil || !strings.Contains(err.Error(), "policy drifted") || merged || checks < 2 || reviews < 2 {
+		t.Fatalf("policy drift result err=%v merged=%t checks=%d reviews=%d", err, merged, checks, reviews)
 	}
 }
 
@@ -545,16 +623,17 @@ func TestRepositoryContractZeroCommitBaseComesOnlyFromPersistedBaselineEvidence(
 }
 
 func TestHostAdapterRestoresPlanBoundPublicationEvidence(t *testing.T) {
-	adapter := HostAdapter{CreatedRepositories: map[string]bool{}, PublishedHistoryHeads: map[string]string{}, InitialBaselineHeads: map[string]string{}}
+	adapter := HostAdapter{CreatedRepositories: map[string]bool{}, PublishedHistoryHeads: map[string]string{}, InitialBaselineHeads: map[string]string{}, ApprovedGitHubPolicies: map[string]string{}}
 	published := strings.Repeat("a", 40)
 	baseline := strings.Repeat("b", 40)
+	policy := approvedPolicyJSON(t, onboarding.RepositoryPolicy{ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true})
 	err := adapter.RestoreEffectResults([]setupcontract.EffectResult{
-		{EffectID: "create", Status: setupcontract.EffectSatisfied, Evidence: "created; " + repositoryCreatedEvidence + "create:owner/repo"},
+		{EffectID: "create", Status: setupcontract.EffectSatisfied, Evidence: "created; " + repositoryCreatedPolicyEvidence + base64.StdEncoding.EncodeToString([]byte(policy)) + "; " + repositoryCreatedEvidence + "create:owner/repo"},
 		{EffectID: "publish", Evidence: "published; " + publishedHistoryHeadEvidence + published},
 		{EffectID: "baseline", Evidence: "baseline; " + initialBaselineHeadEvidence + baseline},
 	})
-	if err != nil || !adapter.CreatedRepositories["owner/repo"] || adapter.PublishedHistoryHeads["publish"] != published || adapter.InitialBaselineHeads["baseline"] != baseline {
-		t.Fatalf("restored publication evidence = %#v %#v %#v err=%v", adapter.CreatedRepositories, adapter.PublishedHistoryHeads, adapter.InitialBaselineHeads, err)
+	if err != nil || !adapter.CreatedRepositories["owner/repo"] || adapter.PublishedHistoryHeads["publish"] != published || adapter.InitialBaselineHeads["baseline"] != baseline || adapter.ApprovedGitHubPolicies["owner/repo"] != policy {
+		t.Fatalf("restored publication evidence = %#v %#v %#v %#v err=%v", adapter.CreatedRepositories, adapter.PublishedHistoryHeads, adapter.InitialBaselineHeads, adapter.ApprovedGitHubPolicies, err)
 	}
 }
 
@@ -765,6 +844,15 @@ func hostGitOutput(t *testing.T, dir string, args ...string) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func approvedPolicyJSON(t *testing.T, policy onboarding.RepositoryPolicy) string {
+	t.Helper()
+	raw, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {

@@ -233,6 +233,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	assertSingleRepair("bundle ownership skills", "workflow_skill_bundle", "install", "-GitHubOwner", "owner")
 	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), bundleOwnerJSON)
 	noOpState["workflow"].(map[string]any)["sha256"] = strings.Repeat("0", 64)
+	noOpState["control_plane"] = map[string]any{"state": "stopped", "diagnostic": "installed Workflow CLI trust repair prevents live status inspection", "runtime": nil}
 	cliOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cliOnlyFacts)
 	assertSingleRepair("CLI-only", "platform_cli", "install", "-GitHubOwner", "owner")

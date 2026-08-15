@@ -332,6 +332,10 @@ func runSetupPlan(args []string, output io.Writer) error {
 	discovery, discoveryErr := onboarding.Discover(context.Background(), *repository, onboardingGitHubRemote{Client: client})
 	if discoveryErr == nil && discovery.Repository != "" {
 		if verifyErr := verifyRecordedAdmissionForSetup(context.Background(), database, layout, client, discovery.Repository); verifyErr == nil {
+			intentErr := verifyConfirmedReadyIntent(context.Background(), database, client, discovery, verification.Owner, *repositoryName, private, *domainLayout)
+			if intentErr != nil {
+				return writeSetupResponse(output, setupResponse{Status: "blocked", PlatformReady: true, Blocker: "confirmed repository intent: " + intentErr.Error()})
+			}
 			return writeSetupResponse(output, setupResponse{Status: "ready", PlatformReady: true, RepositoryAdmitted: true})
 		}
 	}
@@ -372,6 +376,67 @@ func runSetupPlan(args []string, output io.Writer) error {
 		return err
 	}
 	return writeSetupResponse(output, setupResponse{Status: "plan_required", PlatformReady: true, PlanPath: planPath, DigestSHA256: digest, Projection: setupengine.Project(plan, digest)})
+}
+
+func verifyConfirmedReadyIntent(ctx context.Context, database *store.Store, client *github.Client, discovery onboarding.Discovery, owner, repositoryName string, private bool, domainLayout string) error {
+	if client == nil || strings.TrimSpace(repositoryName) == "" {
+		return errors.New("repository name was not confirmed")
+	}
+	expectedRepository := owner + "/" + repositoryName
+	if !strings.EqualFold(discovery.Repository, expectedRepository) {
+		return fmt.Errorf("repository identity is %q, want %q", discovery.Repository, expectedRepository)
+	}
+	httpsOrigin, err := onboarding.GitHubHTTPSURL(expectedRepository)
+	if err != nil {
+		return err
+	}
+	sshOrigin := "git@github.com:" + expectedRepository + ".git"
+	if !strings.EqualFold(discovery.Origin, httpsOrigin) && !strings.EqualFold(discovery.Origin, sshOrigin) {
+		return errors.New("origin is not the canonical confirmed GitHub HTTPS or SSH URL")
+	}
+	policy, err := client.DiscoverPolicy(ctx, expectedRepository, discovery.DefaultBranch)
+	if err != nil {
+		return fmt.Errorf("verify confirmed repository visibility: %w", err)
+	}
+	if policy.Private != private {
+		return errors.New("repository visibility differs from the confirmed intent")
+	}
+	admissionValue, err := database.RepositoryAdmission(ctx, expectedRepository)
+	if err != nil {
+		return err
+	}
+	manifest, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+		return client.RepositoryFile(ctx, expectedRepository, path, discovery.DefaultBranch)
+	}, expectedRepository, discovery.DefaultBranch, admissionValue.ManifestDigestSHA256)
+	if err != nil {
+		return fmt.Errorf("verify confirmed Repository Contract: %w", err)
+	}
+	return validateConfirmedReadyIntent(discovery, policy, manifest, owner, repositoryName, private, domainLayout)
+}
+
+func validateConfirmedReadyIntent(discovery onboarding.Discovery, policy onboarding.RepositoryPolicy, manifest repositorycontract.Manifest, owner, repositoryName string, private bool, domainLayout string) error {
+	if strings.TrimSpace(repositoryName) == "" {
+		return errors.New("repository name was not confirmed")
+	}
+	expectedRepository := owner + "/" + repositoryName
+	if !strings.EqualFold(discovery.Repository, expectedRepository) {
+		return fmt.Errorf("repository identity is %q, want %q", discovery.Repository, expectedRepository)
+	}
+	httpsOrigin, err := onboarding.GitHubHTTPSURL(expectedRepository)
+	if err != nil {
+		return err
+	}
+	sshOrigin := "git@github.com:" + expectedRepository + ".git"
+	if !strings.EqualFold(discovery.Origin, httpsOrigin) && !strings.EqualFold(discovery.Origin, sshOrigin) {
+		return errors.New("origin is not the canonical confirmed GitHub HTTPS or SSH URL")
+	}
+	if policy.Private != private {
+		return errors.New("repository visibility differs from the confirmed intent")
+	}
+	if manifest.DomainLayout != domainLayout {
+		return errors.New("Repository Contract domain layout differs from the confirmed intent")
+	}
+	return nil
 }
 
 func requirePlatformReadyForOnboarding(ctx context.Context, database *store.Store, layout workflowhome.Layout, output io.Writer) (bool, error) {
@@ -487,8 +552,13 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}, CreatedRepositories: map[string]bool{}, InitialBaselineHeads: map[string]string{}, PublishedHistoryHeads: map[string]string{}}
+	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}, CreatedRepositories: map[string]bool{}, InitialBaselineHeads: map[string]string{}, PublishedHistoryHeads: map[string]string{}, ApprovedGitHubPolicies: map[string]string{}}
 	if plan.Kind == setupcontract.RepositoryOnboarding {
+		for _, precondition := range plan.Preconditions {
+			if precondition.Kind == "github_policy" {
+				adapter.ApprovedGitHubPolicies[precondition.Subject] = precondition.Expected
+			}
+		}
 		database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
 		if openErr != nil {
 			return openErr

@@ -12,14 +12,61 @@ import (
 
 func TestScannerAllowsOnlyCredentialFileAndDurableVerificationFingerprint(t *testing.T) {
 	s, home, evidence := newScannerFixture(t)
+	if err := s.compactMainDatabase(); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.scanRoot(home); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.scanRoot(evidence); err != nil {
 		t.Fatal(err)
 	}
-	if s.allowedFingerprint != 1 {
-		t.Fatalf("allowed durable fingerprint count = %d", s.allowedFingerprint)
+	if s.allowedFingerprint != 1 || s.rawMainFingerprint != 1 {
+		t.Fatalf("allowed durable fingerprint semantic=%d raw=%d", s.allowedFingerprint, s.rawMainFingerprint)
+	}
+}
+
+func TestScannerVacuumRemovesDeletedFingerprintPagesBeforeRawScan(t *testing.T) {
+	s, home, evidence := newScannerFixture(t)
+	database, err := sql.Open("sqlite", s.mainDatabase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE deleted_evidence(value TEXT); INSERT INTO deleted_evidence(value) VALUES(?); DELETE FROM deleted_evidence`, s.fingerprint); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.compactMainDatabase(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.scanRoot(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.scanRoot(evidence); err != nil {
+		t.Fatal(err)
+	}
+	if s.rawMainFingerprint != 1 {
+		t.Fatalf("compressed database retained deleted fingerprint pages: %d", s.rawMainFingerprint)
+	}
+}
+
+func TestScannerDoesNotExemptWALOrSHMBytes(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		t.Run(suffix, func(t *testing.T) {
+			s, home, _ := newScannerFixture(t)
+			if err := s.compactMainDatabase(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(s.mainDatabase+suffix, []byte("Authorization: Bearer "+s.token), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.scanRoot(home); err == nil || !strings.Contains(err.Error(), suffix) {
+				t.Fatalf("credential-bearing SQLite sidecar accepted: %v", err)
+			}
+		})
 	}
 }
 

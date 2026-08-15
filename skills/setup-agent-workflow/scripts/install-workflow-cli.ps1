@@ -92,8 +92,11 @@ try {
     if ($actual -ne $asset.sha256) { throw "Workflow CLI asset checksum mismatch" }
     $expanded = Join-Path $temporaryRoot "expanded"
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
-    $executable = Get-ChildItem -LiteralPath $expanded -Filter workflow.exe -Recurse | Select-Object -First 1
-    if ($null -eq $executable) { throw "Workflow CLI archive has no workflow.exe" }
+    $expectedExecutablePath = Join-Path $expanded "bin\workflow.exe"
+    $workflowExecutableEntries = @(Get-ChildItem -LiteralPath $expanded -File -Recurse | Where-Object { [string]::Equals($_.Name, "workflow.exe", [StringComparison]::OrdinalIgnoreCase) })
+    if ($workflowExecutableEntries.Count -ne 1 -or -not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or -not [string]::Equals([IO.Path]::GetFullPath($workflowExecutableEntries[0].FullName), [IO.Path]::GetFullPath($expectedExecutablePath), [StringComparison]::OrdinalIgnoreCase)) { throw "Workflow CLI archive must contain only exact bin/workflow.exe" }
+    $executable = Get-Item -LiteralPath $expectedExecutablePath
+    if ((Get-SHA256File $executable.FullName) -cne [string]$workflowExecutablePins[0].sha256) { throw "Workflow CLI executable checksum differs from the signed workflow_cli_sha256" }
     $patEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "github_pat" })
     if ($patEffects.Count -gt 1) { throw "Approved Setup Plan contains multiple GitHub PAT effects" }
     if ($patEffects.Count -eq 1) {
@@ -110,12 +113,18 @@ try {
     New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
     $pinPath = Join-Path $pinDirectory "bootstrap-platform-release-pin.json"
     $pinTemporaryPath = $pinPath + ".tmp-" + [Guid]::NewGuid().ToString("N")
+    $controlPlaneAuthorizationDigest = $ApprovedDigest
+    $cliRepairEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "platform_cli" -and [string]$_.parameters.control_plane_plan_digest_sha256 -match '^[0-9a-f]{64}$' })
+    if ($cliRepairEffects.Count -eq 1) { $controlPlaneAuthorizationDigest = [string]$cliRepairEffects[0].parameters.control_plane_plan_digest_sha256 }
     $pin = [ordered]@{
         schema_version = 1
         release_version = [string]$manifest.release.version
         release_manifest_digest_sha256 = $manifestDigest
         platform_setup_contract_digest_sha256 = $contractDigest
         workflow_cli_sha256 = [string]$workflowExecutablePins[0].sha256
+        release_bundled_files_json = $releaseBundledFilesJSON
+        release_bundled_files_digest_sha256 = $releaseBundledFilesDigest
+        control_plane_plan_digest_sha256 = $controlPlaneAuthorizationDigest
         manifest_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath)))
         signature_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($SignaturePath)))
     }

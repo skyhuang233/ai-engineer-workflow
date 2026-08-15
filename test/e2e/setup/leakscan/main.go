@@ -24,6 +24,7 @@ type scanner struct {
 	mainDatabase       string
 	credentialFile     string
 	allowedFingerprint int
+	rawMainFingerprint int
 }
 
 func main() {
@@ -53,6 +54,9 @@ func main() {
 		mainDatabase:   filepath.Clean(filepath.Join(home, "state", "workflow.db")),
 		credentialFile: filepath.Clean(filepath.Join(home, "state", "credentials", "github.pat")),
 	}
+	if err := s.compactMainDatabase(); err != nil {
+		fatal(err)
+	}
 	for _, root := range []string{home, evidence} {
 		if err := s.scanRoot(root); err != nil {
 			fatal(err)
@@ -61,6 +65,37 @@ func main() {
 	if s.allowedFingerprint != 1 {
 		fatal(fmt.Errorf("github_pat_verifications.fingerprint_sha256 durable singleton count = %d, want 1", s.allowedFingerprint))
 	}
+	if s.rawMainFingerprint != 1 {
+		fatal(fmt.Errorf("compressed Workflow database raw fingerprint count = %d, want 1", s.rawMainFingerprint))
+	}
+}
+
+func (s *scanner) compactMainDatabase() error {
+	if _, err := os.Stat(s.mainDatabase); err != nil {
+		return fmt.Errorf("Workflow database is unavailable for credential scan: %w", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(s.mainDatabase))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var busy, logFrames, checkpointed int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("checkpoint Workflow database before credential scan: %w", err)
+	}
+	if busy != 0 {
+		return errors.New("Workflow database is busy during credential scan checkpoint")
+	}
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return fmt.Errorf("compact Workflow database before raw credential scan: %w", err)
+	}
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("checkpoint compacted Workflow database before credential scan: %w", err)
+	}
+	if busy != 0 {
+		return errors.New("Workflow database is busy after credential scan compaction")
+	}
+	return nil
 }
 
 func (s *scanner) scanRoot(root string) error {
@@ -82,21 +117,24 @@ func (s *scanner) scanRoot(root string) error {
 			}
 			return nil
 		}
-		if clean == s.mainDatabase {
-			return s.scanSQLite(clean, true)
-		}
-		// The live database WAL/SHM are physical pages of the same semantic
-		// database. Querying the main database above includes them; raw scanning
-		// would misclassify the one allowed durable fingerprint field.
-		if clean == s.mainDatabase+"-wal" || clean == s.mainDatabase+"-shm" {
-			return nil
-		}
 		body, err := os.ReadFile(clean)
 		if err != nil {
 			return err
 		}
+		if clean == s.mainDatabase {
+			if err := s.scanSQLite(clean, true); err != nil {
+				return err
+			}
+			if err := s.rejectNeedles(clean, body, true); err != nil {
+				return err
+			}
+			s.rawMainFingerprint = bytes.Count(body, []byte(s.fingerprint))
+			return nil
+		}
 		if bytes.HasPrefix(body, []byte("SQLite format 3\x00")) {
-			return s.scanSQLite(clean, false)
+			if err := s.scanSQLite(clean, false); err != nil {
+				return err
+			}
 		}
 		return s.rejectNeedles(clean, body, false)
 	})
@@ -175,15 +213,20 @@ func sqliteColumns(db *sql.DB, table string) ([]string, error) {
 
 func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
 
-func (s *scanner) rejectNeedles(location string, body []byte, _ bool) error {
+func (s *scanner) rejectNeedles(location string, body []byte, allowMainFingerprint bool) error {
 	for label, needle := range map[string]string{
 		"exact PAT":             s.token,
 		"exact PAT fingerprint": s.fingerprint,
-		"Authorization header":  "Authorization: Bearer " + s.token,
 	} {
+		if allowMainFingerprint && label == "exact PAT fingerprint" {
+			continue
+		}
 		if bytes.Contains(body, []byte(needle)) {
 			return fmt.Errorf("credential leak in %s: %s", location, label)
 		}
+	}
+	if bytes.Contains(bytes.ToLower(body), []byte("authorization: bearer")) {
+		return fmt.Errorf("credential leak in %s: Authorization header", location)
 	}
 	return nil
 }

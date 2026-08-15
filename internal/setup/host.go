@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -44,6 +45,7 @@ type HostAdapter struct {
 	InitialBaselineHeads       map[string]string
 	PublishedHistoryHeads      map[string]string
 	OnboardingCheckDiagnostics map[string][]string
+	ApprovedGitHubPolicies     map[string]string
 	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
 }
 
@@ -57,11 +59,36 @@ type hostIdentityPrecondition struct {
 }
 
 const repositoryCreatedEvidence = "repository_created="
+const repositoryCreatedPolicyEvidence = "repository_created_policy_base64="
 const initialBaselineHeadEvidence = "initial_baseline_head="
 const publishedHistoryHeadEvidence = "published_history_head="
 
 func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
 	for _, result := range results {
+		if index := strings.Index(result.Evidence, repositoryCreatedPolicyEvidence); index >= 0 && a.ApprovedGitHubPolicies != nil {
+			if result.Status != setupcontract.EffectSatisfied {
+				return errors.New("persisted repository-creation policy evidence is invalid")
+			}
+			encoded := result.Evidence[index+len(repositoryCreatedPolicyEvidence):]
+			if end := strings.Index(encoded, ";"); end >= 0 {
+				encoded = encoded[:end]
+			}
+			raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+			var policy onboarding.RepositoryPolicy
+			if err != nil || json.Unmarshal(raw, &policy) != nil {
+				return errors.New("persisted repository-creation policy evidence is invalid")
+			}
+			createdIndex := strings.Index(result.Evidence, repositoryCreatedEvidence)
+			if createdIndex < 0 {
+				return errors.New("persisted repository-creation policy lacks repository identity evidence")
+			}
+			binding := strings.TrimSpace(result.Evidence[createdIndex+len(repositoryCreatedEvidence):])
+			_, repository, bound := strings.Cut(binding, ":")
+			if !bound || !strings.Contains(repository, "/") {
+				return errors.New("persisted repository-creation policy repository identity is invalid")
+			}
+			a.ApprovedGitHubPolicies[repository] = string(raw)
+		}
 		if index := strings.Index(result.Evidence, repositoryCreatedEvidence); index >= 0 && a.CreatedRepositories != nil {
 			binding := strings.TrimSpace(result.Evidence[index+len(repositoryCreatedEvidence):])
 			effectID, repository, bound := strings.Cut(binding, ":")
@@ -304,7 +331,17 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if repository.Private != wantPrivate {
 				return setupcontract.EffectConflicting, "created GitHub repository visibility differs from approved plan", nil
 			}
-			evidence := "GitHub repository created by this Setup Plan with approved identity and visibility; " + repositoryCreatedEvidence + effect.ID + ":" + effect.Subject
+			policyEvidence := ""
+			if a.ApprovedGitHubPolicies != nil && a.ApprovedGitHubPolicies[effect.Subject] == "" {
+				policy, policyErr := a.GitHub.DiscoverPolicy(ctx, effect.Subject, repository.DefaultBranch)
+				if policyErr != nil {
+					return setupcontract.EffectFailed, "", fmt.Errorf("bind created repository policy transition: %w", policyErr)
+				}
+				raw, _ := json.Marshal(policy)
+				a.ApprovedGitHubPolicies[effect.Subject] = string(raw)
+				policyEvidence = repositoryCreatedPolicyEvidence + base64.StdEncoding.EncodeToString(raw) + "; "
+			}
+			evidence := "GitHub repository created by this Setup Plan with approved identity and visibility; " + policyEvidence + repositoryCreatedEvidence + effect.ID + ":" + effect.Subject
 			return setupcontract.EffectSatisfied, evidence, nil
 		},
 		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -385,6 +422,17 @@ func hostReadbackHandlers() map[string]effectReadback {
 			}
 			if !policy.HasIssues || !policy.ActionsEnabled || policy.ActionsAllowed != effect.Parameters["allowed_actions"] {
 				return setupcontract.EffectRequired, "GitHub Issues or Actions is disabled", nil
+			}
+			if raw := a.ApprovedGitHubPolicies[effect.Subject]; raw != "" {
+				var approved onboarding.RepositoryPolicy
+				if json.Unmarshal([]byte(raw), &approved) != nil {
+					return setupcontract.EffectFailed, "", errors.New("approved GitHub repository policy evidence is invalid")
+				}
+				approved.HasIssues, approved.ActionsEnabled = true, true
+				approved.ActionsAllowed, approved.GitHubOwnedActionsAllowed = policy.ActionsAllowed, policy.GitHubOwnedActionsAllowed
+				approved.AllowFeatureEnable = true
+				updated, _ := json.Marshal(approved)
+				a.ApprovedGitHubPolicies[effect.Subject] = string(updated)
 			}
 			return setupcontract.EffectSatisfied, "GitHub Issues and Actions are enabled", nil
 		},
@@ -991,20 +1039,9 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 			return errors.New("Onboarding Pull Request has requested changes")
 		}
 	}
-	repository, err := a.GitHub.RepositoryForOnboarding(ctx, effect.Subject)
+	approvedPolicy, method, err := a.approvedRepositoryMergePolicy(effect.Subject)
 	if err != nil {
 		return err
-	}
-	method := ""
-	switch {
-	case repository.AllowSquashMerge:
-		method = "squash"
-	case repository.AllowMergeCommit:
-		method = "merge"
-	case repository.AllowRebaseMerge:
-		method = "rebase"
-	default:
-		return errors.New("repository has no supported merge method")
 	}
 	// Re-read both sides immediately before exercising the approved merge
 	// authority. Checks and repository-policy reads above may take minutes.
@@ -1014,6 +1051,21 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	}
 	if current.Head.SHA != workspace.Head || current.Base.Ref != effect.Parameters["base_branch"] || current.Base.SHA != baseHead || current.Mergeable == nil || !*current.Mergeable {
 		return errors.New("Onboarding Pull Request drifted before merge")
+	}
+	if _, err := waitForOnboardingChecks(ctx, a.GitHub, effect.Subject, workspace.Head, requiredChecks, time.Second); err != nil {
+		return fmt.Errorf("approved checks drifted before merge: %w", err)
+	}
+	reviews, err = a.GitHub.OnboardingPullRequestReviews(ctx, effect.Subject, pull.Number)
+	if err != nil {
+		return err
+	}
+	for _, review := range reviews {
+		if strings.EqualFold(review.State, "CHANGES_REQUESTED") {
+			return errors.New("Onboarding Pull Request received requested changes before merge")
+		}
+	}
+	if err := a.recheckApprovedGitHubPolicy(ctx, effect.Subject, effect.Parameters["base_branch"], approvedPolicy); err != nil {
+		return err
 	}
 	if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
 		return err
@@ -1032,6 +1084,41 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	}
 	if mergedDefault.Name != effect.Parameters["base_branch"] || mergedDefault.Head != merge.SHA {
 		return fmt.Errorf("%s%s; GitHub default branch advanced before the approved merge HEAD could be bound", onboardingMergeHeadEvidence, merge.SHA)
+	}
+	return nil
+}
+
+func (a HostAdapter) approvedRepositoryMergePolicy(repository string) (onboarding.RepositoryPolicy, string, error) {
+	raw := a.ApprovedGitHubPolicies[repository]
+	var policy onboarding.RepositoryPolicy
+	if raw == "" || json.Unmarshal([]byte(raw), &policy) != nil {
+		return policy, "", errors.New("approved GitHub repository policy is required before merge")
+	}
+	switch {
+	case policy.AllowSquashMerge:
+		return policy, "squash", nil
+	case policy.AllowMergeCommit:
+		return policy, "merge", nil
+	case policy.AllowRebaseMerge:
+		return policy, "rebase", nil
+	default:
+		return policy, "", errors.New("approved GitHub repository policy has no supported merge method")
+	}
+}
+
+func (a HostAdapter) recheckApprovedGitHubPolicy(ctx context.Context, repository, branch string, approved onboarding.RepositoryPolicy) error {
+	actual, err := a.GitHub.DiscoverPolicy(ctx, repository, branch)
+	if err != nil {
+		return fmt.Errorf("re-read approved GitHub repository policy before merge: %w", err)
+	}
+	if approved.AllowFeatureEnable {
+		actual.HasIssues, actual.ActionsEnabled = approved.HasIssues, approved.ActionsEnabled
+	}
+	actual.AllowFeatureEnable = approved.AllowFeatureEnable
+	want, _ := json.Marshal(approved)
+	got, _ := json.Marshal(actual)
+	if !bytes.Equal(want, got) {
+		return errors.New("approved GitHub repository policy drifted before merge; Setup Plan approval is invalid")
 	}
 	return nil
 }

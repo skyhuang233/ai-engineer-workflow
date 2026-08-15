@@ -279,7 +279,10 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	if json.Unmarshal(pin, &pinDocument) != nil {
 		t.Fatal("bootstrap release pin is not JSON")
 	}
-	pinDocument["release_manifest_digest_sha256"] = strings.Repeat("0", 64)
+	if pinDocument["release_bundled_files_json"] == "" || pinDocument["release_bundled_files_digest_sha256"] == "" || pinDocument["control_plane_plan_digest_sha256"] != envelope.Digest {
+		t.Fatalf("bootstrap release pin omitted signed bundle inventory or Control Plane authorization fence: %#v", pinDocument)
+	}
+	pinDocument["unexpected_future_authority"] = "not-approved"
 	tamperedPin, _ := json.Marshal(pinDocument)
 	if err := os.WriteFile(pinPath, tamperedPin, 0o600); err != nil {
 		t.Fatal(err)
@@ -293,7 +296,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 			Diagnostic string `json:"diagnostic"`
 		} `json:"workflow"`
 	}
-	if decodeErr := json.Unmarshal(tamperedOutput, &tamperedFacts); tamperedErr != nil || decodeErr != nil || tamperedFacts.Workflow.TrustState != "conflict" || !strings.Contains(tamperedFacts.Workflow.Diagnostic, "Bootstrap Platform Release pin conflict") {
+	if decodeErr := json.Unmarshal(tamperedOutput, &tamperedFacts); tamperedErr != nil || decodeErr != nil || tamperedFacts.Workflow.TrustState != "conflict" || !strings.Contains(tamperedFacts.Workflow.Diagnostic, "missing or unknown fields") {
 		t.Fatalf("tampered bootstrap pin was not reported as a non-executed conflict: err=%v decode=%v output=%s", tamperedErr, decodeErr, tamperedOutput)
 	}
 	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
@@ -352,6 +355,24 @@ func main() {
 	sum := sha256.Sum256(auth)
 	if !facts.CodexAuth.Verified || facts.CodexAuth.Source != authPath || facts.CodexAuth.FingerprintSHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("fresh Codex auth facts=%#v", facts.CodexAuth)
+	}
+}
+
+func TestBootstrapInstallerUsesOnlyExactPinnedArchiveExecutable(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	scriptPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "install-workflow-cli.ps1")
+	body, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(body)
+	for _, required := range []string{`Join-Path $expanded "bin\workflow.exe"`, "Workflow CLI archive must contain only exact bin/workflow.exe", "Workflow CLI executable checksum differs from the signed workflow_cli_sha256"} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("bootstrap installer lacks exact archive executable contract %q", required)
+		}
+	}
+	if strings.Contains(content, `-Filter workflow.exe -Recurse`) {
+		t.Fatal("bootstrap installer still chooses a recursive or ambiguous workflow.exe")
 	}
 }
 

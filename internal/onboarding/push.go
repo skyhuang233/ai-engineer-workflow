@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -41,7 +40,7 @@ func PublishDefaultBranch(ctx context.Context, repository, remoteURL, branch str
 	args = append(args, pushTarget, "refs/heads/"+branch+":refs/heads/"+branch)
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = repository
-	command.Env = append(os.Environ(), gitCredentialEnvironment(credential)...)
+	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("publish default branch: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -66,7 +65,7 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	}
 	command := exec.CommandContext(ctx, "git", "fetch", remoteURL, expectedMergeHead)
 	command.Dir = repository
-	command.Env = append(os.Environ(), gitCredentialEnvironment(credential)...)
+	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, remoteURL))
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("fetch merged default branch: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -84,6 +83,7 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	}
 	command = exec.CommandContext(ctx, "git", "merge", "--ff-only", "FETCH_HEAD")
 	command.Dir = repository
+	command.Env = isolatedGitEnvironment(nil)
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("safe fast-forward merged default branch: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
