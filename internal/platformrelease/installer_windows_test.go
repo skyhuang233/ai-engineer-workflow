@@ -117,11 +117,16 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	var inspected struct {
 		SchemaVersion int  `json:"schema_version"`
 		SupportedHost bool `json:"supported_host"`
+		HostIdentity  struct {
+			UserID              string `json:"user_id"`
+			Username            string `json:"username"`
+			WorkflowHomeOwnerID string `json:"workflow_home_owner_id"`
+		} `json:"host_identity"`
 	}
-	if err != nil || json.Unmarshal(inspectOutput, &inspected) != nil || inspected.SchemaVersion != 1 || !inspected.SupportedHost {
+	if err != nil || json.Unmarshal(inspectOutput, &inspected) != nil || inspected.SchemaVersion != 1 || !inspected.SupportedHost || !strings.HasPrefix(inspected.HostIdentity.UserID, "S-") || inspected.HostIdentity.Username == "" || inspected.HostIdentity.WorkflowHomeOwnerID != inspected.HostIdentity.UserID {
 		t.Fatalf("fresh host inspection on powershell.exe: %v (%s)", err, inspectOutput)
 	}
-	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
+	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
 	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath)
 	planOutput, err := planCommand.CombinedOutput()

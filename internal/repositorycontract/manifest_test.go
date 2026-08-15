@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,5 +144,13 @@ func TestRuntimeContractTemplatesAreByteIdenticalToDeployInputs(t *testing.T) {
 	sum := sha256.Sum256(blockBytes)
 	if manifest.ManagedBlockSHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("managed block digest parity = %q", manifest.ManagedBlockSHA256)
+	}
+}
+
+func TestGeneratedRuntimeContractTemplatesAreCurrentWithDeployCanonicalSource(t *testing.T) {
+	command := exec.Command("go", "run", "./cmd/gentemplates", "-check", "-source", filepath.Join("..", "..", "deploy", "platform", "repository-contract"), "-output", "templates_generated.go")
+	command.Dir = "."
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated Repository Contract templates are stale: %v\n%s", err, output)
 	}
 }

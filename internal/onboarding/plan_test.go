@@ -231,7 +231,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		if repository != "owner/repo" || branch != "main" {
 			t.Fatalf("policy target=%s branch=%s", repository, branch)
 		}
-		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, RequiredChecks: []string{"build"}}, nil
+		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, RequiredChecks: []RequiredCheck{{Context: "build", AppID: 42}}}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		case "repository_features":
 			features = effect.Parameters["allowed_actions"] == "selected"
 		case "repository_contract_pr":
-			contract = effect.Parameters["required_checks_json"] == `["workflow-contract","build"]`
+			contract = effect.Parameters["required_checks_json"] == `[{"context":"workflow-contract","app_id":15368},{"context":"build","app_id":42}]`
 		}
 	}
 	if !features || !contract {
@@ -260,6 +260,18 @@ func TestPlanBlocksRepositoryPolicyThatNeedsHumanReview(t *testing.T) {
 	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
 	if err == nil || !strings.Contains(err.Error(), "human review") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPlanFailsClosedWhenRequiredCheckLacksAppIdentity(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true, RequiredChecks: []RequiredCheck{{Context: "build"}}}, nil
+	})
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
+	if err == nil || !strings.Contains(err.Error(), "App identity") {
+		t.Fatalf("unbound required check accepted: %v", err)
 	}
 }
 
@@ -328,8 +340,38 @@ func TestPlanContainsOnlyUnsatisfiedOnboardingDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Effects) != 1 || plan.Effects[0].Kind != "github_label" || plan.Effects[0].Parameters["name"] != "workflow:ticket" {
+	if len(plan.Effects) != 2 || plan.Effects[0].Kind != "github_label" || plan.Effects[0].Parameters["name"] != "workflow:ticket" || plan.Effects[1].Kind != "repository_admission" {
 		t.Fatalf("non-delta effects = %#v", plan.Effects)
+	}
+	raw, _ := json.Marshal(plan)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
+		t.Fatalf("label-only repair plan is not executable: %v", err)
+	}
+}
+
+func TestPlanAlwaysReverifiesAdmissionForFeatureOnlyRepair(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	state := onboardingStateFunc(func(context.Context, string, string, string, []Label) (OnboardingState, error) {
+		return OnboardingState{ContractSatisfied: true, AdmissionSatisfied: true}, nil
+	})
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: false, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
+	})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("b", 64), Policy: policy, State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]bool{}
+	for _, effect := range plan.Effects {
+		kinds[effect.Kind] = true
+	}
+	if !kinds["repository_features"] || !kinds["repository_admission"] {
+		t.Fatalf("feature repair lacks admission reverification: %#v", plan.Effects)
+	}
+	raw, _ := json.Marshal(plan)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
+		t.Fatal(err)
 	}
 }
 

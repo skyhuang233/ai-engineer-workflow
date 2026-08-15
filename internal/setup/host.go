@@ -40,17 +40,52 @@ type HostAdapter struct {
 	DockerDesktopHost          hostsetup.DockerDesktopHost
 	CurrentUserPATHReconciled  func(string) (bool, error)
 	OnboardingMergeHeads       map[string]string
+	CreatedRepositories        map[string]bool
+	InitialBaselineHeads       map[string]string
+	PublishedHistoryHeads      map[string]string
 	OnboardingCheckDiagnostics map[string][]string
 	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
 
+type hostIdentityPrecondition struct {
+	UserID              string `json:"user_id"`
+	Username            string `json:"username"`
+	WorkflowHome        string `json:"workflow_home"`
+	WorkflowHomeOwnerID string `json:"workflow_home_owner_id"`
+}
+
+const repositoryCreatedEvidence = "repository_created="
+const initialBaselineHeadEvidence = "initial_baseline_head="
+const publishedHistoryHeadEvidence = "published_history_head="
+
 func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
-	if a.OnboardingMergeHeads == nil {
-		return nil
-	}
 	for _, result := range results {
+		if index := strings.Index(result.Evidence, repositoryCreatedEvidence); index >= 0 && a.CreatedRepositories != nil {
+			repository := strings.TrimSpace(result.Evidence[index+len(repositoryCreatedEvidence):])
+			if !strings.Contains(repository, "/") {
+				return errors.New("persisted repository-creation evidence is invalid")
+			}
+			a.CreatedRepositories[repository] = true
+		}
+		if index := strings.Index(result.Evidence, initialBaselineHeadEvidence); index >= 0 && a.InitialBaselineHeads != nil {
+			head := strings.TrimSpace(result.Evidence[index+len(initialBaselineHeadEvidence):])
+			if !fullSetupCommitID(head) {
+				return errors.New("persisted Initial Repository Baseline HEAD is invalid")
+			}
+			a.InitialBaselineHeads[result.EffectID] = head
+		}
+		if index := strings.Index(result.Evidence, publishedHistoryHeadEvidence); index >= 0 && a.PublishedHistoryHeads != nil {
+			head := strings.TrimSpace(result.Evidence[index+len(publishedHistoryHeadEvidence):])
+			if !fullSetupCommitID(head) {
+				return errors.New("persisted published-history HEAD is invalid")
+			}
+			a.PublishedHistoryHeads[result.EffectID] = head
+		}
+		if a.OnboardingMergeHeads == nil {
+			continue
+		}
 		index := strings.Index(result.Evidence, onboardingMergeHeadEvidence)
 		if index < 0 {
 			continue
@@ -196,7 +231,11 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if repository.Private != wantPrivate {
 				return setupcontract.EffectConflicting, "existing GitHub repository visibility differs from approved plan", nil
 			}
-			return setupcontract.EffectSatisfied, "GitHub repository exists with approved identity and visibility", nil
+			evidence := "GitHub repository exists with approved identity and visibility"
+			if a.CreatedRepositories[effect.Subject] {
+				evidence += "; " + repositoryCreatedEvidence + effect.Subject
+			}
+			return setupcontract.EffectSatisfied, evidence, nil
 		},
 		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
 			head, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
@@ -224,14 +263,14 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if err != nil {
 				return setupcontract.EffectFailed, "", err
 			}
-			return setupcontract.EffectSatisfied, "approved Initial Repository Baseline is published", nil
+			return setupcontract.EffectSatisfied, "approved Initial Repository Baseline is published; " + initialBaselineHeadEvidence + head, nil
 		},
 		"publish_history": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
 			if a.GitHub == nil {
 				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
 			}
 			revision, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
-			if github.IsNotFound(err) || github.IsConflict(err) && effect.Parameters["new_repository"] == "true" {
+			if github.IsNotFound(err) || github.IsConflict(err) && a.CreatedRepositories[effect.Subject] {
 				return setupcontract.EffectRequired, "committed history is not published", nil
 			}
 			if err != nil {
@@ -240,7 +279,7 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if revision.Head != effect.Parameters["head"] {
 				return setupcontract.EffectConflicting, "published default branch differs from approved committed history", nil
 			}
-			return setupcontract.EffectSatisfied, "approved committed history is published", nil
+			return setupcontract.EffectSatisfied, "approved committed history is published; " + publishedHistoryHeadEvidence + revision.Head, nil
 		},
 		"github_label": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
 			if a.GitHub == nil {
@@ -476,6 +515,9 @@ func hostApplyHandlers() map[string]effectApply {
 				return errors.New("GitHub client is required")
 			}
 			_, err := a.GitHub.CreateRepository(ctx, effect.Parameters["owner"], effect.Parameters["authenticated_login"], effect.Parameters["name"], effect.Parameters["private"] == "true")
+			if err == nil && a.CreatedRepositories != nil {
+				a.CreatedRepositories[effect.Subject] = true
+			}
 			return err
 		},
 		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
@@ -565,15 +607,16 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 		return err
 	}
 	if value.Kind == "host_identity" {
-		if value.Subject != "current-user" {
-			return errors.New("host identity precondition subject must be current-user")
-		}
-		current, err := user.Current()
+		expected, err := a.checkHostIdentityBeforeLayout(value)
 		if err != nil {
-			return fmt.Errorf("read current host identity: %w", err)
+			return err
 		}
-		if value.Expected != current.Uid && !strings.EqualFold(value.Expected, current.Username) && value.Expected != current.Name {
-			return errors.New("current host identity drifted from the approved plan")
+		ownerID, err := workflowHomeOwnerIdentity(a.Layout.Root)
+		if err != nil {
+			return fmt.Errorf("read Workflow Home owner identity: %w", err)
+		}
+		if !strings.EqualFold(expected.WorkflowHomeOwnerID, ownerID) {
+			return errors.New("Workflow Home owner identity drifted from the approved plan")
 		}
 		return nil
 	}
@@ -608,7 +651,22 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 		return errors.New("GitHub default-branch HEAD drifted from the approved onboarding base")
 	}
 	if value.Kind == "onboarding_snapshot" {
-		return onboarding.VerifyApprovalSnapshot(ctx, value.Expected)
+		transitions := onboarding.ApprovalTransitions{}
+		for repository, created := range a.CreatedRepositories {
+			if created {
+				transitions.CreatedRepository = repository
+			}
+		}
+		for _, head := range a.PublishedHistoryHeads {
+			transitions.PublishedHistoryHead = head
+		}
+		for _, head := range a.InitialBaselineHeads {
+			transitions.InitialBaselineHead = head
+		}
+		for _, head := range a.OnboardingMergeHeads {
+			transitions.MergedHead = head
+		}
+		return onboarding.VerifyApprovalSnapshotTransitions(ctx, value.Expected, transitions)
 	}
 	if value.Kind == "github_policy" {
 		if a.GitHub == nil {
@@ -645,18 +703,72 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 	output, err := command.Output()
 	if value.Expected == "" {
 		if err == nil {
-			message, messageErr := gitCommandOutput(ctx, value.Subject, "log", "-1", "--format=%B")
-			if messageErr == nil && strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
-				return nil
+			actual := strings.TrimSpace(string(output))
+			for _, head := range a.InitialBaselineHeads {
+				if actual == head {
+					return nil
+				}
+			}
+			for _, head := range a.OnboardingMergeHeads {
+				if actual == head {
+					return nil
+				}
 			}
 			return errors.New("repository gained a commit after planning")
 		}
 		return nil
 	}
 	if err != nil || strings.TrimSpace(string(output)) != value.Expected {
+		actual := strings.TrimSpace(string(output))
+		for _, head := range a.InitialBaselineHeads {
+			if actual == head {
+				return nil
+			}
+		}
+		for _, head := range a.OnboardingMergeHeads {
+			if actual == head {
+				return nil
+			}
+		}
 		return errors.New("local Git HEAD drifted after planning")
 	}
 	return nil
+}
+
+// CheckPreLayoutPrecondition fences a Platform Plan to the approved current
+// user without reading or creating Workflow Home. CheckPrecondition repeats
+// this identity check after layout creation and additionally verifies its real
+// filesystem owner.
+func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupcontract.Precondition) error {
+	if err := setupcontract.ValidatePreconditionForExecution(value); err != nil {
+		return err
+	}
+	if value.Kind != "host_identity" {
+		return fmt.Errorf("pre-layout verification is unsupported for precondition kind %q", value.Kind)
+	}
+	_, err := a.checkHostIdentityBeforeLayout(value)
+	return err
+}
+
+func (a HostAdapter) checkHostIdentityBeforeLayout(value setupcontract.Precondition) (hostIdentityPrecondition, error) {
+	if value.Subject != "current-user" {
+		return hostIdentityPrecondition{}, errors.New("host identity precondition subject must be current-user")
+	}
+	var expected hostIdentityPrecondition
+	if err := json.Unmarshal([]byte(value.Expected), &expected); err != nil || expected.UserID == "" || expected.Username == "" || expected.WorkflowHome == "" || expected.WorkflowHomeOwnerID == "" {
+		return hostIdentityPrecondition{}, errors.New("approved host identity precondition is invalid")
+	}
+	if a.Layout.Root == "" || !strings.EqualFold(filepath.Clean(expected.WorkflowHome), filepath.Clean(a.Layout.Root)) {
+		return hostIdentityPrecondition{}, errors.New("approved host identity is not bound to the target Workflow Home")
+	}
+	current, err := user.Current()
+	if err != nil {
+		return hostIdentityPrecondition{}, fmt.Errorf("read current host identity: %w", err)
+	}
+	if expected.UserID != current.Uid || !strings.EqualFold(expected.Username, current.Username) {
+		return hostIdentityPrecondition{}, errors.New("current host identity drifted from the approved plan")
+	}
+	return expected, nil
 }
 
 func gitCommandOutput(ctx context.Context, repository string, args ...string) (string, error) {
@@ -748,7 +860,7 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 			return err
 		}
 	}
-	var requiredChecks []string
+	var requiredChecks []onboarding.RequiredCheck
 	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &requiredChecks); err != nil || len(requiredChecks) == 0 {
 		return errors.New("Onboarding Pull Request lacks approved required checks")
 	}
@@ -846,26 +958,41 @@ func (a HostAdapter) requireOnboardingBase(ctx context.Context, repository, bran
 	return nil
 }
 
-func waitForOnboardingChecks(ctx context.Context, client *github.Client, repository, head string, required []string, timeout time.Duration) ([]string, error) {
+func waitForOnboardingChecks(ctx context.Context, client *github.Client, repository, head string, required []onboarding.RequiredCheck, timeout time.Duration) ([]string, error) {
 	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
-		checks, err := client.PullRequestChecks(deadline, repository, head)
+		checks, err := client.OnboardingChecks(deadline, repository, head)
 		if err != nil {
 			return nil, err
 		}
-		requiredSet := make(map[string]bool, len(required))
-		for _, name := range required {
-			requiredSet[name] = true
+		requiredSet := make(map[string]onboarding.RequiredCheck, len(required))
+		for _, binding := range required {
+			if binding.Context == "" || binding.AppID <= 0 {
+				return nil, errors.New("approved required check lacks an App identity")
+			}
+			if existing, ok := requiredSet[binding.Context]; ok && existing.AppID != binding.AppID {
+				return nil, errors.New("approved required check context has conflicting App identities")
+			}
+			requiredSet[binding.Context] = binding
 		}
 		passed := map[string]bool{}
 		diagnostics := make([]string, 0, len(checks))
 		requiredObserved := map[string]string{}
 		for _, check := range checks {
-			if !requiredSet[check.Name] {
+			binding, isRequired := requiredSet[check.Name]
+			if !isRequired {
 				diagnostics = append(diagnostics, fmt.Sprintf("optional check %q: status=%s conclusion=%s", check.Name, check.Status, check.Conclusion))
+				continue
+			}
+			if check.AppID != binding.AppID {
+				diagnostics = append(diagnostics, fmt.Sprintf("same-name check %q from unapproved App %d (want %d)", check.Name, check.AppID, binding.AppID))
+				continue
+			}
+			if check.HeadSHA != head {
+				diagnostics = append(diagnostics, fmt.Sprintf("required check %q reports unapproved head %q", check.Name, check.HeadSHA))
 				continue
 			}
 			requiredObserved[check.Name] = "status=" + check.Status + " conclusion=" + check.Conclusion
@@ -882,8 +1009,8 @@ func waitForOnboardingChecks(ctx context.Context, client *github.Client, reposit
 			}
 		}
 		allRequired := true
-		for _, name := range required {
-			if !passed[name] {
+		for _, binding := range required {
+			if !passed[binding.Context] {
 				allRequired = false
 				break
 			}
@@ -894,7 +1021,8 @@ func waitForOnboardingChecks(ctx context.Context, client *github.Client, reposit
 		select {
 		case <-deadline.Done():
 			states := make([]string, 0, len(required))
-			for _, name := range required {
+			for _, binding := range required {
+				name := binding.Context
 				state := requiredObserved[name]
 				if state == "" {
 					state = "not observed"

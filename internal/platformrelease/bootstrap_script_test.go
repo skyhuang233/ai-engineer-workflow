@@ -92,7 +92,8 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	skillsRoot := filepath.Join(directory, "codex-skills")
 	hostFacts, _ := json.Marshal(map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
-		"workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
+		"host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"},
+		"workflow":      map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
 		"github_credential": map[string]any{"exists": true, "verified": true, "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
 		"codex_auth":        map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)},
 		"codex_skills_root": skillsRoot,
@@ -122,7 +123,17 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	}
 	parsed, canonical, digest, parseErr := setupcontract.ParsePlan([]byte(planned.CanonicalJSON))
 	manifestDigest := sha256.Sum256(raw)
-	if err != nil || !hasSkillBundle || !hasExactCLI || parseErr != nil || string(canonical) != planned.CanonicalJSON || digest != planned.DigestSHA256 || parsed.Preconditions[0].Kind != "platform_release" || parsed.Preconditions[0].Expected != hex.EncodeToString(manifestDigest[:]) {
+	hostIdentityBound := false
+	for _, precondition := range parsed.Preconditions {
+		var identity struct {
+			UserID              string `json:"user_id"`
+			Username            string `json:"username"`
+			WorkflowHome        string `json:"workflow_home"`
+			WorkflowHomeOwnerID string `json:"workflow_home_owner_id"`
+		}
+		hostIdentityBound = hostIdentityBound || precondition.Kind == "host_identity" && precondition.Subject == "current-user" && json.Unmarshal([]byte(precondition.Expected), &identity) == nil && identity.UserID == "S-1-5-21-planner" && identity.Username == `DOMAIN\planner` && identity.WorkflowHome == workflowHome && identity.WorkflowHomeOwnerID == "S-1-5-21-planner"
+	}
+	if err != nil || !hasSkillBundle || !hasExactCLI || !hostIdentityBound || parseErr != nil || string(canonical) != planned.CanonicalJSON || digest != planned.DigestSHA256 || parsed.Preconditions[0].Kind != "platform_release" || parsed.Preconditions[0].Expected != hex.EncodeToString(manifestDigest[:]) {
 		t.Fatalf("verified Platform Bootstrap Plan omitted exact Workflow Skill Bundle: %q, %v", output, err)
 	}
 	var projected struct {
@@ -144,9 +155,11 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(filepath.Join(skillsRoot, "implement", "SKILL.md"), skillBody)
-	ownerJSON, _ := json.Marshal(map[string]string{"owner": "agent-workflow-platform", "version": manifest.PlatformSetup.SkillBundle.Version})
-	write(filepath.Join(skillsRoot, "implement", ".agent-workflow-owner.json"), ownerJSON)
-	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), ownerJSON)
+	skillOwnerJSON, _ := json.Marshal(map[string]string{"owner": "agent-workflow-platform", "version": manifest.PlatformSetup.SkillBundle.Version})
+	bundleOwner := map[string]any{"owner": "agent-workflow-platform", "version": manifest.PlatformSetup.SkillBundle.Version, "skills": []string{"implement"}, "file_digests": map[string]string{"implement/SKILL.md": hex.EncodeToString(skillDigest[:])}}
+	bundleOwnerJSON, _ := json.Marshal(bundleOwner)
+	write(filepath.Join(skillsRoot, "implement", ".agent-workflow-owner.json"), skillOwnerJSON)
+	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), bundleOwnerJSON)
 	contractDigest := parsed.Preconditions[1].Expected
 	bundledRaw, _ := json.Marshal(manifest.BundledFiles)
 	bundledCanonical, bundledDigest, err := setupcontract.Canonicalize(bundledRaw)
@@ -156,6 +169,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	controlPlaneDigest := strings.Repeat("f", 64)
 	noOpState := map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
+		"host_identity":     map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"},
 		"workflow":          map[string]any{"installed": true, "owned": true, "path_reconciled": true, "version": manifest.Release.Version, "sha256": manifest.BundledFiles[0].SHA256},
 		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": manifest.BundledFiles[0].SHA256, "release_bundled_files_json": string(bundledCanonical), "release_bundled_files_digest": bundledDigest, "control_plane_plan_digest_sha256": controlPlaneDigest},
 		"docker":            map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
@@ -198,6 +212,16 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 			t.Fatalf("%s repair was not independently release-bound: %q, %v, %v, %v", name, output, runErr, decodeErr, parseErr)
 		}
 	}
+	bundleOwner["file_digests"] = map[string]string{"implement/SKILL.md": strings.Repeat("0", 64)}
+	tamperedBundleOwnerJSON, _ := json.Marshal(bundleOwner)
+	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), tamperedBundleOwnerJSON)
+	assertSingleRepair("bundle ownership inventory", "workflow_skill_bundle", "install", "-GitHubOwner", "owner")
+	bundleOwner["file_digests"] = map[string]string{"implement/SKILL.md": hex.EncodeToString(skillDigest[:])}
+	bundleOwner["skills"] = []string{"different-skill"}
+	tamperedBundleOwnerJSON, _ = json.Marshal(bundleOwner)
+	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), tamperedBundleOwnerJSON)
+	assertSingleRepair("bundle ownership skills", "workflow_skill_bundle", "install", "-GitHubOwner", "owner")
+	write(filepath.Join(workflowHome, "config", "workflow-skills.owner.json"), bundleOwnerJSON)
 	noOpState["workflow"].(map[string]any)["sha256"] = strings.Repeat("0", 64)
 	cliOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cliOnlyFacts)

@@ -48,6 +48,7 @@ func TestWorkflowSkillBundleUsesConciseOneLevelNavigationAndOperationalReference
 		t.Fatalf("main SKILL.md is %d bytes; keep detailed operations in references", len(main))
 	}
 	references := map[string][]string{
+		"github.md":        {"gh auth status", "nameWithOwner", "sub_issues", "dependencies/blocked_by", "issue_id", "read back", "human-only", "gh pr merge"},
 		"plans.md":         {"workflow:plan", "workflow:active", "runtime-configure", "Plan Amendment"},
 		"tickets.md":       {"workflow:ticket", "sub-issue", "dependencies", "independently reviewable"},
 		"inbox.md":         {"workflow:inbox", "workflow-answer:<question-id>", "allowed answer", "uncertain"},
@@ -109,8 +110,8 @@ func TestWorkflowSkillBundleEverySourceFileIsManifestedInstalledAndReadBack(t *t
 		want = append(want, file.Path)
 	}
 	sort.Strings(want)
-	if len(want) != 7 {
-		t.Fatalf("manifested Workflow Skill Bundle files = %v, want SKILL.md, agents metadata, and five references", want)
+	if len(want) != 8 {
+		t.Fatalf("manifested Workflow Skill Bundle files = %v, want SKILL.md, agents metadata, and six references", want)
 	}
 	installation := workflowhome.Installation{Layout: layout}
 	if err := installation.InstallSkillBundle(source, spec); err != nil {

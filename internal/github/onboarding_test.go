@@ -87,6 +87,27 @@ func TestActionsEnablementRejectsUnplannedAllowedActions(t *testing.T) {
 	}
 }
 
+func TestPolicyDiscoveryFailsClosedForLegacyRequiredContextWithoutAppIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","has_issues":true,"permissions":{"admin":true},"allow_squash_merge":true}`))
+		case "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case "/repos/owner/repo/branches/main/protection":
+			_, _ = w.Write([]byte(`{"required_status_checks":{"contexts":["build"],"checks":[]}}`))
+		default:
+			t.Fatalf("policy discovery continued after unbound context: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	_, err := NewClient(server.URL, "token", server.Client()).DiscoverPolicy(context.Background(), "owner/repo", "main")
+	if err == nil || !strings.Contains(err.Error(), "lacks an App identity") {
+		t.Fatalf("legacy same-name check authority was accepted: %v", err)
+	}
+}
+
 func TestOrganizationPublicationPreflightFailsClosed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

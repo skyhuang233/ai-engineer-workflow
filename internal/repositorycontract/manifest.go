@@ -36,54 +36,6 @@ type ManagedFile struct {
 	SHA256 string `json:"sha256"`
 }
 
-var block = []byte(BlockStart + "\n## Agent Workflow\n\nFollow `docs/agents/issue-tracker.md` for tracker conventions and `docs/agents/domain.md` for domain documentation.\nLoad and follow the installed `$agent-workflow` skill whenever creating or activating Workflow plans and tickets.\n" + BlockEnd + "\n")
-var wholeFiles = map[string][]byte{
-	"docs/agents/issue-tracker.md": []byte("# Issue tracker\n\nIssues and PRDs are tracked in this repository's GitHub Issues.\n"),
-	"docs/agents/domain.md":        []byte("# Domain documentation\n\nUse root `CONTEXT.md` and `docs/adr/`; create them lazily when the first domain term or decision is recorded.\n"),
-	".github/workflows/workflow-contract.yml": []byte(`name: workflow-contract
-
-on:
-  pull_request:
-  push:
-    branches: [main]
-
-permissions:
-  contents: read
-
-jobs:
-  verify:
-    name: workflow-contract
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Verify repository contract
-        shell: bash
-        run: |
-          test -f .workflow/repository.json
-          jq --exit-status '.schema_version == 1 and .contract_version == "1" and .required_check == "workflow-contract"' .workflow/repository.json
-          jq -r '.managed_files[] | "\(.sha256)  \(.path)"' .workflow/repository.json | sha256sum --check --strict
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          data = Path("AGENTS.md").read_bytes()
-          start_marker = b"<!-- agent-workflow:start -->"
-          end_marker = b"<!-- agent-workflow:end -->"
-          if data.count(start_marker) != 1 or data.count(end_marker) != 1:
-              raise SystemExit("AGENTS.md must contain exactly one managed block")
-          start = data.index(start_marker)
-          end = data.index(end_marker, start) + len(end_marker)
-          if data[end:end + 2] == b"\r\n":
-              end += 2
-          elif data[end:end + 1] == b"\n":
-              end += 1
-          expected = json.loads(Path(".workflow/repository.json").read_text(encoding="utf-8"))["managed_block_sha256"]
-          actual = hashlib.sha256(data[start:end]).hexdigest()
-          if actual != expected:
-              raise SystemExit("AGENTS.md managed block digest differs")
-          PY
-`),
-}
-
 func Render(domainLayout string, existingAgents []byte, repository, defaultBranch string) (map[string][]byte, Manifest, string, error) {
 	if repository == "" || defaultBranch == "" {
 		return nil, Manifest{}, "", errors.New("repository identity and default branch are required")
@@ -104,7 +56,7 @@ func Render(domainLayout string, existingAgents []byte, repository, defaultBranc
 		whole[path] = append([]byte(nil), data...)
 	}
 	if domainLayout == "multi-context" {
-		whole["docs/agents/domain.md"] = []byte("# Domain documentation\n\nUse root `CONTEXT-MAP.md` plus one `CONTEXT.md` and `docs/adr/` per bounded context; create them lazily when the first real term or decision is recorded.\n")
+		whole["docs/agents/domain.md"] = append([]byte(nil), multiContextDomain...)
 	}
 	paths := make([]string, 0, len(wholeFiles))
 	for path, data := range whole {

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -155,6 +156,7 @@ func TestSetupPlanReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
+	beforeTree := setupPlanTreeSnapshot(t, layout.Root)
 	var output bytes.Buffer
 	if err := runSetupPlan([]string{"--repo", t.TempDir(), "--workflow-home", layout.Root}, &output); err != nil {
 		t.Fatal(err)
@@ -162,6 +164,10 @@ func TestSetupPlanReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
 	var response setupResponse
 	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "blocked" || !strings.Contains(response.Blocker, "approved Platform repair") {
 		t.Fatalf("old schema response=%s err=%v", output.String(), err)
+	}
+	afterTree := setupPlanTreeSnapshot(t, layout.Root)
+	if !reflect.DeepEqual(afterTree, beforeTree) {
+		t.Fatalf("setup plan changed Workflow Home tree:\nbefore=%#v\nafter=%#v", beforeTree, afterTree)
 	}
 	raw, err = sql.Open("sqlite", databasePath)
 	if err != nil {
@@ -172,6 +178,32 @@ func TestSetupPlanReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
 	if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
 		t.Fatalf("setup plan migrated schema: version=%d err=%v", version, err)
 	}
+}
+
+type setupPlanTreeEntry struct {
+	Mode    os.FileMode
+	Size    int64
+	ModTime time.Time
+}
+
+func setupPlanTreeSnapshot(t *testing.T, root string) map[string]setupPlanTreeEntry {
+	t.Helper()
+	result := map[string]setupPlanTreeEntry{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		result[relative] = setupPlanTreeEntry{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func TestSetupPlanAdmissionInspectionDoesNotRefreshOrSuspendStoredAdmission(t *testing.T) {

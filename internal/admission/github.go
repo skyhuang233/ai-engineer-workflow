@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -48,8 +49,15 @@ func (v GitHubVerifier) Verify(ctx context.Context, value store.RepositoryAdmiss
 	if err != nil {
 		return err
 	}
+	return validateRuntimePolicy(policy)
+}
+
+func validateRuntimePolicy(policy onboarding.RepositoryPolicy) error {
 	if !policy.HasIssues || !policy.ActionsEnabled {
 		return errors.New("GitHub Issues or Actions is unavailable")
+	}
+	if !policy.GitHubOwnedActionsAllowed || policy.ActionsAllowed != "all" && policy.ActionsAllowed != "selected" {
+		return errors.New("GitHub Actions policy no longer allows the GitHub-owned checkout action")
 	}
 	return nil
 }

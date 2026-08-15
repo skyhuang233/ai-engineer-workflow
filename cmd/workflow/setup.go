@@ -421,7 +421,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
+	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}, CreatedRepositories: map[string]bool{}, InitialBaselineHeads: map[string]string{}, PublishedHistoryHeads: map[string]string{}}
 	if plan.Kind == setupcontract.RepositoryOnboarding {
 		database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
 		if openErr != nil {

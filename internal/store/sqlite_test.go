@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeTree := snapshotDirectoryTree(t, filepath.Dir(path))
 	opened, err := OpenReadOnly(ctx, path)
 	if opened != nil {
 		opened.Close()
@@ -58,6 +60,10 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	after, err := os.Stat(path)
 	if err != nil || !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
 		t.Fatalf("planning changed old database: before=%#v after=%#v err=%v", before, after, err)
+	}
+	afterTree := snapshotDirectoryTree(t, filepath.Dir(path))
+	if !reflect.DeepEqual(afterTree, beforeTree) {
+		t.Fatalf("read-only schema inspection changed database tree:\nbefore=%#v\nafter=%#v", beforeTree, afterTree)
 	}
 	matches, err := filepath.Glob(path + ".backup*")
 	if err != nil || len(matches) != 0 {
@@ -72,6 +78,32 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if err := raw.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
 		t.Fatalf("schema changed: version=%d err=%v", version, err)
 	}
+}
+
+type treeEntry struct {
+	Mode    os.FileMode
+	Size    int64
+	ModTime time.Time
+}
+
+func snapshotDirectoryTree(t *testing.T, root string) map[string]treeEntry {
+	t.Helper()
+	result := map[string]treeEntry{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		result[relative] = treeEntry{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func TestOpenForRuntimeSkipsMigrationDiscoveryAndHoldsRestoreBarrier(t *testing.T) {

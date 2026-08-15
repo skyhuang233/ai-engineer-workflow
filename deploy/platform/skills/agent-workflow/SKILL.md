@@ -7,8 +7,9 @@ description: Operate an admitted Agent Workflow repository through Delivery Plan
 
 Read the repository's `AGENTS.md` managed block and `.workflow/repository.json` first. Follow `docs/agents/issue-tracker.md` for repository-specific tracker commands and `docs/agents/domain.md` for domain-document routing. Do not copy configuration from this skill into the repository.
 
-Load only the reference needed for the operation:
+Load only the references needed for the operation. For every GitHub read or write, load `references/github.md` in addition to the operation-specific reference:
 
+- Resolve GitHub identity and perform deterministic, idempotent reads/writes: [references/github.md](references/github.md)
 - Create, approve, activate, inspect, or amend a Delivery Plan: [references/plans.md](references/plans.md)
 - Publish or relate Executable Tickets: [references/tickets.md](references/tickets.md)
 - Read or answer the Workflow Inbox: [references/inbox.md](references/inbox.md)

@@ -78,6 +78,7 @@ type BranchProtection struct {
 		Contexts []string `json:"contexts"`
 		Checks   []struct {
 			Context string `json:"context"`
+			AppID   int64  `json:"app_id"`
 		} `json:"checks"`
 	} `json:"required_status_checks"`
 	RequiredPullRequestReviews *struct {
@@ -91,7 +92,8 @@ type RepositoryRuleset struct {
 		Parameters struct {
 			RequiredApprovingReviewCount int `json:"required_approving_review_count"`
 			RequiredStatusChecks         []struct {
-				Context string `json:"context"`
+				Context       string `json:"context"`
+				IntegrationID int64  `json:"integration_id"`
 			} `json:"required_status_checks"`
 		} `json:"parameters"`
 	} `json:"rules"`
@@ -142,9 +144,18 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 		result.RequiredHumanReviews = true
 	}
 	if protection.RequiredStatusChecks != nil {
-		result.RequiredChecks = append(result.RequiredChecks, protection.RequiredStatusChecks.Contexts...)
+		identified := map[string]int64{}
 		for _, check := range protection.RequiredStatusChecks.Checks {
-			result.RequiredChecks = append(result.RequiredChecks, check.Context)
+			if check.AppID <= 0 {
+				return result, errors.New("branch protection required check lacks an App identity")
+			}
+			identified[check.Context] = check.AppID
+			result.RequiredChecks = append(result.RequiredChecks, onboarding.RequiredCheck{Context: check.Context, AppID: check.AppID})
+		}
+		for _, context := range protection.RequiredStatusChecks.Contexts {
+			if identified[context] <= 0 {
+				return result, fmt.Errorf("legacy branch protection required context %q lacks an App identity", context)
+			}
 		}
 	}
 	var rulesets []RepositoryRuleset
@@ -165,7 +176,10 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 				}
 			case "required_status_checks":
 				for _, check := range rule.Parameters.RequiredStatusChecks {
-					result.RequiredChecks = append(result.RequiredChecks, check.Context)
+					if check.IntegrationID <= 0 {
+						return result, errors.New("ruleset required check lacks an integration identity")
+					}
+					result.RequiredChecks = append(result.RequiredChecks, onboarding.RequiredCheck{Context: check.Context, AppID: check.IntegrationID})
 				}
 			}
 		}
@@ -174,12 +188,13 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 	return result, nil
 }
 
-func uniquePolicyChecks(values []string) []string {
+func uniquePolicyChecks(values []onboarding.RequiredCheck) []onboarding.RequiredCheck {
 	seen := map[string]bool{}
-	result := make([]string, 0, len(values))
+	result := make([]onboarding.RequiredCheck, 0, len(values))
 	for _, value := range values {
-		if value != "" && !seen[value] {
-			seen[value] = true
+		key := value.Context + ":" + strconv.FormatInt(value.AppID, 10)
+		if value.Context != "" && value.AppID > 0 && !seen[key] {
+			seen[key] = true
 			result = append(result, value)
 		}
 	}

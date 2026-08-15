@@ -74,6 +74,12 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     }
     if ($Name -in @("clean-new-repository","unrelated-dirty-files","second-same-owner")) {
         if (-not $result.platform_ready -or -not $result.repository_admitted) { throw "Scenario '$Name' did not reach both readiness gates" }
+		if ($Name -eq "unrelated-dirty-files") {
+			$unrelatedPath = Join-Path $target "unrelated.txt"
+			if (-not (Test-Path -LiteralPath $unrelatedPath -PathType Leaf) -or [IO.File]::ReadAllText($unrelatedPath) -cne "preserve exactly`n") { throw "Published dirty scenario did not preserve unrelated.txt byte-for-byte" }
+			$dirtyStatus = [string](git -C $target status --porcelain=v1 --untracked-files=all -- unrelated.txt)
+			if ($LASTEXITCODE -ne 0 -or $dirtyStatus.Trim() -cne "?? unrelated.txt") { throw "Published dirty scenario no longer preserves unrelated.txt as unrelated dirty state" }
+		}
     } elseif ([string]::IsNullOrWhiteSpace([string]$result.blocker)) {
         throw "Negative scenario '$Name' did not report an exact blocker"
     }
@@ -107,6 +113,12 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
         git -C $target init -b main | Out-Null
         [IO.File]::WriteAllText((Join-Path $target "README.md"), "baseline`n")
         git -C $target add README.md; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
+		$publishedDirtyRepository = "$GitHubOwner/workflow-setup-e2e-$runID-published-dirty"
+		gh repo create $publishedDirtyRepository --private --source $target --remote origin --push
+		if ($LASTEXITCODE -ne 0) { throw "Cannot create the published dirty fixture repository" }
+		$repositories.Add($publishedDirtyRepository)
+		$origin = [string](git -C $target remote get-url origin)
+		if ($LASTEXITCODE -ne 0 -or $origin -notmatch '^https://github.com/.+\.git$') { throw "Published dirty fixture lacks a real GitHub origin" }
         [IO.File]::WriteAllText((Join-Path $target "unrelated.txt"), "preserve exactly`n")
       }
       Invoke-Scenario "managed-path-drift" {

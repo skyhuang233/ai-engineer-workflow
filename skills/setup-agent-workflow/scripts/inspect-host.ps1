@@ -25,6 +25,17 @@ $WorkflowHome = [System.IO.Path]::GetFullPath($WorkflowHome)
 if ($WorkflowHome.StartsWith("\\")) {
     throw "Workflow Home must be a local path"
 }
+$windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if ($null -eq $windowsIdentity -or $null -eq $windowsIdentity.User -or [string]::IsNullOrWhiteSpace([string]$windowsIdentity.Name)) {
+    throw "Current Windows identity is unavailable"
+}
+$currentUserSID = [string]$windowsIdentity.User.Value
+$workflowHomeOwnerSID = $currentUserSID
+if (Test-Path -LiteralPath $WorkflowHome) {
+    $ownerAccount = New-Object Security.Principal.NTAccount((Get-Acl -LiteralPath $WorkflowHome).Owner)
+    $workflowHomeOwnerSID = [string]$ownerAccount.Translate([Security.Principal.SecurityIdentifier]).Value
+}
+$hostIdentity = [ordered]@{ user_id = $currentUserSID; username = [string]$windowsIdentity.Name; workflow_home_owner_id = $workflowHomeOwnerSID }
 
 function Invoke-ObservedCommand([string]$Name, [string[]]$Arguments) {
     $command = Get-Command $Name -ErrorAction SilentlyContinue
@@ -147,6 +158,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     supported_host = ($env:OS -eq "Windows_NT")
     repository = $repoPath
     workflow_home = $WorkflowHome
+	host_identity = $hostIdentity
     git = $gitFacts
     docker = $docker
     codex = $codex

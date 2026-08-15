@@ -30,13 +30,22 @@ type PlanOptions struct {
 	DomainLayout          string
 }
 type Label struct{ Name, Color, Description string }
+type RequiredCheck struct {
+	Context string `json:"context"`
+	AppID   int64  `json:"app_id"`
+}
+
+// GitHubActionsAppID is GitHub's stable public integration identity for
+// check-runs produced by Actions workflows, including workflow-contract.
+const GitHubActionsAppID int64 = 15368
+
 type RepositoryPolicy struct {
 	HasIssues, ActionsEnabled, Admin                     bool
 	AllowSquashMerge, AllowMergeCommit, AllowRebaseMerge bool
 	RequiredHumanReviews, MergeQueue                     bool
 	ActionsAllowed                                       string
 	GitHubOwnedActionsAllowed                            bool
-	RequiredChecks                                       []string
+	RequiredChecks                                       []RequiredCheck
 	AllowFeatureEnable                                   bool
 }
 type PolicyDiscovery interface {
@@ -108,7 +117,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			return setupcontract.Plan{}, err
 		}
 	}
-	snapshotJSON, err := CaptureApprovalSnapshot(ctx, discovery, zeroBaseline)
+	snapshotJSON, err := CaptureApprovalSnapshot(ctx, discovery, repositoryID, zeroBaseline)
 	if err != nil {
 		return setupcontract.Plan{}, err
 	}
@@ -148,7 +157,19 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "enable-repository-features", Kind: "repository_features", Subject: repositoryID, Action: "enable", Parameters: map[string]string{"issues": "true", "actions": "true", "allowed_actions": policy.ActionsAllowed}})
 			policy.AllowFeatureEnable = true
 		}
-		policy.RequiredChecks = uniqueStrings(policy.RequiredChecks)
+		for _, required := range policy.RequiredChecks {
+			if strings.TrimSpace(required.Context) == "" || required.AppID <= 0 {
+				return setupcontract.Plan{}, errors.New("repository required check lacks an App identity")
+			}
+		}
+		policy.RequiredChecks = uniqueRequiredChecks(policy.RequiredChecks)
+		checkApps := map[string]int64{}
+		for _, required := range policy.RequiredChecks {
+			if existing := checkApps[required.Context]; existing != 0 && existing != required.AppID {
+				return setupcontract.Plan{}, errors.New("repository required check context has conflicting App identities")
+			}
+			checkApps[required.Context] = required.AppID
+		}
 		policyJSON, _ := json.Marshal(policy)
 		plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "github-policy", Kind: "github_policy", Subject: repositoryID, Expected: string(policyJSON)})
 	}
@@ -198,14 +219,15 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	if err != nil {
 		return setupcontract.Plan{}, err
 	}
-	requiredChecks := uniqueStrings(append([]string{"workflow-contract"}, policy.RequiredChecks...))
+	requiredChecks := uniqueRequiredChecks(append([]RequiredCheck{{Context: "workflow-contract", AppID: GitHubActionsAppID}}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	if !state.ContractSatisfied {
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
 	}
-	if !state.AdmissionSatisfied || !state.ContractSatisfied {
-		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
-	}
+	// Every approved onboarding plan terminates in a live admission readback.
+	// This also binds label-, feature-, and policy-only repairs to the complete
+	// Repository Contract instead of treating their individual delta as Ready.
+	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
 	if !state.ContractSatisfied {
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head, "merge_head_effect_id": "repository-contract-pr"}})
 	}
@@ -222,6 +244,19 @@ func uniqueStrings(values []string) []string {
 			seen[value] = true
 			result = append(result, value)
 		}
+	}
+	return result
+}
+func uniqueRequiredChecks(values []RequiredCheck) []RequiredCheck {
+	seen := map[string]bool{}
+	result := make([]RequiredCheck, 0, len(values))
+	for _, value := range values {
+		value.Context = strings.TrimSpace(value.Context)
+		if value.Context == "" || value.AppID <= 0 || seen[value.Context+":"+fmt.Sprint(value.AppID)] {
+			continue
+		}
+		seen[value.Context+":"+fmt.Sprint(value.AppID)] = true
+		result = append(result, value)
 	}
 	return result
 }

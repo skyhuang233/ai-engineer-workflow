@@ -52,6 +52,9 @@ type EffectAdapter interface {
 type PreconditionChecker interface {
 	CheckPrecondition(context.Context, setupcontract.Precondition) error
 }
+type PreLayoutPreconditionChecker interface {
+	CheckPreLayoutPrecondition(context.Context, setupcontract.Precondition) error
+}
 type EffectResultRestorer interface {
 	RestoreEffectResults([]setupcontract.EffectResult) error
 }
@@ -77,6 +80,24 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	layout, err := workflowhome.Resolve(plan.Target.WorkflowHome)
 	if err != nil {
 		return setupcontract.ExecutionResult{}, err
+	}
+	if e.Adapter == nil {
+		return setupcontract.ExecutionResult{}, errors.New("Setup effect adapter is required")
+	}
+	// Fence a generated Platform Plan to its approved Windows user before even
+	// creating Workflow Home. The ordinary precondition pass repeats the check
+	// after layout creation and verifies the resulting/existing directory owner.
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind != "host_identity" {
+			continue
+		}
+		checker, ok := e.Adapter.(PreLayoutPreconditionChecker)
+		if !ok {
+			return setupcontract.ExecutionResult{}, errors.New("Setup adapter cannot verify the host identity before creating Workflow Home")
+		}
+		if err := checker.CheckPreLayoutPrecondition(ctx, precondition); err != nil {
+			return setupcontract.ExecutionResult{}, err
+		}
 	}
 	if err := layout.Ensure(); err != nil {
 		return setupcontract.ExecutionResult{}, err
@@ -105,9 +126,6 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	}
 	attempt := len(prior) + 1
 	result := setupcontract.ExecutionResult{SchemaVersion: 1, PlanID: plan.PlanID, PlanDigest: digest, AttemptID: "attempt-" + strconv.Itoa(attempt), StartedAt: now, Status: setupcontract.ExecutionSucceeded}
-	if e.Adapter == nil {
-		return result, errors.New("Setup effect adapter is required")
-	}
 	if restorer, ok := e.Adapter.(EffectResultRestorer); ok {
 		for _, previous := range prior {
 			var effects []setupcontract.EffectResult
@@ -361,23 +379,66 @@ func checkPlatformInstallationPrecondition(ctx context.Context, database *store.
 	if plan.Kind != setupcontract.PlatformBootstrap || precondition.Subject != plan.Target.WorkflowHome {
 		return errors.New("Platform Installation transition precondition is not bound to its Workflow Home")
 	}
-	found := false
+	var approvedEffect *setupcontract.Effect
 	for _, effect := range plan.Effects {
 		handler, ok := effectHandlers[effect.Kind]
-		found = found || ok && handler.contract.Engine == setupeffect.PlatformInstallEffect
+		if ok && handler.contract.Engine == setupeffect.PlatformInstallEffect {
+			if approvedEffect != nil || effect.Subject != plan.Target.WorkflowHome {
+				return errors.New("Platform Installation transition must bind one exact approved record effect")
+			}
+			copy := effect
+			approvedEffect = &copy
+		}
 	}
-	if !found {
+	if approvedEffect == nil {
 		return errors.New("Platform Installation transition precondition has no approved record effect")
 	}
 	installation, err := database.PlatformInstallation(ctx)
 	if err != nil {
 		return err
 	}
-	_, digest, err := setupcontract.Canonicalize(platformInstallationStateJSON(installation))
-	if err != nil || digest != precondition.Expected {
+	_, actualDigest, err := setupcontract.Canonicalize(platformInstallationStateJSON(installation))
+	if err != nil {
 		return errors.Join(errors.New("Platform Installation transition source pins drifted"), err)
 	}
-	return nil
+	if actualDigest == precondition.Expected {
+		return nil
+	}
+	// A previous attempt may have durably recorded the approved installation
+	// before a later Control Plane effect failed. Accept only the exact state
+	// that this same approved record effect writes (authorization is still
+	// blank at that boundary); any third state remains drift.
+	approvedNew := store.PlatformInstallation{
+		PlatformVersion:                   approvedEffect.Parameters["version"],
+		ReleaseManifestDigestSHA256:       approvedEffect.Parameters["release_manifest_digest"],
+		PlatformSetupContractDigestSHA256: approvedEffect.Parameters["platform_setup_contract_digest"],
+		WorkflowCLISHA256:                 approvedEffect.Parameters["workflow_cli_sha256"],
+		ReleaseBundledFilesDigestSHA256:   approvedEffect.Parameters["release_bundled_files_digest"],
+	}
+	_, approvedNewDigest, newErr := setupcontract.Canonicalize(platformInstallationStateJSON(approvedNew))
+	if newErr == nil && actualDigest == approvedNewDigest && platformInstallationEffectPreviouslySatisfied(ctx, database, plan.PlanID, approvedEffect.ID) {
+		return nil
+	}
+	return errors.Join(errors.New("Platform Installation transition source pins drifted"), newErr)
+}
+
+func platformInstallationEffectPreviouslySatisfied(ctx context.Context, database *store.Store, planID, effectID string) bool {
+	results, err := database.SetupExecutionResults(ctx, planID)
+	if err != nil {
+		return false
+	}
+	for _, result := range results {
+		var effects []setupcontract.EffectResult
+		if json.Unmarshal([]byte(result.EffectsJSON), &effects) != nil {
+			continue
+		}
+		for _, effect := range effects {
+			if effect.EffectID == effectID && effect.Status == setupcontract.EffectSatisfied {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasPlatformInstallationTransition(plan setupcontract.Plan) bool {

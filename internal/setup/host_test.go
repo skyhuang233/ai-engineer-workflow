@@ -33,12 +33,40 @@ func TestHostAdapterChecksApprovedCurrentUserIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := HostAdapter{}
-	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: current.Uid}); err != nil {
+	root := t.TempDir()
+	ownerID, err := workflowHomeOwnerIdentity(root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: "different-user"}); err == nil {
+	expected, _ := json.Marshal(hostIdentityPrecondition{UserID: current.Uid, Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: ownerID})
+	adapter := HostAdapter{Layout: workflowhome.Layout{Root: root}}
+	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(expected)}); err != nil {
+		t.Fatal(err)
+	}
+	wrongUser, _ := json.Marshal(hostIdentityPrecondition{UserID: "different-user", Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: ownerID})
+	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(wrongUser)}); err == nil {
 		t.Fatal("accepted drifted host identity")
+	}
+	wrongOwner, _ := json.Marshal(hostIdentityPrecondition{UserID: current.Uid, Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: "different-owner"})
+	if err := adapter.CheckPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(wrongOwner)}); err == nil {
+		t.Fatal("accepted Workflow Home owned by another identity")
+	}
+}
+
+func TestHostAdapterAllowsMatchingIdentityBeforeCreatingWorkflowHome(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "fresh-workflow-home")
+	expected, _ := json.Marshal(hostIdentityPrecondition{UserID: current.Uid, Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: current.Uid})
+	adapter := HostAdapter{Layout: workflowhome.Layout{Root: root}}
+	precondition := setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(expected)}
+	if err := adapter.CheckPreLayoutPrecondition(context.Background(), precondition); err != nil {
+		t.Fatalf("matching pre-layout host identity was rejected: %v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("identity preflight created Workflow Home: %v", err)
 	}
 }
 
@@ -234,7 +262,7 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		},
 	}
 	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
-		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `["workflow-contract"]`,
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
 	}}
 	err = adapter.applyRepositoryContract(context.Background(), effect)
 	if err == nil {
@@ -252,10 +280,10 @@ func TestOnboardingCheckWaiterIgnoresOptionalFailuresAndPendingRuns(t *testing.T
 		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/check-runs") {
 			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
 		}
-		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success"},{"name":"optional-lint","status":"completed","conclusion":"failure"},{"name":"optional-preview","status":"in_progress","conclusion":""}]}`))
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success","head_sha":"` + strings.Repeat("a", 40) + `","app":{"id":15368}},{"name":"optional-lint","status":"completed","conclusion":"failure","app":{"id":99}},{"name":"optional-preview","status":"in_progress","conclusion":"","app":{"id":99}}]}`))
 	}))
 	defer server.Close()
-	diagnostics, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []string{"workflow-contract"}, 100*time.Millisecond)
+	diagnostics, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []onboarding.RequiredCheck{{Context: "workflow-contract", AppID: 15368}}, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("optional checks blocked onboarding: %v", err)
 	}
@@ -267,12 +295,23 @@ func TestOnboardingCheckWaiterIgnoresOptionalFailuresAndPendingRuns(t *testing.T
 
 func TestOnboardingCheckWaiterTimeoutReportsRequiredObservedState(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"in_progress","conclusion":""}]}`))
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"in_progress","conclusion":"","head_sha":"` + strings.Repeat("a", 40) + `","app":{"id":15368}}]}`))
 	}))
 	defer server.Close()
-	_, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []string{"workflow-contract", "build"}, 10*time.Millisecond)
+	_, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []onboarding.RequiredCheck{{Context: "workflow-contract", AppID: 15368}, {Context: "build", AppID: 42}}, 10*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "workflow-contract (status=in_progress") || !strings.Contains(err.Error(), "build (not observed)") {
 		t.Fatalf("required-check timeout diagnostics = %v", err)
+	}
+}
+
+func TestOnboardingCheckWaiterRejectsSameNameFromDifferentApp(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"workflow-contract","status":"completed","conclusion":"success","head_sha":"` + strings.Repeat("a", 40) + `","app":{"id":999}}]}`))
+	}))
+	defer server.Close()
+	diagnostics, err := waitForOnboardingChecks(context.Background(), workflowgithub.NewClient(server.URL, "token", server.Client()), "owner/repo", strings.Repeat("a", 40), []onboarding.RequiredCheck{{Context: "workflow-contract", AppID: 15368}}, 10*time.Millisecond)
+	if err == nil || !strings.Contains(strings.Join(diagnostics, "\n"), "unapproved App 999") {
+		t.Fatalf("same-name check from another App was accepted: diagnostics=%#v err=%v", diagnostics, err)
 	}
 }
 
@@ -290,21 +329,38 @@ func TestPublishHistoryTreatsRefConflictAsRequiredOnlyForApprovedNewRepository(t
 		}
 	}))
 	defer server.Close()
-	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client())}
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), CreatedRepositories: map[string]bool{}}
 	for _, test := range []struct {
 		name, newlyCreated string
+		createdEvidence    bool
 		want               setupcontract.EffectStatus
 	}{
-		{name: "approved unpublished", newlyCreated: "true", want: setupcontract.EffectRequired},
+		{name: "plan flag without evidence", newlyCreated: "true", want: setupcontract.EffectFailed},
 		{name: "existing repository", newlyCreated: "false", want: setupcontract.EffectFailed},
+		{name: "verified created", newlyCreated: "true", createdEvidence: true, want: setupcontract.EffectRequired},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			adapter.CreatedRepositories["owner/repo"] = test.createdEvidence
 			effect := setupcontract.Effect{ID: "publish", Kind: "publish_history", Subject: "owner/repo", Action: "push", Parameters: map[string]string{"branch": "main", "head": strings.Repeat("a", 40), "new_repository": test.newlyCreated}}
 			status, _, err := adapter.Readback(context.Background(), effect)
 			if status != test.want || test.want == setupcontract.EffectFailed && err == nil {
 				t.Fatalf("409 readback = %s, %v; want %s", status, err, test.want)
 			}
 		})
+	}
+}
+
+func TestHostAdapterRestoresPlanBoundPublicationEvidence(t *testing.T) {
+	adapter := HostAdapter{CreatedRepositories: map[string]bool{}, PublishedHistoryHeads: map[string]string{}, InitialBaselineHeads: map[string]string{}}
+	published := strings.Repeat("a", 40)
+	baseline := strings.Repeat("b", 40)
+	err := adapter.RestoreEffectResults([]setupcontract.EffectResult{
+		{EffectID: "create", Evidence: "created; " + repositoryCreatedEvidence + "owner/repo"},
+		{EffectID: "publish", Evidence: "published; " + publishedHistoryHeadEvidence + published},
+		{EffectID: "baseline", Evidence: "baseline; " + initialBaselineHeadEvidence + baseline},
+	})
+	if err != nil || !adapter.CreatedRepositories["owner/repo"] || adapter.PublishedHistoryHeads["publish"] != published || adapter.InitialBaselineHeads["baseline"] != baseline {
+		t.Fatalf("restored publication evidence = %#v %#v %#v err=%v", adapter.CreatedRepositories, adapter.PublishedHistoryHeads, adapter.InitialBaselineHeads, err)
 	}
 }
 
@@ -350,7 +406,7 @@ func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *tes
 	defer server.Close()
 	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
 	effect := setupcontract.Effect{Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{
-		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `["workflow-contract"]`,
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
 	}}
 	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: strings.Repeat("a", 64), TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{}}
 	err := adapter.applyRepositoryContract(context.Background(), effect)

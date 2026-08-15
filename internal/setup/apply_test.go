@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,6 +53,10 @@ func (f *fakeAdapter) CheckPrecondition(_ context.Context, p setupcontract.Preco
 		return errors.New("precondition drifted")
 	}
 	return nil
+}
+
+func (f *fakeAdapter) CheckPreLayoutPrecondition(ctx context.Context, p setupcontract.Precondition) error {
+	return f.CheckPrecondition(ctx, p)
 }
 func (f *fakeAdapter) Apply(_ context.Context, e setupcontract.Effect, _ *SecretInput) error {
 	if e.ID == f.fail {
@@ -263,6 +268,29 @@ func TestEngineChecksPlatformReleasePreconditionBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestEngineRejectsCrossUserPlatformPlanBeforeCreatingWorkflowHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, _ := json.Marshal(hostIdentityPrecondition{UserID: "S-1-5-21-other-user", Username: current.Username, WorkflowHome: home, WorkflowHomeOwnerID: "S-1-5-21-other-user"})
+	plan := testPlan(home)
+	plan.Preconditions = []setupcontract.Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: string(expected)}}
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, applyErr := (&Engine{Adapter: HostAdapter{Layout: workflowhome.Layout{Root: home}}}).Apply(context.Background(), raw, digest)
+	if applyErr == nil || result.Status != "" {
+		t.Fatalf("cross-user preflight result=%#v err=%v", result, applyErr)
+	}
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cross-user apply created Workflow Home before identity verification: %v", err)
+	}
+}
+
 func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -270,7 +298,7 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
 		wantStatus setupcontract.ExecutionStatus
 	}{
 		{name: "unapproved changed pins conflict", wantStatus: setupcontract.ExecutionDrifted},
-		{name: "approved old pins transition", authorized: true, wantStatus: setupcontract.ExecutionSucceeded},
+		{name: "approved old pins transition", authorized: true, wantStatus: setupcontract.ExecutionIncomplete},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -301,7 +329,10 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
 			plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "upgrade", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{
 				{ID: "release", Kind: "platform_release", Subject: "platform-v2.0.0", Expected: repeat("5", 64)},
 				{ID: "contract", Kind: "platform_setup_contract", Subject: "platform-v2.0.0", Expected: contractDigest},
-			}, Effects: []setupcontract.Effect{{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+			}, Effects: []setupcontract.Effect{
+				{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}},
+				{ID: "control-plane", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
+			}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 			if test.authorized {
 				priorRaw, _ := json.Marshal(map[string]string{"version": old.PlatformVersion, "release_manifest_digest": old.ReleaseManifestDigestSHA256, "platform_setup_contract_digest": old.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": old.WorkflowCLISHA256, "release_bundled_files_digest": old.ReleaseBundledFilesDigestSHA256, "control_plane_plan_digest_sha256": old.ControlPlanePlanDigestSHA256})
 				_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
@@ -312,8 +343,10 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, applyErr := (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, raw, digest)
-			if result.Status != test.wantStatus || test.authorized && applyErr != nil || !test.authorized && applyErr == nil {
+			adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}, fail: "control-plane"}
+			engine := &Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
+			result, applyErr := engine.Apply(ctx, raw, digest)
+			if result.Status != test.wantStatus || applyErr == nil {
 				t.Fatalf("result=%#v err=%v", result, applyErr)
 			}
 			if test.authorized {
@@ -321,10 +354,39 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer database.Close()
 				got, err := database.PlatformInstallation(ctx)
-				if err != nil || got.PlatformVersion != "2.0.0" || got.ReleaseManifestDigestSHA256 != repeat("5", 64) {
+				if err != nil || got.PlatformVersion != "2.0.0" || got.ReleaseManifestDigestSHA256 != repeat("5", 64) || got.ControlPlanePlanDigestSHA256 != "" {
 					t.Fatalf("upgraded installation=%#v err=%v", got, err)
+				}
+				if err := database.Close(); err != nil {
+					t.Fatal(err)
+				}
+				// A failed later effect may leave the installation effect durably
+				// recorded. The same approved plan must accept its exact new pins
+				// on retry even though its transition precondition names the old pins.
+				adapter.fail = ""
+				result, applyErr = engine.Apply(ctx, raw, digest)
+				if applyErr != nil || result.Status != setupcontract.ExecutionSucceeded {
+					t.Fatalf("Control Plane retry from exact-new installation result=%#v err=%v", result, applyErr)
+				}
+
+				database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				third := got
+				third.PlatformVersion = "3.0.0"
+				third.ReleaseManifestDigestSHA256 = repeat("9", 64)
+				if err := database.RecordPlatformInstallation(ctx, third); err != nil {
+					database.Close()
+					t.Fatal(err)
+				}
+				if err := database.Close(); err != nil {
+					t.Fatal(err)
+				}
+				result, applyErr = (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, raw, digest)
+				if applyErr == nil || result.Status != setupcontract.ExecutionDrifted {
+					t.Fatalf("third-state retry result=%#v err=%v", result, applyErr)
 				}
 			}
 		})

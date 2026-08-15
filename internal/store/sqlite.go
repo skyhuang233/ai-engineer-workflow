@@ -94,18 +94,17 @@ func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
 	if databasePath == "" {
 		return nil, errors.New("read-only Store requires a database file")
 	}
-	barrier, err := startup.AcquireDatabaseAccess(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro"}).String()
+	// Planning must be observational: acquiring the runtime/restore barrier
+	// creates lock files beside the database. SQLite immutable mode also avoids
+	// journal discovery or any attempt to modify sidecars while inspecting the
+	// already-closed current-schema snapshot.
+	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro&immutable=1"}).String()
 	db, err := sql.Open("sqlite", uri)
 	if err != nil {
-		_ = barrier.Close()
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db, databasePath: databasePath, restoreBarrier: barrier}
+	store := &Store{db: db, databasePath: databasePath}
 	version, err := store.schemaVersion(ctx)
 	if err != nil {
 		store.Close()
@@ -1849,7 +1848,15 @@ func (s *Store) Close() error {
 	if s == nil {
 		return nil
 	}
-	return errors.Join(s.db.Close(), s.restoreBarrier.Close())
+	var databaseErr error
+	if s.db != nil {
+		databaseErr = s.db.Close()
+	}
+	var barrierErr error
+	if s.restoreBarrier != nil {
+		barrierErr = s.restoreBarrier.Close()
+	}
+	return errors.Join(databaseErr, barrierErr)
 }
 
 // BeginActivation writes a complete immutable version in one transaction.

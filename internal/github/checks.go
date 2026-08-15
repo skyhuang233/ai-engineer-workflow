@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,46 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/store"
 )
+
+type OnboardingCheck struct {
+	Name, Status, Conclusion, HeadSHA string
+	AppID                             int64
+}
+
+// OnboardingChecks returns the check-run App identity needed by Setup's
+// approval fence. The general poll projection intentionally remains unchanged.
+func (c *Client) OnboardingChecks(ctx context.Context, repository, commit string) ([]OnboardingCheck, error) {
+	if err := ValidateRepository(repository); err != nil {
+		return nil, err
+	}
+	if commit == "" {
+		return nil, errors.New("candidate commit is required")
+	}
+	type checkRun struct {
+		Name, Status, Conclusion string
+		HeadSHA                  string `json:"head_sha"`
+		App                      struct {
+			ID int64 `json:"id"`
+		} `json:"app"`
+	}
+	type response struct {
+		CheckRuns []checkRun `json:"check_runs"`
+	}
+	var checks []OnboardingCheck
+	for page := 1; ; page++ {
+		var result response
+		path := "/repos/" + repository + "/commits/" + url.PathEscape(commit) + "/check-runs?per_page=100&page=" + strconv.Itoa(page)
+		if err := c.getJSON(ctx, path, &result); err != nil {
+			return nil, err
+		}
+		for _, check := range result.CheckRuns {
+			checks = append(checks, OnboardingCheck{Name: check.Name, Status: check.Status, Conclusion: check.Conclusion, HeadSHA: check.HeadSHA, AppID: check.App.ID})
+		}
+		if len(result.CheckRuns) < 100 {
+			return checks, nil
+		}
+	}
+}
 
 func (c *Client) PullRequestChecks(ctx context.Context, repository, commit string) ([]store.PullRequestCheck, error) {
 	checks, _, _, err := c.PullRequestChecksIfChanged(ctx, repository, commit, "", true)

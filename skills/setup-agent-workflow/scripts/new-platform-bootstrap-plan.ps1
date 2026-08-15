@@ -67,13 +67,33 @@ $skillFiles = @($manifest.bundled_files | Where-Object { ([string]$_.path).Start
     [ordered]@{ path = ([string]$_.path).Substring(7); sha256 = [string]$_.sha256 }
 })
 if ($managedSkills.Count -eq 0 -or $skillFiles.Count -eq 0) { throw "Verified Platform Release has no Workflow Skill Bundle files" }
+$expectedSkillFileDigests = [ordered]@{}
+foreach ($file in $skillFiles) { $expectedSkillFileDigests[[string]$file.path] = [string]$file.sha256 }
 $bundleCurrent = $true
 $bundleStatePath = Join-Path $facts.workflow_home "config\workflow-skills.owner.json"
 if (-not (Test-Path -LiteralPath $bundleStatePath -PathType Leaf)) {
     $bundleCurrent = $false
 } else {
-    $bundleState = Get-Content -LiteralPath $bundleStatePath -Raw | ConvertFrom-Json
-    if ($bundleState.owner -ne "agent-workflow-platform" -or [string]$bundleState.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { $bundleCurrent = $false }
+    try {
+        $bundleState = Get-Content -LiteralPath $bundleStatePath -Raw | ConvertFrom-Json
+        if ($bundleState.owner -ne "agent-workflow-platform") { throw "Existing Workflow Skill Bundle state is not owned by Agent Workflow" }
+        if ([string]$bundleState.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { $bundleCurrent = $false }
+        $recordedSkills = @($bundleState.skills | ForEach-Object { [string]$_ } | Sort-Object)
+        $expectedSkills = @($managedSkills | Sort-Object)
+        if (($recordedSkills -join "`n") -cne ($expectedSkills -join "`n")) { $bundleCurrent = $false }
+        $recordedDigestProperties = @($bundleState.file_digests.PSObject.Properties)
+        if ($recordedDigestProperties.Count -ne $expectedSkillFileDigests.Count) {
+            $bundleCurrent = $false
+        } else {
+            foreach ($expectedDigest in $expectedSkillFileDigests.GetEnumerator()) {
+                $property = $bundleState.file_digests.PSObject.Properties[[string]$expectedDigest.Key]
+                if ($null -eq $property -or [string]$property.Value -cne [string]$expectedDigest.Value) { $bundleCurrent = $false; break }
+            }
+        }
+    } catch {
+        if ([string]$_.Exception.Message -eq "Existing Workflow Skill Bundle state is not owned by Agent Workflow") { throw }
+        $bundleCurrent = $false
+    }
 }
 foreach ($skill in $managedSkills) {
     if ($skill -ne [IO.Path]::GetFileName($skill)) { throw "Verified Platform Release has an invalid managed skill name" }
@@ -145,6 +165,14 @@ $platformPreconditions = @(
     [ordered]@{ id = "platform-release"; kind = "platform_release"; subject = [string]$manifest.release.tag; expected = $manifestDigest }
     [ordered]@{ id = "platform-setup-contract"; kind = "platform_setup_contract"; subject = [string]$manifest.release.tag; expected = $platformSetupContractDigest }
 )
+$hostUserID = [string]$facts.host_identity.user_id
+$hostUsername = [string]$facts.host_identity.username
+$workflowHomeOwnerID = [string]$facts.host_identity.workflow_home_owner_id
+if ([string]::IsNullOrWhiteSpace($hostUserID) -or [string]::IsNullOrWhiteSpace($hostUsername) -or [string]::IsNullOrWhiteSpace($workflowHomeOwnerID)) {
+    throw "A complete current-user and Workflow Home owner identity snapshot is required"
+}
+$approvedHostIdentity = [ordered]@{ user_id = $hostUserID; username = $hostUsername; workflow_home = [IO.Path]::GetFullPath([string]$facts.workflow_home); workflow_home_owner_id = $workflowHomeOwnerID }
+$platformPreconditions += [ordered]@{ id = "windows-user-and-home-owner"; kind = "host_identity"; subject = "current-user"; expected = ($approvedHostIdentity | ConvertTo-Json -Compress) }
 $codexAuthVerified = ($facts.codex_auth.verified -and [IO.Path]::IsPathRooted([string]$facts.codex_auth.source) -and [string]$facts.codex_auth.fingerprint_sha256 -match '^[0-9a-f]{64}$')
 if (-not $codexAuthVerified) { throw "A supported verified Codex ChatGPT authentication snapshot is required" }
 $platformState = [ordered]@{

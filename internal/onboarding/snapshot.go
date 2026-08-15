@@ -26,7 +26,16 @@ type ApprovalSnapshot struct {
 	ZeroBaseline          []BaselineFile `json:"zero_baseline,omitempty"`
 }
 
-func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, zeroBaseline []BaselineFile) (string, error) {
+// ApprovalTransitions contains only effect results durably recorded for this
+// approved Setup Plan. It must never be inferred from a matching-looking tree.
+type ApprovalTransitions struct {
+	CreatedRepository    string
+	PublishedHistoryHead string
+	InitialBaselineHead  string
+	MergedHead           string
+}
+
+func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedRepository string, zeroBaseline []BaselineFile) (string, error) {
 	status, err := gitBytes(ctx, discovery.Root, "status", "--porcelain=v2", "--untracked-files=all")
 	if err != nil {
 		return "", err
@@ -36,8 +45,8 @@ func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, zeroBasel
 		return "", err
 	}
 	cloneURL := ""
-	if discovery.Repository != "" {
-		cloneURL, err = GitHubHTTPSURL(discovery.Repository)
+	if intendedRepository != "" {
+		cloneURL, err = GitHubHTTPSURL(intendedRepository)
 		if err != nil {
 			return "", err
 		}
@@ -52,6 +61,10 @@ func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, zeroBasel
 }
 
 func VerifyApprovalSnapshot(ctx context.Context, encoded string) error {
+	return VerifyApprovalSnapshotTransitions(ctx, encoded, ApprovalTransitions{})
+}
+
+func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, transitions ApprovalTransitions) error {
 	var expected ApprovalSnapshot
 	if err := json.Unmarshal([]byte(encoded), &expected); err != nil || expected.Root == "" || expected.Branch == "" || expected.StatusSHA256 == "" || expected.ManagedBoundarySHA256 == "" {
 		return errors.New("approved onboarding discovery snapshot is invalid")
@@ -96,10 +109,54 @@ func VerifyApprovalSnapshot(ctx context.Context, encoded string) error {
 		}
 	}
 	actual := ApprovalSnapshot{Root: root, Branch: branch, Head: head, HasCommits: hasCommits, Origin: origin, Repository: repository, AuthenticatedCloneURL: cloneURL, StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: baseline}
-	wantJSON, _ := json.Marshal(expected)
-	gotJSON, _ := json.Marshal(actual)
-	if string(wantJSON) != string(gotJSON) {
+	if actual.Root != expected.Root || actual.Branch != expected.Branch {
 		return errors.New("onboarding discovery drifted from the approved snapshot")
+	}
+	forwardHead := head == transitions.InitialBaselineHead && fullSHA.MatchString(transitions.InitialBaselineHead) || head == transitions.MergedHead && fullSHA.MatchString(transitions.MergedHead)
+	if head != expected.Head && !forwardHead || hasCommits != expected.HasCommits && !forwardHead {
+		return errors.New("onboarding discovery HEAD drifted from the approved plan transition")
+	}
+	approvedForwardRepository := strings.TrimPrefix(strings.TrimSuffix(expected.AuthenticatedCloneURL, ".git"), "https://github.com/")
+	originForward := expected.Origin == "" && transitions.CreatedRepository == approvedForwardRepository && (transitions.PublishedHistoryHead != "" || transitions.InitialBaselineHead != "") && origin == expected.AuthenticatedCloneURL && repository == approvedForwardRepository && cloneURL == expected.AuthenticatedCloneURL
+	exactOrigin := origin == expected.Origin && repository == expected.Repository && (expected.Repository == "" && cloneURL == "" || expected.Repository != "" && cloneURL == expected.AuthenticatedCloneURL)
+	if !exactOrigin && !originForward {
+		return errors.New("onboarding discovery origin drifted from the approved plan transition")
+	}
+	wantStatus := expected.StatusSHA256
+	baselineTransition := !expected.HasCommits && head == transitions.InitialBaselineHead && fullSHA.MatchString(transitions.InitialBaselineHead)
+	mergeAfterBaseline := !expected.HasCommits && head == transitions.MergedHead && fullSHA.MatchString(transitions.MergedHead)
+	if mergeAfterBaseline {
+		wantStatus = digestSnapshotBytes(nil)
+	}
+	if !baselineTransition && actual.StatusSHA256 != wantStatus {
+		return errors.New("onboarding discovery dirty state drifted from the approved snapshot")
+	}
+	if actual.ManagedBoundarySHA256 != expected.ManagedBoundarySHA256 && head != transitions.MergedHead {
+		return errors.New("onboarding managed boundary drifted without the approved merge evidence")
+	}
+	if !expected.HasCommits && !hasCommits {
+		expectedBaselineJSON, _ := json.Marshal(expected.ZeroBaseline)
+		actualBaselineJSON, _ := json.Marshal(actual.ZeroBaseline)
+		if string(expectedBaselineJSON) != string(actualBaselineJSON) {
+			return errors.New("Initial Repository Baseline content drifted from the approved snapshot")
+		}
+	}
+	if baselineTransition {
+		if err := VerifyInitialBaseline(ctx, root, head, expected.ZeroBaseline); err != nil {
+			return err
+		}
+		workingBaseline, baselineErr := BaselineSnapshot(ctx, root)
+		if baselineErr != nil {
+			return baselineErr
+		}
+		expectedBaselineJSON, _ := json.Marshal(expected.ZeroBaseline)
+		workingBaselineJSON, _ := json.Marshal(workingBaseline)
+		if string(expectedBaselineJSON) != string(workingBaselineJSON) {
+			return errors.New("Initial Repository Baseline working tree drifted from the approved snapshot")
+		}
+		if err := verifyBaselineSnapshot(ctx, root, expected.ZeroBaseline); err != nil {
+			return err
+		}
 	}
 	return nil
 }

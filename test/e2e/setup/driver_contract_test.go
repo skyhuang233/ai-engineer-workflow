@@ -96,6 +96,29 @@ func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
 	}
 }
 
+func TestUnrelatedDirtyQualificationUsesPublishedRepository(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	start := strings.Index(harness, `Invoke-Scenario "unrelated-dirty-files"`)
+	if start < 0 {
+		t.Fatal("unrelated dirty scenario is missing")
+	}
+	end := strings.Index(harness[start:], `Invoke-Scenario "managed-path-drift"`)
+	if end < 0 {
+		t.Fatal("unrelated dirty scenario boundary is missing")
+	}
+	block := harness[start : start+end]
+	create := strings.Index(block, "gh repo create")
+	dirty := strings.Index(block, `unrelated.txt`)
+	if create < 0 || dirty < 0 || create > dirty || !strings.Contains(block, "remote get-url origin") || !strings.Contains(block, "https://github.com/") {
+		t.Fatalf("unrelated dirty scenario is not a real published-origin fixture:\n%s", block)
+	}
+	for _, assertion := range []string{"ReadAllText($unrelatedPath)", "preserve exactly", "status --porcelain=v1", "?? unrelated.txt"} {
+		if !strings.Contains(harness, assertion) {
+			t.Fatalf("published dirty postcondition lacks %q", assertion)
+		}
+	}
+}
+
 func TestPowerShellHarnessAndDriverParse(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {
