@@ -48,7 +48,7 @@ func PublishDefaultBranch(ctx context.Context, repository, remoteURL, branch str
 	return nil
 }
 
-func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expectedPreMergeHead string, credential GitCredential) error {
+func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expectedPreMergeHead, expectedMergeHead string, credential GitCredential) error {
 	currentBranch, err := gitOutput(ctx, repository, "branch", "--show-current")
 	if err != nil || currentBranch != branch {
 		return fmt.Errorf("safe fast-forward requires checked-out branch %q", branch)
@@ -57,15 +57,22 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	if err != nil || !fullSHA.MatchString(expectedPreMergeHead) || currentHead != expectedPreMergeHead {
 		return errors.New("local pre-merge HEAD differs from the approved onboarding base")
 	}
+	if !fullSHA.MatchString(expectedMergeHead) {
+		return errors.New("persisted onboarding merge HEAD is invalid")
+	}
 	remoteURL, err := GitHubHTTPSURL(repositoryID)
 	if err != nil {
 		return err
 	}
-	command := exec.CommandContext(ctx, "git", "fetch", remoteURL, "refs/heads/"+branch)
+	command := exec.CommandContext(ctx, "git", "fetch", remoteURL, expectedMergeHead)
 	command.Dir = repository
 	command.Env = append(os.Environ(), gitCredentialEnvironment(credential)...)
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("fetch merged default branch: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	fetchedHead, err := gitOutput(ctx, repository, "rev-parse", "--verify", "FETCH_HEAD")
+	if err != nil || fetchedHead != expectedMergeHead {
+		return errors.New("fetched revision differs from the persisted onboarding merge HEAD")
 	}
 	currentBranch, err = gitOutput(ctx, repository, "branch", "--show-current")
 	if err != nil || currentBranch != branch {
@@ -79,6 +86,10 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	command.Dir = repository
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("safe fast-forward merged default branch: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	mergedHead, err := gitOutput(ctx, repository, "rev-parse", "--verify", "HEAD")
+	if err != nil || mergedHead != expectedMergeHead {
+		return errors.New("local default branch did not reach the persisted onboarding merge HEAD")
 	}
 	return nil
 }

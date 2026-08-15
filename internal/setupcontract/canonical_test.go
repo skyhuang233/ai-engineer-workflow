@@ -88,6 +88,33 @@ func TestParsePlanRejectsKindSpecificEffectParameterDrift(t *testing.T) {
 	}
 }
 
+func TestParsePlanRejectsUnknownSemanticCombinations(t *testing.T) {
+	base := Plan{SchemaVersion: 1, PlanID: "semantic-registry", Kind: PlatformBootstrap, Target: Target{WorkflowHome: `C:\Workflow`}, Preconditions: []Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "user"}}, Effects: []Effect{{ID: "file", Kind: "install_file", Subject: "workflow.exe", Action: "install", Parameters: map[string]string{"sha256": strings.Repeat("a", 64)}}}, ExpectedResults: []ExpectedResult{{ID: "file-ready", Kind: "file_digest", Subject: "workflow.exe", Expected: strings.Repeat("a", 64)}}}
+	tests := map[string]func(*Plan){
+		"unknown precondition":        func(p *Plan) { p.Preconditions[0].Kind = "surprise" },
+		"wrong precondition for plan": func(p *Plan) { p.Preconditions[0].Kind = "git_head" },
+		"unknown action":              func(p *Plan) { p.Effects[0].Action = "overwrite_anything" },
+		"wrong effect for plan": func(p *Plan) {
+			p.Effects[0] = Effect{ID: "repo", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true"}}
+		},
+		"unknown expected result": func(p *Plan) { p.ExpectedResults[0].Kind = "surprise" },
+		"wrong result for plan":   func(p *Plan) { p.ExpectedResults[0].Kind = "repository_admission" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			plan := base
+			plan.Preconditions = append([]Precondition(nil), base.Preconditions...)
+			plan.Effects = append([]Effect(nil), base.Effects...)
+			plan.ExpectedResults = append([]ExpectedResult(nil), base.ExpectedResults...)
+			mutate(&plan)
+			raw, _ := json.Marshal(plan)
+			if _, _, _, err := ParsePlan(raw); err == nil {
+				t.Fatalf("accepted unsupported semantic combination: %#v", plan)
+			}
+		})
+	}
+}
+
 func TestPlanValidationFailsClosed(t *testing.T) {
 	tests := map[string]func(string) string{
 		"unknown field": func(s string) string { return strings.Replace(s, `"plan_id":`, `"surprise":true,"plan_id":`, 1) },

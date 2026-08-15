@@ -221,7 +221,7 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 	}
 	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "incomplete-onboarding", Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"}, Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: "ok"}}, Effects: []setupcontract.Effect{
 		{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
-		{ID: "later", Kind: "install_file", Subject: "later", Action: "install", Parameters: map[string]string{"sha256": repeat("c", 64)}},
+		{ID: "later", Kind: "github_label", Subject: "owner/repo#later", Action: "reconcile", Parameters: map[string]string{"name": "later", "color": "ffffff", "description": "later"}},
 	}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("b", 64)}}}
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)

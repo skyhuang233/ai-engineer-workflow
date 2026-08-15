@@ -170,6 +170,14 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			break
 		}
 		if status == setupcontract.EffectSatisfied {
+			if effect.Kind == "control_plane" {
+				if authErr := authorizeControlPlane(ctx, database, effect, digest); authErr != nil {
+					result.Status = setupcontract.ExecutionIncomplete
+					result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: authErr.Error()})
+					err = authErr
+					break
+				}
+			}
 			if effect.Kind == "github_pat" {
 				if verifyErr := verifyAndRecordPAT(ctx, database, layout, effect); verifyErr != nil {
 					if e.SecretInput == nil || e.SecretInput.Reader == nil {
@@ -231,6 +239,14 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 				result.Status = setupcontract.ExecutionIncomplete
 				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: verifyErr.Error()})
 				err = verifyErr
+				break
+			}
+		}
+		if effect.Kind == "control_plane" {
+			if authErr := authorizeControlPlane(ctx, database, effect, digest); authErr != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: authErr.Error()})
+				err = authErr
 				break
 			}
 		}
@@ -417,6 +433,12 @@ func readPlatformInstallation(ctx context.Context, database *store.Store, effect
 	if value.PlatformVersion != effect.Parameters["version"] || value.ReleaseManifestDigestSHA256 != effect.Parameters["release_manifest_digest"] {
 		return setupcontract.EffectConflicting, "Platform Installation differs from the approved release", nil
 	}
+	if value.PlatformSetupContractDigestSHA256 == "" || value.WorkflowCLISHA256 == "" {
+		return setupcontract.EffectRequired, "Platform Installation lacks durable verified release pins", nil
+	}
+	if value.PlatformSetupContractDigestSHA256 != effect.Parameters["platform_setup_contract_digest"] || value.WorkflowCLISHA256 != effect.Parameters["workflow_cli_sha256"] {
+		return setupcontract.EffectConflicting, "Platform Installation durable release pins differ", nil
+	}
 	contractPath := filepath.Join(value.WorkflowHome, "config", "platform-setup-contract.json")
 	raw, fileErr := os.ReadFile(contractPath)
 	canonical, contractDigest, canonicalErr := setupcontract.Canonicalize(raw)
@@ -444,7 +466,11 @@ func recordPlatformInstallation(ctx context.Context, database *store.Store, layo
 	if err := writeAtomic(contractPath, contractRaw); err != nil {
 		return err
 	}
-	return database.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now})
+	return database.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"], WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now})
+}
+
+func authorizeControlPlane(ctx context.Context, database *store.Store, effect setupcontract.Effect, planDigest string) error {
+	return database.AuthorizeControlPlane(ctx, store.PlatformInstallation{PlatformVersion: effect.Parameters["version"], ReleaseManifestDigestSHA256: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigestSHA256: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"]}, planDigest)
 }
 
 func writeAtomic(path string, data []byte) error {

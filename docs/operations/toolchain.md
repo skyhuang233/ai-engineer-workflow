@@ -142,18 +142,18 @@ go run ./cmd/workflow doctor `
   --config config/toolchain.json `
   --workflow-repository skyhuang233/ai-engineer-workflow `
   --database C:\ProgramData\workflow\workflow.db `
-  --codex-auth-file $env:WORKFLOW_CODEX_AUTH_FILE `
   --report docs/operations/doctor-report.md
 ```
 
 The Control Plane authenticates Ticket Agents with the trusted operator's
 existing ChatGPT login source. Run `codex login status` before starting the
-workflow and complete `codex login` if necessary. Because Codex exposes no
-supported command that returns its private credential path, the invoking Codex
-integration must provide an absolute `WORKFLOW_CODEX_AUTH_FILE`; `doctor`,
-`run-ticket`, and `poll-github` use that explicit source by default and never
-infer one from `CODEX_HOME` or the user profile. The source must use ChatGPT
-authentication. It is atomically copied only when a Ticket Session has
+workflow and complete `codex login` if necessary. The Workflow CLI discovers
+the absolute source from the redacted machine-readable `codex doctor --json`
+report, requiring schema 1, verified stored ChatGPT tokens/mode, and an auth
+file beneath the report's verified `CODEX_HOME`. Ordinary users do not provide
+a path. `WORKFLOW_CODEX_AUTH_FILE` remains only a controlled test override and
+still requires the same doctor and login validation. The source is atomically
+copied only when a Ticket Session has
 no `auth.json`, so a Session-local cache refreshed by Codex is never
 overwritten.
 

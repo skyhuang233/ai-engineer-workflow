@@ -69,6 +69,9 @@ func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) 
 }
 
 func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+	if err := setupcontract.ValidateEffectForExecution(effect); err != nil {
+		return setupcontract.EffectFailed, "", err
+	}
 	switch effect.Kind {
 	case "github_pat":
 		_, err := credential.NewFileStore(a.Layout.CredentialFile).Get(ctx, credential.GatewayTarget)
@@ -156,6 +159,9 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 			return setupcontract.EffectConflicting, observation.Diagnostic, nil
 		}
 		if record.PlatformVersion != effect.Parameters["version"] || record.ApprovedPlanDigestSHA256 != a.PlanDigest {
+			if effect.Action == "replace" {
+				return setupcontract.EffectRequired, "approved Control Plane replacement is required", nil
+			}
 			return setupcontract.EffectConflicting, "a different approved Control Plane instance is running", nil
 		}
 		return setupcontract.EffectSatisfied, "Control Plane process identity and health are verified", nil
@@ -320,16 +326,24 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 		if a.GitHub == nil {
 			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
 		}
+		mergeEvidenceID := effect.Parameters["merge_head_effect_id"]
+		mergeHead := a.OnboardingMergeHeads[mergeEvidenceID]
+		if mergeEvidenceID == "" || !fullSetupCommitID(mergeHead) {
+			return setupcontract.EffectFailed, "", errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
+		}
 		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
 		if err != nil {
 			return setupcontract.EffectFailed, "", err
+		}
+		if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
+			return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + mergeHead + "; GitHub default branch advanced after the approved onboarding merge", nil
 		}
 		branch, branchErr := onboardingGitBranch(ctx, effect.Subject)
 		if branchErr != nil || branch != effect.Parameters["branch"] {
 			return setupcontract.EffectConflicting, "checked-out branch differs from the approved default branch", nil
 		}
 		local, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", effect.Parameters["branch"])
-		if err == nil && local == remote.Head {
+		if err == nil && local == mergeHead {
 			return setupcontract.EffectSatisfied, "local default branch matches admitted GitHub branch", nil
 		}
 		expected := effect.Parameters["pre_merge_head"]
@@ -349,6 +363,9 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 }
 
 func (a HostAdapter) Apply(ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+	if err := setupcontract.ValidateEffectForExecution(effect); err != nil {
+		return err
+	}
 	switch effect.Kind {
 	case "github_pat":
 		secret, err := input.Read()
@@ -411,7 +428,7 @@ func (a HostAdapter) Apply(ctx context.Context, effect setupcontract.Effect, inp
 		if start == nil {
 			start = controlplane.Start
 		}
-		_, err := start(ctx, controlplane.StartOptions{Layout: a.Layout, Executable: executable, PlatformVersion: effect.Parameters["version"], ApprovedPlanDigestSHA256: a.PlanDigest, Timeout: 30 * time.Second})
+		_, err := start(ctx, controlplane.StartOptions{Layout: a.Layout, Executable: executable, PlatformVersion: effect.Parameters["version"], ApprovedPlanDigestSHA256: a.PlanDigest, Timeout: 30 * time.Second, Replace: effect.Action == "replace"})
 		return err
 	case "create_repository":
 		if a.GitHub == nil {
@@ -461,6 +478,20 @@ func (a HostAdapter) Apply(ctx context.Context, effect setupcontract.Effect, inp
 		// independent remote mutation.
 		return nil
 	case "local_fast_forward":
+		if a.GitHub == nil {
+			return errors.New("GitHub client is required")
+		}
+		mergeHead := a.OnboardingMergeHeads[effect.Parameters["merge_head_effect_id"]]
+		if !fullSetupCommitID(mergeHead) {
+			return errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
+		}
+		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
+		if err != nil {
+			return err
+		}
+		if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
+			return errors.New("GitHub default branch advanced after the approved onboarding merge")
+		}
 		expected := effect.Parameters["pre_merge_head"]
 		if expected == "" {
 			var err error
@@ -473,13 +504,16 @@ func (a HostAdapter) Apply(ctx context.Context, effect setupcontract.Effect, inp
 				return errors.New("local pre-merge baseline is not bound to the approved plan")
 			}
 		}
-		return onboarding.SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], expected, a.GitCredential)
+		return onboarding.SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], expected, mergeHead, a.GitCredential)
 	default:
 		return fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
 	}
 }
 
 func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.Precondition) error {
+	if err := setupcontract.ValidatePreconditionForExecution(value); err != nil {
+		return err
+	}
 	if value.Kind == "github_default_head" {
 		if a.GitHub == nil {
 			return errors.New("GitHub client is required to verify the approved default-branch base")

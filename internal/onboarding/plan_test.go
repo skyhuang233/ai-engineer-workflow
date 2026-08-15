@@ -71,6 +71,9 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	kinds := map[string]bool{}
 	for _, effect := range plan.Effects {
 		kinds[effect.Kind] = true
+		if effect.Kind == "local_fast_forward" && effect.Parameters["merge_head_effect_id"] != "repository-contract-pr" {
+			t.Fatalf("local fast-forward is not bound to merge evidence: %#v", effect)
+		}
 	}
 	if !kinds["create_repository"] || !kinds["initial_baseline"] || !kinds["repository_contract_pr"] {
 		t.Fatalf("effects=%#v", plan.Effects)
@@ -253,5 +256,27 @@ func TestPlanContainsOnlyUnsatisfiedOnboardingDeltas(t *testing.T) {
 	}
 	if len(plan.Effects) != 1 || plan.Effects[0].Kind != "github_label" || plan.Effects[0].Parameters["name"] != "workflow:ticket" {
 		t.Fatalf("non-delta effects = %#v", plan.Effects)
+	}
+}
+
+func TestPlanCreatesForwardRepairForManagedContractDrift(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	state := onboardingStateFunc(func(context.Context, string, string, string, []Label) (OnboardingState, error) {
+		return OnboardingState{ContractSatisfied: false, AdmissionSatisfied: true}, nil
+	})
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", AllowSquashMerge: true}, nil
+	})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy, State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]bool{}
+	for _, effect := range plan.Effects {
+		kinds[effect.Kind] = true
+	}
+	if !kinds["repository_contract_pr"] || !kinds["local_fast_forward"] || kinds["repository_admission"] {
+		t.Fatalf("forward-repair effects = %#v", plan.Effects)
 	}
 }

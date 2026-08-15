@@ -1,11 +1,15 @@
 package setup
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
@@ -79,7 +83,7 @@ func projectFileDiff(beforeRaw, afterRaw string) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		if beforeExists && afterExists && beforeText == afterText {
+		if beforeExists && afterExists && bytes.Equal(beforeText, afterText) {
 			continue
 		}
 		beforeName, afterName := path, path
@@ -89,24 +93,55 @@ func projectFileDiff(beforeRaw, afterRaw string) (string, bool) {
 		if !afterExists {
 			afterName = "/dev/null"
 		}
-		fmt.Fprintf(&output, "    --- %s\n    +++ %s\n", beforeName, afterName)
-		for _, line := range projectedLines(beforeText, beforeExists) {
-			fmt.Fprintf(&output, "    - %s\n", line)
+		fmt.Fprintf(&output, "    --- %s (%s)\n    +++ %s (%s)\n", beforeName, projectedByteMetadata(beforeText, beforeExists), afterName, projectedByteMetadata(afterText, afterExists))
+		if beforeExists {
+			fmt.Fprintf(&output, "    - %s\n", projectedExactBytes(beforeText))
 		}
-		for _, line := range projectedLines(afterText, afterExists) {
-			fmt.Fprintf(&output, "    + %s\n", line)
+		if afterExists {
+			fmt.Fprintf(&output, "    + %s\n", projectedExactBytes(afterText))
+		}
+		if projectedText(beforeText, beforeExists) && projectedText(afterText, afterExists) {
+			for _, line := range projectedLines(string(beforeText), beforeExists) {
+				fmt.Fprintf(&output, "    - %s\n", line)
+			}
+			for _, line := range projectedLines(string(afterText), afterExists) {
+				fmt.Fprintf(&output, "    + %s\n", line)
+			}
 		}
 	}
 	return output.String(), true
 }
 
-func decodeProjectedFile(encoded map[string]string, path string) (string, bool, bool) {
+func decodeProjectedFile(encoded map[string]string, path string) ([]byte, bool, bool) {
 	value, exists := encoded[path]
 	if !exists {
-		return "", false, true
+		return nil, false, true
 	}
 	data, err := base64.StdEncoding.DecodeString(value)
-	return string(data), true, err == nil
+	return data, true, err == nil
+}
+
+func projectedByteMetadata(value []byte, exists bool) string {
+	if !exists {
+		return "absent"
+	}
+	sum := sha256.Sum256(value)
+	encoding := "utf-8-json"
+	if !projectedText(value, true) {
+		encoding = "base64"
+	}
+	return fmt.Sprintf("bytes=%d sha256=%x encoding=%s", len(value), sum, encoding)
+}
+
+func projectedExactBytes(value []byte) string {
+	if projectedText(value, true) {
+		return "text_json=" + strconv.Quote(string(value))
+	}
+	return "base64=" + base64.StdEncoding.EncodeToString(value)
+}
+
+func projectedText(value []byte, exists bool) bool {
+	return !exists || utf8.Valid(value) && !bytes.ContainsRune(value, '\x00')
 }
 
 func projectedLines(value string, exists bool) []string {

@@ -47,9 +47,29 @@ try {
     $platformKinds = @("platform_cli", "workflow_skill_bundle", "docker_desktop", "github_pat", "platform_installation", "control_plane")
     $platformEffects = @($approvedPlan.effects | Where-Object { $platformKinds -contains [string]$_.kind })
     $boundEffects = @($platformEffects | Where-Object { [string]$_.parameters.release_manifest_digest -eq $manifestDigest -and [string]$_.parameters.platform_setup_contract_digest -eq $contractDigest -and [string]$_.parameters.workflow_cli_sha256 -eq [string]$workflowExecutablePins[0].sha256 })
-    if ($releasePreconditions.Count -ne 1 -or $contractPreconditions.Count -ne 1 -or $platformEffects.Count -lt 1 -or $boundEffects.Count -ne $platformEffects.Count) { throw "Approved Setup Plan does not bind the verified Platform Release and contract" }
-    $plannedVersions = @($approvedPlan.effects | Where-Object { $_.kind -eq "platform_cli" -and $_.action -eq "install" } | ForEach-Object { [string]$_.parameters.version })
-    if ($plannedVersions.Count -gt 1 -or ($plannedVersions.Count -eq 1 -and $plannedVersions[0] -ne [string]$manifest.release.version)) { throw "Approved Setup Plan does not bind the verified Platform Release version" }
+    if ([string]$approvedPlan.kind -ne "platform_bootstrap" -or $releasePreconditions.Count -ne 1 -or $contractPreconditions.Count -ne 1 -or $platformEffects.Count -lt 1 -or $boundEffects.Count -ne $platformEffects.Count -or $platformEffects.Count -ne @($approvedPlan.effects).Count) { throw "Approved Setup Plan does not bind the verified Platform Release and contract" }
+    foreach ($effect in $platformEffects) {
+        switch ([string]$effect.kind) {
+            "platform_cli" {
+                if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.sha256 -ne [string]$workflowExecutablePins[0].sha256) { throw "Approved Setup Plan Platform CLI effect differs from the verified manifest" }
+            }
+            "workflow_skill_bundle" {
+                if ([string]$effect.action -ne "install" -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { throw "Approved Setup Plan Workflow Skill Bundle effect differs from the verified manifest" }
+            }
+            "docker_desktop" {
+                if (@("install", "upgrade", "repair") -notcontains [string]$effect.action -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.docker_desktop.version -or [string]$effect.parameters.installer_url -ne [string]$manifest.platform_setup_contract.docker_desktop.installer_url -or [string]$effect.parameters.windows_amd64_sha256 -ne [string]$manifest.platform_setup_contract.docker_desktop.windows_amd64_sha256) { throw "Approved Setup Plan Docker Desktop effect differs from the verified manifest" }
+            }
+            "github_pat" {
+                if (@("persist", "replace") -notcontains [string]$effect.action) { throw "Approved Setup Plan GitHub PAT action is invalid" }
+            }
+            "platform_installation" {
+                if ([string]$effect.action -ne "record" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.platform_setup_contract_json -ne [IO.File]::ReadAllText($contractCanonical)) { throw "Approved Setup Plan Platform Installation effect differs from the verified manifest" }
+            }
+            "control_plane" {
+                if (@("start", "replace") -notcontains [string]$effect.action -or [string]$effect.parameters.version -ne [string]$manifest.release.version) { throw "Approved Setup Plan Control Plane effect differs from the verified manifest" }
+            }
+        }
+    }
     $archive = Join-Path $temporaryRoot $asset.name
     $assetURL = "https://github.com/$($manifest.release.repository)/releases/download/$($manifest.release.tag)/$($asset.name)"
     Invoke-WebRequest -Uri $assetURL -OutFile $archive -UseBasicParsing

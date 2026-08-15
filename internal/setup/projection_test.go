@@ -3,6 +3,7 @@ package setup
 import (
 	"encoding/base64"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,5 +25,28 @@ func TestProjectShowsExactManagedFileContentsAndRedactsSecretInputs(t *testing.T
 	}
 	if strings.Contains(projection, "must-not-appear") {
 		t.Fatal("projection leaked secret")
+	}
+}
+
+func TestProjectFileDiffMakesTrailingNewlineAndBinaryBytesUnambiguous(t *testing.T) {
+	before, _ := json.Marshal(map[string]string{
+		"newline.txt": base64.StdEncoding.EncodeToString([]byte("x\n")),
+		"binary.bin":  base64.StdEncoding.EncodeToString([]byte{0, 1, 255}),
+	})
+	after, _ := json.Marshal(map[string]string{
+		"newline.txt": base64.StdEncoding.EncodeToString([]byte("x")),
+		"binary.bin":  base64.StdEncoding.EncodeToString([]byte{0, 2, 255}),
+	})
+	projection, ok := projectFileDiff(string(before), string(after))
+	if !ok {
+		t.Fatal("byte-exact file projection failed")
+	}
+	for _, expected := range []string{`bytes=2`, `text_json="x\n"`, `bytes=1`, `text_json="x"`, `encoding=base64`, `base64=AAH/`, `base64=AAL/`} {
+		if !strings.Contains(projection, expected) {
+			t.Fatalf("projection lacks %q:\n%s", expected, projection)
+		}
+	}
+	if count := len(regexp.MustCompile(`sha256=[0-9a-f]{64}`).FindAllString(projection, -1)); count != 4 {
+		t.Fatalf("projection has %d byte digests, want 4:\n%s", count, projection)
 	}
 }

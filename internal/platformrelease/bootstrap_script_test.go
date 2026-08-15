@@ -171,7 +171,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		t.Fatalf("exact platform readback did not produce digest-bound no-op: %q, %v, %v", output, err, decodeErr)
 	}
 
-	assertSingleRepair := func(name, wantKind string, extra ...string) {
+	assertSingleRepair := func(name, wantKind, wantAction string, extra ...string) {
 		t.Helper()
 		output, runErr := run(planScript, append([]string{"-HostFactsPath", hostFactsPath, "-OutputPath", planPath}, extra...)...)
 		var repair struct {
@@ -186,23 +186,27 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		}
 		decodeErr := json.Unmarshal([]byte(output), &repair)
 		_, _, _, parseErr := setupcontract.ParsePlan([]byte(repair.CanonicalJSON))
-		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 1 || repair.Plan.Effects[0].Kind != wantKind || repair.Plan.Effects[0].Parameters["release_manifest_digest"] != hex.EncodeToString(manifestDigest[:]) || repair.Plan.Effects[0].Parameters["platform_setup_contract_digest"] != contractDigest || repair.Plan.Effects[0].Parameters["workflow_cli_sha256"] != manifest.BundledFiles[0].SHA256 {
+		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 1 || repair.Plan.Effects[0].Kind != wantKind || repair.Plan.Effects[0].Action != wantAction || repair.Plan.Effects[0].Parameters["release_manifest_digest"] != hex.EncodeToString(manifestDigest[:]) || repair.Plan.Effects[0].Parameters["platform_setup_contract_digest"] != contractDigest || repair.Plan.Effects[0].Parameters["workflow_cli_sha256"] != manifest.BundledFiles[0].SHA256 {
 			t.Fatalf("%s repair was not independently release-bound: %q, %v, %v, %v", name, output, runErr, decodeErr, parseErr)
 		}
 	}
 	noOpState["workflow"].(map[string]any)["sha256"] = strings.Repeat("0", 64)
 	cliOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cliOnlyFacts)
-	assertSingleRepair("CLI-only", "platform_cli")
+	assertSingleRepair("CLI-only", "platform_cli", "install")
 	noOpState["workflow"].(map[string]any)["sha256"] = manifest.BundledFiles[0].SHA256
 	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": map[string]any{"platform_version": manifest.Release.Version}}
 	cpOnlyFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, cpOnlyFacts)
-	assertSingleRepair("Control-Plane-only", "control_plane")
+	assertSingleRepair("Control-Plane-only", "control_plane", "start")
+	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": "0.9.0"}}
+	upgradeFacts, _ := json.Marshal(noOpState)
+	write(hostFactsPath, upgradeFacts)
+	assertSingleRepair("running Control Plane upgrade", "control_plane", "replace")
 	noOpState["control_plane"] = map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version}}
 	ownerFacts, _ := json.Marshal(noOpState)
 	write(hostFactsPath, ownerFacts)
-	assertSingleRepair("wrong-owner PAT", "github_pat", "-GitHubOwner", "different-owner")
+	assertSingleRepair("wrong-owner PAT", "github_pat", "replace", "-GitHubOwner", "different-owner")
 
 	installScript := filepath.Join(filepath.Dir(script), "install-workflow-cli.ps1")
 	tampered := parsed
@@ -220,6 +224,40 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	if err == nil || !strings.Contains(output, "does not bind the verified Platform Release and contract") {
 		t.Fatalf("manifest/precondition mismatch reached download or apply: %q, %v", output, err)
 	}
+
+	var wrongVersion setupcontract.Plan
+	deepPlan, _ := json.Marshal(parsed)
+	_ = json.Unmarshal(deepPlan, &wrongVersion)
+	for index := range wrongVersion.Effects {
+		if wrongVersion.Effects[index].Kind == "workflow_skill_bundle" {
+			wrongVersion.Effects[index].Parameters["version"] = "9.9.9"
+		}
+	}
+	wrongRaw, _ := json.Marshal(wrongVersion)
+	_, wrongCanonical, wrongDigest, parseErr := setupcontract.ParsePlan(wrongRaw)
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	wrongEnvelope, _ := json.Marshal(map[string]any{"status": "plan_required", "digest_sha256": wrongDigest, "canonical_json": string(wrongCanonical), "plan": wrongVersion, "projection": "wrong version"})
+	wrongPlanPath := filepath.Join(directory, "wrong-version-plan.json")
+	write(wrongPlanPath, wrongEnvelope)
+	output, err = run(installScript, "-PlanPath", wrongPlanPath, "-ApprovedDigest", wrongDigest)
+	if err == nil || !strings.Contains(output, "Workflow Skill Bundle effect differs from the verified manifest") {
+		t.Fatalf("effect version mismatch reached download or apply: %q, %v", output, err)
+	}
+
+	incompatible := manifest
+	incompatible.BootstrapContract.MinimumSchema, incompatible.BootstrapContract.MaximumSchema = 2, 2
+	incompatibleRaw, _, _ := incompatible.Canonical()
+	incompatibleSignature, _ := Sign(incompatibleRaw, key)
+	write(manifestPath, incompatibleRaw)
+	write(signaturePath, incompatibleSignature)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
+	if err == nil || !strings.Contains(output, "incompatible with this bootstrap planner") {
+		t.Fatalf("incompatible bootstrap contract reached planning: %q, %v", output, err)
+	}
+	write(manifestPath, raw)
+	write(signaturePath, signature)
 
 	write(signaturePath, append([]byte(nil), signature[:len(signature)-1]...))
 	output, err = run(installScript, "-PlanPath", filepath.Join(directory, "not-read-before-trust.json"), "-ApprovedDigest", strings.Repeat("0", 64))

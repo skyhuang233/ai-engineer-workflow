@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+func RequireCurrentUserProcess(pid int) error {
+	info, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	if err != nil {
+		return fmt.Errorf("inspect process owner: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return errors.New("Control Plane process belongs to a different user")
+	}
+	return nil
+}
+
 func OSProcessIdentity(pid int) (time.Time, bool, error) {
 	if pid <= 0 {
 		return time.Time{}, false, nil

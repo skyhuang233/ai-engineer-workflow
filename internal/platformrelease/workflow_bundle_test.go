@@ -16,7 +16,7 @@ func TestWorkflowSkillBundleAutomaticallyBindsPublishedPlanRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(bundle)
-	for _, required := range []string{"automatically", "workflow runtime-configure --source", "--root <plan-root-issue-number>", "--codex-auth-file $env:WORKFLOW_CODEX_AUTH_FILE", "not a user step", "never infer a private Codex credential path"} {
+	for _, required := range []string{"automatically", "workflow runtime-configure --source", "--root <plan-root-issue-number>", "not a user step", "codex doctor --json", "must not ask the user"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("Workflow Skill Bundle lacks automatic Plan Root binding contract %q", required)
 		}

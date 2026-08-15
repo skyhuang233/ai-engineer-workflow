@@ -25,6 +25,7 @@ if (-not [string]::IsNullOrWhiteSpace($PublicKeyPath)) { $verificationArguments.
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
 if ($manifest.schema_version -ne 1) { throw "Unsupported Platform Release Manifest schema" }
+if ([int]$manifest.bootstrap_contract.minimum_schema -gt 1 -or [int]$manifest.bootstrap_contract.maximum_schema -lt 1) { throw "Platform Release is incompatible with this bootstrap planner" }
 if ($facts.schema_version -ne 1) { throw "Unsupported host-facts schema" }
 if (-not $facts.supported_host) { throw "Agent Workflow setup supports Windows only" }
 
@@ -119,7 +120,8 @@ if (-not $platformRecordCurrent) {
     $actions.Add([ordered]@{ id = "record-platform-installation"; kind = "platform_installation"; subject = $facts.workflow_home; action = "record"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_json = $platformSetupContractJSON; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
 }
 if (-not $controlPlaneReady) {
-    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = "start"; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
+    $controlPlaneAction = $(if ([string]$facts.control_plane.state -eq "ready") { "replace" } else { "start" })
+    $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = $controlPlaneAction; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256 } })
 }
 
 $identitySeed = [ordered]@{

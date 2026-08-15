@@ -12,6 +12,36 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func RequireCurrentUserProcess(pid int) error {
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return fmt.Errorf("open process owner: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+	var processToken windows.Token
+	if err := windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &processToken); err != nil {
+		return fmt.Errorf("open process token: %w", err)
+	}
+	defer processToken.Close()
+	processUser, err := processToken.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("read process user: %w", err)
+	}
+	currentToken, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return fmt.Errorf("open current process token: %w", err)
+	}
+	defer currentToken.Close()
+	currentUser, err := currentToken.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("read current process user: %w", err)
+	}
+	if !processUser.User.Sid.Equals(currentUser.User.Sid) {
+		return errors.New("Control Plane process belongs to a different user")
+	}
+	return nil
+}
+
 func OSProcessIdentity(pid int) (time.Time, bool, error) {
 	if pid <= 0 {
 		return time.Time{}, false, nil

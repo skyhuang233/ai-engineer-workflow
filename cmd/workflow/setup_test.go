@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,10 +18,56 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestOnboardingStateRequiresEveryManagedContractSurface(t *testing.T) {
+	files, _, digest, err := repositorycontract.Render("single-context", []byte("# User instructions\n"), "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftPath := "docs/agents/domain.md"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := "/repos/owner/repo/contents/"
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+		path := strings.TrimPrefix(r.URL.Path, prefix)
+		data, ok := files[path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+			return
+		}
+		if path == driftPath {
+			data = []byte("managed drift\n")
+		}
+		_, _ = w.Write([]byte(`{"encoding":"base64","content":"` + base64.StdEncoding.EncodeToString(data) + `"}`))
+	}))
+	defer server.Close()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	state, err := (onboardingCurrentState{Client: github.NewClient(server.URL, "token", server.Client()), Store: database}).DiscoverOnboardingState(context.Background(), "owner/repo", "main", digest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ContractSatisfied {
+		t.Fatal("manifest-only match hid managed file drift")
+	}
+}
 
 func TestSetupPlanReportsBootstrapBlockerWithoutMutatingRepository(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "home")
@@ -98,7 +145,7 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 	if err := db.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: plan.PlanID, Kind: string(plan.Kind), SchemaVersion: 1, Target: layout.Root, DigestSHA256: digest, CanonicalJSON: string(canonical), Projection: "inspection", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
+	if err := db.RecordPlatformInstallation(ctx, store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: releaseDigest, PlatformSetupContractDigestSHA256: contractDigest, WorkflowCLISHA256: cliDigest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

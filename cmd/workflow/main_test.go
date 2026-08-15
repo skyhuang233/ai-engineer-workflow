@@ -389,6 +389,30 @@ func TestDefaultCodexAuthFileRequiresExplicitWorkflowIntegrationSource(t *testin
 	}
 }
 
+func TestResolveDoctorCodexAuthUsesVerifiedDoctorSource(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "auth.json")
+	got, err := resolveDoctorCodexAuth(context.Background(), "", func(context.Context) (string, error) {
+		return want, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("resolved source = %q, want %q", got, want)
+	}
+}
+
+func TestResolveDoctorCodexAuthRejectsUnverifiedRequestedSource(t *testing.T) {
+	verified := filepath.Join(t.TempDir(), "verified", "auth.json")
+	requested := filepath.Join(t.TempDir(), "requested", "auth.json")
+	_, err := resolveDoctorCodexAuth(context.Background(), requested, func(context.Context) (string, error) {
+		return verified, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("unverified requested source error = %v", err)
+	}
+}
+
 func TestDoctorVerificationBudgetAllowsColdWorkerPullAndCodexResume(t *testing.T) {
 	if doctorVerificationTimeout != 10*time.Minute {
 		t.Fatalf("doctorVerificationTimeout = %s, want 10m", doctorVerificationTimeout)

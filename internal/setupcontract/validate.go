@@ -17,6 +17,41 @@ var (
 	githubRepository  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 )
 
+type effectContract struct {
+	planKind PlanKind
+	actions  []string
+	required []string
+	optional []string
+}
+
+var effectContracts = map[string]effectContract{
+	"install_file":           {PlatformBootstrap, []string{"install"}, []string{"sha256"}, nil},
+	"platform_cli":           {PlatformBootstrap, []string{"install"}, []string{"version", "sha256"}, nil},
+	"workflow_skill_bundle":  {PlatformBootstrap, []string{"install"}, []string{"version", "managed_skills_json", "files_json"}, nil},
+	"docker_desktop":         {PlatformBootstrap, []string{"install", "upgrade", "repair"}, []string{"version", "installer_url", "windows_amd64_sha256"}, nil},
+	"github_pat":             {PlatformBootstrap, []string{"persist", "replace"}, []string{"input", "owner"}, []string{"api_base"}},
+	"platform_installation":  {PlatformBootstrap, []string{"record"}, []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256"}, nil},
+	"control_plane":          {PlatformBootstrap, []string{"start", "replace"}, []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256"}, nil},
+	"create_repository":      {RepositoryOnboarding, []string{"create"}, []string{"owner", "authenticated_login", "name", "private"}, nil},
+	"initial_baseline":       {RepositoryOnboarding, []string{"commit_and_push"}, []string{"branch", "files_json", "repository", "source_url"}, nil},
+	"publish_history":        {RepositoryOnboarding, []string{"push"}, []string{"branch", "head"}, nil},
+	"github_label":           {RepositoryOnboarding, []string{"reconcile"}, []string{"name", "color", "description"}, nil},
+	"repository_features":    {RepositoryOnboarding, []string{"enable"}, []string{"issues", "actions", "allowed_actions"}, nil},
+	"repository_contract_pr": {RepositoryOnboarding, []string{"create_check_merge"}, []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}, nil},
+	"repository_admission":   {RepositoryOnboarding, []string{"verify_and_record"}, []string{"default_branch", "manifest_digest", "contract_version"}, []string{"labels_json", "actions_allowed"}},
+	"local_fast_forward":     {RepositoryOnboarding, []string{"fast_forward_if_safe"}, []string{"repository", "branch", "pre_merge_head", "merge_head_effect_id"}, nil},
+}
+
+var preconditionPlanKinds = map[string]PlanKind{
+	"host_identity": PlatformBootstrap, "release": PlatformBootstrap, "platform_release": "", "platform_setup_contract": PlatformBootstrap,
+	"git_head": RepositoryOnboarding, "github_policy": RepositoryOnboarding, "github_default_head": RepositoryOnboarding,
+}
+
+var expectedResultPlanKinds = map[string]PlanKind{
+	"file_digest": PlatformBootstrap, "platform": PlatformBootstrap, "platform_readiness": PlatformBootstrap,
+	"repository_admission": RepositoryOnboarding,
+}
+
 func ParsePlan(raw []byte) (Plan, []byte, string, error) {
 	canonical, digest, err := Canonicalize(raw)
 	if err != nil {
@@ -82,6 +117,10 @@ func (p Plan) Validate() error {
 		if strings.TrimSpace(precondition.Kind) == "" || strings.TrimSpace(precondition.Subject) == "" || (!allowEmptyExpected && strings.TrimSpace(precondition.Expected) == "") {
 			return fmt.Errorf("precondition %q is incomplete", precondition.ID)
 		}
+		allowed, ok := preconditionPlanKinds[precondition.Kind]
+		if !ok || allowed != "" && allowed != p.Kind {
+			return fmt.Errorf("precondition %q kind %q is unsupported for %q", precondition.ID, precondition.Kind, p.Kind)
+		}
 	}
 	for _, effect := range p.Effects {
 		if strings.TrimSpace(effect.Kind) == "" || strings.TrimSpace(effect.Subject) == "" || strings.TrimSpace(effect.Action) == "" || effect.Parameters == nil {
@@ -100,6 +139,10 @@ func (p Plan) Validate() error {
 		if strings.TrimSpace(expected.Kind) == "" || strings.TrimSpace(expected.Subject) == "" || strings.TrimSpace(expected.Expected) == "" {
 			return fmt.Errorf("expected result %q is incomplete", expected.ID)
 		}
+		allowed, ok := expectedResultPlanKinds[expected.Kind]
+		if !ok || allowed != p.Kind {
+			return fmt.Errorf("expected result %q kind %q is unsupported for %q", expected.ID, expected.Kind, p.Kind)
+		}
 	}
 	encoded, _ := json.Marshal(p)
 	var semantic any
@@ -111,29 +154,15 @@ func (p Plan) Validate() error {
 }
 
 func validateEffect(planKind PlanKind, effect Effect) error {
-	type contract struct{ required, optional []string }
-	contracts := map[string]contract{
-		// install_file is retained only for the schema-v1 cross-language golden
-		// document. Production adapters do not implement it.
-		"install_file":           {required: []string{"sha256"}},
-		"platform_cli":           {required: []string{"version", "sha256"}},
-		"workflow_skill_bundle":  {required: []string{"version", "managed_skills_json", "files_json"}},
-		"docker_desktop":         {required: []string{"version", "installer_url", "windows_amd64_sha256"}},
-		"github_pat":             {required: []string{"input", "owner"}, optional: []string{"api_base"}},
-		"platform_installation":  {required: []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256"}},
-		"control_plane":          {required: []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256"}},
-		"create_repository":      {required: []string{"owner", "authenticated_login", "name", "private"}},
-		"initial_baseline":       {required: []string{"branch", "files_json", "repository", "source_url"}},
-		"publish_history":        {required: []string{"branch", "head"}},
-		"github_label":           {required: []string{"name", "color", "description"}},
-		"repository_features":    {required: []string{"issues", "actions", "allowed_actions"}},
-		"repository_contract_pr": {required: []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}},
-		"repository_admission":   {required: []string{"default_branch", "manifest_digest", "contract_version"}, optional: []string{"labels_json", "actions_allowed"}},
-		"local_fast_forward":     {required: []string{"repository", "branch", "pre_merge_head"}},
-	}
-	schema, ok := contracts[effect.Kind]
+	schema, ok := effectContracts[effect.Kind]
 	if !ok {
 		return fmt.Errorf("unknown effect kind %q", effect.Kind)
+	}
+	if schema.planKind != planKind {
+		return fmt.Errorf("effect kind %q is unsupported for %q", effect.Kind, planKind)
+	}
+	if !containsSemantic(schema.actions, effect.Action) {
+		return fmt.Errorf("action %q is unsupported for effect kind %q", effect.Action, effect.Kind)
 	}
 	if planKind == PlatformBootstrap && isPlatformMutationEffect(effect.Kind) && effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
 		schema.required = append(schema.required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256")
@@ -186,6 +215,32 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 		if value, exists := effect.Parameters[key]; exists && !json.Valid([]byte(value)) {
 			return fmt.Errorf("parameter %q must be valid JSON", key)
 		}
+	}
+	return nil
+}
+
+func containsSemantic(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateEffectForExecution keeps direct Readback and Apply calls on the same
+// kind/action registry used by Setup Plan validation.
+func ValidateEffectForExecution(effect Effect) error {
+	schema, ok := effectContracts[effect.Kind]
+	if !ok {
+		return fmt.Errorf("unknown effect kind %q", effect.Kind)
+	}
+	return validateEffect(schema.planKind, effect)
+}
+
+func ValidatePreconditionForExecution(precondition Precondition) error {
+	if _, ok := preconditionPlanKinds[precondition.Kind]; !ok {
+		return fmt.Errorf("unknown precondition kind %q", precondition.Kind)
 	}
 	return nil
 }

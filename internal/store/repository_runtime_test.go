@@ -99,7 +99,7 @@ func TestMigration58BackfillsIdentitySourceBranchAndExistingRoot(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, `DROP TABLE repository_runtime_configurations`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version=58`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version>=58`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Migrate(ctx); err != nil {

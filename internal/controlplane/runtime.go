@@ -155,6 +155,8 @@ type StartOptions struct {
 	Timeout                  time.Duration
 	Inspector                Inspector
 	Launch                   func(string, []string, string, string) (int, error)
+	Replace                  bool
+	AuthorizeReplacement     func(int) error
 }
 
 func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
@@ -177,7 +179,19 @@ func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
 			if existing.PlatformVersion == options.PlatformVersion && existing.ApprovedPlanDigestSHA256 == options.ApprovedPlanDigestSHA256 {
 				return existing, nil
 			}
-			return RuntimeRecord{}, errors.New("a different verified Control Plane instance is already running")
+			if !options.Replace {
+				return RuntimeRecord{}, errors.New("a different verified Control Plane instance is already running")
+			}
+			authorize := options.AuthorizeReplacement
+			if authorize == nil {
+				authorize = RequireCurrentUserProcess
+			}
+			if err := authorize(existing.PID); err != nil {
+				return RuntimeRecord{}, fmt.Errorf("authorize Control Plane replacement: %w", err)
+			}
+			if err := Stop(ctx, existing, options.Inspector); err != nil {
+				return RuntimeRecord{}, fmt.Errorf("stop replaced Control Plane: %w", err)
+			}
 		case StateStale:
 			// A stale observational record is replaced only after process absence
 			// has been verified above.

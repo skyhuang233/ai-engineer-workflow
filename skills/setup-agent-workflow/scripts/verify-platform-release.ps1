@@ -85,6 +85,7 @@ Assert-PlatformRelease (Test-Path -LiteralPath $PublicKeyPath -PathType Leaf) "P
 $manifestBytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath))
 $manifest = [Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json
 Assert-PlatformRelease ($manifest.schema_version -eq 1) "Unsupported Platform Release Manifest schema"
+Assert-PlatformRelease ([int]$manifest.bootstrap_contract.minimum_schema -le 1 -and [int]$manifest.bootstrap_contract.maximum_schema -ge 1) "Platform Release is incompatible with this bootstrap planner"
 Assert-PlatformRelease ($manifest.release.repository -eq $policy.repository) "Platform Release repository does not match pinned trust policy"
 Assert-PlatformRelease ($manifest.provenance.repository -eq $policy.repository) "Platform Release provenance repository does not match pinned trust policy"
 Assert-PlatformRelease ($manifest.provenance.workflow_path -eq $policy.workflow_path) "Platform Release workflow does not match pinned trust policy"

@@ -44,6 +44,18 @@ func defaultCodexAuthFile() string {
 	return strings.TrimSpace(os.Getenv(codexauth.SourceOverrideEnvironment))
 }
 
+func resolveDoctorCodexAuth(ctx context.Context, requested string, resolve func(context.Context) (string, error)) (string, error) {
+	resolved, err := resolve(ctx)
+	if err != nil {
+		return "", err
+	}
+	requested = strings.TrimSpace(requested)
+	if requested != "" && !strings.EqualFold(filepath.Clean(requested), filepath.Clean(resolved)) {
+		return "", errors.New("--codex-auth-file must match the ChatGPT source verified by codex doctor and codex login status")
+	}
+	return resolved, nil
+}
+
 func controlPlaneContainerID(databasePath string) string {
 	canonical, err := startup.DatabaseIdentity(databasePath)
 	if err != nil || canonical == "" {
@@ -338,16 +350,18 @@ func runDoctor(args []string) {
 	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
 	reportPath := flags.String("report", "", "optional Markdown report path")
 	workflowRepository := flags.String("workflow-repository", "", "GitHub repository containing the Worker publisher workflow")
-	codexAuthFile := flags.String("codex-auth-file", defaultCodexAuthFile(), "absolute host ChatGPT auth.json used to seed Worker sessions")
+	codexAuthFile := flags.String("codex-auth-file", defaultCodexAuthFile(), "optional controlled override for the ChatGPT source verified through Codex doctor")
 	_ = flags.Parse(args)
 	if *workflowRepository == "" {
 		fmt.Fprintln(os.Stderr, "doctor requires workflow-repository")
 		os.Exit(2)
 	}
-	if err := codexauth.ValidateChatGPT(*codexAuthFile); err != nil {
+	resolvedCodexAuth, err := resolveDoctorCodexAuth(context.Background(), *codexAuthFile, codexauth.ResolveChatGPT)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	*codexAuthFile = resolvedCodexAuth
 
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {

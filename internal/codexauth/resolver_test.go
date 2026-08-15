@@ -2,26 +2,26 @@ package codexauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestResolverRejectsImplicitCodexHomeAfterChatGPTStatus(t *testing.T) {
+func TestResolverUsesMachineReadableCodexDoctorAuthenticationPath(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "codex")
-	writeChatGPTCache(t, filepath.Join(home, FileName))
+	source := filepath.Join(home, FileName)
+	writeChatGPTCache(t, source)
 	resolver := Resolver{
-		LookupEnvironment: func(name string) string {
-			if name == "CODEX_HOME" {
-				return home
-			}
-			return ""
+		LookupEnvironment: func(string) string { return "" },
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, home, source, "true", "chatgpt"), nil
 		},
 		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT\n"), nil },
 	}
-	if got, err := resolver.ResolveChatGPT(context.Background()); err == nil {
-		t.Fatalf("implicitly resolved private source %q", got)
+	if got, err := resolver.ResolveChatGPT(context.Background()); err != nil || got != source {
+		t.Fatalf("doctor source = %q, %v", got, err)
 	}
 }
 
@@ -34,6 +34,9 @@ func TestResolverSupportsExplicitWorkflowIntegrationSource(t *testing.T) {
 				return source
 			}
 			return ""
+		},
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, filepath.Dir(source), source, "true", "chatgpt"), nil
 		},
 		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT"), nil },
 	}
@@ -54,6 +57,9 @@ func TestResolverRejectsRelativeIntegrationSource(t *testing.T) {
 			}
 			return ""
 		},
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, working, filepath.Join(working, FileName), "true", "chatgpt"), nil
+		},
 		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT"), nil },
 	}
 	if got, err := resolver.ResolveChatGPT(context.Background()); err == nil {
@@ -62,9 +68,15 @@ func TestResolverRejectsRelativeIntegrationSource(t *testing.T) {
 }
 
 func TestResolverRejectsNonChatGPTOrInvalidCache(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, FileName)
+	writeChatGPTCache(t, source)
 	resolver := Resolver{
-		LookupEnvironment: func(string) string { return filepath.Join(t.TempDir(), "missing") },
-		LoginStatus:       func(context.Context) ([]byte, error) { return []byte("Logged in using an API key"), nil },
+		LookupEnvironment: func(string) string { return "" },
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, home, source, "true", "chatgpt"), nil
+		},
+		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using an API key"), nil },
 	}
 	if _, err := resolver.ResolveChatGPT(context.Background()); err == nil {
 		t.Fatal("non-ChatGPT login was accepted")
@@ -73,6 +85,43 @@ func TestResolverRejectsNonChatGPTOrInvalidCache(t *testing.T) {
 	if _, err := resolver.ResolveChatGPT(context.Background()); err == nil {
 		t.Fatal("failed login status was accepted")
 	}
+}
+
+func TestResolverRejectsIncompleteOrNonChatGPTDoctorCapability(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, FileName)
+	writeChatGPTCache(t, source)
+	resolver := Resolver{
+		LookupEnvironment: func(string) string { return "" },
+		Doctor: func(context.Context) ([]byte, error) {
+			return doctorReportJSON(t, home, source, "false", "chatgpt"), nil
+		},
+		LoginStatus: func(context.Context) ([]byte, error) { return []byte("Logged in using ChatGPT"), nil },
+	}
+	if _, err := resolver.ResolveChatGPT(context.Background()); err == nil {
+		t.Fatal("doctor without stored ChatGPT tokens was accepted")
+	}
+	resolver.Doctor = func(context.Context) ([]byte, error) { return []byte(`{"schemaVersion":2,"checks":{}}`), nil }
+	if _, err := resolver.ResolveChatGPT(context.Background()); err == nil {
+		t.Fatal("unsupported doctor schema was accepted")
+	}
+}
+
+func doctorReportJSON(t *testing.T, home, source, tokens, mode string) []byte {
+	t.Helper()
+	report := map[string]any{
+		"schemaVersion": 1,
+		"codexVersion":  "0.147.0",
+		"checks": map[string]any{
+			"auth.credentials": map[string]any{"status": "ok", "details": map[string]string{"auth file": source, "stored ChatGPT tokens": tokens, "stored auth mode": mode}},
+			"config.load":      map[string]any{"status": "ok", "details": map[string]string{"CODEX_HOME": home}},
+		},
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func writeChatGPTCache(t *testing.T, path string) {

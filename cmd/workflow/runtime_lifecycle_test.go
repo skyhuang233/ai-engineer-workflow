@@ -139,7 +139,7 @@ func TestWindowsDetachedServeSurvivesLauncherAndDoesNotRestartAfterStop(t *testi
 	}
 	now := time.Now().UTC()
 	digest := strings.Repeat("a", 64)
-	if err := database.RecordPlatformInstallation(context.Background(), store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: strings.Repeat("b", 64), WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
+	if err := database.RecordPlatformInstallation(context.Background(), store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: strings.Repeat("b", 64), PlatformSetupContractDigestSHA256: strings.Repeat("c", 64), WorkflowCLISHA256: strings.Repeat("d", 64), ControlPlanePlanDigestSHA256: digest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}

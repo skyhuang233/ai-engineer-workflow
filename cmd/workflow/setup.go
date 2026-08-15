@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,6 +23,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/hostsetup"
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	setupengine "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -113,19 +112,17 @@ func runSetupInspectPlatform(args []string, output io.Writer) error {
 func inspectPlatform(ctx context.Context, database *store.Store, layout workflowhome.Layout) (platformInspection, error) {
 	var facts platformInspection
 	installation, installationErr := database.PlatformInstallation(ctx)
-	plan, planErr := database.LatestSetupPlan(ctx, string(setupcontract.PlatformBootstrap))
-	pins, pinsErr := readPlatformPins(plan)
+	var pins platformPins
 	if installationErr == nil {
+		pins = platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256}
 		facts.Platform.InstallationRecorded = true
 		facts.Platform.Version = installation.PlatformVersion
 		facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
+		facts.Platform.PlatformSetupContractDigest = installation.PlatformSetupContractDigestSHA256
 	}
 	contractRaw, contractErr := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
 	_, contractDigest, canonicalErr := setupcontract.Canonicalize(contractRaw)
-	if contractErr == nil && canonicalErr == nil {
-		facts.Platform.PlatformSetupContractDigest = contractDigest
-	}
-	if pinsErr == nil {
+	if installationErr == nil {
 		facts.WorkflowCLI.Verified, _ = (workflowhome.Installation{Layout: layout}).VerifyVersion(pins.Version, pins.WorkflowCLISHA256)
 	}
 	verification, verificationErr := database.GitHubPATVerification(ctx)
@@ -151,17 +148,11 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	if installationErr != nil {
 		combined = errors.Join(combined, installationErr)
 	}
-	if planErr != nil {
-		combined = errors.Join(combined, planErr)
-	}
-	if pinsErr != nil {
-		combined = errors.Join(combined, pinsErr)
-	}
 	if contractErr != nil || canonicalErr != nil || contractDigest != pins.PlatformSetupContractDigest {
 		combined = errors.Join(combined, errors.New("installed Platform Setup Contract digest differs"))
 	}
-	if installationErr == nil && (installation.PlatformVersion != pins.Version || installation.ReleaseManifestDigestSHA256 != pins.ReleaseManifestDigest) {
-		combined = errors.Join(combined, errors.New("Platform Installation differs from its approved plan"))
+	if installationErr == nil && (pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "") {
+		combined = errors.Join(combined, errors.New("Platform Installation lacks durable verified release pins"))
 	}
 	if !facts.WorkflowCLI.Verified {
 		combined = errors.Join(combined, errors.New("installed Workflow CLI ownership, version, or checksum differs"))
@@ -173,28 +164,6 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 }
 
 type platformPins struct{ Version, ReleaseManifestDigest, PlatformSetupContractDigest, WorkflowCLISHA256 string }
-
-func readPlatformPins(record store.SetupPlanRecord) (platformPins, error) {
-	plan, canonical, digest, err := setupcontract.ParsePlan([]byte(record.CanonicalJSON))
-	if err != nil || plan.Kind != setupcontract.PlatformBootstrap || digest != record.DigestSHA256 || string(canonical) != record.CanonicalJSON {
-		return platformPins{}, errors.New("approved Platform Bootstrap Plan archive is invalid")
-	}
-	var pins platformPins
-	for _, effect := range plan.Effects {
-		if effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
-			continue
-		}
-		candidate := platformPins{Version: effect.Parameters["version"], ReleaseManifestDigest: effect.Parameters["release_manifest_digest"], PlatformSetupContractDigest: effect.Parameters["platform_setup_contract_digest"], WorkflowCLISHA256: effect.Parameters["workflow_cli_sha256"]}
-		if pins.Version != "" && pins != candidate {
-			return platformPins{}, errors.New("approved Platform Bootstrap Plan has inconsistent final platform pins")
-		}
-		pins = candidate
-	}
-	if pins.Version == "" {
-		return platformPins{}, errors.New("approved Platform Bootstrap Plan lacks final platform pins")
-	}
-	return pins, nil
-}
 
 func runSetupPlan(args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("setup plan", flag.ContinueOnError)
@@ -329,13 +298,18 @@ func (d onboardingCurrentState) DiscoverOnboardingState(ctx context.Context, rep
 		}
 		result.SatisfiedLabels[expected.Name] = strings.EqualFold(actual.Color, expected.Color) && actual.Description == expected.Description
 	}
-	manifest, err := d.Client.RepositoryFile(ctx, repository, ".workflow/repository.json", branch)
-	if err == nil {
-		sum := sha256.Sum256(manifest)
-		result.ContractSatisfied = hex.EncodeToString(sum[:]) == manifestDigest
-	} else if !github.IsNotFound(err) {
-		return result, err
+	var fetchErr error
+	_, contractErr := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+		content, err := d.Client.RepositoryFile(ctx, repository, path, branch)
+		if err != nil && fetchErr == nil {
+			fetchErr = err
+		}
+		return content, err
+	}, repository, branch, manifestDigest)
+	if fetchErr != nil && !github.IsNotFound(fetchErr) {
+		return result, fetchErr
 	}
+	result.ContractSatisfied = contractErr == nil
 	if admissionValue, err := d.Store.RepositoryAdmission(ctx, repository); err == nil {
 		result.AdmissionSatisfied = result.ContractSatisfied && admissionValue.Eligible && admissionValue.ManifestDigestSHA256 == manifestDigest && admissionValue.ContractVersion == "1"
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -501,22 +475,18 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	if err != nil {
 		return err
 	}
-	plan, err := database.LatestSetupPlan(ctx, string(setupcontract.PlatformBootstrap))
-	if err != nil {
-		return err
-	}
-	pins, err := readPlatformPins(plan)
-	if err != nil {
-		return err
-	}
-	if installation.PlatformVersion != pins.Version || installation.ReleaseManifestDigestSHA256 != pins.ReleaseManifestDigest {
-		return errors.New("Platform Installation differs from its approved release pins")
+	pins := platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256}
+	if pins.Version == "" || pins.ReleaseManifestDigest == "" || pins.PlatformSetupContractDigest == "" || pins.WorkflowCLISHA256 == "" || installation.ControlPlanePlanDigestSHA256 == "" {
+		return errors.New("Platform Installation lacks durable verified release or Control Plane authorization pins")
 	}
 	observation := (controlplane.Inspector{}).Inspect(ctx, &record)
 	if observation.State != controlplane.StateReady || record.PlatformVersion != installation.PlatformVersion {
 		return errors.New("Control Plane process identity, health, version, or approved plan digest differs")
 	}
-	if err := verifyRuntimePlanBinding(ctx, database, record, installation.PlatformVersion); err != nil {
+	if record.ApprovedPlanDigestSHA256 != installation.ControlPlanePlanDigestSHA256 {
+		return errors.New("Control Plane runtime differs from its durable authorization identity")
+	}
+	if err := verifyRuntimePlanBinding(ctx, database, record, installation); err != nil {
 		return err
 	}
 	cliVerified, err := (workflowhome.Installation{Layout: layout}).VerifyVersion(pins.Version, pins.WorkflowCLISHA256)
@@ -567,7 +537,7 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	return nil
 }
 
-func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record controlplane.RuntimeRecord, platformVersion string) error {
+func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record controlplane.RuntimeRecord, installation store.PlatformInstallation) error {
 	archived, err := database.SetupPlanByDigest(ctx, record.ApprovedPlanDigestSHA256)
 	if err != nil {
 		return errors.Join(errors.New("Control Plane approved plan is not archived"), err)
@@ -577,7 +547,7 @@ func verifyRuntimePlanBinding(ctx context.Context, database *store.Store, record
 		return errors.New("Control Plane approved plan archive is invalid")
 	}
 	for _, effect := range plan.Effects {
-		if effect.Kind == "control_plane" && effect.Action == "start" && effect.Parameters["version"] == platformVersion {
+		if effect.Kind == "control_plane" && (effect.Action == "start" || effect.Action == "replace") && effect.Parameters["version"] == installation.PlatformVersion && effect.Parameters["release_manifest_digest"] == installation.ReleaseManifestDigestSHA256 && effect.Parameters["platform_setup_contract_digest"] == installation.PlatformSetupContractDigestSHA256 && effect.Parameters["workflow_cli_sha256"] == installation.WorkflowCLISHA256 {
 			return nil
 		}
 	}

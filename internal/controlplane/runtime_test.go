@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -124,5 +125,63 @@ func TestStartLaunchesOnceAndReturnsExistingMatchingInstance(t *testing.T) {
 	}
 	if launches != 1 {
 		t.Fatalf("launches = %d", launches)
+	}
+}
+
+func TestStartReplacesDifferentVerifiedCurrentUserInstanceOnlyWhenAuthorized(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStarted, newStarted := time.Now().UTC().Add(-time.Minute).Round(0), time.Now().UTC().Round(0)
+	oldDigest, newDigest := repeatDigest('a'), repeatDigest('b')
+	oldLive, launches, authorized := true, 0, 0
+	old := RuntimeRecord{PID: 111, PlatformVersion: "1.0.0", ProcessStartedAt: oldStarted, ApprovedPlanDigestSHA256: oldDigest}
+	var launched RuntimeRecord
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			oldLive = false
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		identity := old.Identity()
+		if !oldLive {
+			identity = launched.Identity()
+		}
+		_ = json.NewEncoder(w).Encode(Health{Status: "ready", Identity: identity})
+	}))
+	defer server.Close()
+	old.Endpoints = Endpoints{Health: server.URL + "/health", Shutdown: server.URL + "/shutdown"}
+	if err := WriteRuntimeRecord(layout, old); err != nil {
+		t.Fatal(err)
+	}
+	inspector := Inspector{Client: server.Client(), ProcessIdentity: func(pid int) (time.Time, bool, error) {
+		if pid == old.PID {
+			return oldStarted, oldLive, nil
+		}
+		return newStarted, pid == 222, nil
+	}}
+	launch := func(_ string, _ []string, _, _ string) (int, error) {
+		launches++
+		launched = RuntimeRecord{PID: 222, PlatformVersion: "2.0.0", ProcessStartedAt: newStarted, Endpoints: old.Endpoints, ApprovedPlanDigestSHA256: newDigest}
+		return 222, WriteRuntimeRecord(layout, launched)
+	}
+	options := StartOptions{Layout: layout, Executable: `C:\workflow.exe`, PlatformVersion: "2.0.0", ApprovedPlanDigestSHA256: newDigest, Timeout: time.Second, Inspector: inspector, Launch: launch, Replace: true, AuthorizeReplacement: func(pid int) error {
+		authorized++
+		if pid != 111 {
+			t.Fatalf("authorized pid %d", pid)
+		}
+		return nil
+	}}
+	denied := options
+	denied.AuthorizeReplacement = func(int) error { return errors.New("different user") }
+	if _, err := Start(context.Background(), denied); err == nil || !oldLive || launches != 0 {
+		t.Fatalf("unsafe replacement was not rejected: err=%v oldLive=%v launches=%d", err, oldLive, launches)
+	}
+	if _, err := Start(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if authorized != 1 || launches != 1 || oldLive {
+		t.Fatalf("authorized=%d launches=%d oldLive=%v", authorized, launches, oldLive)
 	}
 }

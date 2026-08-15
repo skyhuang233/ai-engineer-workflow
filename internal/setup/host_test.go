@@ -105,7 +105,7 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	}))
 	defer server.Close()
 	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
-	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "manifest_digest": hex.EncodeToString(manifestSum[:])}}
+	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("c", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": hex.EncodeToString(manifestSum[:]), "required_checks_json": "[]"}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("merged readback = %s, %v", status, err)
@@ -121,6 +121,39 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	status, evidence, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectConflicting || !strings.Contains(evidence, "advanced") {
 		t.Fatalf("post-merge extra commit readback = %s, %q, %v", status, evidence, err)
+	}
+}
+
+func TestLocalFastForwardRejectsRemoteAdvancePastPersistedMergeHead(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	hostGit(t, "", "init", "-b", "main", repo)
+	hostGit(t, repo, "config", "user.name", "Test")
+	hostGit(t, repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, repo, "add", "README.md")
+	hostGit(t, repo, "commit", "-m", "base")
+	preMerge := hostGitOutput(t, repo, "rev-parse", "HEAD")
+	mergeHead := strings.Repeat("a", 40)
+	extraHead := strings.Repeat("b", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + extraHead + `"}}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), OnboardingMergeHeads: map[string]string{"repository-contract-pr": mergeHead}}
+	effect := setupcontract.Effect{ID: "synchronize", Kind: "local_fast_forward", Subject: repo, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": "owner/repo", "branch": "main", "pre_merge_head": preMerge, "merge_head_effect_id": "repository-contract-pr"}}
+	status, evidence, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectConflicting || !strings.Contains(evidence, "advanced") {
+		t.Fatalf("remote post-merge advance readback = %s, %q, %v", status, evidence, err)
 	}
 }
 
@@ -159,7 +192,7 @@ func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 		return nil
 	}}
 	digest := sha256.Sum256([]byte("workflow executable"))
-	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(digest[:])}}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(digest[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(digest[:])}}
 	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +213,7 @@ func TestHostAdapterReadbackRequiresExactOwnedCLIVersionAndChecksum(t *testing.T
 	}
 	sum := sha256.Sum256(contents)
 	adapter := HostAdapter{Layout: layout, Executable: source, PersistUserPATH: func(string) error { return nil }, CurrentUserPATHReconciled: func(string) (bool, error) { return true, nil }}
-	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(sum[:])}}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(sum[:]), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": hex.EncodeToString(sum[:])}}
 	if err := adapter.Apply(context.Background(), effect, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +241,7 @@ func TestHostAdapterDockerReadbackRequiresExactDesktopAndLinuxAMD64Engine(t *tes
 	}
 	host := &setupDockerHost{version: "4.44.0", engineErr: errors.New("Docker engine is windows/amd64")}
 	adapter := HostAdapter{Layout: layout, DockerDesktopHost: host}
-	effect := setupcontract.Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: map[string]string{"version": "4.45.0"}}
+	effect := setupcontract.Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: map[string]string{"version": "4.45.0", "installer_url": "https://example.test/docker.exe", "windows_amd64_sha256": repeat("a", 64), "release_manifest_digest": repeat("b", 64), "platform_setup_contract_digest": repeat("c", 64), "workflow_cli_sha256": repeat("d", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("wrong version readback=%s %v", status, err)
@@ -254,7 +287,7 @@ func TestHostAdapterStartsAndReadsBackDigestBoundControlPlane(t *testing.T) {
 			return controlplane.Observation{State: controlplane.StateReady, Record: &record}
 		},
 	}
-	effect := setupcontract.Effect{ID: "serve", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "1.0.0"}}
+	effect := setupcontract.Effect{ID: "serve", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("initial readback = %s, %v", status, err)
@@ -286,7 +319,7 @@ func TestHostAdapterInstallsExactWorkflowSkillBundle(t *testing.T) {
 	skills, _ := json.Marshal([]string{"agent-workflow"})
 	effect := setupcontract.Effect{
 		ID: "skills", Kind: "workflow_skill_bundle", Subject: filepath.Join(t.TempDir(), "codex-skills"), Action: "install",
-		Parameters: map[string]string{"version": "1.0.0", "managed_skills_json": string(skills), "files_json": string(files)},
+		Parameters: map[string]string{"version": "1.0.0", "managed_skills_json": string(skills), "files_json": string(files), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)},
 	}
 	adapter := HostAdapter{Layout: layout, SkillBundleSource: source}
 	status, _, err := adapter.Readback(context.Background(), effect)
@@ -311,7 +344,7 @@ func TestHostAdapterPersistsPATOnlyThroughSecretInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := HostAdapter{Layout: layout}
-	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin"}}
+	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("initial=%s %v", status, err)

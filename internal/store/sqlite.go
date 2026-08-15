@@ -21,7 +21,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 58
+	latestSchemaVersion = 59
 )
 
 var (
@@ -1648,8 +1648,36 @@ SELECT r.repository,
        '', '', '', 'https://api.github.com', 60, 604800, 1, r.verified_at
 FROM repository_admissions r`,
 		}
-		for _, statement := range statements { if _, err := tx.ExecContext(ctx, statement); err != nil { return fmt.Errorf("migration 58: %w", err) } }
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (58, ?)", formatTimestamp(time.Now())); err != nil { return err }
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 58: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (58, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 59 {
+		columns := []struct{ name, statement string }{
+			{"platform_setup_contract_digest", `ALTER TABLE platform_installation ADD COLUMN platform_setup_contract_digest TEXT NOT NULL DEFAULT ''`},
+			{"workflow_cli_sha256", `ALTER TABLE platform_installation ADD COLUMN workflow_cli_sha256 TEXT NOT NULL DEFAULT ''`},
+			{"control_plane_plan_digest", `ALTER TABLE platform_installation ADD COLUMN control_plane_plan_digest TEXT NOT NULL DEFAULT ''`},
+		}
+		for _, column := range columns {
+			exists, err := tableHasColumnTx(ctx, tx, "platform_installation", column.name)
+			if err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, column.statement); err != nil {
+				return fmt.Errorf("migration 59: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (59, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

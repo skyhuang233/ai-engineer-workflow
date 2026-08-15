@@ -53,12 +53,11 @@ func serveCommand(args []string, output io.Writer) error {
 	}
 	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
 	if digest == "" {
-		plan, planErr := database.LatestSetupPlan(context.Background(), "platform_bootstrap")
-		if planErr != nil {
-			database.Close()
-			return fmt.Errorf("read approved Platform Bootstrap Plan: %w", planErr)
-		}
-		digest = plan.DigestSHA256
+		digest = installation.ControlPlanePlanDigestSHA256
+	}
+	if digest == "" || digest != installation.ControlPlanePlanDigestSHA256 {
+		database.Close()
+		return errors.New("Control Plane launch digest is not the durable Platform Installation authorization")
 	}
 	if err := database.Close(); err != nil {
 		return err

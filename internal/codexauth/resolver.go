@@ -2,6 +2,7 @@ package codexauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,12 +13,23 @@ import (
 
 const SourceOverrideEnvironment = "WORKFLOW_CODEX_AUTH_FILE"
 
-// Resolver validates the invoking Codex ChatGPT login through Codex's supported
-// status command and an explicit source supplied by the Codex integration.
-// Codex does not expose a supported command for discovering its private source.
+// Resolver discovers the invoking Codex ChatGPT login through the redacted,
+// machine-readable doctor report and confirms the active login status.
 type Resolver struct {
 	LookupEnvironment func(string) string
+	Doctor            func(context.Context) ([]byte, error)
 	LoginStatus       func(context.Context) ([]byte, error)
+}
+
+type doctorReport struct {
+	SchemaVersion int                    `json:"schemaVersion"`
+	CodexVersion  string                 `json:"codexVersion"`
+	Checks        map[string]doctorCheck `json:"checks"`
+}
+
+type doctorCheck struct {
+	Status  string            `json:"status"`
+	Details map[string]string `json:"details"`
 }
 
 func ResolveChatGPT(ctx context.Context) (string, error) {
@@ -28,6 +40,24 @@ func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 	lookup := r.LookupEnvironment
 	if lookup == nil {
 		lookup = os.Getenv
+	}
+	doctor := r.Doctor
+	if doctor == nil {
+		doctor = func(ctx context.Context) ([]byte, error) {
+			output, err := exec.CommandContext(ctx, "codex", "doctor", "--json").CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("query redacted Codex doctor report: %w", err)
+			}
+			return output, nil
+		}
+	}
+	doctorOutput, err := doctor(ctx)
+	if err != nil {
+		return "", err
+	}
+	discovered, err := authenticationSourceFromDoctor(doctorOutput)
+	if err != nil {
+		return "", err
 	}
 	status := r.LoginStatus
 	if status == nil {
@@ -49,7 +79,7 @@ func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 
 	source := strings.TrimSpace(lookup(SourceOverrideEnvironment))
 	if source == "" {
-		return "", fmt.Errorf("Codex does not expose its credential source through a supported CLI interface; set %s to the absolute ChatGPT authentication source supplied by the invoking Codex integration", SourceOverrideEnvironment)
+		source = discovered
 	}
 	if !filepath.IsAbs(source) {
 		return "", fmt.Errorf("%s must be an absolute path supplied by the invoking Codex integration", SourceOverrideEnvironment)
@@ -60,6 +90,30 @@ func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 	}
 	if err := ValidateChatGPT(source); err != nil {
 		return "", err
+	}
+	return filepath.Clean(source), nil
+}
+
+func authenticationSourceFromDoctor(raw []byte) (string, error) {
+	var report doctorReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return "", fmt.Errorf("decode redacted Codex doctor report: %w", err)
+	}
+	if report.SchemaVersion != 1 || strings.TrimSpace(report.CodexVersion) == "" {
+		return "", errors.New("Codex doctor machine-readable capability is unsupported")
+	}
+	auth, authOK := report.Checks["auth.credentials"]
+	config, configOK := report.Checks["config.load"]
+	if !authOK || !configOK || auth.Status != "ok" || config.Status != "ok" {
+		return "", errors.New("Codex doctor did not verify authentication and configuration")
+	}
+	if auth.Details["stored ChatGPT tokens"] != "true" || !strings.EqualFold(auth.Details["stored auth mode"], "chatgpt") {
+		return "", errors.New("Codex doctor did not verify stored ChatGPT authentication")
+	}
+	source := strings.TrimSpace(auth.Details["auth file"])
+	home := strings.TrimSpace(config.Details["CODEX_HOME"])
+	if !filepath.IsAbs(source) || !filepath.IsAbs(home) || !strings.EqualFold(filepath.Clean(filepath.Dir(source)), filepath.Clean(home)) {
+		return "", errors.New("Codex doctor returned an invalid authentication source boundary")
 	}
 	return filepath.Clean(source), nil
 }
