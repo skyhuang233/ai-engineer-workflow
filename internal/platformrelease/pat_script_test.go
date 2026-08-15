@@ -193,7 +193,7 @@ func TestBootstrapSkillRestartsStoppedControlPlaneWithDurableAuthorization(t *te
 		`$hostFacts.platform.installation_recorded`,
 		`$hostFacts.platform.control_plane_plan_digest_sha256`,
 		`$hostFacts.control_plane.state -eq "stopped"`,
-		`$confirmedWorkflowHome = [IO.Path]::GetFullPath([string]$hostFacts.workflow_home)`,
+		`$confirmedWorkflowHome = [IO.Path]::GetFullPath(<confirmed-absolute-local-workflow-home>)`,
 		`serve --workflow-home $confirmedWorkflowHome`,
 		`workflow.exe serve --workflow-home`,
 		`--approved-plan-digest $hostFacts.platform.control_plane_plan_digest_sha256`,
@@ -202,6 +202,41 @@ func TestBootstrapSkillRestartsStoppedControlPlaneWithDurableAuthorization(t *te
 	} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks stopped Control Plane authorization contract %q", required)
+		}
+	}
+}
+
+func TestBootstrapSkillChoosesWorkflowHomeBeforeFirstInspection(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	skillPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "SKILL.md")
+	raw, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	for _, required := range []string{
+		"Confirm the absolute local Workflow Home once before the first host inspection",
+		`inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome`,
+		"require `$hostFacts.workflow_home` to equal `$confirmedWorkflowHome`",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("bootstrap skill lacks first-inspection Workflow Home contract %q", required)
+		}
+	}
+}
+
+func TestHostInspectionBindsEveryDurablePlatformFieldToVerifiedPin(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	scriptPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1")
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	for _, field := range []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest", "control_plane_plan_digest_sha256"} {
+		needle := `[string]$inspectedPlatform.` + field + ` -cne [string]$platform.` + field
+		if !strings.Contains(content, needle) {
+			t.Fatalf("inspect-host does not bind signed pin field %q before trusting durable state", field)
 		}
 	}
 }

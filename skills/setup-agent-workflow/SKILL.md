@@ -7,17 +7,19 @@ description: Prepare the current Windows machine and repository for Agent Workfl
 
 Treat the current directory as the target. Keep discovery read-only and use the bundled scripts instead of reproducing host checks by hand. Before discovery, run `codex doctor --json` and `codex login status`. Parse the redacted doctor JSON even when the command exits nonzero: unrelated terminal checks may fail and must not override valid required checks. Continue only when the machine-readable doctor report has schema 1, an `ok` `auth.credentials` check with `stored ChatGPT tokens=true`, `stored auth mode=chatgpt`, and an absolute `auth file` beneath the `CODEX_HOME` reported by the `ok` `config.load` check, and login status reports ChatGPT. The Workflow CLI performs the same checks and resolves the source automatically; never ask an ordinary user to locate or configure a private Codex file.
 
-1. Create a task-temporary directory, then run host inspection once and read its saved JSON:
+1. Confirm the absolute local Workflow Home once before the first host inspection. Use `%LOCALAPPDATA%\AgentWorkflow` only when the user did not select another absolute local path; reject relative and UNC paths. Keep this exact `$confirmedWorkflowHome` for every inspection, plan, apply, verify, and serve operation. Create a task-temporary directory, then run host inspection once and read its saved JSON:
 
    ```powershell
+   $confirmedWorkflowHome = [IO.Path]::GetFullPath(<confirmed-absolute-local-workflow-home>)
    $setupTaskRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-setup-" + [Guid]::NewGuid().ToString("N"))
    New-Item -ItemType Directory -Path $setupTaskRoot | Out-Null
    $hostFactsPath = Join-Path $setupTaskRoot "host-facts.json"
-   $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) | Out-String
+   $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome | Out-String
    [IO.File]::WriteAllText($hostFactsPath, $hostFactsJSON, (New-Object Text.UTF8Encoding($false)))
    $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
-   $confirmedWorkflowHome = [IO.Path]::GetFullPath([string]$hostFacts.workflow_home)
    ```
+
+   Resolve both paths and require `$hostFacts.workflow_home` to equal `$confirmedWorkflowHome`; otherwise fail closed. Every later reinspection must pass `-WorkflowHome $confirmedWorkflowHome` again; never recover the default from process environment after this choice.
 
    Before release resolution, handle an already-authorized stopped runtime as an existing-authorization Control Plane restart. Authority is complete only when `$hostFacts.workflow.trust_state -eq "pinned"`, `$hostFacts.workflow.owned`, `$hostFacts.platform.installation_recorded`, every durable release/contract/CLI/bundle digest is a lowercase SHA-256, `$hostFacts.platform.control_plane_plan_digest_sha256` is a lowercase SHA-256, and `$hostFacts.control_plane.state -eq "stopped"`. In that exact case run the installed `workflow.exe serve --workflow-home` command using the same confirmed home:
 

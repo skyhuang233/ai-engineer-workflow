@@ -50,6 +50,24 @@ func TestPowerShellHostInspectionRequiresExactlyOneRawLocalOrigin(t *testing.T) 
 		}
 	})
 
+	t.Run("unborn repository", func(t *testing.T) {
+		t.Parallel()
+		repo := filepath.Join(t.TempDir(), "unborn")
+		git(t, "", "init", "-b", "main", repo)
+		output, err := run(t, repo)
+		if err != nil {
+			t.Fatalf("inspect unborn repository: %v\n%s", err, output)
+		}
+		var facts struct {
+			IsRepository bool   `json:"is_repository"`
+			Branch       string `json:"branch"`
+			Head         string `json:"head"`
+		}
+		if err := json.Unmarshal(output, &facts); err != nil || !facts.IsRepository || facts.Branch != "main" || facts.Head != "" {
+			t.Fatalf("unborn repository facts = %#v, %v, output=%s", facts, err, output)
+		}
+	})
+
 	t.Run("one raw local value ignores hostile config", func(t *testing.T) {
 		t.Parallel()
 		repo := newRepo(t)

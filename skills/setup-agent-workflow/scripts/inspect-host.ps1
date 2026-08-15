@@ -170,10 +170,10 @@ if ($isRepository) {
     Assert-SafeRepositoryGitConfiguration $repoPath
     $gitFacts.root = $git.output
     $branchResult = Invoke-IsolatedGit @('-C', $repoPath, 'branch', '--show-current')
-    $headResult = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--verify', 'HEAD')
-    if ($branchResult.exit_code -ne 0 -or $headResult.exit_code -ne 0) { throw "Unable to inspect repository branch and HEAD" }
+    $headResult = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--verify', '--quiet', 'HEAD')
+    if ($branchResult.exit_code -ne 0 -or ($headResult.exit_code -ne 0 -and $headResult.exit_code -ne 1)) { throw "Unable to inspect repository branch and HEAD" }
     $gitFacts.branch = ([string]$branchResult.output).Trim()
-    $gitFacts.head = ([string]$headResult.output).Trim()
+    $gitFacts.head = $(if ($headResult.exit_code -eq 0) { ([string]$headResult.output).Trim() } else { "" })
     $gitFacts.origin = Read-RawLocalOrigin $repoPath
     $statusResult = Invoke-IsolatedGit @('-C', $repoPath, 'status', '--porcelain=v2', '-z', '--untracked-files=all')
     if ($statusResult.exit_code -ne 0) { throw "Unable to inspect repository status: $($statusResult.error.Trim())" }
@@ -354,7 +354,14 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
                 $inspectionJSON = $inspection.output | ConvertFrom-Json
                 if ($null -ne $inspectionJSON.result) {
                     $inspectedPlatform = $inspectionJSON.result.platform
-                    if (-not [bool]$inspectedPlatform.installation_recorded -or [string]$inspectedPlatform.version -cne [string]$platform.version -or [string]$inspectedPlatform.release_manifest_digest -cne [string]$platform.release_manifest_digest) { throw "installed Workflow CLI state differs from the verified Bootstrap Platform Release pin" }
+                    if (-not [bool]$inspectedPlatform.installation_recorded -or
+                        [string]$inspectedPlatform.version -cne [string]$platform.version -or
+                        [string]$inspectedPlatform.release_manifest_digest -cne [string]$platform.release_manifest_digest -or
+                        [string]$inspectedPlatform.platform_setup_contract_digest -cne [string]$platform.platform_setup_contract_digest -or
+                        [string]$inspectedPlatform.workflow_cli_sha256 -cne [string]$platform.workflow_cli_sha256 -or
+                        [string]$inspectedPlatform.release_bundled_files_json -cne [string]$platform.release_bundled_files_json -or
+                        [string]$inspectedPlatform.release_bundled_files_digest -cne [string]$platform.release_bundled_files_digest -or
+                        [string]$inspectedPlatform.control_plane_plan_digest_sha256 -cne [string]$platform.control_plane_plan_digest_sha256) { throw "installed Workflow CLI state differs from the verified Bootstrap Platform Release pin" }
                     $platform = $inspectedPlatform
                     $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
                     $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
