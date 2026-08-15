@@ -190,7 +190,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		if err := options.Publication.PreflightCreateRepository(ctx, options.Owner, options.AuthenticatedLogin, repositoryName, defaultPrivate(options)); err != nil {
 			return setupcontract.Plan{}, fmt.Errorf("preflight GitHub repository publication: %w", err)
 		}
-		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: repositoryID, Action: "create", Parameters: map[string]string{"owner": options.Owner, "authenticated_login": options.AuthenticatedLogin, "name": repositoryName, "private": boolString(defaultPrivate(options))}})
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: repositoryID, Action: "create", Parameters: map[string]string{"owner": options.Owner, "authenticated_login": options.AuthenticatedLogin, "name": repositoryName, "private": boolString(defaultPrivate(options)), "approval_absent_repository": repositoryID}})
 		if !discovery.HasCommits {
 			baselineFiles, filesErr := BaselineFiles(ctx, discovery.Root)
 			if filesErr != nil {

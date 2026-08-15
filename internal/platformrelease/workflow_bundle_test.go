@@ -48,7 +48,7 @@ func TestWorkflowSkillBundleUsesConciseOneLevelNavigationAndOperationalReference
 		t.Fatalf("main SKILL.md is %d bytes; keep detailed operations in references", len(main))
 	}
 	references := map[string][]string{
-		"github.md":        {"workflow github", "Repository Admission", "subissues-add", "blocked-by-add", "database `id`", "every API page", "human-only", "no merge operation"},
+		"github.md":        {"workflow github identity", "verified PAT login/id/type", "canonical repository/owner", "Repository Admission", "subissues-add", "blocked-by-add", "database `id`", "every API page", "human-only", "no merge operation"},
 		"plans.md":         {"workflow:plan", "workflow:active", "runtime-configure", "Plan Amendment"},
 		"tickets.md":       {"workflow:ticket", "sub-issue", "dependencies", "independently reviewable"},
 		"inbox.md":         {"workflow:inbox", "workflow answer-inbox", "# Workflow Inbox", "pending field", "allowed answer", "uncertain"},

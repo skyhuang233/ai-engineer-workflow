@@ -58,6 +58,12 @@ type PreLayoutPreconditionChecker interface {
 type EffectResultRestorer interface {
 	RestoreEffectResults([]setupcontract.EffectResult) error
 }
+type RepositoryCreateAttemptRestorer interface {
+	RestoreRepositoryCreateAttemptEvents(setupcontract.Effect, []store.SetupRepositoryCreateAttemptEvent) error
+}
+type RepositoryCreateOutcomeClassifier interface {
+	RepositoryCreateOutcomeUnknown(error) bool
+}
 type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
 type PlatformPreconditionVerifier func(context.Context, setupcontract.Plan) error
 type Engine struct {
@@ -126,6 +132,20 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	}
 	attempt := len(prior) + 1
 	result := setupcontract.ExecutionResult{SchemaVersion: 1, PlanID: plan.PlanID, PlanDigest: digest, AttemptID: "attempt-" + strconv.Itoa(attempt), StartedAt: now, Status: setupcontract.ExecutionSucceeded}
+	if restorer, ok := e.Adapter.(RepositoryCreateAttemptRestorer); ok {
+		for _, effect := range plan.Effects {
+			if effect.Kind != "create_repository" {
+				continue
+			}
+			events, eventsErr := database.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, effect.ID)
+			if eventsErr != nil {
+				return result, fmt.Errorf("restore repository-create attempt evidence: %w", eventsErr)
+			}
+			if err := restorer.RestoreRepositoryCreateAttemptEvents(effect, events); err != nil {
+				return result, err
+			}
+		}
+	}
 	if restorer, ok := e.Adapter.(EffectResultRestorer); ok {
 		for _, previous := range prior {
 			var effects []setupcontract.EffectResult
@@ -206,11 +226,34 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: status, Evidence: evidence})
 			continue
 		}
+		if effect.Kind == "create_repository" {
+			if recordErr := appendRepositoryCreateAttemptEvent(run, effect, attempt, store.RepositoryCreateStarted); recordErr != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: recordErr.Error()})
+				err = recordErr
+				break
+			}
+		}
 		if applyErr := handler.engineApply(run, effect); applyErr != nil {
+			if effect.Kind == "create_repository" {
+				outcome := store.RepositoryCreateDefinitiveFailure
+				if classifier, ok := e.Adapter.(RepositoryCreateOutcomeClassifier); ok && classifier.RepositoryCreateOutcomeUnknown(applyErr) {
+					outcome = store.RepositoryCreateOutcomeUnknown
+				}
+				applyErr = errors.Join(applyErr, appendRepositoryCreateAttemptEvent(run, effect, attempt, outcome))
+			}
 			result.Status = setupcontract.ExecutionIncomplete
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: applyErr.Error()})
 			err = applyErr
 			break
+		}
+		if effect.Kind == "create_repository" {
+			if recordErr := appendRepositoryCreateAttemptEvent(run, effect, attempt, store.RepositoryCreateSucceeded); recordErr != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: recordErr.Error()})
+				err = recordErr
+				break
+			}
 		}
 		status, evidence, readErr = handler.engineReadback(run, effect)
 		if readErr != nil || status != setupcontract.EffectSatisfied {
@@ -268,6 +311,14 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	encoded, _ := json.Marshal(result.Effects)
 	recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
 	return result, errors.Join(err, recordErr)
+}
+
+func appendRepositoryCreateAttemptEvent(run *effectExecution, effect setupcontract.Effect, executionAttempt int, event store.RepositoryCreateAttemptEvent) error {
+	return run.database.AppendSetupRepositoryCreateAttemptEvent(run.ctx, store.SetupRepositoryCreateAttemptEvent{
+		PlanID: run.plan.PlanID, PlanDigestSHA256: run.digest, EffectID: effect.ID, ExecutionAttempt: executionAttempt, Event: event,
+		Owner: effect.Parameters["owner"], Name: effect.Parameters["name"], Private: effect.Parameters["private"] == "true",
+		ApprovalAbsentRepository: effect.Parameters["approval_absent_repository"], RecordedAt: run.now,
+	})
 }
 
 func repositoryAdmissionRecorded(ctx context.Context, database *store.Store, repositoryPath string, effect setupcontract.Effect, planDigest string, requireEligible bool) (bool, error) {

@@ -7,10 +7,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
 func TestManagedGitHubIssueListPaginatesWithoutExposingCredential(t *testing.T) {
@@ -81,5 +88,78 @@ func TestManagedGitHubUsesNativeRelationshipEndpointsAndRejectsUnknownWrites(t *
 	}
 	if err := executeManagedGitHub(context.Background(), client, "owner/repo", "inbox-answer", managedGitHubOptions{Number: 7}, &bytes.Buffer{}); err == nil {
 		t.Fatal("managed GitHub comment path bypassed atomic Workflow Inbox answering")
+	}
+}
+
+func TestManagedGitHubIdentityDistinguishesOrganizationOwnerFromPATLoginWithoutSecret(t *testing.T) {
+	var output bytes.Buffer
+	identity := managedGitHubIdentity{Login: "alice", UserID: 42, Type: "User", Repository: "acme/repo", Owner: "acme"}
+	if err := writeManagedGitHubIdentity(&output, identity); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, `"login":"alice"`) || !strings.Contains(got, `"owner":"acme"`) || strings.Contains(got, "token") {
+		t.Fatalf("managed identity output = %s", got)
+	}
+}
+
+func TestManagedGitHubIdentityUsesWorkflowHomePATAndAdmittedCanonicalRepository(t *testing.T) {
+	const token = "github_pat_identity_secret"
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now().UTC()
+	if err := database.RecordRepositoryAdmission(context.Background(), store.RepositoryAdmission{Repository: "alice/repo", OnboardingPlanDigestSHA256: strings.Repeat("a", 64), ContractVersion: "1", ManifestDigestSHA256: strings.Repeat("b", 64), Eligible: true, VerifiedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordGitHubPATVerification(context.Background(), store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "alice", UserID: 42, Owner: "alice", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	repository := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"remote", "add", "origin", "git@github.com:alice/repo.git"}} {
+		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+		if output, runErr := command.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v: %s", args, runErr, output)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Fatal("managed identity request omitted Workflow Home PAT")
+		}
+		w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+		switch r.URL.Path {
+		case "/user":
+			fmt.Fprint(w, `{"login":"alice","id":42,"type":"User"}`)
+		case "/repos/alice/repo":
+			fmt.Fprint(w, `{"full_name":"alice/repo","private":true,"owner":{"login":"alice"}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	session, err := managedGitHubClient(context.Background(), database, layout, repository, server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := writeManagedGitHubIdentity(&output, session.Identity); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, `"repository":"alice/repo"`) || !strings.Contains(got, `"type":"User"`) || strings.Contains(got, token) {
+		t.Fatalf("identity output = %s", got)
+	}
+	if _, err := os.Stat(filepath.Join(repository, ".git", "index.lock")); !os.IsNotExist(err) {
+		t.Fatalf("managed identity created a Git index lock: %v", err)
 	}
 }

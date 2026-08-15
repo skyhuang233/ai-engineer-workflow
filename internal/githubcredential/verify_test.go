@@ -69,7 +69,7 @@ func TestVerifierRequiresActiveOrganizationAdminMembership(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			_, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), "secret", "acme")
+			_, err := (Verifier{APIBase: server.URL, Client: server.Client(), OrganizationRequiredScopes: []string{"admin:org"}}).Verify(context.Background(), "secret", "acme")
 			if test.wantErr && !errors.Is(err, ErrOwnerMismatch) {
 				t.Fatalf("membership %s error = %v", test.membership, err)
 			}
@@ -80,7 +80,7 @@ func TestVerifierRequiresActiveOrganizationAdminMembership(t *testing.T) {
 	}
 }
 
-func TestVerifierRequiresAdminOrgScopeBeforeOrganizationMembership(t *testing.T) {
+func TestVerifierFailsClosedBeforeOrganizationMembershipWithoutApprovedScopeContract(t *testing.T) {
 	membershipCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -94,7 +94,7 @@ func TestVerifierRequiresAdminOrgScopeBeforeOrganizationMembership(t *testing.T)
 	}))
 	defer server.Close()
 	_, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), "secret", "acme")
-	if !errors.Is(err, ErrScopeDeficient) || membershipCalled {
+	if !errors.Is(err, ErrOrganizationScopeContract) || membershipCalled {
 		t.Fatalf("error=%v membership_called=%t", err, membershipCalled)
 	}
 }

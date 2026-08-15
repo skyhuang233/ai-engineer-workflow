@@ -439,12 +439,70 @@ func TestCreateRepositoryReadbackRejectsTakeoverWithoutThisPlanEvidence(t *testi
 			}))
 			defer server.Close()
 			adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), CreatedRepositories: map[string]bool{"owner/repo": test.created}}
-			effect := setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true"}}
+			effect := setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}}
 			status, _, err := adapter.Readback(context.Background(), effect)
 			if err != nil || status != test.want {
 				t.Fatalf("create repository readback = %s, %v; want %s", status, err, test.want)
 			}
 		})
+	}
+}
+
+func TestCreateRepositoryReadbackAcceptsExactRepositoryAfterRestoredStartedAttempt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"full_name":"owner/repo","private":true}`))
+	}))
+	defer server.Close()
+	digest := strings.Repeat("a", 64)
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), PlanDigest: digest, CreatedRepositories: map[string]bool{}}
+	effect := setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}}
+	events := []store.SetupRepositoryCreateAttemptEvent{{
+		PlanID: "onboarding", PlanDigestSHA256: digest, EffectID: effect.ID, ExecutionAttempt: 1, Event: store.RepositoryCreateStarted,
+		Owner: "owner", Name: "repo", Private: true, ApprovalAbsentRepository: "owner/repo", RecordedAt: time.Now().UTC(),
+	}}
+	if err := adapter.RestoreRepositoryCreateAttemptEvents(effect, events); err != nil {
+		t.Fatal(err)
+	}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("restored unknown-outcome readback = %s, %v", status, err)
+	}
+}
+
+func TestCreateRepositoryReadbackRejectsRepositoryAfterDefinitiveFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"full_name":"owner/repo","private":true}`))
+	}))
+	defer server.Close()
+	digest := strings.Repeat("a", 64)
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), PlanDigest: digest, CreatedRepositories: map[string]bool{}}
+	now := time.Now().UTC()
+	events := []store.SetupRepositoryCreateAttemptEvent{
+		{PlanID: "onboarding", PlanDigestSHA256: digest, EffectID: "create-repository", ExecutionAttempt: 1, Event: store.RepositoryCreateStarted, Owner: "owner", Name: "repo", Private: true, ApprovalAbsentRepository: "owner/repo", RecordedAt: now},
+		{PlanID: "onboarding", PlanDigestSHA256: digest, EffectID: "create-repository", ExecutionAttempt: 1, Event: store.RepositoryCreateDefinitiveFailure, Owner: "owner", Name: "repo", Private: true, ApprovalAbsentRepository: "owner/repo", RecordedAt: now.Add(time.Second)},
+	}
+	effect := setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}}
+	if err := adapter.RestoreRepositoryCreateAttemptEvents(effect, events); err != nil {
+		t.Fatal(err)
+	}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectConflicting {
+		t.Fatalf("definitive-failure readback = %s, %v", status, err)
+	}
+}
+
+func TestRepositoryCreateOutcomeClassification(t *testing.T) {
+	adapter := HostAdapter{}
+	if !adapter.RepositoryCreateOutcomeUnknown(context.DeadlineExceeded) {
+		t.Fatal("transport timeout was treated as a definitive create failure")
+	}
+	if adapter.RepositoryCreateOutcomeUnknown(&workflowgithub.APIError{StatusCode: http.StatusUnprocessableEntity}) {
+		t.Fatal("GitHub validation rejection was treated as an unknown create outcome")
+	}
+	if !adapter.RepositoryCreateOutcomeUnknown(&workflowgithub.APIError{StatusCode: http.StatusInternalServerError}) {
+		t.Fatal("GitHub server failure was treated as a definitive create outcome")
 	}
 }
 

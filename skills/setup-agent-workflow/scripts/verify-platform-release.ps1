@@ -104,6 +104,37 @@ Assert-PlatformRelease ($manifest.provenance.source_commit -eq $manifest.release
 Assert-PlatformRelease ([long]$manifest.provenance.github_actions_run_id -eq [long]$manifest.release.github_actions_run_id) "Platform Release provenance run identity does not match"
 Assert-PlatformRelease ($manifest.provenance.builder_id -eq "github-actions") "Platform Release provenance builder is invalid"
 
+$platformContract = Get-RequiredProperty $manifest "platform_setup_contract"
+Assert-PlatformRelease ([string]$platformContract.workflow_home_default -ceq '%LOCALAPPDATA%\AgentWorkflow') "Workflow Home default is invalid"
+$credentialContract = Get-RequiredProperty $platformContract "credential"
+Assert-PlatformRelease ([string]$credentialContract.kind -ceq "classic-pat" -and [string]$credentialContract.owner_binding -ceq "single-owner" -and [string]$credentialContract.plaintext_relative_path -ceq 'state\credentials\github.pat') "Control Plane credential contract is invalid"
+$requiredScopes = @($credentialContract.required_scopes | ForEach-Object { [string]$_ } | Sort-Object)
+Assert-PlatformRelease ($requiredScopes.Count -eq 2 -and ($requiredScopes -join "`n") -ceq "repo`nworkflow") "Control Plane credential scopes are invalid"
+$dockerContract = Get-RequiredProperty $platformContract "docker_desktop"
+$dockerURI = $null
+$dockerURLValid = [Uri]::TryCreate([string]$dockerContract.installer_url, [UriKind]::Absolute, [ref]$dockerURI)
+Assert-PlatformRelease ($dockerURLValid -and $dockerURI.Scheme -ceq "https" -and -not [string]::IsNullOrWhiteSpace([string]$dockerURI.Host) -and -not [string]::IsNullOrWhiteSpace([string]$dockerContract.version) -and [string]$dockerContract.windows_amd64_sha256 -match '^[0-9a-f]{64}$') "Docker Desktop dependency contract is invalid"
+$workerContract = Get-RequiredProperty $platformContract "worker"
+Assert-PlatformRelease ([string]$workerContract.image -match '^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_./-]+@sha256:[0-9a-f]{64}$') "Worker image contract is invalid"
+$skillContract = Get-RequiredProperty $platformContract "workflow_skill_bundle"
+$managedSkills = @($skillContract.managed_skills | ForEach-Object { [string]$_ })
+Assert-PlatformRelease (-not [string]::IsNullOrWhiteSpace([string]$skillContract.version) -and [string]$skillContract.install_scope -ceq "user" -and $managedSkills.Count -gt 0) "Workflow Skill Bundle contract is incomplete"
+foreach ($skill in $managedSkills) {
+    Assert-PlatformRelease (-not [string]::IsNullOrWhiteSpace($skill) -and $skill -ceq [IO.Path]::GetFileName($skill)) "Workflow Skill Bundle has an invalid managed skill"
+}
+$repositoryContract = Get-RequiredProperty $platformContract "repository_contract"
+Assert-PlatformRelease (-not [string]::IsNullOrWhiteSpace([string]$repositoryContract.version) -and [string]$repositoryContract.manifest_path -ceq ".workflow/repository.json" -and [string]$repositoryContract.check_name -ceq "workflow-contract") "Repository Contract pin is invalid"
+$labelNames = @{}
+$labels = @($repositoryContract.labels)
+Assert-PlatformRelease ($labels.Count -gt 0) "Repository Contract label vocabulary is empty"
+foreach ($label in $labels) {
+    $labelName = [string](Get-RequiredProperty $label "name")
+    Assert-PlatformRelease (-not [string]::IsNullOrWhiteSpace($labelName) -and [string](Get-RequiredProperty $label "color") -match '^[0-9a-fA-F]{6}$' -and -not [string]::IsNullOrWhiteSpace([string](Get-RequiredProperty $label "description"))) "Repository Contract label '$labelName' is invalid"
+    $normalizedLabelName = $labelName.ToLowerInvariant()
+    Assert-PlatformRelease (-not $labelNames.ContainsKey($normalizedLabelName)) "Repository Contract label '$labelName' is duplicated"
+    $labelNames[$normalizedLabelName] = $true
+}
+
 $artifactIdentities = @{}
 foreach ($artifact in @($manifest.artifacts)) {
     $name = [string](Get-RequiredProperty $artifact "name")
@@ -118,6 +149,16 @@ foreach ($artifact in @($manifest.artifacts)) {
 foreach ($required in @("workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json")) {
     Assert-PlatformRelease ($artifactIdentities.ContainsKey($required)) "Platform Release lacks required artifact '$required'"
 }
+$bundledFileIdentities = @{}
+foreach ($bundledFile in @($manifest.bundled_files)) {
+    $bundledPath = [string](Get-RequiredProperty $bundledFile "path")
+    $bundledSHA = [string](Get-RequiredProperty $bundledFile "sha256")
+    $segments = @($bundledPath -split '/')
+    Assert-PlatformRelease (-not [string]::IsNullOrWhiteSpace($bundledPath) -and -not $bundledPath.StartsWith("/") -and -not $bundledPath.EndsWith("/") -and -not $bundledPath.Contains("\") -and @($segments | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }).Count -eq 0 -and $bundledSHA -match '^[0-9a-f]{64}$') "Platform Release bundled file '$bundledPath' is invalid"
+    Assert-PlatformRelease (-not $bundledFileIdentities.ContainsKey($bundledPath)) "Platform Release bundled file '$bundledPath' is duplicated"
+    $bundledFileIdentities[$bundledPath] = $bundledSHA
+}
+Assert-PlatformRelease ($bundledFileIdentities.Count -gt 0) "Platform Release must bind bundled files"
 $subjectIdentities = @{}
 foreach ($subject in @($manifest.provenance.subjects)) {
     $name = [string](Get-RequiredProperty $subject "name")

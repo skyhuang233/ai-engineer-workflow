@@ -96,7 +96,7 @@ func TestParsePlanRejectsUnknownSemanticCombinations(t *testing.T) {
 		"obsolete unchecked release":  func(p *Plan) { p.Preconditions[0].Kind = "release" },
 		"unknown action":              func(p *Plan) { p.Effects[0].Action = "overwrite_anything" },
 		"wrong effect for plan": func(p *Plan) {
-			p.Effects[0] = Effect{ID: "repo", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true"}}
+			p.Effects[0] = Effect{ID: "repo", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}}
 		},
 		"unknown expected result": func(p *Plan) { p.ExpectedResults[0].Kind = "surprise" },
 		"invalid expected value":  func(p *Plan) { p.ExpectedResults[0].Expected = "eventually" },
@@ -114,6 +114,15 @@ func TestParsePlanRejectsUnknownSemanticCombinations(t *testing.T) {
 				t.Fatalf("accepted unsupported semantic combination: %#v", plan)
 			}
 		})
+	}
+}
+
+func TestValidateCreateRepositoryEffectBindsApprovalAbsenceIdentity(t *testing.T) {
+	effect := Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{
+		"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "other/repo",
+	}}
+	if err := ValidateEffectForExecution(effect); err == nil || !strings.Contains(err.Error(), "approval-time absence") {
+		t.Fatalf("mismatched approval absence accepted: %v", err)
 	}
 }
 

@@ -28,7 +28,8 @@ $ownerType = "personal"
 if ([string]::IsNullOrWhiteSpace($boundOwner)) { throw "A personal account or organization owner is required before Platform planning" }
 if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringComparison]::OrdinalIgnoreCase)) {
     $ownerType = "organization"
-    if ($scopes -notcontains "admin:org") { throw "An organization-owned repository requires the classic PAT scopes repo, workflow, and admin:org" }
+    $requiredOrganizationScopes = @(& (Join-Path $PSScriptRoot "resolve-github-required-scopes.ps1") -OwnerType organization)
+    foreach ($requiredScope in $requiredOrganizationScopes) { if ($scopes -notcontains $requiredScope) { throw "The classic PAT lacks an approved organization scope" } }
     try {
         $membershipResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/memberships/" + [Uri]::EscapeDataString([string]$identity.login)) -Headers @{
             Authorization = "Bearer $token"

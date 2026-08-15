@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 60
+	latestSchemaVersion = 61
 )
 
 var (
@@ -1733,6 +1733,27 @@ FROM repository_admissions r`,
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (60, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 61 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS setup_repository_create_attempt_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES setup_plans(plan_id),
+    plan_digest_sha256 TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    execution_attempt INTEGER NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('started', 'outcome_unknown', 'succeeded', 'definitive_failure')),
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL,
+    private INTEGER NOT NULL CHECK (private IN (0, 1)),
+    approval_absent_repository TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(plan_id, effect_id, execution_attempt, event)
+)`); err != nil {
+			return fmt.Errorf("migration 61: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (61, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

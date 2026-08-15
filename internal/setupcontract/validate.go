@@ -260,6 +260,12 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 	if effect.Kind == "github_pat" && effect.Parameters["input"] != "stdin" {
 		return errors.New("GitHub PAT input must be stdin")
 	}
+	if effect.Kind == "create_repository" {
+		approvedRepository := effect.Parameters["owner"] + "/" + effect.Parameters["name"]
+		if effect.Parameters["approval_absent_repository"] != approvedRepository || effect.Subject != approvedRepository {
+			return errors.New("repository creation is not bound to its exact approval-time absence identity")
+		}
+	}
 	if effect.Kind == "repository_contract_pr" && effect.Parameters["base_head"] != "" && effect.Parameters["base_head_effect_id"] != "" {
 		return errors.New("repository contract base must use either an approved HEAD or Initial Repository Baseline evidence")
 	}

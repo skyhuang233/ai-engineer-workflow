@@ -30,6 +30,58 @@ type fakeAdapter struct {
 	fail     string
 }
 
+type repositoryCreateAttemptAdapter struct {
+	*fakeAdapter
+	databasePath string
+	planID       string
+	digest       string
+	repository   string
+	private      bool
+	created      bool
+	startedSeen  bool
+}
+
+func (a *repositoryCreateAttemptAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+	if effect.Kind != "create_repository" {
+		return a.fakeAdapter.Readback(ctx, effect)
+	}
+	if !a.created {
+		return setupcontract.EffectRequired, "absent", nil
+	}
+	if a.states[effect.ID] != setupcontract.EffectSatisfied {
+		return setupcontract.EffectConflicting, "appeared without attempt evidence", nil
+	}
+	return setupcontract.EffectSatisfied, repositoryCreatedEvidence + effect.ID + ":" + effect.Subject, nil
+}
+
+func (a *repositoryCreateAttemptAdapter) Apply(ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+	if effect.Kind != "create_repository" {
+		return a.fakeAdapter.Apply(ctx, effect, input)
+	}
+	db, err := store.OpenReadOnly(ctx, a.databasePath)
+	if err != nil {
+		return err
+	}
+	events, readErr := db.SetupRepositoryCreateAttemptEvents(ctx, a.planID, effect.ID)
+	closeErr := db.Close()
+	if readErr != nil || closeErr != nil {
+		return errors.Join(readErr, closeErr)
+	}
+	a.startedSeen = len(events) == 1 && events[0].Event == store.RepositoryCreateStarted && events[0].PlanDigestSHA256 == a.digest && events[0].ApprovalAbsentRepository == a.repository && events[0].Private == a.private
+	return context.DeadlineExceeded
+}
+
+func (a *repositoryCreateAttemptAdapter) RestoreRepositoryCreateAttemptEvents(effect setupcontract.Effect, events []store.SetupRepositoryCreateAttemptEvent) error {
+	for _, event := range events {
+		if event.EffectID == effect.ID && event.PlanDigestSHA256 == a.digest && event.ApprovalAbsentRepository == a.repository && event.Private == a.private && event.Event != store.RepositoryCreateDefinitiveFailure {
+			a.states[event.EffectID] = setupcontract.EffectSatisfied
+		}
+	}
+	return nil
+}
+
+func (*repositoryCreateAttemptAdapter) RepositoryCreateOutcomeUnknown(error) bool { return true }
+
 func (f *fakeAdapter) Readback(_ context.Context, e setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
 	f.read = append(f.read, e.ID)
 	state := f.states[e.ID]
@@ -161,6 +213,48 @@ func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("retry did not restore merge evidence: %#v", adapter.restored)
+	}
+}
+
+func TestEnginePersistsRepositoryCreateIntentBeforeUnknownExternalOutcomeAndRestoresIt(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(t.TempDir(), "repository")
+	plan := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "create-uncertain", Kind: setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: repositoryPath, GitHubRepository: "owner/repo"},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: repositoryPath, Expected: "ok"}},
+		Effects: []setupcontract.Effect{
+			{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}},
+			{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
+		},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("b", 64)}},
+	}
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &repositoryCreateAttemptAdapter{
+		fakeAdapter:  &fakeAdapter{states: map[string]setupcontract.EffectStatus{"admit": setupcontract.EffectSatisfied}},
+		databasePath: filepath.Join(layout.State, "workflow.db"), planID: plan.PlanID, digest: digest, repository: "owner/repo", private: true,
+	}
+	engine := Engine{Adapter: adapter, ResolveCodexAuth: func(context.Context) (string, error) { return filepath.Join(t.TempDir(), "auth.json"), nil }}
+	first, err := engine.Apply(ctx, raw, digest)
+	if !errors.Is(err, context.DeadlineExceeded) || first.Status != setupcontract.ExecutionIncomplete || !adapter.startedSeen {
+		t.Fatalf("unknown create result=%#v err=%v started-before-call=%t", first, err, adapter.startedSeen)
+	}
+	adapter.created = true
+	adapter.states["create-repository"] = setupcontract.EffectRequired
+	second, err := engine.Apply(ctx, raw, digest)
+	if err != nil || second.Status != setupcontract.ExecutionSucceeded {
+		t.Fatalf("same-plan forward repair=%#v err=%v", second, err)
+	}
+	if len(adapter.applied) != 0 {
+		t.Fatalf("repository creation was retried after exact readback: %v", adapter.applied)
 	}
 }
 

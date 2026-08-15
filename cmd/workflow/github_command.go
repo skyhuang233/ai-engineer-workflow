@@ -58,53 +58,91 @@ func githubCommand(args []string, output io.Writer) error {
 		return err
 	}
 	defer database.Close()
-	repository, client, err := managedGitHubClient(ctx, database, layout, *source)
+	session, err := managedGitHubClient(ctx, database, layout, *source, "", nil)
 	if err != nil {
 		return err
 	}
+	if operation == "identity" {
+		return writeManagedGitHubIdentity(output, session.Identity)
+	}
 	options := managedGitHubOptions{Number: *number, Related: *related, State: *state, Label: *label, Head: *head, Commit: *commit, Title: *title, BodyFile: *bodyFile}
-	if err := executeManagedGitHub(ctx, client, repository, operation, options, output); err != nil {
-		return errors.New(strings.ReplaceAll(err.Error(), client.Token, "<redacted>"))
+	if err := executeManagedGitHub(ctx, session.Client, session.Repository, operation, options, output); err != nil {
+		return errors.New(strings.ReplaceAll(err.Error(), session.Client.Token, "<redacted>"))
 	}
 	return nil
 }
 
-func managedGitHubClient(ctx context.Context, database *store.Store, layout workflowhome.Layout, source string) (string, *workflowgithub.Client, error) {
+func writeManagedGitHubIdentity(output io.Writer, identity managedGitHubIdentity) error {
+	if identity.Login == "" || identity.UserID <= 0 || identity.Type != "User" || workflowgithub.ValidateOwnerGuardedRepositoryName(identity.Repository, identity.Owner) != nil {
+		return errors.New("managed GitHub identity is incomplete")
+	}
+	return json.NewEncoder(output).Encode(identity)
+}
+
+type managedGitHubIdentity struct {
+	Login      string `json:"login"`
+	UserID     int64  `json:"user_id"`
+	Type       string `json:"type"`
+	Repository string `json:"repository"`
+	Owner      string `json:"owner"`
+}
+
+type managedGitHubSession struct {
+	Repository string
+	Client     *workflowgithub.Client
+	Identity   managedGitHubIdentity
+}
+
+func managedGitHubClient(ctx context.Context, database *store.Store, layout workflowhome.Layout, source, apiBase string, httpClient *http.Client) (managedGitHubSession, error) {
 	origin, err := readOnlyGitOutput(ctx, source, "remote", "get-url", "origin")
 	if err != nil {
-		return "", nil, fmt.Errorf("read admitted origin: %w", err)
+		return managedGitHubSession{}, fmt.Errorf("read admitted origin: %w", err)
 	}
 	repository, err := parseOriginRepository(origin)
 	if err != nil {
-		return "", nil, err
+		return managedGitHubSession{}, err
 	}
 	admission, err := database.RepositoryAdmission(ctx, repository)
 	if err != nil || !admission.Eligible {
-		return "", nil, errors.New("repository is not currently admitted")
+		return managedGitHubSession{}, errors.New("repository is not currently admitted")
 	}
 	verification, err := database.GitHubPATVerification(ctx)
 	if err != nil || verification.Status != "verified" {
-		return "", nil, errors.New("Control Plane PAT verification is unavailable")
+		return managedGitHubSession{}, errors.New("Control Plane PAT verification is unavailable")
 	}
 	if !strings.EqualFold(strings.SplitN(repository, "/", 2)[0], verification.Owner) {
-		return "", nil, errors.New("admitted repository owner differs from the Workflow Home credential owner")
+		return managedGitHubSession{}, errors.New("admitted repository owner differs from the Workflow Home credential owner")
 	}
 	if !strings.EqualFold(filepath.Clean(verification.CredentialPath), filepath.Clean(layout.CredentialFile)) {
-		return "", nil, errors.New("Control Plane PAT path differs from its Workflow Home binding")
+		return managedGitHubSession{}, errors.New("Control Plane PAT path differs from its Workflow Home binding")
 	}
 	token, err := credential.NewFileStore(layout.CredentialFile).Get(ctx, credential.GatewayTarget)
 	if err != nil || credential.Fingerprint(token) != verification.FingerprintSHA256 {
-		return "", nil, errors.New("Control Plane PAT differs from its verified fingerprint")
+		return managedGitHubSession{}, errors.New("Control Plane PAT differs from its verified fingerprint")
 	}
-	live, err := (githubcredential.Verifier{}).Verify(ctx, token, verification.Owner)
-	if err != nil || live.FingerprintSHA256 != verification.FingerprintSHA256 {
-		return "", nil, errors.New("Control Plane PAT live verification failed")
+	live, err := (githubcredential.Verifier{APIBase: apiBase, Client: httpClient}).Verify(ctx, token, verification.Owner)
+	if err != nil {
+		return managedGitHubSession{}, fmt.Errorf("Control Plane PAT live verification failed: %w", err)
 	}
-	client := workflowgithub.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+	if live.FingerprintSHA256 != verification.FingerprintSHA256 {
+		return managedGitHubSession{}, errors.New("Control Plane PAT live verification fingerprint drifted")
+	}
+	client := workflowgithub.NewClient(apiBase, token, httpClient).WithRepositoryOwner(verification.Owner)
+	var actor struct {
+		Login string `json:"login"`
+		ID    int64  `json:"id"`
+		Type  string `json:"type"`
+	}
+	if err := client.RequestJSON(ctx, http.MethodGet, "/user", nil, &actor); err != nil {
+		return managedGitHubSession{}, fmt.Errorf("read managed GitHub identity: %w", err)
+	}
+	if !strings.EqualFold(actor.Login, live.Login) || actor.ID != live.UserID || actor.Type != "User" {
+		return managedGitHubSession{}, errors.New("managed GitHub identity differs from the verified human PAT identity")
+	}
 	if err := client.RequireOwnerGuardedRepository(ctx, repository); err != nil {
-		return "", nil, err
+		return managedGitHubSession{}, err
 	}
-	return repository, client, nil
+	return managedGitHubSession{Repository: repository, Client: client, Identity: managedGitHubIdentity{Login: actor.Login, UserID: actor.ID, Type: actor.Type, Repository: repository, Owner: verification.Owner}}, nil
 }
 
 func readOnlyGitOutput(ctx context.Context, repository string, args ...string) (string, error) {

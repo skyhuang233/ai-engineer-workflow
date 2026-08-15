@@ -145,13 +145,12 @@ $credentialOwnerMatches = (-not [string]::IsNullOrWhiteSpace($effectiveGitHubOwn
 if ($facts.github_credential.exists -and -not [string]::IsNullOrWhiteSpace([string]$facts.github_credential.owner) -and -not $credentialOwnerMatches) {
     throw "Existing Workflow Home is already bound to GitHub owner '$([string]$facts.github_credential.owner)' and cannot be rebound to '$effectiveGitHubOwner'"
 }
-$requiredCredentialScopes = @("repo", "workflow")
 $effectiveOwnerType = $GitHubOwnerType
 if ([string]::IsNullOrWhiteSpace($effectiveOwnerType) -and -not [string]::IsNullOrWhiteSpace([string]$facts.github_credential.login)) {
     $effectiveOwnerType = $(if ([string]::Equals([string]$facts.github_credential.login, $effectiveGitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { "personal" } else { "organization" })
 }
 if ([string]::IsNullOrWhiteSpace($effectiveOwnerType)) { throw "GitHubOwnerType must come from the read-only PAT owner verification before Platform planning" }
-if ($effectiveOwnerType -eq "organization") { $requiredCredentialScopes += "admin:org" }
+$requiredCredentialScopes = @(& (Join-Path $PSScriptRoot "resolve-github-required-scopes.ps1") -OwnerType $effectiveOwnerType)
 $credentialScopesMatch = @($requiredCredentialScopes | Where-Object { $observedScopes -notcontains $_ }).Count -eq 0
 $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $credentialScopesMatch)
 if (-not $credentialCurrent) {

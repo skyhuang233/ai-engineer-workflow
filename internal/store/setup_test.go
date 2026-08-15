@@ -42,6 +42,58 @@ func TestSetupPlansAreImmutableAndResultsAppend(t *testing.T) {
 	}
 }
 
+func TestRepositoryCreateAttemptEventsAreAppendOnlyAndPlanBound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	plan := SetupPlanRecord{PlanID: "onboarding-1", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('a'), CanonicalJSON: `{}`, Projection: "Onboard", CreatedAt: now}
+	if err := db.RecordSetupPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	started := SetupRepositoryCreateAttemptEvent{
+		PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "create-repository", ExecutionAttempt: 1,
+		Event: RepositoryCreateStarted, Owner: "owner", Name: "repo", Private: true,
+		ApprovalAbsentRepository: "owner/repo", RecordedAt: now,
+	}
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, started); err != nil {
+		t.Fatal(err)
+	}
+	unknown := started
+	unknown.Event = RepositoryCreateOutcomeUnknown
+	unknown.RecordedAt = now.Add(time.Second)
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, unknown); err != nil {
+		t.Fatal(err)
+	}
+	conflictingDuplicate := started
+	conflictingDuplicate.RecordedAt = now.Add(2 * time.Second)
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, conflictingDuplicate); !errors.Is(err, ErrSetupPlanConflict) {
+		t.Fatalf("duplicate event with another timestamp = %v", err)
+	}
+	events, err := db.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, started.EffectID)
+	if err != nil || len(events) != 2 || events[0].Event != RepositoryCreateStarted || events[1].Event != RepositoryCreateOutcomeUnknown {
+		t.Fatalf("events = %#v, %v", events, err)
+	}
+	if events[0].PlanDigestSHA256 != plan.DigestSHA256 || events[0].Owner != "owner" || events[0].Name != "repo" || !events[0].Private || events[0].ApprovalAbsentRepository != "owner/repo" {
+		t.Fatalf("started event lost approved identity: %#v", events[0])
+	}
+	wrongDigest := started
+	wrongDigest.ExecutionAttempt = 2
+	wrongDigest.PlanDigestSHA256 = repeatHex('b')
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, wrongDigest); !errors.Is(err, ErrSetupPlanConflict) {
+		t.Fatalf("wrong digest append = %v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE setup_repository_create_attempt_events SET recorded_at='not-a-timestamp' WHERE event_id=?`, events[0].EventID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, started.EffectID); err == nil {
+		t.Fatal("malformed durable attempt timestamp was accepted")
+	}
+}
+
 func TestLatestSetupPlanSelectsKindAndNewestCreation(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))

@@ -17,10 +17,11 @@ import (
 )
 
 var (
-	ErrRejected       = errors.New("GitHub credential rejected")
-	ErrScopeDeficient = errors.New("GitHub credential lacks required scopes")
-	ErrOwnerMismatch  = errors.New("GitHub credential owner binding failed")
-	ErrSSOBlocked     = errors.New("GitHub credential requires organization SSO authorization")
+	ErrRejected                  = errors.New("GitHub credential rejected")
+	ErrScopeDeficient            = errors.New("GitHub credential lacks required scopes")
+	ErrOwnerMismatch             = errors.New("GitHub credential owner binding failed")
+	ErrSSOBlocked                = errors.New("GitHub credential requires organization SSO authorization")
+	ErrOrganizationScopeContract = errors.New("organization repository setup requires an approved organization scope contract")
 )
 
 type Verification struct {
@@ -36,6 +37,10 @@ type Verifier struct {
 	APIBase string
 	Client  *http.Client
 	Now     func() time.Time
+	// OrganizationRequiredScopes is deliberately empty until an organization
+	// scope contract is explicitly approved. Keeping the conditional here
+	// prevents personal-account requirements from expanding by accident.
+	OrganizationRequiredScopes []string
 }
 
 func (v Verifier) Verify(ctx context.Context, token, owner string) (Verification, error) {
@@ -86,8 +91,13 @@ func (v Verifier) Verify(ctx context.Context, token, owner string) (Verification
 		return Verification{}, ErrScopeDeficient
 	}
 	if !strings.EqualFold(user.Login, owner) {
-		if !hasScope(scopes, "admin:org") {
-			return Verification{}, ErrScopeDeficient
+		if len(v.OrganizationRequiredScopes) == 0 {
+			return Verification{}, ErrOrganizationScopeContract
+		}
+		for _, required := range v.OrganizationRequiredScopes {
+			if !hasScope(scopes, strings.ToLower(strings.TrimSpace(required))) {
+				return Verification{}, ErrScopeDeficient
+			}
 		}
 		membershipURL := base + "/orgs/" + url.PathEscape(owner) + "/memberships/" + url.PathEscape(user.Login)
 		membership, err := http.NewRequestWithContext(ctx, http.MethodGet, membershipURL, nil)

@@ -28,11 +28,11 @@ func TestProjectShowsExactManagedFileContentsAndRedactsSecretInputs(t *testing.T
 	}
 }
 
-func TestProjectShowsExactOwnerSpecificPATScopes(t *testing.T) {
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "org-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: `C:\Workflow`}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "acme", "required_scopes": "repo,workflow,admin:org"}}}}
+func TestProjectShowsExactApprovedPersonalPATScopes(t *testing.T) {
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "personal-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: `C:\Workflow`}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "alice", "required_scopes": "repo,workflow"}}}}
 	projection := Project(plan, strings.Repeat("a", 64))
-	if !strings.Contains(projection, "required_scopes: repo,workflow,admin:org") {
-		t.Fatalf("projection does not show organization PAT scope requirement:\n%s", projection)
+	if !strings.Contains(projection, "required_scopes: repo,workflow") || strings.Contains(projection, "admin:org") {
+		t.Fatalf("projection does not show only the approved personal PAT scopes:\n%s", projection)
 	}
 }
 

@@ -56,7 +56,7 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if opened != nil {
 		opened.Close()
 	}
-	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 60") {
+	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 61") {
 		t.Fatalf("read-only old schema err=%v", err)
 	}
 	after, err := os.Stat(path)

@@ -7,11 +7,43 @@ description: Prepare the current Windows machine and repository for Agent Workfl
 
 Treat the current directory as the target. Keep discovery read-only and use the bundled scripts instead of reproducing host checks by hand. Before discovery, run `codex doctor --json` and `codex login status`. Parse the redacted doctor JSON even when the command exits nonzero: unrelated terminal checks may fail and must not override valid required checks. Continue only when the machine-readable doctor report has schema 1, an `ok` `auth.credentials` check with `stored ChatGPT tokens=true`, `stored auth mode=chatgpt`, and an absolute `auth file` beneath the `CODEX_HOME` reported by the `ok` `config.load` check, and login status reports ChatGPT. The Workflow CLI performs the same checks and resolves the source automatically; never ask an ordinary user to locate or configure a private Codex file.
 
-1. Run `scripts/inspect-host.ps1 -Repository (Get-Location)` and read its JSON result. If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop if declined, then rerun inspection if accepted.
+1. Create a task-temporary directory, then run host inspection once and read its saved JSON:
+
+   ```powershell
+   $setupTaskRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-setup-" + [Guid]::NewGuid().ToString("N"))
+   New-Item -ItemType Directory -Path $setupTaskRoot | Out-Null
+   $hostFactsPath = Join-Path $setupTaskRoot "host-facts.json"
+   $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) | Out-String
+   [IO.File]::WriteAllText($hostFactsPath, $hostFactsJSON, (New-Object Text.UTF8Encoding($false)))
+   $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
+   ```
+
+   If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop if declined, then rerun inspection into the same file if accepted.
    Record the confirmed owner, repository name, visibility, publication state, and domain layout once; pass these same values to every subsequent plan command without asking again.
-   Require classic PAT scopes `repo,workflow` for a personal owner and `repo,workflow,admin:org` plus active admin membership for an organization owner; show that exact requirement in the readable Platform Plan. Pass the verifier's `owner_type` unchanged as `-GitHubOwnerType <personal|organization>` to the bootstrap planner.
-2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. When no verified credential exists, ask for the classic PAT and pipe it to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`; personal identity or active organization-owner access, `repo`/`workflow` scopes, repository access or absence, organization administration/create policy, Actions checkout feasibility, review/merge-queue policy, and organization SSO must all verify read-only. If any fact cannot be proved, stop before producing a Platform Bootstrap Plan. Never fall back to another owner after rejection. If a Platform Installation exists, obtain the exact release identified by its durable version and manifest digest rather than querying latest. Use the official latest stable release only for the first installation; use a different release only when the user explicitly requested an upgrade, and then pass `-AllowUpgrade`. Run `scripts/new-platform-bootstrap-plan.ps1` with `-ManifestPath`, `-SignaturePath`, the host-facts file, and `-GitHubOwner <owner>`. The script must verify the packaged trust policy, pinned public key, release identity, and signed provenance before producing a plan. If it returns `plan_required`, show its complete readable projection and ask for one approval of the displayed SHA-256 digest.
-3. After approval, run `scripts/install-workflow-cli.ps1` with the same release manifest and signature, approved digest, and generated plan. It re-verifies trust before downloading the platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. Supply a PAT to `workflow setup apply` over standard input; keep it out of arguments and ordinary output.
+   Require the already-approved classic PAT scopes `repo,workflow` for a personal owner. Organization ownership remains supported in the design but must stop with `requires an approved organization scope contract` until that additional credential contract is explicitly approved; do not infer or request extra scopes. Pass the verifier's `owner_type` unchanged as `-GitHubOwnerType <personal|organization>` to the bootstrap planner.
+2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. When no verified credential exists, ask for the classic PAT and pipe it to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`. A personal owner must verify personal identity, exact `repo,workflow` scopes, repository access or absence, Actions checkout feasibility, and review/merge-queue policy read-only. An organization owner stops pending the approved organization scope contract. If any fact cannot be proved, stop before producing a Platform Bootstrap Plan. Never fall back to another owner after rejection.
+
+   Resolve the trusted Platform Release automatically. Do not accept release paths or URLs from the user or an unverified manifest. Add upgrade arguments only when the user explicitly requested an upgrade, and bind them to the exact confirmed version:
+
+   ```powershell
+   $releaseArguments = @{ HostFactsPath = $hostFactsPath }
+   # Add these two entries only when the user explicitly requested this exact upgrade version:
+   $releaseArguments.Version = <confirmed-upgrade-version>
+   $releaseArguments.AllowUpgrade = $true
+   $resolvedRelease = & scripts/resolve-platform-release.ps1 @releaseArguments | ConvertFrom-Json
+   ```
+
+   Omit the two upgrade entries for a fresh installation or repair. The resolver selects latest stable only when fresh, otherwise restores the exact durable pin; it verifies the packaged trust policy, pinned public key, fixed GitHub Release assets, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
+
+   Produce the Platform Plan only from the resolver output:
+
+   ```powershell
+   $platformPlanPath = Join-Path $setupTaskRoot "platform-plan.json"
+   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -SignaturePath $resolvedRelease.signature_path -HostFactsPath $hostFactsPath -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization>
+   ```
+
+   Pass `-AllowUpgrade` to the planner only for the same explicitly confirmed upgrade. If it returns `plan_required`, show its complete readable projection and ask for one approval of the displayed SHA-256 digest.
+3. After approval, run the installer with `$resolvedRelease.manifest_path`, `$resolvedRelease.signature_path`, the approved digest, and `$platformPlanPath`. It re-verifies trust before downloading the platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. Supply a PAT to `workflow setup apply` over standard input; keep it out of arguments and ordinary output. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
 4. Use the installed CLI for the remaining deterministic loop:
 
    ```powershell

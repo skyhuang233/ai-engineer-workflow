@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationOwner(t *testing.T) {
+func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrganizationScope(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows PowerShell 5.1 is the supported bootstrap shell")
 	}
@@ -83,7 +83,7 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 		command.Stdin = strings.NewReader(token)
 		return command.CombinedOutput()
 	}
-	for _, owner := range []string{"alice", "acme"} {
+	for _, owner := range []string{"alice"} {
 		output, runErr := run(owner, "repo", "unpublished")
 		var result struct {
 			Login       string `json:"login"`
@@ -105,25 +105,9 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 			t.Fatalf("owner %s result=%#v", owner, result)
 		}
 	}
-	noAdminOrg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/user" {
-			w.Header().Set("X-OAuth-Scopes", "repo, workflow")
-			_, _ = w.Write([]byte(`{"login":"alice","id":7}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"state":"active","role":"admin"}`))
-	}))
-	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-APIBase", noAdminOrg.URL, "-Owner", "acme", "-RepositoryName", "repo", "-Visibility", "private", "-PublicationState", "unpublished")
-	command.Stdin = strings.NewReader(token)
-	output, runErr := command.CombinedOutput()
-	noAdminOrg.Close()
-	if runErr == nil || !strings.Contains(string(output), "admin:org") {
-		t.Fatalf("organization PAT without admin:org was not rejected: %q, %v", output, runErr)
-	}
-	output, runErr = run("sso-blocked", "repo", "unpublished")
-	if runErr == nil || !strings.Contains(string(output), "SSO") {
-		t.Fatalf("SSO-blocked organization was not rejected: %q, %v", output, runErr)
+	output, runErr := run("acme", "repo", "unpublished")
+	if runErr == nil || !strings.Contains(strings.ToLower(string(output)), "approved organization scope contract") {
+		t.Fatalf("organization setup without an approved scope contract was not blocked: %q, %v", output, runErr)
 	}
 	if output, runErr = run("alice", "published", "published"); runErr != nil {
 		t.Fatalf("published repository with administration permission was rejected: %q, %v", output, runErr)
@@ -150,9 +134,12 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 		t.Fatal(err)
 	}
 	content := string(raw)
-	for _, required := range []string{"present its owner as the candidate together with its repository name", "With no `origin`, explicitly ask", "repository name and private/public visibility", "before any Platform mutation", "confirmed owner, repository name, visibility, publication state, and domain layout", "-Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>", "workflow setup plan --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>", "exact release identified by its durable version and manifest digest", "only when the user explicitly requested an upgrade", "-AllowUpgrade"} {
+	for _, required := range []string{"present its owner as the candidate together with its repository name", "With no `origin`, explicitly ask", "repository name and private/public visibility", "before any Platform mutation", "confirmed owner, repository name, visibility, publication state, and domain layout", "-Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>", "workflow setup plan --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>", "scripts/resolve-platform-release.ps1", "HostFactsPath = $hostFactsPath", "$resolvedRelease.manifest_path", "$resolvedRelease.signature_path", "only when the user explicitly requested an upgrade", "AllowUpgrade = $true"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks owner/release decision contract %q", required)
 		}
+	}
+	if strings.Contains(content, "obtain the exact release") || strings.Contains(content, "with `-ManifestPath`, `-SignaturePath`") {
+		t.Fatal("bootstrap skill still asks the agent to obtain or manually supply release trust inputs")
 	}
 }

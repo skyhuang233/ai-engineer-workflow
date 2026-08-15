@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -22,6 +23,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
+	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
@@ -105,6 +107,71 @@ func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) 
 		a.OnboardingMergeHeads[result.EffectID] = head
 	}
 	return nil
+}
+
+func (a HostAdapter) RestoreRepositoryCreateAttemptEvents(effect setupcontract.Effect, events []store.SetupRepositoryCreateAttemptEvent) error {
+	if err := setupcontract.ValidateEffectForExecution(effect); err != nil || effect.Kind != "create_repository" {
+		return errors.Join(errors.New("repository-creation attempt restore requires an approved create_repository effect"), err)
+	}
+	type attemptState struct {
+		repository string
+		owner      string
+		name       string
+		private    bool
+		started    bool
+		failed     bool
+	}
+	states := map[string]attemptState{}
+	for _, event := range events {
+		if event.PlanDigestSHA256 != a.PlanDigest || event.EffectID != effect.ID || event.ExecutionAttempt <= 0 ||
+			event.Owner != effect.Parameters["owner"] || event.Name != effect.Parameters["name"] || event.Private != (effect.Parameters["private"] == "true") ||
+			event.ApprovalAbsentRepository != effect.Parameters["approval_absent_repository"] {
+			return errors.New("persisted repository-creation attempt evidence is not bound to this Setup Plan")
+		}
+		key := event.EffectID + ":" + fmt.Sprint(event.ExecutionAttempt)
+		state, found := states[key]
+		if found && (state.repository != event.ApprovalAbsentRepository || state.owner != event.Owner || state.name != event.Name || state.private != event.Private) {
+			return errors.New("persisted repository-creation attempt identity conflicts")
+		}
+		if !found {
+			state = attemptState{repository: event.ApprovalAbsentRepository, owner: event.Owner, name: event.Name, private: event.Private}
+		}
+		switch event.Event {
+		case store.RepositoryCreateStarted:
+			state.started = true
+		case store.RepositoryCreateOutcomeUnknown, store.RepositoryCreateSucceeded:
+			if !state.started {
+				return errors.New("persisted repository-creation outcome lacks started evidence")
+			}
+		case store.RepositoryCreateDefinitiveFailure:
+			if !state.started {
+				return errors.New("persisted repository-creation failure lacks started evidence")
+			}
+			state.failed = true
+		default:
+			return errors.New("persisted repository-creation attempt event is invalid")
+		}
+		states[key] = state
+	}
+	for _, state := range states {
+		if state.started && !state.failed {
+			if a.CreatedRepositories == nil {
+				return errors.New("durable repository-creation binding is required")
+			}
+			a.CreatedRepositories[state.repository] = true
+		}
+	}
+	return nil
+}
+
+func (HostAdapter) RepositoryCreateOutcomeUnknown(err error) bool {
+	var api *github.APIError
+	if errors.As(err, &api) {
+		return api.StatusCode == http.StatusRequestTimeout || api.StatusCode == http.StatusTooManyRequests || api.StatusCode >= http.StatusInternalServerError
+	}
+	// A transport, cancellation, or response-decoding failure cannot prove
+	// whether GitHub committed the create before the caller lost the outcome.
+	return true
 }
 
 func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {

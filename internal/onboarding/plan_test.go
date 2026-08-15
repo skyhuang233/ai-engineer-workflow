@@ -91,6 +91,9 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	var baseline, contract setupcontract.Effect
 	for _, effect := range plan.Effects {
 		kinds[effect.Kind] = true
+		if effect.Kind == "create_repository" && effect.Parameters["approval_absent_repository"] != "owner/new-repo" {
+			t.Fatalf("repository creation does not bind approval-time absence identity: %#v", effect)
+		}
 		if effect.Kind == "initial_baseline" {
 			baseline = effect
 		}
