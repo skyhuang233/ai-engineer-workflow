@@ -116,6 +116,21 @@ func (f fakeRestoreContainerIsolator) IsolateControlPlaneContainers(ctx context.
 	return f.isolateControlPlane(ctx)
 }
 
+func TestAnswerInboxDefaultsToWorkflowHomeDatabase(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	got, err := answerInboxDatabasePath("", home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "state", defaultControlPlaneDatabase)
+	if got != want {
+		t.Fatalf("answer-inbox database = %q, want %q", got, want)
+	}
+	if _, err := answerInboxDatabasePath("relative.db", home); err == nil {
+		t.Fatal("relative advanced database override was accepted")
+	}
+}
+
 func TestAnswerWorkflowInboxQuestionIsolatesDeliveryControllerBeforeReplay(t *testing.T) {
 	ctx := context.Background()
 	target := store.TicketClaim{RunID: "delivery-run"}

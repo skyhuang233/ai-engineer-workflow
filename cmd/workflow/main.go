@@ -1011,7 +1011,8 @@ func launchDeliveryClaims(ctx context.Context, claims []store.TicketClaim, launc
 
 func runAnswerInbox(args []string) {
 	flags := flag.NewFlagSet("answer-inbox", flag.ExitOnError)
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced SQLite control-plane database override")
+	workflowHome := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	questionID := flags.String("question", "", "stable Workflow Inbox question ID")
 	answer := flags.String("answer", "", "human decision")
@@ -1020,16 +1021,34 @@ func runAnswerInbox(args []string) {
 		fmt.Fprintln(os.Stderr, "answer-inbox requires repository, question, and answer")
 		os.Exit(2)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	resolvedDatabase, err := answerInboxDatabasePath(*databasePath, *workflowHome)
+	if err != nil {
+		fail(err)
+	}
+	db, err := store.Open(context.Background(), resolvedDatabase)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
 	ctx := context.Background()
-	runtime := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
+	runtime := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(resolvedDatabase)}
 	if err := answerWorkflowInboxQuestion(ctx, db, runtime, *repository, *questionID, *answer, time.Now().UTC()); err != nil {
 		fail(err)
 	}
+}
+
+func answerInboxDatabasePath(databasePath, homeOverride string) (string, error) {
+	if strings.TrimSpace(databasePath) != "" {
+		if !filepath.IsAbs(databasePath) {
+			return "", errors.New("answer-inbox --database override must be absolute")
+		}
+		return filepath.Clean(databasePath), nil
+	}
+	layout, err := workflowhome.Resolve(homeOverride)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(layout.State, defaultControlPlaneDatabase), nil
 }
 
 type workflowInboxAnswerStore interface {
