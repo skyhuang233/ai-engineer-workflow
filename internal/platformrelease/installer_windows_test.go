@@ -190,9 +190,90 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	if decodeErr := json.Unmarshal(pinnedOutput, &pinnedFacts); err != nil || decodeErr != nil || pinnedFacts.Workflow.Installed || !pinnedFacts.Platform.InstallationRecorded || pinnedFacts.Platform.Version != manifest.Release.Version || pinnedFacts.Platform.ReleaseManifestDigest != hex.EncodeToString(manifestDigest[:]) {
 		t.Fatalf("inspect did not preserve the exact release pin without workflow.exe: err=%v decode=%v output=%s", err, decodeErr, pinnedOutput)
 	}
+	// A valid pin is authority to inspect only the exact pinned executable. A
+	// different, otherwise runnable workflow.exe must not execute even once.
+	mismatchedSource := filepath.Join(directory, "mismatched-workflow.go")
+	mismatchedExecutable := filepath.Join(directory, "mismatched-workflow.exe")
+	mismatchedProgram := `package main
+import ("os"; "strings")
+func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("executed:"+strings.Join(os.Args[1:], " ")), 0600) }
+`
+	write(mismatchedSource, []byte(mismatchedProgram))
+	if output, buildErr := exec.Command("go", "build", "-o", mismatchedExecutable, mismatchedSource).CombinedOutput(); buildErr != nil {
+		t.Fatalf("build mismatched workflow.exe: %v (%s)", buildErr, output)
+	}
+	installedExecutable := filepath.Join(workflowHome, "bin", "workflow.exe")
+	if err := os.MkdirAll(filepath.Dir(installedExecutable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mismatchedBytes, err := os.ReadFile(mismatchedExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(installedExecutable, mismatchedBytes)
+	sideEffectPath := filepath.Join(directory, "untrusted-workflow-executed.txt")
+	mismatchedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
+	mismatchedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
+	mismatchedOutput, mismatchedErr := mismatchedInspect.CombinedOutput()
+	var mismatchedFacts struct {
+		Workflow struct {
+			Installed  bool   `json:"installed"`
+			TrustState string `json:"trust_state"`
+			Diagnostic string `json:"diagnostic"`
+		} `json:"workflow"`
+	}
+	if decodeErr := json.Unmarshal(mismatchedOutput, &mismatchedFacts); mismatchedErr != nil || decodeErr != nil || !mismatchedFacts.Workflow.Installed || mismatchedFacts.Workflow.TrustState != "repair_required" || !strings.Contains(mismatchedFacts.Workflow.Diagnostic, "SHA-256") {
+		t.Fatalf("mismatched installed CLI was not reported as a non-executed repair: err=%v decode=%v output=%s", mismatchedErr, decodeErr, mismatchedOutput)
+	}
+	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
+		t.Fatalf("inspect-host executed a workflow.exe before validating its pinned SHA-256: %v", err)
+	}
 	pin, err := os.ReadFile(pinPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Even the exact pinned bytes remain non-executable until the fixed path is
+	// proved to be owned by the current Windows user.
+	write(installedExecutable, executableBytes)
+	ownerSideEffectStdin := filepath.Join(directory, "owner-mismatch-stdin.txt")
+	ownerSideEffectArgs := filepath.Join(directory, "owner-mismatch-args.txt")
+	ownerMismatchWrapper := `function Get-Acl { param([string]$LiteralPath) if ([IO.Path]::GetExtension($LiteralPath) -ieq '.exe') { [pscustomobject]@{ Owner = 'BUILTIN\Administrators' } } else { [pscustomobject]@{ Owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
+	ownerMismatchInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ownerMismatchWrapper)
+	ownerMismatchInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs)
+	ownerMismatchOutput, ownerMismatchErr := ownerMismatchInspect.CombinedOutput()
+	var ownerMismatchFacts struct {
+		Workflow struct {
+			TrustState string `json:"trust_state"`
+			Diagnostic string `json:"diagnostic"`
+		} `json:"workflow"`
+	}
+	if decodeErr := json.Unmarshal(ownerMismatchOutput, &ownerMismatchFacts); ownerMismatchErr != nil || decodeErr != nil || ownerMismatchFacts.Workflow.TrustState != "conflict" || !strings.Contains(ownerMismatchFacts.Workflow.Diagnostic, "owned by the current Windows user") {
+		t.Fatalf("non-current-user CLI ownership was not reported as a non-executed conflict: err=%v decode=%v output=%s", ownerMismatchErr, decodeErr, ownerMismatchOutput)
+	}
+	for _, path := range []string{ownerSideEffectStdin, ownerSideEffectArgs} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("inspect-host executed workflow.exe before validating current-user ownership (%s): %v", path, err)
+		}
+	}
+	if err := os.Remove(pinPath); err != nil {
+		t.Fatal(err)
+	}
+	missingPinInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
+	missingPinInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs)
+	missingPinOutput, missingPinErr := missingPinInspect.CombinedOutput()
+	var missingPinFacts struct {
+		Workflow struct {
+			TrustState string `json:"trust_state"`
+			Diagnostic string `json:"diagnostic"`
+		} `json:"workflow"`
+	}
+	if decodeErr := json.Unmarshal(missingPinOutput, &missingPinFacts); missingPinErr != nil || decodeErr != nil || missingPinFacts.Workflow.TrustState != "repair_required" || !strings.Contains(missingPinFacts.Workflow.Diagnostic, "pin is missing") {
+		t.Fatalf("missing bootstrap pin was not reported as a non-executed repair: err=%v decode=%v output=%s", missingPinErr, decodeErr, missingPinOutput)
+	}
+	for _, path := range []string{ownerSideEffectStdin, ownerSideEffectArgs} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("inspect-host executed workflow.exe without a bootstrap pin (%s): %v", path, err)
+		}
 	}
 	var pinDocument map[string]any
 	if json.Unmarshal(pin, &pinDocument) != nil {
@@ -204,10 +285,19 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 		t.Fatal(err)
 	}
 	tamperedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	tamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome)
+	tamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
 	tamperedOutput, tamperedErr := tamperedInspect.CombinedOutput()
-	if tamperedErr == nil || !strings.Contains(string(tamperedOutput), "Bootstrap Platform Release pin is invalid") {
-		t.Fatalf("tampered bootstrap pin did not fail closed: err=%v output=%s", tamperedErr, tamperedOutput)
+	var tamperedFacts struct {
+		Workflow struct {
+			TrustState string `json:"trust_state"`
+			Diagnostic string `json:"diagnostic"`
+		} `json:"workflow"`
+	}
+	if decodeErr := json.Unmarshal(tamperedOutput, &tamperedFacts); tamperedErr != nil || decodeErr != nil || tamperedFacts.Workflow.TrustState != "conflict" || !strings.Contains(tamperedFacts.Workflow.Diagnostic, "Bootstrap Platform Release pin conflict") {
+		t.Fatalf("tampered bootstrap pin was not reported as a non-executed conflict: err=%v decode=%v output=%s", tamperedErr, decodeErr, tamperedOutput)
+	}
+	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
+		t.Fatalf("inspect-host executed workflow.exe after a bootstrap pin conflict: %v", err)
 	}
 }
 

@@ -388,20 +388,32 @@ func (e *Engine) recordRepositoryAdmission(ctx context.Context, database *store.
 	if err := database.RecordRepositoryAdmission(ctx, value); err != nil {
 		return err
 	}
-	resolveAuth := e.ResolveCodexAuth
-	if resolveAuth == nil {
-		resolveAuth = codexauth.ResolveChatGPT
+	runtime, err := database.RepositoryRuntimeConfiguration(ctx, effect.Subject)
+	if errors.Is(err, store.ErrNotFound) {
+		resolveAuth := e.ResolveCodexAuth
+		if resolveAuth == nil {
+			resolveAuth = codexauth.ResolveChatGPT
+		}
+		authFile, authErr := resolveAuth(ctx)
+		if authErr != nil {
+			return fmt.Errorf("resolve Codex Authentication Source: %w", authErr)
+		}
+		repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(effect.Subject))
+		runtime = store.RepositoryRuntimeConfiguration{
+			WorkspaceRoot: filepath.Join(layout.Workspaces, repositoryKey), StateRoot: filepath.Join(layout.State, "codex", repositoryKey), CodexAuthFile: authFile,
+			GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1,
+		}
+	} else if err != nil {
+		return err
 	}
-	authFile, err := resolveAuth(ctx)
-	if err != nil {
-		return fmt.Errorf("resolve Codex Authentication Source: %w", err)
-	}
-	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(effect.Subject))
-	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{
-		Repository: effect.Subject, DefaultBranch: effect.Parameters["default_branch"], SourcePath: repositoryPath,
-		WorkspaceRoot: filepath.Join(layout.Workspaces, repositoryKey), StateRoot: filepath.Join(layout.State, "codex", repositoryKey), CodexAuthFile: authFile,
-		GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now,
-	}); err != nil {
+	// Re-admission may refresh only fields authorized by the Onboarding Plan.
+	// Repository-owned operational choices stay intact; defaults are applied
+	// only when this is the first runtime record for the repository.
+	runtime.Repository = effect.Subject
+	runtime.DefaultBranch = effect.Parameters["default_branch"]
+	runtime.SourcePath = repositoryPath
+	runtime.UpdatedAt = now
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, runtime); err != nil {
 		return err
 	}
 	value.Eligible = eligible

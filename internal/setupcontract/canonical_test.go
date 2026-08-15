@@ -127,6 +127,15 @@ func TestValidateCreateRepositoryEffectBindsApprovalAbsenceIdentity(t *testing.T
 	}
 }
 
+func TestRepositoryContractEffectRejectsWorkflowCheckFromAnotherApp(t *testing.T) {
+	effect := Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"base_branch": "main", "base_head": strings.Repeat("a", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": `{}`, "files_json": `{}`, "manifest_digest": strings.Repeat("b", 64), "required_checks_json": `[{"context":"workflow-contract","app_id":999}]`,
+	}}
+	if err := ValidateEffectForExecution(effect); err == nil || !strings.Contains(err.Error(), "unapproved App identity") {
+		t.Fatalf("crafted workflow-contract App identity accepted: %v", err)
+	}
+}
+
 func TestRepositoryOnboardingPlanRejectsCrossRepositoryEffects(t *testing.T) {
 	base := Plan{
 		SchemaVersion: 1, PlanID: "identity-fence", Kind: RepositoryOnboarding,

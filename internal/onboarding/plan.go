@@ -35,11 +35,8 @@ type RequiredCheck struct {
 	AppID   int64  `json:"app_id"`
 }
 
-// GitHubActionsAppID is GitHub's stable public integration identity for
-// check-runs produced by Actions workflows, including workflow-contract.
-const GitHubActionsAppID int64 = 15368
-
 type RepositoryPolicy struct {
+	Private                                              bool `json:"private"`
 	HasIssues, ActionsEnabled, Admin                     bool
 	AllowSquashMerge, AllowMergeCommit, AllowRebaseMerge bool
 	RequiredHumanReviews, MergeQueue                     bool
@@ -83,6 +80,8 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		repositoryID = options.Owner + "/" + repositoryName
 	} else if !strings.EqualFold(strings.SplitN(repositoryID, "/", 2)[0], options.Owner) {
 		return setupcontract.Plan{}, errors.New("repository owner differs from the Workflow Home owner binding")
+	} else if options.RepositoryName != "" && !strings.EqualFold(strings.SplitN(repositoryID, "/", 2)[1], options.RepositoryName) {
+		return setupcontract.Plan{}, errors.New("published repository name differs from the confirmed intent")
 	}
 	baseAgents := []byte(nil)
 	if discovery.HasCommits {
@@ -132,6 +131,9 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		if err != nil {
 			return setupcontract.Plan{}, err
 		}
+		if options.Private != nil && policy.Private != *options.Private {
+			return setupcontract.Plan{}, errors.New("published repository visibility differs from the confirmed intent")
+		}
 		if policy.RequiredHumanReviews {
 			return setupcontract.Plan{}, errors.New("repository policy requires a human review of the Onboarding Pull Request")
 		}
@@ -163,7 +165,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			}
 		}
 		policy.RequiredChecks = uniqueRequiredChecks(policy.RequiredChecks)
-		checkApps := map[string]int64{}
+		checkApps := map[string]int64{repositorycontract.RequiredCheckName: repositorycontract.GitHubActionsAppID}
 		for _, required := range policy.RequiredChecks {
 			if existing := checkApps[required.Context]; existing != 0 && existing != required.AppID {
 				return setupcontract.Plan{}, errors.New("repository required check context has conflicting App identities")
@@ -216,7 +218,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	if err != nil {
 		return setupcontract.Plan{}, err
 	}
-	requiredChecks := uniqueRequiredChecks(append([]RequiredCheck{{Context: "workflow-contract", AppID: GitHubActionsAppID}}, policy.RequiredChecks...))
+	requiredChecks := uniqueRequiredChecks(append([]RequiredCheck{{Context: repositorycontract.RequiredCheckName, AppID: repositorycontract.GitHubActionsAppID}}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	if !state.ContractSatisfied {
 		parameters := map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}

@@ -17,7 +17,10 @@ $owner = Require-Environment "WORKFLOW_SETUP_E2E_GITHUB_OWNER"
 $entrySkillSpec = Require-Environment "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC"
 $platformVersion = Require-Environment "WORKFLOW_SETUP_E2E_PLATFORM_VERSION"
 $runID = Require-Environment "WORKFLOW_SETUP_E2E_RUN_ID"
-if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
+$patInputPath = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_E2E_PAT_FILE"))
+if (-not (Test-Path -LiteralPath $patInputPath -PathType Leaf)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is unavailable" }
+$setupToken = [IO.File]::ReadAllText($patInputPath).Trim()
+if ([string]::IsNullOrWhiteSpace($setupToken)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is empty" }
 if (-not (Test-Path -LiteralPath $repositoryPath -PathType Container)) { throw "Scenario repository does not exist" }
 if ($entrySkillSpec -notmatch '@(platform-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must pin an exact release tag or commit" }
 
@@ -30,8 +33,14 @@ $installedSkill = Join-Path $env:USERPROFILE ".agents\skills\setup-agent-workflo
 function Get-DisposableRepositories {
     if ($scenario -eq "organization-rejects-classic-pat") { return @() }
     $prefix = "workflow-setup-e2e-"
-    $raw = gh repo list $owner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner"
-    if ($LASTEXITCODE -ne 0) { throw "cannot enumerate disposable repositories for cleanup fencing" }
+    $priorGitHubToken = $env:GH_TOKEN
+    try {
+        $env:GH_TOKEN = $setupToken
+        $raw = gh repo list $owner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner"
+        if ($LASTEXITCODE -ne 0) { throw "cannot enumerate disposable repositories for cleanup fencing" }
+    } finally {
+        if ($null -eq $priorGitHubToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $priorGitHubToken }
+    }
     return @($raw | Where-Object { ([string]$_).StartsWith("$owner/$prefix") })
 }
 
@@ -46,7 +55,7 @@ Manually invoke `$setup-agent-workflow for the repository at: $repositoryPath
 
 This is the authorized, disposable setup qualification scenario "$scenario" under GitHub owner "$owner".
 Select exact Platform Release version "$platformVersion"; do not fall back to a different stable release.
-Follow the installed skill exactly. If the directory is not a Git repository, answer yes to its Git initialization question. For every plan_required response, inspect the complete projection and approve only the exact displayed digest, then continue applying and verifying it. When a classic PAT is required, never read, echo, print, or place it in an argument; pipe WORKFLOW_SETUP_E2E_PAT directly to the documented verification/apply command from PowerShell. Do not approve effects outside the scenario repository, isolated Workflow Home, current-user Codex skills/PATH, Docker Desktop dependency, and repositories named $owner/workflow-setup-e2e-*.
+Follow the installed skill exactly. If the directory is not a Git repository, answer yes to its Git initialization question. For every plan_required response, inspect the complete projection and approve only the exact displayed digest, then continue applying and verifying it. When a classic PAT is required, never read, echo, print, place it in an argument, or copy it into an environment variable; pipe the bytes from the file named by WORKFLOW_SETUP_E2E_PAT_FILE directly to the documented verification/apply command from PowerShell. Do not approve effects outside the scenario repository, isolated Workflow Home, current-user Codex skills/PATH, Docker Desktop dependency, and repositories named $owner/workflow-setup-e2e-*.
 
 Positive scenarios clean-new-repository, unrelated-dirty-files, and second-same-owner must finish with both Platform Ready and Repository Admitted. Negative scenarios must stop at the exact expected blocker without weakening or bypassing the contract. Preserve unrelated dirty files byte-for-byte.
 
@@ -55,9 +64,9 @@ Return only the JSON object required by the supplied output schema. Include ever
     $prompt | & codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ephemeral --ignore-user-config --json --output-schema $schemaPath --output-last-message $agentResultPath -C $repositoryPath - 2>&1 | Set-Content -LiteralPath $eventsPath -Encoding utf8
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $agentResultPath -PathType Leaf)) { throw "Codex setup interaction failed" }
     $events = Get-Content -LiteralPath $eventsPath -Raw
-    if ($events.Contains($env:WORKFLOW_SETUP_E2E_PAT)) { throw "Codex event stream leaked WORKFLOW_SETUP_E2E_PAT" }
+    if ($events.Contains($setupToken)) { throw "Codex event stream leaked the setup PAT" }
     $raw = Get-Content -LiteralPath $agentResultPath -Raw
-    if ($raw.Contains($env:WORKFLOW_SETUP_E2E_PAT)) { throw "Codex result leaked WORKFLOW_SETUP_E2E_PAT" }
+    if ($raw.Contains($setupToken)) { throw "Codex result leaked the setup PAT" }
     $result = $raw | ConvertFrom-Json
     if ([string]$result.scenario -ne $scenario) { throw "Codex result scenario does not match DriverScript input" }
     $after = @(Get-DisposableRepositories)

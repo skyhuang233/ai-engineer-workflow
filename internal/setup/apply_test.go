@@ -478,6 +478,77 @@ func TestEngineRecordsAndRepairsRepositoryRuntimeConfiguration(t *testing.T) {
 	}
 }
 
+func TestEngineReadmissionPreservesExistingRepositoryRuntimeSettings(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordVerifiedOnboardingIdentity(t, layout, "owner", "owner")
+	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := store.RepositoryRuntimeConfiguration{
+		Repository: "owner/repo", DefaultBranch: "master", SourcePath: filepath.Join(t.TempDir(), "old-source"),
+		RootIssueNumber: 42, WorkspaceRoot: filepath.Join(t.TempDir(), "custom-workspaces"), StateRoot: filepath.Join(t.TempDir(), "custom-state"),
+		CodexAuthFile: filepath.Join(t.TempDir(), "custom-auth.json"), GitHubAPIURL: "https://github.example.test/api/v3",
+		PollInterval: 17 * time.Second, WorkspaceRetention: 19 * 24 * time.Hour, MaxParallelRuns: 7, UpdatedAt: testTime(),
+	}
+	if err := database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: repeat("b", 64), ContractVersion: "1", ManifestDigestSHA256: repeat("b", 64), Eligible: true, VerifiedAt: testTime()}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, previous); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repositoryPath := filepath.Join(t.TempDir(), "new-source")
+	plan := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "readmit-runtime", Kind: setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: repositoryPath, GitHubRepository: "owner/repo"},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: repositoryPath, Expected: repeat("a", 40)}},
+		Effects: []setupcontract.Effect{{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{
+			"default_branch": "main", "manifest_digest": repeat("c", 64), "contract_version": "1",
+		}}},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("c", 64)}},
+	}
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ResolveCodexAuth: func(context.Context) (string, error) {
+		return filepath.Join(t.TempDir(), "replacement-auth.json"), nil
+	}}
+	if result, err := engine.Apply(ctx, raw, digest); err != nil || result.Status != setupcontract.ExecutionSucceeded {
+		t.Fatalf("readmission = %#v, %v", result, err)
+	}
+	database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	got, err := database.RepositoryRuntimeConfiguration(ctx, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Repository != "owner/repo" || got.DefaultBranch != "main" || got.SourcePath != repositoryPath {
+		t.Fatalf("approved runtime identity was not refreshed: %#v", got)
+	}
+	if got.RootIssueNumber != previous.RootIssueNumber || got.WorkspaceRoot != previous.WorkspaceRoot || got.StateRoot != previous.StateRoot || got.CodexAuthFile != previous.CodexAuthFile || got.GitHubAPIURL != previous.GitHubAPIURL || got.PollInterval != previous.PollInterval || got.WorkspaceRetention != previous.WorkspaceRetention || got.MaxParallelRuns != previous.MaxParallelRuns {
+		t.Fatalf("readmission replaced existing operational settings:\nwant=%#v\n got=%#v", previous, got)
+	}
+	admission, err := database.RepositoryAdmission(ctx, "owner/repo")
+	if err != nil || admission.ManifestDigestSHA256 != repeat("c", 64) || admission.OnboardingPlanDigestSHA256 != digest || !admission.Eligible {
+		t.Fatalf("approved admission identity was not refreshed: %#v, %v", admission, err)
+	}
+}
+
 func TestEngineChecksPlatformReleasePreconditionBeforeMutation(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)

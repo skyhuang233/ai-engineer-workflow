@@ -96,10 +96,11 @@ $currentUserPath = ""
 try { $currentUserPath = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name Path -ErrorAction Stop).Path } catch { }
 $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI is unavailable" }
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
-$workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
+$workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; trust_state = "absent"; diagnostic = "installed Workflow CLI is absent"; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 $platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
 $bootstrapPinPath = Join-Path $WorkflowHome "config\bootstrap-platform-release-pin.json"
 $bootstrapPinLoaded = $false
+$bootstrapPinConflictDiagnostic = ""
 if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
     $pinScratch = Join-Path ([IO.Path]::GetTempPath()) ("workflow-bootstrap-pin-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $pinScratch | Out-Null
@@ -122,10 +123,14 @@ if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
         $platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256 }
         $bootstrapPinLoaded = $true
     } catch {
-        throw "Bootstrap Platform Release pin is invalid: $($_.Exception.Message)"
+        $bootstrapPinConflictDiagnostic = "Bootstrap Platform Release pin conflict: $($_.Exception.Message)"
     } finally {
         Remove-Item -LiteralPath $pinScratch -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+if (-not [string]::IsNullOrWhiteSpace($bootstrapPinConflictDiagnostic)) {
+    $workflow.trust_state = "conflict"
+    $workflow.diagnostic = $bootstrapPinConflictDiagnostic
 }
 $githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; login = ""; owner = ""; scopes = @(); fingerprint_sha256 = "" }
 $codexAuth = [ordered]@{ verified = $false; source = ""; fingerprint_sha256 = "" }
@@ -154,42 +159,76 @@ if ($codex.installed) {
     } catch { }
 }
 if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
-    $installedVersion = Invoke-ObservedCommand $installedWorkflow @("--version")
-    $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
     $workflow.installed = $true
-    $workflow.version = $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { [string]$installedVersion.output })
     $workflow.sha256 = Get-SHA256File $installedWorkflow
-    $inspection = Invoke-ObservedCommand $installedWorkflow @("setup", "inspect-platform", "--workflow-home", $WorkflowHome)
-    if ($inspection.exit_code -eq 0) {
-        try {
-            $inspectionJSON = $inspection.output | ConvertFrom-Json
-            if ($null -ne $inspectionJSON.result) {
-                $inspectedPlatform = $inspectionJSON.result.platform
-                if ($bootstrapPinLoaded -and (-not [bool]$inspectedPlatform.installation_recorded -or [string]$inspectedPlatform.version -cne [string]$platform.version -or [string]$inspectedPlatform.release_manifest_digest -cne [string]$platform.release_manifest_digest)) { throw "installed Workflow CLI state differs from the verified Bootstrap Platform Release pin" }
-                $platform = $inspectedPlatform
-                $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
-                $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
-                $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified
-                $githubCredential.login = [string]$inspectionJSON.result.github_credential.login
-                $githubCredential.owner = [string]$inspectionJSON.result.github_credential.owner
-                $githubCredential.scopes = @($inspectionJSON.result.github_credential.scopes | ForEach-Object { [string]$_ })
-				$githubCredential.fingerprint_sha256 = [string]$inspectionJSON.result.github_credential.fingerprint_sha256
-				$codexAuth.verified = [bool]$inspectionJSON.result.codex_auth.verified
-				$codexAuth.source = [string]$inspectionJSON.result.codex_auth.source
-				$codexAuth.fingerprint_sha256 = [string]$inspectionJSON.result.codex_auth.fingerprint_sha256
-            }
-        } catch { }
-    }
-    $status = Invoke-ObservedCommand $installedWorkflow @("status", "--workflow-home", $WorkflowHome)
-    if ($status.exit_code -eq 0) {
-        try {
-            $statusJSON = $status.output | ConvertFrom-Json
-            $controlPlane = [ordered]@{ state = [string]$statusJSON.state; diagnostic = [string]$statusJSON.diagnostic; runtime = $statusJSON.runtime }
-        } catch {
-            $controlPlane = [ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI returned invalid status JSON" }
-        }
+    $workflowTrustedForExecution = $false
+    if (-not [string]::IsNullOrWhiteSpace($bootstrapPinConflictDiagnostic)) {
+        $workflow.trust_state = "conflict"
+        $workflow.diagnostic = $bootstrapPinConflictDiagnostic
+    } elseif (-not $bootstrapPinLoaded) {
+        $workflow.trust_state = "repair_required"
+        $workflow.diagnostic = "Bootstrap Platform Release pin is missing; repair the installed Workflow CLI before execution"
+    } elseif (-not [string]::Equals([IO.Path]::GetFullPath($installedWorkflow), [IO.Path]::GetFullPath((Join-Path $WorkflowHome "bin\workflow.exe")), [StringComparison]::OrdinalIgnoreCase)) {
+        $workflow.trust_state = "conflict"
+        $workflow.diagnostic = "Installed Workflow CLI path differs from the fixed Workflow Home path"
+    } elseif ($workflow.sha256 -cne [string]$platform.workflow_cli_sha256) {
+        $workflow.trust_state = "repair_required"
+        $workflow.diagnostic = "Installed Workflow CLI SHA-256 differs from the verified Bootstrap Platform Release pin"
     } else {
-        $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI status command failed" }
+        try {
+            $workflowItem = Get-Item -LiteralPath $installedWorkflow -Force
+            if (($workflowItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not [string]::Equals([IO.Path]::GetFullPath($workflowItem.FullName), [IO.Path]::GetFullPath($installedWorkflow), [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Installed Workflow CLI path is a reparse point or resolves outside the fixed Workflow Home path"
+            }
+            $workflowOwnerAccount = New-Object Security.Principal.NTAccount((Get-Acl -LiteralPath $installedWorkflow).Owner)
+            $workflowOwnerSID = [string]$workflowOwnerAccount.Translate([Security.Principal.SecurityIdentifier]).Value
+            if (-not [string]::Equals($workflowOwnerSID, $currentUserSID, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Installed Workflow CLI is not owned by the current Windows user"
+            }
+            $workflowTrustedForExecution = $true
+            $workflow.trust_state = "pinned"
+            $workflow.diagnostic = "Installed Workflow CLI fixed path, current-user ownership, and SHA-256 match the verified Bootstrap Platform Release pin"
+        } catch {
+            $workflow.trust_state = "conflict"
+            $workflow.diagnostic = $_.Exception.Message
+        }
+    }
+    if ($workflowTrustedForExecution) {
+        $installedVersion = Invoke-ObservedCommand $installedWorkflow @("--version")
+        $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
+        $workflow.version = $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { [string]$installedVersion.output })
+        $inspection = Invoke-ObservedCommand $installedWorkflow @("setup", "inspect-platform", "--workflow-home", $WorkflowHome)
+        if ($inspection.exit_code -eq 0) {
+            try {
+                $inspectionJSON = $inspection.output | ConvertFrom-Json
+                if ($null -ne $inspectionJSON.result) {
+                    $inspectedPlatform = $inspectionJSON.result.platform
+                    if (-not [bool]$inspectedPlatform.installation_recorded -or [string]$inspectedPlatform.version -cne [string]$platform.version -or [string]$inspectedPlatform.release_manifest_digest -cne [string]$platform.release_manifest_digest) { throw "installed Workflow CLI state differs from the verified Bootstrap Platform Release pin" }
+                    $platform = $inspectedPlatform
+                    $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
+                    $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
+                    $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified
+                    $githubCredential.login = [string]$inspectionJSON.result.github_credential.login
+                    $githubCredential.owner = [string]$inspectionJSON.result.github_credential.owner
+                    $githubCredential.scopes = @($inspectionJSON.result.github_credential.scopes | ForEach-Object { [string]$_ })
+					$githubCredential.fingerprint_sha256 = [string]$inspectionJSON.result.github_credential.fingerprint_sha256
+					$codexAuth.verified = [bool]$inspectionJSON.result.codex_auth.verified
+					$codexAuth.source = [string]$inspectionJSON.result.codex_auth.source
+					$codexAuth.fingerprint_sha256 = [string]$inspectionJSON.result.codex_auth.fingerprint_sha256
+                }
+            } catch { }
+        }
+        $status = Invoke-ObservedCommand $installedWorkflow @("status", "--workflow-home", $WorkflowHome)
+        if ($status.exit_code -eq 0) {
+            try {
+                $statusJSON = $status.output | ConvertFrom-Json
+                $controlPlane = [ordered]@{ state = [string]$statusJSON.state; diagnostic = [string]$statusJSON.diagnostic; runtime = $statusJSON.runtime }
+            } catch {
+                $controlPlane = [ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI returned invalid status JSON" }
+            }
+        } else {
+            $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI status command failed" }
+        }
     }
 }
 

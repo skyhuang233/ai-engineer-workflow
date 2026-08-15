@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	ManifestPath = ".workflow/repository.json"
-	BlockStart   = "<!-- agent-workflow:start -->"
-	BlockEnd     = "<!-- agent-workflow:end -->"
+	ManifestPath             = ".workflow/repository.json"
+	BlockStart               = "<!-- agent-workflow:start -->"
+	BlockEnd                 = "<!-- agent-workflow:end -->"
+	RequiredCheckName        = "workflow-contract"
+	GitHubActionsAppID int64 = 15368
 )
 
 type Manifest struct {
@@ -68,7 +70,7 @@ func Render(domainLayout string, existingAgents []byte, repository, defaultBranc
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	manifest := Manifest{SchemaVersion: 1, ContractVersion: "1", Repository: repository, DefaultBranch: defaultBranch, IssueTracker: "github-issues", DomainLayout: domainLayout, RequiredCheck: "workflow-contract", ManagedBlockSHA256: digest(block)}
+	manifest := Manifest{SchemaVersion: 1, ContractVersion: "1", Repository: repository, DefaultBranch: defaultBranch, IssueTracker: "github-issues", DomainLayout: domainLayout, RequiredCheck: RequiredCheckName, ManagedBlockSHA256: digest(block)}
 	for _, path := range paths {
 		manifest.ManagedFiles = append(manifest.ManagedFiles, ManagedFile{Path: path, SHA256: digest(files[path])})
 	}
@@ -101,7 +103,7 @@ func Verify(root string) (string, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return "", err
 	}
-	if manifest.SchemaVersion != 1 || manifest.ContractVersion != "1" || manifest.RequiredCheck != "workflow-contract" || manifest.DomainLayout != "single-context" && manifest.DomainLayout != "multi-context" {
+	if manifest.SchemaVersion != 1 || manifest.ContractVersion != "1" || manifest.RequiredCheck != RequiredCheckName || manifest.DomainLayout != "single-context" && manifest.DomainLayout != "multi-context" {
 		return "", errors.New("unsupported Repository Contract Manifest")
 	}
 	for _, managed := range manifest.ManagedFiles {
@@ -138,7 +140,7 @@ func VerifyRemote(fetch func(string) ([]byte, error), repository, defaultBranch,
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return Manifest{}, err
 	}
-	if manifest.SchemaVersion != 1 || manifest.ContractVersion != "1" || manifest.Repository != repository || manifest.DefaultBranch != defaultBranch || manifest.RequiredCheck != "workflow-contract" || manifest.DomainLayout != "single-context" && manifest.DomainLayout != "multi-context" {
+	if manifest.SchemaVersion != 1 || manifest.ContractVersion != "1" || manifest.Repository != repository || manifest.DefaultBranch != defaultBranch || manifest.RequiredCheck != RequiredCheckName || manifest.DomainLayout != "single-context" && manifest.DomainLayout != "multi-context" {
 		return Manifest{}, errors.New("Repository Contract Manifest identity is invalid")
 	}
 	for _, managed := range manifest.ManagedFiles {

@@ -33,14 +33,67 @@ import (
 )
 
 type setupResponse struct {
-	Status             string `json:"status"`
-	PlatformReady      bool   `json:"platform_ready,omitempty"`
-	RepositoryAdmitted bool   `json:"repository_admitted,omitempty"`
-	Blocker            string `json:"blocker,omitempty"`
-	Result             any    `json:"result,omitempty"`
-	PlanPath           string `json:"plan_path,omitempty"`
-	DigestSHA256       string `json:"digest_sha256,omitempty"`
-	Projection         string `json:"projection,omitempty"`
+	Status             string                   `json:"status"`
+	PlatformReady      bool                     `json:"platform_ready,omitempty"`
+	RepositoryAdmitted bool                     `json:"repository_admitted,omitempty"`
+	Blocker            string                   `json:"blocker,omitempty"`
+	Result             any                      `json:"result,omitempty"`
+	PlanPath           string                   `json:"plan_path,omitempty"`
+	DigestSHA256       string                   `json:"digest_sha256,omitempty"`
+	Projection         string                   `json:"projection,omitempty"`
+	Verification       *setupVerificationReport `json:"verification,omitempty"`
+}
+
+type setupVerificationCheck struct {
+	Status     string `json:"status"`
+	Evidence   string `json:"evidence,omitempty"`
+	RepairHint string `json:"repair_hint,omitempty"`
+}
+
+type setupVerificationReport struct {
+	Credential struct {
+		setupVerificationCheck
+		Login             string   `json:"login,omitempty"`
+		UserID            int64    `json:"user_id,omitempty"`
+		Owner             string   `json:"owner,omitempty"`
+		Scopes            []string `json:"scopes,omitempty"`
+		FingerprintSHA256 string   `json:"fingerprint_sha256,omitempty"`
+	} `json:"credential"`
+	Discovery struct {
+		setupVerificationCheck
+		Repository     string `json:"repository,omitempty"`
+		RepositoryPath string `json:"repository_path,omitempty"`
+		Origin         string `json:"origin,omitempty"`
+		DefaultBranch  string `json:"default_branch,omitempty"`
+		Head           string `json:"head,omitempty"`
+		Published      bool   `json:"published"`
+	} `json:"discovery"`
+	Admission struct {
+		setupVerificationCheck
+		Repository                 string `json:"repository,omitempty"`
+		OnboardingPlanDigestSHA256 string `json:"onboarding_plan_digest_sha256,omitempty"`
+		ContractVersion            string `json:"contract_version,omitempty"`
+		ManifestDigestSHA256       string `json:"manifest_digest_sha256,omitempty"`
+		Eligible                   bool   `json:"eligible"`
+	} `json:"admission"`
+	Readiness struct {
+		setupVerificationCheck
+		PlatformReady   bool `json:"platform_ready"`
+		RepositoryReady bool `json:"repository_ready"`
+	} `json:"readiness"`
+}
+
+func setupVerificationBlocked(err error, repairHint string, secrets ...string) setupVerificationCheck {
+	diagnostic := "verification evidence is unavailable"
+	if err != nil {
+		diagnostic = err.Error()
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			diagnostic = strings.ReplaceAll(diagnostic, secret, "[redacted]")
+		}
+	}
+	return setupVerificationCheck{Status: "blocked", Evidence: diagnostic, RepairHint: repairHint}
 }
 
 var (
@@ -670,17 +723,56 @@ func runSetupVerify(args []string, output io.Writer) error {
 	defer database.Close()
 	platformErr := verifyPlatformReady(context.Background(), database, layout)
 	platformReady := platformErr == nil
+	report := &setupVerificationReport{}
+	report.Readiness.PlatformReady = platformReady
+	if platformErr == nil {
+		report.Readiness.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "Platform Installation, Control Plane, Docker Worker, Workflow Skill Bundle, and Codex session are ready"}
+	} else {
+		report.Readiness.setupVerificationCheck = setupVerificationBlocked(platformErr, "rerun the approved Platform Bootstrap repair plan")
+	}
 	verification, credentialErr := database.GitHubPATVerification(context.Background())
+	report.Credential.Login, report.Credential.UserID, report.Credential.Owner = verification.Login, verification.UserID, verification.Owner
+	report.Credential.Scopes = append([]string(nil), verification.Scopes...)
+	report.Credential.FingerprintSHA256 = verification.FingerprintSHA256
 	repositoryReady := false
+	token := ""
 	if credentialErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		if token, tokenErr := verifiedClassicPAT(context.Background(), database, config); tokenErr == nil {
+		var tokenErr error
+		if token, tokenErr = verifiedClassicPAT(context.Background(), database, config); tokenErr == nil {
+			report.Credential.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "persisted PAT fingerprint, login, user ID, owner, scopes, and credential path match the live credential"}
 			client := github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 			if discovery, discoveryErr := onboarding.Discover(context.Background(), *repository, onboardingGitHubRemote{Client: client}); discoveryErr == nil && discovery.Repository != "" {
-				repositoryReady = verifyRecordedAdmission(context.Background(), database, layout, client, discovery.Repository) == nil
+				report.Discovery.Repository, report.Discovery.RepositoryPath, report.Discovery.Origin = discovery.Repository, discovery.Root, discovery.Origin
+				report.Discovery.DefaultBranch, report.Discovery.Head, report.Discovery.Published = discovery.DefaultBranch, discovery.Head, discovery.Published
+				report.Discovery.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "local root, canonical GitHub origin, default branch, and exact HEAD match read-only discovery"}
+				admissionErr := verifyRecordedAdmission(context.Background(), database, layout, client, discovery.Repository)
+				repositoryReady = admissionErr == nil
+				if admission, readErr := database.RepositoryAdmission(context.Background(), discovery.Repository); readErr == nil {
+					report.Admission.Repository, report.Admission.OnboardingPlanDigestSHA256 = admission.Repository, admission.OnboardingPlanDigestSHA256
+					report.Admission.ContractVersion, report.Admission.ManifestDigestSHA256, report.Admission.Eligible = admission.ContractVersion, admission.ManifestDigestSHA256, admission.Eligible
+				}
+				if admissionErr == nil {
+					report.Admission.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "eligible admission matches the exact Onboarding Plan and Repository Contract Manifest digests"}
+				} else {
+					report.Admission.setupVerificationCheck = setupVerificationBlocked(admissionErr, "rerun Repository Onboarding to forward-repair admission and managed contract drift", token)
+				}
+			} else {
+				report.Discovery.setupVerificationCheck = setupVerificationBlocked(discoveryErr, "restore the confirmed canonical origin, default branch, and approved repository HEAD", token)
 			}
+		} else {
+			report.Credential.setupVerificationCheck = setupVerificationBlocked(tokenErr, "rerun the approved credential repair with the confirmed owner and classic PAT")
 		}
+	} else {
+		report.Credential.setupVerificationCheck = setupVerificationBlocked(credentialErr, "rerun the approved credential repair with the confirmed owner and classic PAT")
 	}
+	if report.Discovery.Status == "" {
+		report.Discovery.setupVerificationCheck = setupVerificationBlocked(errors.New("credential verification did not authorize repository discovery"), "repair the Control Plane GitHub credential, then rerun setup verify")
+	}
+	if report.Admission.Status == "" {
+		report.Admission.setupVerificationCheck = setupVerificationBlocked(errors.New("exact repository discovery did not authorize admission verification"), "repair repository discovery, then rerun Repository Onboarding")
+	}
+	report.Readiness.RepositoryReady = repositoryReady
 	status, blocker := "ready", ""
 	if !platformReady || !repositoryReady {
 		status = "blocked"
@@ -692,8 +784,12 @@ func runSetupVerify(args []string, output io.Writer) error {
 			reasons = append(reasons, "Repository Admitted: live contract or admission evidence is unavailable")
 		}
 		blocker = strings.Join(reasons, "; ")
+		blocker = setupVerificationBlocked(errors.New(blocker), "follow the stage-specific repair hints", token).Evidence
 	}
-	return writeSetupResponse(output, setupResponse{Status: status, PlatformReady: platformReady, RepositoryAdmitted: repositoryReady, Blocker: blocker})
+	if platformReady && repositoryReady {
+		report.Readiness.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "Platform Ready and exact Repository Admission verification both passed"}
+	}
+	return writeSetupResponse(output, setupResponse{Status: status, PlatformReady: platformReady, RepositoryAdmitted: repositoryReady, Blocker: blocker, Verification: report})
 }
 
 func verifyPlatformReady(ctx context.Context, database *store.Store, layout workflowhome.Layout) error {

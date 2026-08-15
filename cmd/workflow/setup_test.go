@@ -88,6 +88,37 @@ func TestSetupPlanReportsBootstrapBlockerWithoutMutatingRepository(t *testing.T)
 	}
 }
 
+func TestSetupVerificationJSONRetainsExactEvidenceAndRepairHintsWithoutPAT(t *testing.T) {
+	const token = "ghp_setup_verification_secret"
+	report := &setupVerificationReport{}
+	report.Credential.setupVerificationCheck = setupVerificationBlocked(errors.New("credential "+token+" drifted"), "repair credential", token)
+	report.Credential.Login, report.Credential.UserID, report.Credential.Owner = "alice", 7, "owner"
+	report.Credential.Scopes = []string{"repo", "workflow"}
+	report.Credential.FingerprintSHA256 = strings.Repeat("a", 64)
+	report.Discovery.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "exact discovery"}
+	report.Discovery.Repository, report.Discovery.RepositoryPath, report.Discovery.Origin = "owner/repo", `C:\repo`, "https://github.com/owner/repo.git"
+	report.Discovery.DefaultBranch, report.Discovery.Head, report.Discovery.Published = "main", strings.Repeat("b", 40), true
+	report.Admission.setupVerificationCheck = setupVerificationCheck{Status: "blocked", Evidence: "manifest drift", RepairHint: "rerun Repository Onboarding"}
+	report.Admission.Repository, report.Admission.OnboardingPlanDigestSHA256 = "owner/repo", strings.Repeat("c", 64)
+	report.Admission.ContractVersion, report.Admission.ManifestDigestSHA256 = "1", strings.Repeat("d", 64)
+	report.Readiness.setupVerificationCheck = setupVerificationCheck{Status: "blocked", Evidence: "repository is not ready", RepairHint: "follow stage hints"}
+	report.Readiness.PlatformReady = true
+
+	var output bytes.Buffer
+	if err := writeSetupResponse(&output, setupResponse{Status: "blocked", PlatformReady: true, Verification: report}); err != nil {
+		t.Fatal(err)
+	}
+	encoded := output.String()
+	for _, required := range []string{`"login":"alice"`, `"user_id":7`, `"owner":"owner"`, `"fingerprint_sha256":"` + strings.Repeat("a", 64), `"repository":"owner/repo"`, `"default_branch":"main"`, `"head":"` + strings.Repeat("b", 40), `"onboarding_plan_digest_sha256":"` + strings.Repeat("c", 64), `"manifest_digest_sha256":"` + strings.Repeat("d", 64), `"repair_hint":"repair credential"`, `"repair_hint":"rerun Repository Onboarding"`} {
+		if !strings.Contains(encoded, required) {
+			t.Fatalf("verification JSON omitted %q: %s", required, encoded)
+		}
+	}
+	if strings.Contains(encoded, token) || !strings.Contains(encoded, "[redacted]") {
+		t.Fatalf("verification JSON leaked PAT-shaped input: %s", encoded)
+	}
+}
+
 func TestSetupPlanBindsConfirmedPublicationStateBeforePlatformReadback(t *testing.T) {
 	repository := t.TempDir()
 	command := exec.Command("git", "-C", repository, "init")

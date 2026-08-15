@@ -13,10 +13,10 @@ import (
 func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T) {
 	driver := read(t, "codex-driver.ps1")
 	for _, required := range []string{
-		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT`,
+		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT_FILE`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
-		`Get-DisposableRepositories`, `result leaked WORKFLOW_SETUP_E2E_PAT`,
+		`Get-DisposableRepositories`, `result leaked the setup PAT`,
 	} {
 		if !strings.Contains(driver, required) {
 			t.Fatalf("Codex DriverScript lacks required contract %q", required)
@@ -93,6 +93,30 @@ func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
 	outerTry := strings.Index(harness, "try {")
 	if prior < 0 || firstMutation < 0 || outerTry < 0 || prior > firstMutation || outerTry > firstMutation {
 		t.Fatalf("outer environment was not captured before the full cleanup-protected mutation boundary")
+	}
+}
+
+func TestHarnessScansSuccessfulSetupCredentialBoundariesWithOneDurableFingerprintAllowance(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	scanner := read(t, "leakscan/main.go")
+	qualification := harness + "\n" + scanner
+	for _, required := range []string{
+		"Invoke-SetupCredentialLeakScan", "WORKFLOW_SETUP_E2E_PAT", "fingerprint",
+		"workflow-home", `filepath.WalkDir`, `filepath.Join(home, "state", "workflow.db")`, `[]string{home, evidence}`,
+		"processEnvironmentEvidence", "dockerInspectEvidence", "dockerContainerEvidence",
+		"github_pat_verifications.fingerprint_sha256", "Authorization: Bearer",
+	} {
+		if !strings.Contains(qualification, required) {
+			t.Fatalf("setup credential leak scan lacks required boundary/needle %q", required)
+		}
+	}
+	if !strings.Contains(harness, "Interrupted setup scenarios are intentionally excluded") {
+		t.Fatal("setup credential leak scan does not record the intentional interrupted-setup exclusion")
+	}
+	for _, excluded := range []string{"interrupted-before-apply", "interrupted-during-apply", "interrupted-after-apply"} {
+		if strings.Contains(harness, `Invoke-Scenario "`+excluded+`"`) {
+			t.Fatalf("setup E2E unexpectedly claims unsupported interrupted scenario %q", excluded)
+		}
 	}
 }
 

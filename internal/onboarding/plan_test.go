@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
 
@@ -76,6 +77,49 @@ func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	if !found {
 		t.Fatal("contract PR effect missing")
 	}
+}
+
+func TestPlanBindsPublishedRepositoryNameAndVisibilityToDiscovery(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	private := true
+	policyCalls := 0
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		policyCalls++
+		return RepositoryPolicy{Private: false, HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
+	})
+
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", RepositoryName: "different", Private: &private, Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: policy})
+	if err == nil || !strings.Contains(err.Error(), "repository name differs from the confirmed intent") || policyCalls != 0 {
+		t.Fatalf("published name mismatch reached policy discovery: calls=%d err=%v", policyCalls, err)
+	}
+
+	_, err = Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", RepositoryName: "repo", Private: &private, Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: policy})
+	if err == nil || !strings.Contains(err.Error(), "visibility differs from the confirmed intent") || policyCalls != 1 {
+		t.Fatalf("published visibility mismatch was accepted: calls=%d err=%v", policyCalls, err)
+	}
+}
+
+func TestPlanPublishedPolicyPreconditionRetainsVerifiedVisibility(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	public := false
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{Private: false, HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
+	})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", RepositoryName: "repo", Private: &public, Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind == "github_policy" {
+			if !strings.Contains(precondition.Expected, `"private":false`) {
+				t.Fatalf("GitHub policy omitted verified visibility: %s", precondition.Expected)
+			}
+			return
+		}
+	}
+	t.Fatal("GitHub policy precondition missing")
 }
 func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "new-repo")
@@ -286,6 +330,18 @@ func TestPlanBlocksRepositoryPolicyThatNeedsHumanReview(t *testing.T) {
 	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
 	if err == nil || !strings.Contains(err.Error(), "human review") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPlanBlocksWorkflowContractCheckFromAnotherAppBeforeEffects(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, Admin: true, AllowSquashMerge: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, RequiredChecks: []RequiredCheck{{Context: repositorycontract.RequiredCheckName, AppID: 999}}}, nil
+	})
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
+	if err == nil || !strings.Contains(err.Error(), "conflicting App identities") {
+		t.Fatalf("same-name unapproved check reached effects: %v", err)
 	}
 }
 

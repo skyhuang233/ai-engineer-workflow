@@ -108,7 +108,7 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 	if repo.Archived || repo.Disabled {
 		return result, errors.New("repository is archived or disabled")
 	}
-	result.HasIssues, result.Admin = repo.HasIssues, repo.Permissions.Admin
+	result.Private, result.HasIssues, result.Admin = repo.Private, repo.HasIssues, repo.Permissions.Admin
 	result.AllowSquashMerge, result.AllowMergeCommit, result.AllowRebaseMerge = repo.AllowSquashMerge, repo.AllowMergeCommit, repo.AllowRebaseMerge
 	if branch == "" {
 		branch = repo.DefaultBranch

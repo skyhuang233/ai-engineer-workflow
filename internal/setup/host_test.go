@@ -141,7 +141,7 @@ func TestRepositoryContractReadbackRequiresRepairForManagedContentDrift(t *testi
 					"before_files_json":    "[]",
 					"files_json":           "[]",
 					"manifest_digest":      digest,
-					"required_checks_json": "[]",
+					"required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
 				},
 			}
 			status, evidence, err := adapter.Readback(context.Background(), effect)
@@ -659,7 +659,7 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	}))
 	defer server.Close()
 	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: digest, OnboardingMergeHeads: map[string]string{}}
-	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("c", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": manifestDigest, "required_checks_json": "[]"}}
+	effect := setupcontract.Effect{ID: "contract", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": strings.Repeat("c", 40), "source_url": "https://github.com/owner/repo.git", "before_files_json": "[]", "files_json": "[]", "manifest_digest": manifestDigest, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("merged readback = %s, %v", status, err)

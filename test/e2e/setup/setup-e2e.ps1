@@ -30,9 +30,12 @@ $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
+$patInputPath = Join-Path $qualificationRoot "setup-pat.stdin"
 $prior = @{
     USERPROFILE = $env:USERPROFILE; HOME = $env:HOME; CODEX_HOME = $env:CODEX_HOME
     WORKFLOW_HOME = $env:WORKFLOW_HOME; GH_CONFIG_DIR = $env:GH_CONFIG_DIR; GH_TOKEN = $env:GH_TOKEN
+	WORKFLOW_SETUP_E2E_PAT = $env:WORKFLOW_SETUP_E2E_PAT
+	WORKFLOW_SETUP_E2E_PAT_FILE = $env:WORKFLOW_SETUP_E2E_PAT_FILE
 	WORKFLOW_SETUP_E2E_GITHUB_OWNER = $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER
 	WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC = $env:WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC
 	WORKFLOW_SETUP_E2E_PLATFORM_VERSION = $env:WORKFLOW_SETUP_E2E_PLATFORM_VERSION
@@ -47,6 +50,13 @@ $env:GH_TOKEN = $setupToken
 Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 
 New-Item -ItemType Directory -Force -Path $profileRoot,$workflowHome,$evidenceRoot,$githubConfig | Out-Null
+[IO.File]::WriteAllText($patInputPath, $setupToken, (New-Object Text.UTF8Encoding($false)))
+$patACL = New-Object Security.AccessControl.FileSecurity
+$patACL.SetAccessRuleProtection($true, $false)
+$patACL.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User, "FullControl", "Allow")))
+Set-Acl -LiteralPath $patInputPath -AclObject $patACL
+$env:WORKFLOW_SETUP_E2E_PAT_FILE = $patInputPath
+Remove-Item Env:WORKFLOW_SETUP_E2E_PAT
 $codexDoctor = (& codex doctor --json | ConvertFrom-Json)
 $authCheck = $codexDoctor.checks.'auth.credentials'
 $configCheck = $codexDoctor.checks.'config.load'
@@ -63,10 +73,12 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     $env:WORKFLOW_SETUP_E2E_SCENARIO = $Name
     $env:WORKFLOW_SETUP_E2E_REPOSITORY_PATH = $target
     $env:WORKFLOW_SETUP_E2E_RESULT_PATH = $resultPath
-    & $DriverScript
+    $driverGitHubToken = $env:GH_TOKEN
+    Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+    try { & $DriverScript } finally { $env:GH_TOKEN = $driverGitHubToken }
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw "Scenario '$Name' did not produce a result" }
     $raw = Get-Content -LiteralPath $resultPath -Raw
-    if ($raw.Contains($env:WORKFLOW_SETUP_E2E_PAT)) { throw "Scenario '$Name' leaked the PAT into evidence" }
+    if ($raw.Contains($setupToken)) { throw "Scenario '$Name' leaked the PAT into evidence" }
     $result = $raw | ConvertFrom-Json
     foreach ($repository in @($result.temporary_repositories)) {
         if (-not ([string]$repository).StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Driver returned an unsafe cleanup repository '$repository'" }
@@ -91,6 +103,40 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     }
 }
 
+function Invoke-SetupCredentialLeakScan {
+    $processEnvironmentEvidence = Join-Path $evidenceRoot "process-environment.txt"
+    $dockerInspectEvidence = Join-Path $evidenceRoot "docker-inspect.json"
+    $dockerContainerEvidence = Join-Path $evidenceRoot "docker-containers.json"
+    $savedGitHubToken = $env:GH_TOKEN
+    try {
+        Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+        @(Get-ChildItem Env: | Sort-Object Name | ForEach-Object { $_.Name + "=" + $_.Value }) | Set-Content -LiteralPath $processEnvironmentEvidence -Encoding utf8
+
+        $workerContainers = @(
+            @(docker container ls --all --quiet --filter "label=workflow.run_id")
+            if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate Workflow Worker containers for credential qualification" }
+            @(docker container ls --all --quiet --filter "label=workflow.control_plane")
+            if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate Workflow Control Plane containers for credential qualification" }
+            @(docker container ls --all --quiet --filter "label=com.skyhuang233.workflow.setup-probe=true")
+            if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate Workflow setup probe containers for credential qualification" }
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique
+        if ($workerContainers.Count -gt 0) {
+            @(docker container inspect $workerContainers) | Set-Content -LiteralPath $dockerInspectEvidence -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect Workflow Worker containers for credential qualification" }
+            @(docker container ls --all --no-trunc --format "{{json .}}" --filter "label=workflow.run_id") | Set-Content -LiteralPath $dockerContainerEvidence -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw "Cannot record Workflow Worker container evidence" }
+        } else {
+            [IO.File]::WriteAllText($dockerInspectEvidence, "[]`n")
+            [IO.File]::WriteAllText($dockerContainerEvidence, "[]`n")
+        }
+
+        $setupToken | & go run (Join-Path $PSScriptRoot "leakscan") --workflow-home $workflowHome --evidence-root $evidenceRoot
+        if ($LASTEXITCODE -ne 0) { throw "Setup credential leak scan rejected qualification evidence" }
+    } finally {
+        if ($null -eq $savedGitHubToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $savedGitHubToken }
+    }
+}
+
 function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
     if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw "Fixture repository must be canonical owner/name" }
     $resolvedTarget = [IO.Path]::GetFullPath($Target)
@@ -105,7 +151,7 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
 	New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
 	Copy-Item -LiteralPath $sourceCodexAuth -Destination (Join-Path $env:CODEX_HOME "auth.json")
     $env:WORKFLOW_HOME = $workflowHome; $env:GH_CONFIG_DIR = $githubConfig
-    $env:GH_TOKEN = $env:WORKFLOW_SETUP_E2E_PAT
+    $env:GH_TOKEN = $setupToken
     $env:WORKFLOW_SETUP_E2E_RUN_ID = $runID
 	$env:WORKFLOW_SETUP_E2E_GITHUB_OWNER = $GitHubOwner
 	$env:WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC = $EntrySkillSpec
@@ -144,6 +190,9 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
       if ($ClassicPATRejectedRepository.Split('/')[0] -ine $GitHubOwner) { throw "ClassicPATRejectedRepository must belong to GitHubOwner so owner mismatch cannot mask organization policy" }
       Invoke-Scenario "organization-rejects-classic-pat" { param($target); Initialize-PublishedFixture $target $ClassicPATRejectedRepository }
     }
+    # Interrupted setup scenarios are intentionally excluded: this qualification
+    # covers completed or cleanly blocked setup attempts, not cross-invocation recovery.
+    Invoke-SetupCredentialLeakScan
 } catch {
     $qualificationError = $_.Exception
 } finally {

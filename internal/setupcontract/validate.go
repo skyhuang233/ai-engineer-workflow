@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/setupeffect"
 )
 
@@ -337,6 +338,28 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 	for _, key := range []string{"managed_skills_json", "files_json", "before_files_json", "required_checks_json", "labels_json", "platform_setup_contract_json", "release_bundled_files_json"} {
 		if value, exists := effect.Parameters[key]; exists && !json.Valid([]byte(value)) {
 			return fmt.Errorf("parameter %q must be valid JSON", key)
+		}
+	}
+	if effect.Kind == "repository_contract_pr" {
+		var checks []struct {
+			Context string `json:"context"`
+			AppID   int64  `json:"app_id"`
+		}
+		if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil {
+			return errors.New("repository contract required checks are invalid")
+		}
+		identities := map[string]int64{}
+		for _, check := range checks {
+			if check.Context == "" || check.AppID <= 0 {
+				return errors.New("repository contract required check lacks an App identity")
+			}
+			if existing := identities[check.Context]; existing != 0 && existing != check.AppID {
+				return errors.New("repository contract required check context has conflicting App identities")
+			}
+			identities[check.Context] = check.AppID
+		}
+		if identities[repositorycontract.RequiredCheckName] != repositorycontract.GitHubActionsAppID {
+			return errors.New("workflow-contract required check has an unapproved App identity")
 		}
 	}
 	return nil

@@ -1,6 +1,5 @@
 [CmdletBinding()]
 param(
-    [string]$APIBase = "https://api.github.com",
     [Parameter(Mandatory = $true)][string]$Owner,
     [Parameter(Mandatory = $true)][string]$RepositoryName,
     [Parameter(Mandatory = $true)][ValidateSet("private", "public")][string]$Visibility,
@@ -8,10 +7,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$GitHubPublicAPI = "https://api.github.com"
 $token = [Console]::In.ReadToEnd().Trim()
 if ([string]::IsNullOrWhiteSpace($token)) { throw "A classic GitHub PAT is required on standard input" }
 try {
-    $response = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/user") -Headers @{
+    $response = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/user") -Headers @{
         Authorization = "Bearer $token"
         Accept = "application/vnd.github+json"
         "X-GitHub-Api-Version" = "2022-11-28"
@@ -31,7 +31,7 @@ if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringCompariso
     $requiredOrganizationScopes = @(& (Join-Path $PSScriptRoot "resolve-github-required-scopes.ps1") -OwnerType organization)
     foreach ($requiredScope in $requiredOrganizationScopes) { if ($scopes -notcontains $requiredScope) { throw "The classic PAT lacks an approved organization scope" } }
     try {
-        $membershipResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/memberships/" + [Uri]::EscapeDataString([string]$identity.login)) -Headers @{
+        $membershipResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/memberships/" + [Uri]::EscapeDataString([string]$identity.login)) -Headers @{
             Authorization = "Bearer $token"
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
@@ -47,7 +47,7 @@ if ([string]::IsNullOrWhiteSpace($repositoryNameValue) -or $repositoryNameValue.
 $repositoryID = $boundOwner + "/" + $repositoryNameValue
 $repositoryExists = $false
 try {
-    $repositoryResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue)) -Headers @{
+    $repositoryResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue)) -Headers @{
         Authorization = "Bearer $token"
         Accept = "application/vnd.github+json"
         "X-GitHub-Api-Version" = "2022-11-28"
@@ -67,15 +67,15 @@ if ($PublicationState -eq "published") {
     try {
         if ([string]::IsNullOrWhiteSpace([string]$repository.default_branch)) { throw "GitHub repository has no default branch" }
         if (-not [bool]$repository.allow_squash_merge -and -not [bool]$repository.allow_merge_commit -and -not [bool]$repository.allow_rebase_merge) { throw "GitHub repository has no supported merge method" }
-        $repositoryActionsResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+        $repositoryActionsResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
         $repositoryActions = $repositoryActionsResponse.Content | ConvertFrom-Json
         if ([string]$repositoryActions.allowed_actions -eq "local_only") { throw "Repository Actions policy forbids the GitHub-owned checkout action" }
         if ([string]$repositoryActions.allowed_actions -eq "selected") {
-            $repositorySelectedResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $repositorySelectedResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
             $repositorySelected = $repositorySelectedResponse.Content | ConvertFrom-Json
             if (-not [bool]$repositorySelected.github_owned_allowed) { throw "Repository Actions policy does not allow the GitHub-owned checkout action" }
         } elseif ([string]$repositoryActions.allowed_actions -ne "all") { throw "Repository Actions policy is unavailable" }
-        $repositoryRulesetResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+        $repositoryRulesetResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
         foreach ($ruleset in @($repositoryRulesetResponse.Content | ConvertFrom-Json)) {
             if ([string]$ruleset.enforcement -ne "active") { continue }
             foreach ($rule in @($ruleset.rules)) {
@@ -84,7 +84,7 @@ if ($PublicationState -eq "published") {
             }
         }
         try {
-            $protectionResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/branches/" + [Uri]::EscapeDataString([string]$repository.default_branch) + "/protection") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $protectionResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/branches/" + [Uri]::EscapeDataString([string]$repository.default_branch) + "/protection") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
             $protection = $protectionResponse.Content | ConvertFrom-Json
             if ([int]$protection.required_pull_request_reviews.required_approving_review_count -gt 0) { throw "Repository branch protection requires human review before onboarding" }
         } catch {
@@ -99,19 +99,19 @@ if ($PublicationState -eq "published") {
     if ($repositoryExists) { throw "The confirmed unpublished GitHub repository already exists" }
     if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringComparison]::OrdinalIgnoreCase)) {
         try {
-            $organizationResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner)) -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $organizationResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/orgs/" + [Uri]::EscapeDataString($boundOwner)) -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
             $organization = $organizationResponse.Content | ConvertFrom-Json
             if (-not [string]::Equals([string]$organization.login, $boundOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Organization policy returned a different owner" }
-            $actionsResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $actionsResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
             $actions = $actionsResponse.Content | ConvertFrom-Json
             if ([string]$actions.enabled_repositories -ne "all") { throw "Organization Actions policy does not prove new-repository enablement" }
             if ([string]$actions.allowed_actions -eq "local_only") { throw "Organization Actions policy forbids the GitHub-owned checkout action" }
             if ([string]$actions.allowed_actions -eq "selected") {
-                $selectedResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+                $selectedResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
                 $selected = $selectedResponse.Content | ConvertFrom-Json
                 if (-not [bool]$selected.github_owned_allowed) { throw "Organization Actions policy does not allow the GitHub-owned checkout action" }
             } elseif ([string]$actions.allowed_actions -ne "all") { throw "Organization Actions policy is unavailable" }
-            $rulesetResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $rulesetResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
             foreach ($ruleset in @($rulesetResponse.Content | ConvertFrom-Json)) {
                 if ([string]$ruleset.enforcement -ne "active") { continue }
                 foreach ($rule in @($ruleset.rules)) {

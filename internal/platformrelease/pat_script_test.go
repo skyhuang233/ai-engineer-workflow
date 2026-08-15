@@ -77,9 +77,17 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrga
 	}))
 	defer server.Close()
 	_, current, _, _ := runtime.Caller(0)
-	script := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "verify-github-pat.ps1")
+	productionScript := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "verify-github-pat.ps1")
+	productionBody, err := os.ReadFile(productionScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(productionBody), "$APIBase") || !strings.Contains(string(productionBody), `"https://api.github.com`) {
+		t.Fatal("production PAT verifier must use the fixed public GitHub API origin without an APIBase override")
+	}
+	script := copyPATVerifierForTest(t, productionScript, server.URL)
 	run := func(owner, repository, publicationState string) ([]byte, error) {
-		command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-APIBase", server.URL, "-Owner", owner, "-RepositoryName", repository, "-Visibility", "private", "-PublicationState", publicationState)
+		command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Owner", owner, "-RepositoryName", repository, "-Visibility", "private", "-PublicationState", publicationState)
 		command.Stdin = strings.NewReader(token)
 		return command.CombinedOutput()
 	}
@@ -124,6 +132,32 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrga
 	if runErr == nil || !strings.Contains(string(output), "requires human review") {
 		t.Fatalf("published repository with an unfulfillable review policy was not rejected: %q, %v", output, runErr)
 	}
+}
+
+func copyPATVerifierForTest(t *testing.T, productionScript, apiBase string) string {
+	t.Helper()
+	sourceRoot := filepath.Dir(productionScript)
+	targetRoot := filepath.Join(t.TempDir(), "scripts")
+	if err := os.MkdirAll(targetRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"verify-github-pat.ps1", "resolve-github-required-scopes.ps1"} {
+		body, err := os.ReadFile(filepath.Join(sourceRoot, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "verify-github-pat.ps1" {
+			const fixedAPIBase = "https://api.github.com"
+			if strings.Count(string(body), fixedAPIBase) != 1 {
+				t.Fatalf("production PAT verifier fixed API origin count = %d, want 1", strings.Count(string(body), fixedAPIBase))
+			}
+			body = []byte(strings.Replace(string(body), fixedAPIBase, apiBase, 1))
+		}
+		if err := os.WriteFile(filepath.Join(targetRoot, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(targetRoot, "verify-github-pat.ps1")
 }
 
 func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testing.T) {
