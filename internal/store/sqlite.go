@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +40,7 @@ var (
 	ErrDeliveryLaunchLeaseExpired = errors.New("delivery controller lease expired before launch")
 	ErrDatabaseIntegrity          = errors.New("database integrity check failed")
 	ErrNeedsAttention             = errors.New("workflow needs attention")
+	ErrSchemaUpgradeRequired      = errors.New("workflow database schema requires repair")
 )
 
 func IsDatabaseError(err error) bool {
@@ -78,6 +81,41 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 func OpenForRestore(ctx context.Context, dsn string) (*Store, error) {
 	return open(ctx, dsn, false)
+}
+
+// OpenReadOnly opens an existing current-schema database without running
+// configuration, integrity repair, backup, or migration writes. It is the
+// supported Store seam for read-only planning and inspection.
+func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
+	databasePath, err := startup.DatabaseFilePath(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if databasePath == "" {
+		return nil, errors.New("read-only Store requires a database file")
+	}
+	barrier, err := startup.AcquireDatabaseAccess(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		_ = barrier.Close()
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	store := &Store{db: db, databasePath: databasePath, restoreBarrier: barrier}
+	version, err := store.schemaVersion(ctx)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("inspect workflow database schema read-only: %w", err)
+	}
+	if version != latestSchemaVersion {
+		store.Close()
+		return nil, fmt.Errorf("%w: found schema %d, require schema %d; apply an approved Platform repair before planning", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	}
+	return store, nil
 }
 
 // OpenForRuntime configures SQLite and acquires the restore barrier without

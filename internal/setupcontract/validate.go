@@ -8,6 +8,8 @@ import (
 	"io"
 	"regexp"
 	"strings"
+
+	"github.com/skyhuang233/workflow/internal/setupeffect"
 )
 
 var (
@@ -17,33 +19,9 @@ var (
 	githubRepository  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 )
 
-type effectContract struct {
-	planKind PlanKind
-	actions  []string
-	required []string
-	optional []string
-}
-
-var effectContracts = map[string]effectContract{
-	"platform_cli":           {PlatformBootstrap, []string{"install"}, []string{"version", "sha256"}, nil},
-	"workflow_skill_bundle":  {PlatformBootstrap, []string{"install"}, []string{"version", "managed_skills_json", "files_json"}, nil},
-	"docker_desktop":         {PlatformBootstrap, []string{"install", "upgrade", "repair"}, []string{"version", "installer_url", "windows_amd64_sha256"}, nil},
-	"github_pat":             {PlatformBootstrap, []string{"persist", "replace"}, []string{"input", "owner"}, []string{"api_base"}},
-	"platform_installation":  {PlatformBootstrap, []string{"record"}, []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest"}, nil},
-	"control_plane":          {PlatformBootstrap, []string{"start", "replace"}, []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest"}, nil},
-	"create_repository":      {RepositoryOnboarding, []string{"create"}, []string{"owner", "authenticated_login", "name", "private"}, nil},
-	"initial_baseline":       {RepositoryOnboarding, []string{"commit_and_push"}, []string{"branch", "files_json", "repository", "source_url"}, nil},
-	"publish_history":        {RepositoryOnboarding, []string{"push"}, []string{"branch", "head"}, nil},
-	"github_label":           {RepositoryOnboarding, []string{"reconcile"}, []string{"name", "color", "description"}, nil},
-	"repository_features":    {RepositoryOnboarding, []string{"enable"}, []string{"issues", "actions", "allowed_actions"}, nil},
-	"repository_contract_pr": {RepositoryOnboarding, []string{"create_check_merge"}, []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}, nil},
-	"repository_admission":   {RepositoryOnboarding, []string{"verify_and_record"}, []string{"default_branch", "manifest_digest", "contract_version"}, []string{"labels_json", "actions_allowed"}},
-	"local_fast_forward":     {RepositoryOnboarding, []string{"fast_forward_if_safe"}, []string{"repository", "branch", "pre_merge_head", "merge_head_effect_id"}, nil},
-}
-
 var preconditionPlanKinds = map[string]PlanKind{
-	"host_identity": PlatformBootstrap, "platform_release": "", "platform_setup_contract": PlatformBootstrap,
-	"git_head": RepositoryOnboarding, "github_policy": RepositoryOnboarding, "github_default_head": RepositoryOnboarding,
+	"host_identity": PlatformBootstrap, "platform_release": "", "platform_setup_contract": PlatformBootstrap, "platform_installation": PlatformBootstrap, "platform_state": PlatformBootstrap,
+	"git_head": RepositoryOnboarding, "onboarding_snapshot": RepositoryOnboarding, "github_policy": RepositoryOnboarding, "github_default_head": RepositoryOnboarding,
 }
 
 var expectedResultPlanKinds = map[string]PlanKind{
@@ -170,6 +148,17 @@ func (p Plan) Validate() error {
 			return err
 		}
 	}
+	if p.Kind == RepositoryOnboarding {
+		created := map[string]bool{}
+		for _, effect := range p.Effects {
+			if effect.Kind == "create_repository" {
+				created[effect.Subject] = true
+			}
+			if effect.Kind == "publish_history" && effect.Parameters["new_repository"] == "true" && !created[effect.Subject] {
+				return fmt.Errorf("publish history effect %q claims a new repository without an earlier approved creation", effect.ID)
+			}
+		}
+	}
 	for _, expected := range p.ExpectedResults {
 		if strings.TrimSpace(expected.Kind) == "" || strings.TrimSpace(expected.Subject) == "" || strings.TrimSpace(expected.Expected) == "" {
 			return fmt.Errorf("expected result %q is incomplete", expected.ID)
@@ -211,21 +200,21 @@ func validateExpectedResultBinding(plan Plan, expected ExpectedResult) error {
 }
 
 func validateEffect(planKind PlanKind, effect Effect) error {
-	schema, ok := effectContracts[effect.Kind]
+	schema, ok := setupeffect.Lookup(effect.Kind)
 	if !ok {
 		return fmt.Errorf("unknown effect kind %q", effect.Kind)
 	}
-	if schema.planKind != planKind {
+	if string(schema.PlanKind) != string(planKind) {
 		return fmt.Errorf("effect kind %q is unsupported for %q", effect.Kind, planKind)
 	}
-	if !containsSemantic(schema.actions, effect.Action) {
+	if !containsSemantic(schema.Actions, effect.Action) {
 		return fmt.Errorf("action %q is unsupported for effect kind %q", effect.Action, effect.Kind)
 	}
 	if planKind == PlatformBootstrap && isPlatformMutationEffect(effect.Kind) && effect.Kind != "platform_installation" && effect.Kind != "control_plane" {
-		schema.required = append(schema.required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest")
+		schema.Required = append(schema.Required, "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest")
 	}
 	allowed := map[string]bool{}
-	for _, key := range append(append([]string{}, schema.required...), schema.optional...) {
+	for _, key := range append(append([]string{}, schema.Required...), schema.Optional...) {
 		allowed[key] = true
 	}
 	for key := range effect.Parameters {
@@ -233,7 +222,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			return fmt.Errorf("unknown parameter %q", key)
 		}
 	}
-	for _, key := range schema.required {
+	for _, key := range schema.Required {
 		value, exists := effect.Parameters[key]
 		allowEmpty := (effect.Kind == "repository_contract_pr" && key == "base_head") || (effect.Kind == "local_fast_forward" && key == "pre_merge_head")
 		if !exists || (!allowEmpty && strings.TrimSpace(value) == "") {
@@ -288,11 +277,11 @@ func containsSemantic(values []string, wanted string) bool {
 // ValidateEffectForExecution keeps direct Readback and Apply calls on the same
 // kind/action registry used by Setup Plan validation.
 func ValidateEffectForExecution(effect Effect) error {
-	schema, ok := effectContracts[effect.Kind]
+	schema, ok := setupeffect.Lookup(effect.Kind)
 	if !ok {
 		return fmt.Errorf("unknown effect kind %q", effect.Kind)
 	}
-	return validateEffect(schema.planKind, effect)
+	return validateEffect(PlanKind(schema.PlanKind), effect)
 }
 
 func ValidatePreconditionForExecution(precondition Precondition) error {
@@ -303,12 +292,8 @@ func ValidatePreconditionForExecution(precondition Precondition) error {
 }
 
 func isPlatformMutationEffect(kind string) bool {
-	switch kind {
-	case "platform_cli", "workflow_skill_bundle", "docker_desktop", "github_pat", "platform_installation", "control_plane":
-		return true
-	default:
-		return false
-	}
+	descriptor, ok := setupeffect.Lookup(kind)
+	return ok && descriptor.PlatformMutation
 }
 
 func validatePlatformEffectPins(effects []Effect) error {

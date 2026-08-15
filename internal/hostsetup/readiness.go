@@ -86,6 +86,19 @@ func (v DockerWorkerVerifier) Verify(ctx context.Context, image, stateRoot, work
 		return err
 	}
 	token := hex.EncodeToString(tokenBytes)
+	containerBytes := make([]byte, 12)
+	if _, err := rand.Read(containerBytes); err != nil {
+		return err
+	}
+	containerName := "workflow-setup-docker-" + hex.EncodeToString(containerBytes)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		output, cleanupErr := executor.Run(cleanupCtx, []string{"docker", "rm", "-f", containerName})
+		if cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove Docker readiness container %q: %w (%s)", containerName, cleanupErr, strings.TrimSpace(string(output))))
+		}
+	}()
 	listener, err := net.Listen("tcp4", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("listen for Docker Gateway readiness probe: %w", err)
@@ -112,7 +125,7 @@ test "$(cat /workspace/marker)" = agent-workflow-readiness
 printf 'worker\n' > /workflow-state/container-marker
 printf 'worker\n' > /workspace/container-marker
 curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_PROBE_TOKEN}" "http://host.docker.internal:${WORKFLOW_GATEWAY_PROBE_PORT}/health"`
-	args := []string{"docker", "run", "--rm", "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
+	args := []string{"docker", "run", "--name", containerName, "--label", "com.skyhuang233.workflow.setup-probe=true", "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
 		"--mount", "type=bind,source=" + stateProbe + ",target=/workflow-state",
 		"--mount", "type=bind,source=" + workspaceProbe + ",target=/workspace",
 		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN=" + token,

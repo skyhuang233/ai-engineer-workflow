@@ -60,6 +60,37 @@ if ($PublicationState -eq "published") {
     if (-not [string]::Equals([string]$repository.full_name, $repositoryID, [StringComparison]::OrdinalIgnoreCase)) { throw "GitHub returned a different repository owner or name" }
     if ([bool]$repository.private -ne ($Visibility -eq "private")) { throw "GitHub repository visibility differs from the confirmed intent" }
     if (-not [bool]$repository.permissions.admin) { throw "The classic PAT identity lacks repository administration" }
+    try {
+        if ([string]::IsNullOrWhiteSpace([string]$repository.default_branch)) { throw "GitHub repository has no default branch" }
+        if (-not [bool]$repository.allow_squash_merge -and -not [bool]$repository.allow_merge_commit -and -not [bool]$repository.allow_rebase_merge) { throw "GitHub repository has no supported merge method" }
+        $repositoryActionsResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+        $repositoryActions = $repositoryActionsResponse.Content | ConvertFrom-Json
+        if ([string]$repositoryActions.allowed_actions -eq "local_only") { throw "Repository Actions policy forbids the GitHub-owned checkout action" }
+        if ([string]$repositoryActions.allowed_actions -eq "selected") {
+            $repositorySelectedResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/actions/permissions/selected-actions") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $repositorySelected = $repositorySelectedResponse.Content | ConvertFrom-Json
+            if (-not [bool]$repositorySelected.github_owned_allowed) { throw "Repository Actions policy does not allow the GitHub-owned checkout action" }
+        } elseif ([string]$repositoryActions.allowed_actions -ne "all") { throw "Repository Actions policy is unavailable" }
+        $repositoryRulesetResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+        foreach ($ruleset in @($repositoryRulesetResponse.Content | ConvertFrom-Json)) {
+            if ([string]$ruleset.enforcement -ne "active") { continue }
+            foreach ($rule in @($ruleset.rules)) {
+                if ([string]$rule.type -eq "merge_queue") { throw "Repository policy requires an unsupported merge queue" }
+                if ([string]$rule.type -eq "pull_request" -and [int]$rule.parameters.required_approving_review_count -gt 0) { throw "Repository policy requires human review before onboarding" }
+            }
+        }
+        try {
+            $protectionResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/branches/" + [Uri]::EscapeDataString([string]$repository.default_branch) + "/protection") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            $protection = $protectionResponse.Content | ConvertFrom-Json
+            if ([int]$protection.required_pull_request_reviews.required_approving_review_count -gt 0) { throw "Repository branch protection requires human review before onboarding" }
+        } catch {
+            $protectionStatus = 0
+            if ($null -ne $_.Exception.Response) { $protectionStatus = [int]$_.Exception.Response.StatusCode }
+            if ($protectionStatus -ne 404) { throw }
+        }
+    } catch {
+        throw "Published repository policy cannot be proved before Platform mutation: $($_.Exception.Message)"
+    }
 } else {
     if ($repositoryExists) { throw "The confirmed unpublished GitHub repository already exists" }
     if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringComparison]::OrdinalIgnoreCase)) {

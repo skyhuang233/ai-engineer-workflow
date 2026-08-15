@@ -31,10 +31,16 @@ func (f onboardingStateFunc) DiscoverOnboardingState(ctx context.Context, reposi
 	return f(ctx, repository, branch, manifestDigest, labels)
 }
 
+func approvedPublishedPolicy() PolicyDiscovery {
+	return policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
+	})
+}
+
 func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	repo := newRepo(t)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: approvedPublishedPolicy()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +90,31 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	}
 }
 
+func TestNewRepositoryHistoryPublicationRequiresEarlierApprovedCreation(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "new-repo")
+	git(t, "", "init", "-b", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("history\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "README.md")
+	git(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutCreate := plan
+	withoutCreate.Effects = nil
+	for _, effect := range plan.Effects {
+		if effect.Kind != "create_repository" {
+			withoutCreate.Effects = append(withoutCreate.Effects, effect)
+		}
+	}
+	raw, _ := json.Marshal(withoutCreate)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err == nil || !strings.Contains(err.Error(), "without an earlier approved creation") {
+		t.Fatalf("unverified new-repository publication accepted: %v", err)
+	}
+}
+
 func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "new-repo")
 	git(t, "", "init", "-b", "main", repo)
@@ -121,6 +152,37 @@ func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *te
 	}
 }
 
+func TestPlanApprovalSnapshotRejectsZeroBaselineDriftBeforeEffects(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "new-repo")
+	git(t, "", "init", "-b", "main", repo)
+	path := filepath.Join(repo, "README.md")
+	if err := os.WriteFile(path, []byte("approved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot setupcontract.Precondition
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind == "onboarding_snapshot" {
+			snapshot = precondition
+		}
+	}
+	if snapshot.Expected == "" || !strings.Contains(snapshot.Expected, `"mode":"100644"`) || !strings.Contains(snapshot.Expected, `"status_sha256"`) || !strings.Contains(snapshot.Expected, `"managed_boundary_sha256"`) {
+		t.Fatalf("approval snapshot = %#v", snapshot)
+	}
+	if err := VerifyApprovalSnapshot(context.Background(), snapshot.Expected); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyApprovalSnapshot(context.Background(), snapshot.Expected); err == nil || !strings.Contains(err.Error(), "drifted") {
+		t.Fatalf("zero-baseline drift accepted: %v", err)
+	}
+}
+
 func TestPlanUsesCanonicalHTTPSForSSHOriginAndBindsRemoteBase(t *testing.T) {
 	repo := newRepo(t)
 	git(t, repo, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
@@ -130,7 +192,7 @@ func TestPlanUsesCanonicalHTTPSForSSHOriginAndBindsRemoteBase(t *testing.T) {
 		resolvedURL = value
 		return "main", head, nil
 	})
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: remote, PlatformReleaseDigest: repeatString("c", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: remote, PlatformReleaseDigest: repeatString("c", 64), Policy: approvedPublishedPolicy()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +231,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		if repository != "owner/repo" || branch != "main" {
 			t.Fatalf("policy target=%s branch=%s", repository, branch)
 		}
-		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", RequiredChecks: []string{"build"}}, nil
+		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, RequiredChecks: []string{"build"}}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy})
 	if err != nil {
@@ -198,6 +260,18 @@ func TestPlanBlocksRepositoryPolicyThatNeedsHumanReview(t *testing.T) {
 	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
 	if err == nil || !strings.Contains(err.Error(), "human review") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPlanBlocksPublishedRepositoryWithoutVerifiedAdministration(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true}, nil
+	})
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("d", 64), Policy: policy})
+	if err == nil || !strings.Contains(err.Error(), "administration") {
+		t.Fatalf("published PAT preflight = %v", err)
 	}
 }
 
@@ -248,7 +322,7 @@ func TestPlanContainsOnlyUnsatisfiedOnboardingDeltas(t *testing.T) {
 		return OnboardingState{SatisfiedLabels: map[string]bool{"workflow:plan": true}, ContractSatisfied: true, AdmissionSatisfied: true}, nil
 	})
 	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
-		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "selected", AllowSquashMerge: true}, nil
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("b", 64), Labels: labels, Policy: policy, State: state})
 	if err != nil {
@@ -266,7 +340,7 @@ func TestPlanCreatesForwardRepairForManagedContractDrift(t *testing.T) {
 		return OnboardingState{ContractSatisfied: false, AdmissionSatisfied: true}, nil
 	})
 	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
-		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", AllowSquashMerge: true}, nil
+		return RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, Admin: true, AllowSquashMerge: true}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy, State: state})
 	if err != nil {
@@ -276,7 +350,11 @@ func TestPlanCreatesForwardRepairForManagedContractDrift(t *testing.T) {
 	for _, effect := range plan.Effects {
 		kinds[effect.Kind] = true
 	}
-	if !kinds["repository_contract_pr"] || !kinds["local_fast_forward"] || kinds["repository_admission"] {
+	if !kinds["repository_contract_pr"] || !kinds["local_fast_forward"] || !kinds["repository_admission"] {
 		t.Fatalf("forward-repair effects = %#v", plan.Effects)
+	}
+	raw, _ := json.Marshal(plan)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
+		t.Fatalf("forward-repair plan is not executable: %v", err)
 	}
 }

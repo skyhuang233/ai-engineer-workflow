@@ -24,8 +24,20 @@ func TestVerifyDockerWorkerUsesSelectedMountsAndCleansMarkers(t *testing.T) {
 			return []byte("linux/x86_64\n"), nil
 		}
 		joined := strings.Join(args, " ")
+		if strings.HasPrefix(joined, "docker rm -f ") {
+			if !strings.Contains(joined, "workflow-setup-docker-") {
+				t.Fatalf("cleanup args=%#v", args)
+			}
+			return nil, nil
+		}
 		if !strings.Contains(joined, "source="+state) || !strings.Contains(joined, "source="+workspace) || !strings.Contains(joined, "host.docker.internal:host-gateway") || !strings.Contains(joined, "WORKFLOW_GATEWAY_PROBE_TOKEN") || !strings.Contains(joined, "worker@sha256:") || strings.Contains(joined, "readonly") {
 			t.Fatalf("args=%#v", args)
+		}
+		if !strings.Contains(joined, "--name workflow-setup-docker-") || !strings.Contains(joined, "--label com.skyhuang233.workflow.setup-probe=true") {
+			t.Fatalf("probe lacks unique ownership metadata: %#v", args)
+		}
+		if strings.Contains(joined, " --rm ") {
+			t.Fatalf("probe cannot combine auto-removal with required explicit cleanup: %#v", args)
 		}
 		for _, root := range []string{state, workspace} {
 			entries, readErr := os.ReadDir(root)
@@ -40,6 +52,9 @@ func TestVerifyDockerWorkerUsesSelectedMountsAndCleansMarkers(t *testing.T) {
 	})
 	if err := VerifyDockerWorker(context.Background(), executor, "ghcr.io/owner/worker@sha256:"+strings.Repeat("a", 64), state, workspace); err != nil {
 		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls=%d, want info, run, and explicit rm", calls)
 	}
 	for _, root := range []string{state, workspace} {
 		entries, err := os.ReadDir(root)
@@ -66,7 +81,7 @@ func TestDockerWorkerVerifierAggregatesPrimaryAndEveryCleanupFailure(t *testing.
 		RemoveAll: func(path string) error { return errors.New("cleanup " + filepath.Base(path)) },
 	}
 	err := verifier.Verify(context.Background(), "ghcr.io/owner/worker@sha256:"+strings.Repeat("a", 64), state, workspace)
-	if err == nil || !strings.Contains(err.Error(), "container failure") || strings.Count(err.Error(), "cleanup .setup-readiness-") != 2 {
+	if err == nil || !strings.Contains(err.Error(), "container failure") || !strings.Contains(err.Error(), "remove Docker readiness container") || strings.Count(err.Error(), "cleanup .setup-readiness-") != 2 {
 		t.Fatalf("aggregated err=%v", err)
 	}
 }

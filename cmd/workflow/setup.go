@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,10 +44,12 @@ type setupResponse struct {
 }
 
 var (
-	verifyPlatformReadyForSetup     = verifyPlatformReady
-	verifyRecordedAdmissionForSetup = verifyRecordedAdmissionReadOnly
-	setupInspectionAPIBase          = ""
-	setupInspectionHTTPClient       *http.Client
+	verifyPlatformReadyForSetup         = verifyPlatformReady
+	verifyPlatformPreconditionsForSetup = verifySatisfiedPlatformComponents
+	verifyRecordedAdmissionForSetup     = verifyRecordedAdmissionReadOnly
+	resolveCodexAuthForSetup            = codexauth.ResolveChatGPT
+	setupInspectionAPIBase              = ""
+	setupInspectionHTTPClient           *http.Client
 )
 
 func setupCommand(args []string) error {
@@ -81,12 +85,19 @@ type platformInspection struct {
 		Verified bool `json:"verified"`
 	} `json:"workflow_cli"`
 	GitHubCredential struct {
-		Exists     bool     `json:"exists"`
-		Verified   bool     `json:"verified"`
-		Owner      string   `json:"owner,omitempty"`
-		Scopes     []string `json:"scopes,omitempty"`
-		Diagnostic string   `json:"diagnostic,omitempty"`
+		Exists            bool     `json:"exists"`
+		Verified          bool     `json:"verified"`
+		Owner             string   `json:"owner,omitempty"`
+		Scopes            []string `json:"scopes,omitempty"`
+		FingerprintSHA256 string   `json:"fingerprint_sha256,omitempty"`
+		Diagnostic        string   `json:"diagnostic,omitempty"`
 	} `json:"github_credential"`
+	CodexAuth struct {
+		Verified          bool   `json:"verified"`
+		Source            string `json:"source,omitempty"`
+		FingerprintSHA256 string `json:"fingerprint_sha256,omitempty"`
+		Diagnostic        string `json:"diagnostic,omitempty"`
+	} `json:"codex_auth"`
 }
 
 func runSetupInspectPlatform(args []string, output io.Writer) error {
@@ -152,6 +163,24 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	} else {
 		facts.GitHubCredential.Diagnostic = errors.Join(tokenErr, verificationErr).Error()
 	}
+	if verificationErr == nil {
+		facts.GitHubCredential.FingerprintSHA256 = verification.FingerprintSHA256
+	}
+	authSource, authErr := resolveCodexAuthForSetup(ctx)
+	if authErr == nil {
+		authContent, readErr := os.ReadFile(authSource)
+		if readErr == nil {
+			sum := sha256.Sum256(authContent)
+			facts.CodexAuth.Verified = true
+			facts.CodexAuth.Source = filepath.Clean(authSource)
+			facts.CodexAuth.FingerprintSHA256 = hex.EncodeToString(sum[:])
+		} else {
+			authErr = readErr
+		}
+	}
+	if authErr != nil {
+		facts.CodexAuth.Diagnostic = authErr.Error()
+	}
 	var combined error
 	if installationErr != nil {
 		combined = errors.Join(combined, installationErr)
@@ -172,6 +201,9 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	}
 	if !facts.GitHubCredential.Verified {
 		combined = errors.Join(combined, errors.New("Control Plane PAT live verification failed"))
+	}
+	if !facts.CodexAuth.Verified {
+		combined = errors.Join(combined, errors.New("Codex ChatGPT authentication source verification failed"))
 	}
 	return facts, combined
 }
@@ -206,9 +238,9 @@ func runSetupPlan(args []string, output io.Writer) error {
 	if _, err := os.Stat(filepath.Join(layout.State, "workflow.db")); errors.Is(err, os.ErrNotExist) {
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "Platform Bootstrap must be completed by the entry skill"})
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	database, err := store.OpenReadOnly(context.Background(), filepath.Join(layout.State, "workflow.db"))
 	if err != nil {
-		return err
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
 	}
 	defer database.Close()
 	if _, err := database.PlatformInstallation(context.Background()); err != nil {
@@ -409,7 +441,14 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 		adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 		adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
 	}
-	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, ExpectedResultVerifier: func(ctx context.Context, _ setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
+		database, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+		if openErr != nil {
+			return openErr
+		}
+		defer database.Close()
+		return verifyPlatformPreconditionsForSetup(ctx, database, layout, adapter, plan)
+	}, ExpectedResultVerifier: func(ctx context.Context, _ setupcontract.Plan, expected setupcontract.ExpectedResult) error {
 		if expected.Kind != "platform_readiness" {
 			return nil
 		}
@@ -423,6 +462,174 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	result, applyErr := engine.Apply(context.Background(), raw, *approved)
 	writeErr := writeSetupResponse(output, setupResponse{Status: string(result.Status), Result: result})
 	return errors.Join(applyErr, writeErr)
+}
+
+func verifySatisfiedPlatformComponents(ctx context.Context, database *store.Store, layout workflowhome.Layout, adapter setupengine.HostAdapter, plan setupcontract.Plan) error {
+	planned := map[string]bool{}
+	for _, effect := range plan.Effects {
+		planned[effect.Kind] = true
+	}
+	statePreconditions := make([]setupcontract.Precondition, 0, 1)
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind == "platform_state" {
+			statePreconditions = append(statePreconditions, precondition)
+		}
+	}
+	if len(statePreconditions) != 1 || !strings.EqualFold(filepath.Clean(statePreconditions[0].Subject), filepath.Clean(layout.Root)) {
+		return errors.New("approved plan lacks one exact Platform state precondition")
+	}
+	stateDigest, err := currentPlatformStateDigest(ctx, database, !planned["github_pat"])
+	if err != nil {
+		return err
+	}
+	if stateDigest != statePreconditions[0].Expected {
+		return errors.New("satisfied PAT or Codex authentication changed after planning")
+	}
+	installation, err := database.PlatformInstallation(ctx)
+	if err != nil {
+		if planned["platform_installation"] {
+			return nil
+		}
+		return err
+	}
+	contractRaw, err := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
+	if err != nil {
+		return err
+	}
+	var contract platformrelease.PlatformSetupContract
+	if err := json.Unmarshal(contractRaw, &contract); err != nil {
+		return err
+	}
+	if err := contract.Validate(); err != nil {
+		return err
+	}
+	_, contractDigest, err := setupcontract.Canonicalize(contractRaw)
+	if err != nil || contractDigest != installation.PlatformSetupContractDigestSHA256 {
+		return errors.Join(errors.New("installed Platform Setup Contract drifted before mutation"), err)
+	}
+	pins := map[string]string{"release_manifest_digest": installation.ReleaseManifestDigestSHA256, "platform_setup_contract_digest": installation.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": installation.WorkflowCLISHA256, "release_bundled_files_digest": installation.ReleaseBundledFilesDigestSHA256}
+	check := func(effect setupcontract.Effect) error {
+		status, evidence, readErr := adapter.Readback(ctx, effect)
+		if readErr != nil {
+			return readErr
+		}
+		if status != setupcontract.EffectSatisfied {
+			return fmt.Errorf("satisfied %s drifted before mutation: %s", effect.Kind, evidence)
+		}
+		return nil
+	}
+	withPins := func(values map[string]string) map[string]string {
+		for key, value := range pins {
+			values[key] = value
+		}
+		return values
+	}
+	if !planned["platform_cli"] {
+		if err := check(setupcontract.Effect{ID: "precondition-platform-cli", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: withPins(map[string]string{"version": installation.PlatformVersion, "sha256": installation.WorkflowCLISHA256})}); err != nil {
+			return err
+		}
+	}
+	if !planned["workflow_skill_bundle"] {
+		userProfile := os.Getenv("USERPROFILE")
+		if userProfile == "" {
+			return errors.New("USERPROFILE is required to verify the satisfied Workflow Skill Bundle")
+		}
+		bundled, err := durableReleaseBundle(installation)
+		if err != nil {
+			return err
+		}
+		files := make([]workflowhome.SkillBundleFile, 0)
+		for _, file := range bundled {
+			if strings.HasPrefix(file.Path, "skills/") {
+				files = append(files, workflowhome.SkillBundleFile{Path: strings.TrimPrefix(file.Path, "skills/"), SHA256: file.SHA256})
+			}
+		}
+		skillsJSON, _ := json.Marshal(contract.SkillBundle.ManagedSkills)
+		filesJSON, _ := json.Marshal(files)
+		if err := check(setupcontract.Effect{ID: "precondition-workflow-skill-bundle", Kind: "workflow_skill_bundle", Subject: filepath.Join(userProfile, ".agents", "skills"), Action: "install", Parameters: withPins(map[string]string{"version": contract.SkillBundle.Version, "managed_skills_json": string(skillsJSON), "files_json": string(filesJSON)})}); err != nil {
+			return err
+		}
+	}
+	if !planned["docker_desktop"] {
+		if err := check(setupcontract.Effect{ID: "precondition-docker-desktop", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: withPins(map[string]string{"version": contract.Docker.Version, "installer_url": contract.Docker.InstallerURL, "windows_amd64_sha256": contract.Docker.WindowsAMD64SHA256})}); err != nil {
+			return err
+		}
+	}
+	if !planned["github_pat"] {
+		verification, err := database.GitHubPATVerification(ctx)
+		if err != nil || verification.Status != "verified" {
+			return errors.Join(errors.New("satisfied GitHub PAT drifted before mutation"), err)
+		}
+		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
+		token, err := verifiedClassicPAT(ctx, database, config)
+		if err != nil {
+			return err
+		}
+		if result := (doctor.GitHubPATCheck{Pin: config.GitHub.Credential, Token: token, Verification: verification}).Run(ctx); result.Status != doctor.Pass {
+			return errors.New(result.Summary)
+		}
+	}
+	if !planned["control_plane"] && !planned["platform_installation"] {
+		record, err := controlplane.ReadRuntimeRecord(layout)
+		if err != nil {
+			return err
+		}
+		if observation := (controlplane.Inspector{}).Inspect(ctx, &record); observation.State != controlplane.StateReady || record.PlatformVersion != installation.PlatformVersion || record.ApprovedPlanDigestSHA256 != installation.ControlPlanePlanDigestSHA256 {
+			return errors.New("satisfied Control Plane drifted before mutation")
+		}
+		if err := verifyRuntimePlanBinding(ctx, database, record, installation); err != nil {
+			return err
+		}
+	}
+	if _, err := codexauth.ResolveChatGPT(ctx); err != nil {
+		return fmt.Errorf("satisfied Codex authentication drifted before mutation: %w", err)
+	}
+	return nil
+}
+
+type platformStateSnapshot struct {
+	CodexAuth struct {
+		Source            string `json:"source"`
+		FingerprintSHA256 string `json:"fingerprint_sha256"`
+	} `json:"codex_auth"`
+	GitHubPAT *struct {
+		FingerprintSHA256 string   `json:"fingerprint_sha256"`
+		Owner             string   `json:"owner"`
+		Scopes            []string `json:"scopes"`
+	} `json:"github_pat,omitempty"`
+}
+
+func currentPlatformStateDigest(ctx context.Context, database *store.Store, includePAT bool) (string, error) {
+	source, err := resolveCodexAuthForSetup(ctx)
+	if err != nil {
+		return "", err
+	}
+	content, err := os.ReadFile(source)
+	if err != nil {
+		return "", err
+	}
+	var snapshot platformStateSnapshot
+	sum := sha256.Sum256(content)
+	snapshot.CodexAuth.Source = filepath.Clean(source)
+	snapshot.CodexAuth.FingerprintSHA256 = hex.EncodeToString(sum[:])
+	if includePAT {
+		verification, err := database.GitHubPATVerification(ctx)
+		if err != nil {
+			return "", err
+		}
+		value := struct {
+			FingerprintSHA256 string   `json:"fingerprint_sha256"`
+			Owner             string   `json:"owner"`
+			Scopes            []string `json:"scopes"`
+		}{FingerprintSHA256: verification.FingerprintSHA256, Owner: verification.Owner, Scopes: append([]string(nil), verification.Scopes...)}
+		snapshot.GitHubPAT = &value
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+	_, digest, err := setupcontract.Canonicalize(raw)
+	return digest, err
 }
 
 func runSetupVerify(args []string, output io.Writer) error {

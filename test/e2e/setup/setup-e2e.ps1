@@ -30,14 +30,6 @@ $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
-$env:GH_TOKEN = $cleanupToken
-$cleanupBaseline = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
-if ($LASTEXITCODE -ne 0) { throw "Cleanup credential cannot enumerate disposable repositories" }
-$env:GH_TOKEN = $setupToken
-# The deletion credential is harness-only and must never enter Codex or a Worker.
-Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
-
-New-Item -ItemType Directory -Force -Path $profileRoot,$workflowHome,$evidenceRoot,$githubConfig | Out-Null
 $prior = @{
     USERPROFILE = $env:USERPROFILE; HOME = $env:HOME; CODEX_HOME = $env:CODEX_HOME
     WORKFLOW_HOME = $env:WORKFLOW_HOME; GH_CONFIG_DIR = $env:GH_CONFIG_DIR; GH_TOKEN = $env:GH_TOKEN
@@ -46,6 +38,15 @@ $prior = @{
 	WORKFLOW_SETUP_E2E_PLATFORM_VERSION = $env:WORKFLOW_SETUP_E2E_PLATFORM_VERSION
 	WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = $cleanupToken
 }
+try {
+$env:GH_TOKEN = $cleanupToken
+$cleanupBaseline = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
+if ($LASTEXITCODE -ne 0) { throw "Cleanup credential cannot enumerate disposable repositories" }
+$env:GH_TOKEN = $setupToken
+# The deletion credential is harness-only and must never enter Codex or a Worker.
+Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
+
+New-Item -ItemType Directory -Force -Path $profileRoot,$workflowHome,$evidenceRoot,$githubConfig | Out-Null
 $codexDoctor = (& codex doctor --json | ConvertFrom-Json)
 $authCheck = $codexDoctor.checks.'auth.credentials'
 $configCheck = $codexDoctor.checks.'config.load'
@@ -87,7 +88,6 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
     if ($LASTEXITCODE -ne 0) { throw "Cannot clone fixture repository $Repository" }
 }
 
-try {
     $env:USERPROFILE = $profileRoot; $env:HOME = $profileRoot
     $env:CODEX_HOME = Join-Path $profileRoot ".codex"
 	New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null

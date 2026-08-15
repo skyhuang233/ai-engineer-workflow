@@ -121,7 +121,7 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	if err != nil || json.Unmarshal(inspectOutput, &inspected) != nil || inspected.SchemaVersion != 1 || !inspected.SupportedHost {
 		t.Fatalf("fresh host inspection on powershell.exe: %v (%s)", err, inspectOutput)
 	}
-	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_skills_root": filepath.Join(directory, "skills")})
+	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
 	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath)
 	planOutput, err := planCommand.CombinedOutput()
@@ -154,5 +154,59 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	args, err := os.ReadFile(argsCapture)
 	if err != nil || strings.Contains(string(args), token) || !strings.Contains(string(args), "setup\napply\n--plan") || !strings.Contains(string(args), "--approved-digest\n"+envelope.Digest) {
 		t.Fatalf("workflow setup apply args=%q err=%v", args, err)
+	}
+}
+
+func TestFreshHostInspectionResolvesCodexDoctorAuthBeforeWorkflowCLIExistsOnPowerShell51(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell 5.1 is the supported bootstrap shell")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	directory := t.TempDir()
+	authPath := filepath.Join(directory, "codex-home", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","account_id":"account","id_token":"id","refresh_token":"refresh"}}`)
+	if err := os.WriteFile(authPath, auth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeSource := filepath.Join(directory, "fake-codex.go")
+	fakeCodex := filepath.Join(directory, "codex.exe")
+	program := `package main
+import ("encoding/json"; "fmt"; "os")
+func main() {
+ if len(os.Args)>2 && os.Args[1]=="doctor" && os.Args[2]=="--json" { report:=map[string]any{"schemaVersion":1,"codexVersion":"0.147.0","checks":map[string]any{"auth.credentials":map[string]any{"status":"ok","details":map[string]string{"auth file":os.Getenv("WORKFLOW_TEST_CODEX_AUTH"),"stored ChatGPT tokens":"true","stored auth mode":"chatgpt"}},"config.load":map[string]any{"status":"ok","details":map[string]string{"CODEX_HOME":os.Getenv("WORKFLOW_TEST_CODEX_HOME")}}}}; _=json.NewEncoder(os.Stdout).Encode(report); os.Exit(1) }
+ if len(os.Args)>2 && os.Args[1]=="login" && os.Args[2]=="status" { fmt.Println("Logged in using ChatGPT"); return }
+ fmt.Println("codex-cli 0.147.0")
+}`
+	if err := os.WriteFile(fakeSource, []byte(program), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", fakeCodex, fakeSource)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fake codex.exe: %v (%s)", err, output)
+	}
+	_, currentFile, _, _ := runtime.Caller(0)
+	script := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1"))
+	command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Repository", directory, "-WorkflowHome", filepath.Join(directory, "workflow-home"))
+	command.Env = append(os.Environ(), "PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"), "WORKFLOW_TEST_CODEX_AUTH="+authPath, "WORKFLOW_TEST_CODEX_HOME="+filepath.Dir(authPath))
+	output, err := command.CombinedOutput()
+	var facts struct {
+		CodexAuth struct {
+			Verified          bool   `json:"verified"`
+			Source            string `json:"source"`
+			FingerprintSHA256 string `json:"fingerprint_sha256"`
+		} `json:"codex_auth"`
+	}
+	if decodeErr := json.Unmarshal(bytes.TrimPrefix(output, []byte{0xef, 0xbb, 0xbf}), &facts); err != nil || decodeErr != nil {
+		t.Fatalf("fresh inspect output=%q run=%v decode=%v", output, err, decodeErr)
+	}
+	sum := sha256.Sum256(auth)
+	if !facts.CodexAuth.Verified || facts.CodexAuth.Source != authPath || facts.CodexAuth.FingerprintSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("fresh Codex auth facts=%#v", facts.CodexAuth)
 	}
 }

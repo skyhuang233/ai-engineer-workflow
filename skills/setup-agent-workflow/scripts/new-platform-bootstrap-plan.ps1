@@ -141,14 +141,44 @@ if (-not $controlPlaneReady) {
     $actions.Add([ordered]@{ id = "start-control-plane"; kind = "control_plane"; subject = $facts.workflow_home; action = $controlPlaneAction; parameters = [ordered]@{ version = [string]$manifest.release.version; release_manifest_digest = $manifestDigest; platform_setup_contract_digest = $platformSetupContractDigest; workflow_cli_sha256 = [string]$workflowExecutable[0].sha256; release_bundled_files_digest = $releaseBundledFilesDigest } })
 }
 
+$platformPreconditions = @(
+    [ordered]@{ id = "platform-release"; kind = "platform_release"; subject = [string]$manifest.release.tag; expected = $manifestDigest }
+    [ordered]@{ id = "platform-setup-contract"; kind = "platform_setup_contract"; subject = [string]$manifest.release.tag; expected = $platformSetupContractDigest }
+)
+$codexAuthVerified = ($facts.codex_auth.verified -and [IO.Path]::IsPathRooted([string]$facts.codex_auth.source) -and [string]$facts.codex_auth.fingerprint_sha256 -match '^[0-9a-f]{64}$')
+if (-not $codexAuthVerified) { throw "A supported verified Codex ChatGPT authentication snapshot is required" }
+$platformState = [ordered]@{
+    codex_auth = [ordered]@{ source = [IO.Path]::GetFullPath([string]$facts.codex_auth.source); fingerprint_sha256 = [string]$facts.codex_auth.fingerprint_sha256 }
+}
+if ($credentialCurrent) {
+    if ([string]$facts.github_credential.fingerprint_sha256 -notmatch '^[0-9a-f]{64}$') { throw "Verified GitHub PAT snapshot lacks a fingerprint" }
+    $platformState.github_pat = [ordered]@{ fingerprint_sha256 = [string]$facts.github_credential.fingerprint_sha256; owner = [string]$facts.github_credential.owner; scopes = @($observedScopes) }
+}
+$stateInput = Join-Path $scratchRoot "platform-state.input.json"; $stateCanonical = Join-Path $scratchRoot "platform-state.canonical.json"
+[IO.File]::WriteAllText($stateInput, ($platformState | ConvertTo-Json -Depth 8 -Compress), (New-Object Text.UTF8Encoding($false)))
+$platformStateDigest = (& $canonicalizer -InputPath $stateInput -OutputPath $stateCanonical | Select-Object -Last 1).Trim()
+$platformPreconditions += [ordered]@{ id = "satisfied-platform-state"; kind = "platform_state"; subject = $facts.workflow_home; expected = $platformStateDigest }
+if ($AllowUpgrade -and $facts.platform.installation_recorded -and -not $platformRecordCurrent) {
+    $priorInstallation = [ordered]@{
+        version = [string]$facts.platform.version
+        release_manifest_digest = [string]$facts.platform.release_manifest_digest
+        platform_setup_contract_digest = [string]$facts.platform.platform_setup_contract_digest
+        workflow_cli_sha256 = [string]$facts.platform.workflow_cli_sha256
+        release_bundled_files_digest = [string]$facts.platform.release_bundled_files_digest
+        control_plane_plan_digest_sha256 = [string]$facts.platform.control_plane_plan_digest_sha256
+    }
+    foreach ($value in $priorInstallation.Values) { if ([string]::IsNullOrWhiteSpace([string]$value)) { throw "Explicit upgrade requires every durable prior Platform Installation pin" } }
+    $priorInput = Join-Path $scratchRoot "prior-installation.input.json"; $priorCanonical = Join-Path $scratchRoot "prior-installation.canonical.json"
+    [IO.File]::WriteAllText($priorInput, ($priorInstallation | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    $priorDigest = (& $canonicalizer -InputPath $priorInput -OutputPath $priorCanonical | Select-Object -Last 1).Trim()
+    $platformPreconditions += [ordered]@{ id = "installed-platform-transition"; kind = "platform_installation"; subject = $facts.workflow_home; expected = $priorDigest }
+}
+
 $identitySeed = [ordered]@{
     kind = "platform_bootstrap"
     schema_version = 1
     target = [ordered]@{ workflow_home = $facts.workflow_home; repository_path = ""; github_repository = "" }
-    preconditions = @(
-        [ordered]@{ id = "platform-release"; kind = "platform_release"; subject = [string]$manifest.release.tag; expected = $manifestDigest }
-        [ordered]@{ id = "platform-setup-contract"; kind = "platform_setup_contract"; subject = [string]$manifest.release.tag; expected = $platformSetupContractDigest }
-    )
+    preconditions = @($platformPreconditions)
     effects = @($actions)
     expected_results = @([ordered]@{ id = "platform-ready"; kind = "platform_readiness"; subject = $facts.workflow_home; expected = "ready" })
 }

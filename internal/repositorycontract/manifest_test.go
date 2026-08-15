@@ -2,6 +2,8 @@ package repositorycontract
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,5 +113,35 @@ func TestRenderedWorkflowVerifiesExactManagedAgentsBlockDigest(t *testing.T) {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow does not verify exact AGENTS block digest: missing %q", required)
 		}
+	}
+}
+
+func TestRuntimeContractTemplatesAreByteIdenticalToDeployInputs(t *testing.T) {
+	files, manifest, _, err := Render("single-context", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployRoot := filepath.Join("..", "..", "deploy", "platform", "repository-contract")
+	for _, path := range []string{"AGENTS.md", "docs/agents/issue-tracker.md", "docs/agents/domain.md", ".github/workflows/workflow-contract.yml"} {
+		deployPath := path
+		if path == "AGENTS.md" {
+			deployPath = "AGENTS.block.md"
+		}
+		expected, err := os.ReadFile(filepath.Join(deployRoot, filepath.FromSlash(deployPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(files[path], bytes.ReplaceAll(expected, []byte("\r\n"), []byte("\n"))) {
+			t.Fatalf("runtime contract surface %s differs from deploy template", path)
+		}
+	}
+	blockBytes, err := os.ReadFile(filepath.Join(deployRoot, "AGENTS.block.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockBytes = bytes.ReplaceAll(blockBytes, []byte("\r\n"), []byte("\n"))
+	sum := sha256.Sum256(blockBytes)
+	if manifest.ManagedBlockSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("managed block digest parity = %q", manifest.ManagedBlockSHA256)
 	}
 }

@@ -3,13 +3,18 @@ package setup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -66,7 +71,7 @@ func TestEngineAppliesRequiredEffectsAndRetriesSatisfiedOnes(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}, fail: "second"}
-	engine := Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("secret\n")}, ExpectedResultVerifier: passingExpectedResultVerifier}
+	engine := Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("secret\n")}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
 	first, err := engine.Apply(context.Background(), raw, digest)
 	if err == nil || first.Status != setupcontract.ExecutionIncomplete {
 		t.Fatalf("first=%#v err=%v", first, err)
@@ -90,12 +95,12 @@ func TestEngineFailsClosedUntilPlatformReadyExpectedResultIsVerified(t *testing.
 		t.Fatal(err)
 	}
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}}
-	result, err := (&Engine{Adapter: adapter}).Apply(context.Background(), raw, digest)
+	result, err := (&Engine{Adapter: adapter, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(context.Background(), raw, digest)
 	if err == nil || result.Status != setupcontract.ExecutionIncomplete || !strings.Contains(err.Error(), "Platform Ready verifier") {
 		t.Fatalf("missing verifier result=%#v err=%v", result, err)
 	}
 	verified := false
-	result, err = (&Engine{Adapter: adapter, ExpectedResultVerifier: func(_ context.Context, got setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+	result, err = (&Engine{Adapter: adapter, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier, ExpectedResultVerifier: func(_ context.Context, got setupcontract.Plan, expected setupcontract.ExpectedResult) error {
 		verified = got.PlanID == plan.PlanID && expected.Kind == "platform_readiness" && expected.Subject == home
 		return nil
 	}}).Apply(context.Background(), raw, digest)
@@ -104,9 +109,26 @@ func TestEngineFailsClosedUntilPlatformReadyExpectedResultIsVerified(t *testing.
 	}
 }
 
+func TestEngineChecksSatisfiedPlatformComponentsBeforeFirstMutation(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	plan := testPlan(home)
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}
+	result, err := (&Engine{Adapter: adapter, PlatformPreconditionVerifier: func(context.Context, setupcontract.Plan) error { return errors.New("satisfied Docker drifted") }, ExpectedResultVerifier: passingExpectedResultVerifier}).Apply(context.Background(), raw, digest)
+	if err == nil || result.Status != setupcontract.ExecutionDrifted || len(adapter.applied) != 0 || !strings.Contains(err.Error(), "Docker drifted") {
+		t.Fatalf("result=%#v err=%v applied=%v", result, err, adapter.applied)
+	}
+}
+
 func passingExpectedResultVerifier(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error {
 	return nil
 }
+
+func passingPlatformPreconditionVerifier(context.Context, setupcontract.Plan) error { return nil }
 
 func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
@@ -118,7 +140,7 @@ func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	}
 	mergeHead := repeat("a", 40)
 	adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{"first": setupcontract.EffectSatisfied, "second": setupcontract.EffectSatisfied}, evidence: map[string]string{"first": onboardingMergeHeadEvidence + mergeHead}}
-	engine := Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier}
+	engine := Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
 	if result, err := engine.Apply(context.Background(), raw, digest); err != nil || result.Status != setupcontract.ExecutionSucceeded {
 		t.Fatalf("first result=%#v err=%v", result, err)
 	}
@@ -240,6 +262,86 @@ func TestEngineChecksPlatformReleasePreconditionBeforeMutation(t *testing.T) {
 		t.Fatalf("unchecked Platform Release precondition: result=%#v err=%v applied=%v", result, err, adapter.applied)
 	}
 }
+
+func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		authorized bool
+		wantStatus setupcontract.ExecutionStatus
+	}{
+		{name: "unapproved changed pins conflict", wantStatus: setupcontract.ExecutionDrifted},
+		{name: "approved old pins transition", authorized: true, wantStatus: setupcontract.ExecutionSucceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+			if err != nil || layout.Ensure() != nil {
+				t.Fatal(err)
+			}
+			executable := filepath.Join(t.TempDir(), "workflow.exe")
+			if err := os.WriteFile(executable, []byte("new workflow"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cliSum := sha256.Sum256([]byte("new workflow"))
+			cliDigest := hex.EncodeToString(cliSum[:])
+			if err := (workflowhome.Installation{Layout: layout}).InstallVersion("2.0.0", executable, cliDigest); err != nil {
+				t.Fatal(err)
+			}
+			bundleRaw, _ := json.Marshal([]platformrelease.BundledFile{{Path: "bin/workflow.exe", SHA256: cliDigest}})
+			bundleCanonical, bundleDigest, _ := setupcontract.Canonicalize(bundleRaw)
+			old := store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: repeat("1", 64), PlatformSetupContractDigestSHA256: repeat("2", 64), WorkflowCLISHA256: repeat("3", 64), ReleaseBundledFilesJSON: string(bundleCanonical), ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: repeat("4", 64), WorkflowHome: layout.Root}
+			old.InstalledAt, old.VerifiedAt = testTime(), testTime()
+			database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+			if err != nil || database.RecordPlatformInstallation(ctx, old) != nil || database.AuthorizeControlPlane(ctx, old, old.ControlPlanePlanDigestSHA256) != nil {
+				t.Fatalf("record old installation: %v", err)
+			}
+			database.Close()
+			contractRaw := validPlatformSetupContractJSON(t)
+			contractCanonical, contractDigest, _ := setupcontract.Canonicalize(contractRaw)
+			plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "upgrade", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{
+				{ID: "release", Kind: "platform_release", Subject: "platform-v2.0.0", Expected: repeat("5", 64)},
+				{ID: "contract", Kind: "platform_setup_contract", Subject: "platform-v2.0.0", Expected: contractDigest},
+			}, Effects: []setupcontract.Effect{{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+			if test.authorized {
+				priorRaw, _ := json.Marshal(map[string]string{"version": old.PlatformVersion, "release_manifest_digest": old.ReleaseManifestDigestSHA256, "platform_setup_contract_digest": old.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": old.WorkflowCLISHA256, "release_bundled_files_digest": old.ReleaseBundledFilesDigestSHA256, "control_plane_plan_digest_sha256": old.ControlPlanePlanDigestSHA256})
+				_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
+				plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "installed", Kind: "platform_installation", Subject: layout.Root, Expected: priorDigest})
+			}
+			raw, _ := json.Marshal(plan)
+			_, _, digest, err := setupcontract.ParsePlan(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, applyErr := (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, raw, digest)
+			if result.Status != test.wantStatus || test.authorized && applyErr != nil || !test.authorized && applyErr == nil {
+				t.Fatalf("result=%#v err=%v", result, applyErr)
+			}
+			if test.authorized {
+				database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer database.Close()
+				got, err := database.PlatformInstallation(ctx)
+				if err != nil || got.PlatformVersion != "2.0.0" || got.ReleaseManifestDigestSHA256 != repeat("5", 64) {
+					t.Fatalf("upgraded installation=%#v err=%v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func validPlatformSetupContractJSON(t *testing.T) []byte {
+	t.Helper()
+	contract := platformrelease.PlatformSetupContract{WorkflowHomeDefault: `%LOCALAPPDATA%\AgentWorkflow`, Credential: platformrelease.CredentialContract{Kind: "classic-pat", RequiredScopes: []string{"repo", "workflow"}, OwnerBinding: "single-owner", PlaintextRelativePath: `state\credentials\github.pat`}, Docker: platformrelease.DockerDependency{Version: "4.45.0", InstallerURL: "https://example.test/docker.exe", WindowsAMD64SHA256: repeat("6", 64)}, Worker: platformrelease.WorkerPin{Image: "ghcr.io/owner/worker@sha256:" + repeat("7", 64)}, SkillBundle: platformrelease.SkillBundleContract{Version: "2.0.0", InstallScope: "user", ManagedSkills: []string{"implement"}}, RepositoryContract: platformrelease.RepositoryContractPin{Version: "1", ManifestPath: ".workflow/repository.json", CheckName: "workflow-contract", Labels: []platformrelease.RepositoryLabel{{Name: "workflow:plan", Color: "0e8a16", Description: "plan"}}}}
+	raw, err := json.Marshal(contract)
+	if err != nil || contract.Validate() != nil {
+		t.Fatalf("valid test contract: %v", err)
+	}
+	return raw
+}
+
+func testTime() time.Time { return time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC) }
 
 func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 	ctx := context.Background()

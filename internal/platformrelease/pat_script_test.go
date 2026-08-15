@@ -40,9 +40,28 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"message":"not found"}`))
 		case "/repos/alice/published":
-			_, _ = w.Write([]byte(`{"full_name":"alice/published","private":true,"permissions":{"admin":true}}`))
+			_, _ = w.Write([]byte(`{"full_name":"alice/published","private":true,"default_branch":"main","has_issues":true,"allow_squash_merge":true,"allow_merge_commit":false,"allow_rebase_merge":false,"permissions":{"admin":true}}`))
 		case "/repos/alice/read-only":
 			_, _ = w.Write([]byte(`{"full_name":"alice/read-only","private":true,"permissions":{"admin":false}}`))
+		case "/repos/alice/no-merge":
+			_, _ = w.Write([]byte(`{"full_name":"alice/no-merge","private":true,"default_branch":"main","allow_squash_merge":false,"allow_merge_commit":false,"allow_rebase_merge":false,"permissions":{"admin":true}}`))
+		case "/repos/alice/protected":
+			_, _ = w.Write([]byte(`{"full_name":"alice/protected","private":true,"default_branch":"main","allow_squash_merge":true,"permissions":{"admin":true}}`))
+		case "/repos/alice/published/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":false,"allowed_actions":"selected"}`))
+		case "/repos/alice/published/actions/permissions/selected-actions":
+			_, _ = w.Write([]byte(`{"github_owned_allowed":true}`))
+		case "/repos/alice/published/rulesets":
+			_, _ = w.Write([]byte(`[]`))
+		case "/repos/alice/published/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not protected"}`))
+		case "/repos/alice/protected/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case "/repos/alice/protected/rulesets":
+			_, _ = w.Write([]byte(`[]`))
+		case "/repos/alice/protected/branches/main/protection":
+			_, _ = w.Write([]byte(`{"required_pull_request_reviews":{"required_approving_review_count":1}}`))
 		case "/orgs/acme":
 			_, _ = w.Write([]byte(`{"login":"acme"}`))
 		case "/orgs/acme/actions/permissions":
@@ -91,6 +110,14 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndBindsPersonalOrOrganizationO
 	output, runErr = run("alice", "read-only", "published")
 	if runErr == nil || !strings.Contains(string(output), "repository administration") {
 		t.Fatalf("published repository without administration permission was not rejected: %q, %v", output, runErr)
+	}
+	output, runErr = run("alice", "no-merge", "published")
+	if runErr == nil || !strings.Contains(string(output), "supported merge method") {
+		t.Fatalf("published repository without an onboarding merge method was not rejected: %q, %v", output, runErr)
+	}
+	output, runErr = run("alice", "protected", "published")
+	if runErr == nil || !strings.Contains(string(output), "requires human review") {
+		t.Fatalf("published repository with an unfulfillable review policy was not rejected: %q, %v", output, runErr)
 	}
 }
 

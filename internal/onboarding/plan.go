@@ -101,10 +101,24 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	}
 	encodedFiles, _ := json.Marshal(filePayload)
 	encodedBeforeFiles, _ := json.Marshal(beforePayload)
-	plan := setupcontract.Plan{SchemaVersion: 1, Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: options.WorkflowHome, RepositoryPath: discovery.Root, GitHubRepository: repositoryID}, Preconditions: []setupcontract.Precondition{{ID: "platform-release", Kind: "platform_release", Subject: options.WorkflowHome, Expected: options.PlatformReleaseDigest}, {ID: "local-head", Kind: "git_head", Subject: discovery.Root, Expected: discovery.Head}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "repository-admitted", Kind: "repository_admission", Subject: repositoryID, Expected: manifestDigest}}}
+	var zeroBaseline []BaselineFile
+	if !discovery.HasCommits {
+		zeroBaseline, err = BaselineSnapshot(ctx, discovery.Root)
+		if err != nil {
+			return setupcontract.Plan{}, err
+		}
+	}
+	snapshotJSON, err := CaptureApprovalSnapshot(ctx, discovery, zeroBaseline)
+	if err != nil {
+		return setupcontract.Plan{}, err
+	}
+	plan := setupcontract.Plan{SchemaVersion: 1, Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: options.WorkflowHome, RepositoryPath: discovery.Root, GitHubRepository: repositoryID}, Preconditions: []setupcontract.Precondition{{ID: "platform-release", Kind: "platform_release", Subject: options.WorkflowHome, Expected: options.PlatformReleaseDigest}, {ID: "onboarding-discovery", Kind: "onboarding_snapshot", Subject: discovery.Root, Expected: snapshotJSON}, {ID: "local-head", Kind: "git_head", Subject: discovery.Root, Expected: discovery.Head}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "repository-admitted", Kind: "repository_admission", Subject: repositoryID, Expected: manifestDigest}}}
 	policy := RepositoryPolicy{}
 	state := OnboardingState{}
-	if discovery.Published && options.Policy != nil {
+	if discovery.Published && options.Policy == nil {
+		return setupcontract.Plan{}, errors.New("published repository requires complete read-only GitHub policy preflight")
+	}
+	if discovery.Published {
 		policy, err = options.Policy.DiscoverPolicy(ctx, repositoryID, discovery.DefaultBranch)
 		if err != nil {
 			return setupcontract.Plan{}, err
@@ -117,6 +131,12 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		}
 		if !policy.AllowSquashMerge && !policy.AllowMergeCommit && !policy.AllowRebaseMerge {
 			return setupcontract.Plan{}, errors.New("repository has no supported merge method")
+		}
+		if !policy.Admin {
+			return setupcontract.Plan{}, errors.New("published repository onboarding requires verified repository administration")
+		}
+		if !policy.GitHubOwnedActionsAllowed {
+			return setupcontract.Plan{}, errors.New("published repository Actions policy does not prove GitHub-owned checkout")
 		}
 		if !policy.HasIssues || !policy.ActionsEnabled {
 			if !policy.Admin {
@@ -161,14 +181,10 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			if findings := ScanCredentialMaterial(discovery.Root, baselineFiles); len(findings) > 0 {
 				return setupcontract.Plan{}, errors.New("credential material blocks Initial Repository Baseline")
 			}
-			snapshot, snapshotErr := BaselineSnapshot(ctx, discovery.Root)
-			if snapshotErr != nil {
-				return setupcontract.Plan{}, snapshotErr
-			}
-			encoded, _ := json.Marshal(snapshot)
+			encoded, _ := json.Marshal(zeroBaseline)
 			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: discovery.Root, Action: "commit_and_push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "files_json": string(encoded), "repository": repositoryID, "source_url": "https://github.com/" + repositoryID + ".git"}})
 		} else {
-			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "publish-history", Kind: "publish_history", Subject: repositoryID, Action: "push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "head": discovery.Head}})
+			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "publish-history", Kind: "publish_history", Subject: repositoryID, Action: "push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "head": discovery.Head, "new_repository": "true"}})
 		}
 	}
 	for index, label := range options.Labels {
@@ -187,7 +203,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	if !state.ContractSatisfied {
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
 	}
-	if !state.AdmissionSatisfied {
+	if !state.AdmissionSatisfied || !state.ContractSatisfied {
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
 	}
 	if !state.ContractSatisfied {

@@ -20,6 +20,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
+	"github.com/skyhuang233/workflow/internal/setupeffect"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -55,12 +56,14 @@ type EffectResultRestorer interface {
 	RestoreEffectResults([]setupcontract.EffectResult) error
 }
 type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
+type PlatformPreconditionVerifier func(context.Context, setupcontract.Plan) error
 type Engine struct {
-	Adapter                EffectAdapter
-	SecretInput            *SecretInput
-	Now                    func() time.Time
-	ResolveCodexAuth       func(context.Context) (string, error)
-	ExpectedResultVerifier ExpectedResultVerifier
+	Adapter                      EffectAdapter
+	SecretInput                  *SecretInput
+	Now                          func() time.Time
+	ResolveCodexAuth             func(context.Context) (string, error)
+	ExpectedResultVerifier       ExpectedResultVerifier
+	PlatformPreconditionVerifier PlatformPreconditionVerifier
 }
 
 func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (setupcontract.ExecutionResult, error) {
@@ -122,6 +125,8 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			checkErr = checkPlatformReleasePrecondition(ctx, database, plan, precondition)
 		} else if precondition.Kind == "platform_setup_contract" {
 			checkErr = checkPlatformSetupContractPrecondition(plan, precondition)
+		} else if precondition.Kind == "platform_installation" {
+			checkErr = checkPlatformInstallationPrecondition(ctx, database, plan, precondition)
 		} else if checker, ok := e.Adapter.(PreconditionChecker); ok {
 			checkErr = checker.CheckPrecondition(ctx, precondition)
 		} else {
@@ -136,28 +141,30 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			return result, errors.Join(checkErr, recordErr)
 		}
 	}
-	for _, effect := range plan.Effects {
-		if effect.Kind == "platform_installation" {
-			status, evidence, platformErr := readPlatformInstallation(ctx, database, effect)
-			if platformErr == nil && status == setupcontract.EffectRequired {
-				platformErr = recordPlatformInstallation(ctx, database, layout, effect, now)
-				if platformErr == nil {
-					status, evidence, platformErr = readPlatformInstallation(ctx, database, effect)
-				}
-			}
-			if platformErr != nil || status != setupcontract.EffectSatisfied {
-				result.Status = setupcontract.ExecutionIncomplete
-				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: evidence})
-				err = platformErr
-				if err == nil {
-					err = errors.New("Platform Installation did not read back")
-				}
-				break
-			}
-			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: status, Evidence: evidence})
-			continue
+	if plan.Kind == setupcontract.PlatformBootstrap {
+		if e.PlatformPreconditionVerifier == nil {
+			err = errors.New("Platform component precondition verifier is required")
+		} else {
+			err = e.PlatformPreconditionVerifier(ctx, plan)
 		}
-		status, evidence, readErr := e.Adapter.Readback(ctx, effect)
+		if err != nil {
+			result.Status = setupcontract.ExecutionDrifted
+			result.Blocker = err.Error()
+			result.FinishedAt = time.Now().UTC()
+			encoded, _ := json.Marshal(result.Effects)
+			recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
+			return result, errors.Join(err, recordErr)
+		}
+	}
+	for _, effect := range plan.Effects {
+		handler, ok := effectHandlers[effect.Kind]
+		if !ok {
+			result.Status = setupcontract.ExecutionIncomplete
+			err = fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
+			break
+		}
+		run := &effectExecution{engine: e, ctx: ctx, database: database, layout: layout, plan: plan, digest: digest, now: now}
+		status, evidence, readErr := handler.engineReadback(run, effect)
 		if readErr != nil {
 			result.Status = setupcontract.ExecutionIncomplete
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: readErr.Error()})
@@ -166,67 +173,28 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		}
 		if status == setupcontract.EffectConflicting {
 			result.Status = setupcontract.ExecutionDrifted
-			result.Blocker = "effect precondition drifted"
+			result.Blocker = handler.conflict()
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: status, Evidence: evidence})
 			err = errors.New(result.Blocker)
 			break
 		}
 		if status == setupcontract.EffectSatisfied {
-			if effect.Kind == "control_plane" {
-				if authErr := authorizeControlPlane(ctx, database, effect, digest); authErr != nil {
-					result.Status = setupcontract.ExecutionIncomplete
-					result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: authErr.Error()})
-					err = authErr
-					break
-				}
-			}
-			if effect.Kind == "github_pat" {
-				if verifyErr := verifyAndRecordPAT(ctx, database, layout, effect); verifyErr != nil {
-					if e.SecretInput == nil || e.SecretInput.Reader == nil {
-						result.Status = setupcontract.ExecutionIncomplete
-						result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: verifyErr.Error()})
-						err = verifyErr
-						break
-					}
-					if replaceErr := e.Adapter.Apply(ctx, effect, e.SecretInput); replaceErr != nil {
-						result.Status = setupcontract.ExecutionIncomplete
-						result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: replaceErr.Error()})
-						err = replaceErr
-						break
-					}
-					if verifyErr = verifyAndRecordPAT(ctx, database, layout, effect); verifyErr != nil {
-						result.Status = setupcontract.ExecutionIncomplete
-						result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: verifyErr.Error()})
-						err = verifyErr
-						break
-					}
-				}
-			}
-			if effect.Kind == "repository_admission" {
-				if recorded, admissionErr := repositoryAdmissionRecorded(ctx, database, plan.Target.RepositoryPath, effect, digest, false); admissionErr != nil {
-					result.Status = setupcontract.ExecutionIncomplete
-					result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
-					err = admissionErr
-					break
-				} else if !recorded {
-					if admissionErr := e.recordRepositoryAdmission(ctx, database, layout, plan.Target.RepositoryPath, effect, digest, now, false); admissionErr != nil {
-						result.Status = setupcontract.ExecutionIncomplete
-						result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
-						err = admissionErr
-						break
-					}
-				}
+			if postErr := handler.afterSatisfied(run, effect, true); postErr != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: postErr.Error()})
+				err = postErr
+				break
 			}
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: status, Evidence: evidence})
 			continue
 		}
-		if applyErr := e.Adapter.Apply(ctx, effect, e.SecretInput); applyErr != nil {
+		if applyErr := handler.engineApply(run, effect); applyErr != nil {
 			result.Status = setupcontract.ExecutionIncomplete
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: applyErr.Error()})
 			err = applyErr
 			break
 		}
-		status, evidence, readErr = e.Adapter.Readback(ctx, effect)
+		status, evidence, readErr = handler.engineReadback(run, effect)
 		if readErr != nil || status != setupcontract.EffectSatisfied {
 			if readErr == nil {
 				readErr = fmt.Errorf("effect %q did not read back as satisfied", effect.ID)
@@ -236,51 +204,25 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			err = readErr
 			break
 		}
-		if effect.Kind == "github_pat" {
-			if verifyErr := verifyAndRecordPAT(ctx, database, layout, effect); verifyErr != nil {
-				result.Status = setupcontract.ExecutionIncomplete
-				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: verifyErr.Error()})
-				err = verifyErr
-				break
-			}
-		}
-		if effect.Kind == "control_plane" {
-			if authErr := authorizeControlPlane(ctx, database, effect, digest); authErr != nil {
-				result.Status = setupcontract.ExecutionIncomplete
-				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: authErr.Error()})
-				err = authErr
-				break
-			}
-		}
-		if effect.Kind == "repository_admission" {
-			if recorded, admissionErr := repositoryAdmissionRecorded(ctx, database, plan.Target.RepositoryPath, effect, digest, false); admissionErr != nil {
-				result.Status = setupcontract.ExecutionIncomplete
-				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
-				err = admissionErr
-				break
-			} else if !recorded {
-				if admissionErr := e.recordRepositoryAdmission(ctx, database, layout, plan.Target.RepositoryPath, effect, digest, now, false); admissionErr != nil {
-					result.Status = setupcontract.ExecutionIncomplete
-					result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
-					err = admissionErr
-					break
-				}
-			}
+		if postErr := handler.afterSatisfied(run, effect, false); postErr != nil {
+			result.Status = setupcontract.ExecutionIncomplete
+			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: postErr.Error()})
+			err = postErr
+			break
 		}
 		result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: status, Evidence: evidence})
 	}
-	if err == nil && plan.Kind == setupcontract.RepositoryOnboarding {
+	if err == nil {
+		run := &effectExecution{engine: e, ctx: ctx, database: database, layout: layout, plan: plan, digest: digest, now: now}
 		for _, effect := range plan.Effects {
-			if effect.Kind == "repository_admission" {
-				if recorded, admissionErr := repositoryAdmissionRecorded(ctx, database, plan.Target.RepositoryPath, effect, digest, true); admissionErr != nil {
-					result.Status = setupcontract.ExecutionIncomplete
-					err = admissionErr
-				} else if !recorded {
-					if admissionErr := e.recordRepositoryAdmission(ctx, database, layout, plan.Target.RepositoryPath, effect, digest, now, true); admissionErr != nil {
-						result.Status = setupcontract.ExecutionIncomplete
-						err = admissionErr
-					}
-				}
+			handler, ok := effectHandlers[effect.Kind]
+			if !ok {
+				err = fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
+				break
+			}
+			if finalizeErr := handler.finalize(run, effect); finalizeErr != nil {
+				result.Status = setupcontract.ExecutionIncomplete
+				err = finalizeErr
 				break
 			}
 		}
@@ -292,15 +234,9 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		}
 	}
 	if err == nil {
+		run := &effectExecution{engine: e, ctx: ctx, database: database, layout: layout, plan: plan, digest: digest, now: now}
 		for _, expected := range plan.ExpectedResults {
-			if expected.Kind != "platform_readiness" {
-				continue
-			}
-			if e.ExpectedResultVerifier == nil {
-				err = errors.New("Platform Ready verifier is required")
-			} else {
-				err = e.ExpectedResultVerifier(ctx, plan, expected)
-			}
+			err = verifyExpectedResult(run, expected)
 			if err != nil {
 				result.Status = setupcontract.ExecutionIncomplete
 				break
@@ -421,13 +357,50 @@ func checkPlatformSetupContractPrecondition(plan setupcontract.Plan, preconditio
 	return errors.New("Platform Setup Contract precondition is not bound to an approved platform effect")
 }
 
-func isPlatformMutationEffect(kind string) bool {
-	switch kind {
-	case "platform_cli", "workflow_skill_bundle", "docker_desktop", "github_pat", "platform_installation", "control_plane":
-		return true
-	default:
-		return false
+func checkPlatformInstallationPrecondition(ctx context.Context, database *store.Store, plan setupcontract.Plan, precondition setupcontract.Precondition) error {
+	if plan.Kind != setupcontract.PlatformBootstrap || precondition.Subject != plan.Target.WorkflowHome {
+		return errors.New("Platform Installation transition precondition is not bound to its Workflow Home")
 	}
+	found := false
+	for _, effect := range plan.Effects {
+		handler, ok := effectHandlers[effect.Kind]
+		found = found || ok && handler.contract.Engine == setupeffect.PlatformInstallEffect
+	}
+	if !found {
+		return errors.New("Platform Installation transition precondition has no approved record effect")
+	}
+	installation, err := database.PlatformInstallation(ctx)
+	if err != nil {
+		return err
+	}
+	_, digest, err := setupcontract.Canonicalize(platformInstallationStateJSON(installation))
+	if err != nil || digest != precondition.Expected {
+		return errors.Join(errors.New("Platform Installation transition source pins drifted"), err)
+	}
+	return nil
+}
+
+func hasPlatformInstallationTransition(plan setupcontract.Plan) bool {
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind == "platform_installation" {
+			return true
+		}
+	}
+	return false
+}
+
+func platformInstallationStateJSON(value store.PlatformInstallation) []byte {
+	raw, _ := json.Marshal(map[string]string{
+		"version": value.PlatformVersion, "release_manifest_digest": value.ReleaseManifestDigestSHA256,
+		"platform_setup_contract_digest": value.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": value.WorkflowCLISHA256,
+		"release_bundled_files_digest": value.ReleaseBundledFilesDigestSHA256, "control_plane_plan_digest_sha256": value.ControlPlanePlanDigestSHA256,
+	})
+	return raw
+}
+
+func isPlatformMutationEffect(kind string) bool {
+	handler, ok := effectHandlers[kind]
+	return ok && handler.contract.PlatformMutation
 }
 
 func verifyAndRecordPAT(ctx context.Context, database *store.Store, layout workflowhome.Layout, effect setupcontract.Effect) error {
@@ -446,7 +419,7 @@ func verifyAndRecordPAT(ctx context.Context, database *store.Store, layout workf
 	return database.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: verification.FingerprintSHA256, Login: verification.Login, UserID: verification.UserID, Owner: verification.Owner, Scopes: verification.Scopes, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: verification.VerifiedAt})
 }
 
-func readPlatformInstallation(ctx context.Context, database *store.Store, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+func readPlatformInstallation(ctx context.Context, database *store.Store, effect setupcontract.Effect, allowTransition bool) (setupcontract.EffectStatus, string, error) {
 	value, err := database.PlatformInstallation(ctx)
 	if errors.Is(err, store.ErrNotFound) {
 		return setupcontract.EffectRequired, "Platform Installation is not recorded", nil
@@ -455,12 +428,18 @@ func readPlatformInstallation(ctx context.Context, database *store.Store, effect
 		return setupcontract.EffectFailed, "", err
 	}
 	if value.PlatformVersion != effect.Parameters["version"] || value.ReleaseManifestDigestSHA256 != effect.Parameters["release_manifest_digest"] {
+		if allowTransition {
+			return setupcontract.EffectRequired, "approved Platform Installation release transition is required", nil
+		}
 		return setupcontract.EffectConflicting, "Platform Installation differs from the approved release", nil
 	}
 	if value.PlatformSetupContractDigestSHA256 == "" || value.WorkflowCLISHA256 == "" || value.ReleaseBundledFilesDigestSHA256 == "" || value.ReleaseBundledFilesJSON == "" {
 		return setupcontract.EffectRequired, "Platform Installation lacks durable verified release pins", nil
 	}
 	if value.PlatformSetupContractDigestSHA256 != effect.Parameters["platform_setup_contract_digest"] || value.WorkflowCLISHA256 != effect.Parameters["workflow_cli_sha256"] || value.ReleaseBundledFilesDigestSHA256 != effect.Parameters["release_bundled_files_digest"] || value.ReleaseBundledFilesJSON != effect.Parameters["release_bundled_files_json"] {
+		if allowTransition {
+			return setupcontract.EffectRequired, "approved Platform Installation pin transition is required", nil
+		}
 		return setupcontract.EffectConflicting, "Platform Installation durable release pins differ", nil
 	}
 	contractPath := filepath.Join(value.WorkflowHome, "config", "platform-setup-contract.json")

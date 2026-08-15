@@ -289,20 +289,28 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	if result.Status != Pass {
 		t.Fatalf("Run() = %#v, want PASS", result)
 	}
-	if len(executor.commands) != 2 {
-		t.Fatalf("commands = %#v, want initial and resumed Worker containers", executor.commands)
+	if len(executor.commands) != 4 {
+		t.Fatalf("commands = %#v, want initial/resume containers and explicit cleanup", executor.commands)
 	}
 	initial := strings.Join(executor.commands[0], " ")
-	resumed := strings.Join(executor.commands[1], " ")
-	if !strings.HasPrefix(initial, "docker run --rm") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec --sandbox read-only") {
+	resumed := strings.Join(executor.commands[2], " ")
+	if !strings.HasPrefix(initial, "docker run --name") || strings.Contains(initial, " --rm ") || !strings.Contains(initial, "CODEX_HOME=/codex-state") || !strings.Contains(initial, "ghcr.io/owner/worker@sha256:bbbb codex exec --sandbox read-only") {
 		t.Fatalf("initial Worker Codex command = %q", initial)
 	}
 	for _, command := range []string{initial, resumed} {
+		if !strings.Contains(command, "--name workflow-doctor-codex-") || !strings.Contains(command, "--label com.skyhuang233.workflow.setup-probe=true") {
+			t.Fatalf("Worker Codex command omits unique ownership metadata: %q", command)
+		}
 		if !strings.Contains(command, "--cap-add SYS_ADMIN") || !strings.Contains(command, "--security-opt seccomp=unconfined") {
 			t.Fatalf("Worker Codex command omits bubblewrap sandbox permissions: %q", command)
 		}
 		if !strings.Contains(command, "--output-schema /codex-state/output-schema.json") {
 			t.Fatalf("Worker Codex command omits the Candidate output schema: %q", command)
+		}
+	}
+	for _, index := range []int{1, 3} {
+		if got := strings.Join(executor.commands[index], " "); !strings.HasPrefix(got, "docker rm -f workflow-doctor-codex-") {
+			t.Fatalf("cleanup command = %q", got)
 		}
 	}
 	if !strings.Contains(resumed, "codex exec --sandbox read-only resume") || !strings.Contains(resumed, "worker-session-7") {
@@ -482,6 +490,9 @@ type recordingExecutor struct {
 
 func (e *recordingExecutor) Run(_ context.Context, command []string) ([]byte, error) {
 	e.commands = append(e.commands, append([]string(nil), command...))
+	if len(command) >= 3 && command[0] == "docker" && command[1] == "rm" && command[2] == "-f" {
+		return nil, nil
+	}
 	output := e.outputs[0]
 	e.outputs = e.outputs[1:]
 	var err error

@@ -190,6 +190,10 @@ func IsNotFound(err error) bool {
 	var api *apiError
 	return errors.As(err, &api) && api.StatusCode == http.StatusNotFound
 }
+func IsConflict(err error) bool {
+	var api *apiError
+	return errors.As(err, &api) && api.StatusCode == http.StatusConflict
+}
 func (c *Client) Label(ctx context.Context, repository, name string) (ManagedLabel, error) {
 	var result ManagedLabel
 	err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/labels/"+url.PathEscape(name), nil, &result)

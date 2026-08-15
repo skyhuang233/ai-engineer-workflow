@@ -75,296 +75,318 @@ func (a HostAdapter) Readback(ctx context.Context, effect setupcontract.Effect) 
 	if err := setupcontract.ValidateEffectForExecution(effect); err != nil {
 		return setupcontract.EffectFailed, "", err
 	}
-	switch effect.Kind {
-	case "github_pat":
-		_, err := credential.NewFileStore(a.Layout.CredentialFile).Get(ctx, credential.GatewayTarget)
-		if errors.Is(err, credential.ErrNotFound) {
-			return setupcontract.EffectRequired, "credential file is absent", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		return setupcontract.EffectSatisfied, "credential file exists", nil
-	case "platform_cli":
-		verified, err := (workflowhome.Installation{Layout: a.Layout}).VerifyVersion(effect.Parameters["version"], effect.Parameters["sha256"])
-		if err != nil {
-			if strings.Contains(err.Error(), "not owned") {
-				return setupcontract.EffectConflicting, err.Error(), nil
+	handler, ok := effectHandlers[effect.Kind]
+	if !ok {
+		return setupcontract.EffectFailed, "", fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
+	}
+	return handler.readback(a, ctx, effect)
+}
+
+func hostReadbackHandlers() map[string]effectReadback {
+	return map[string]effectReadback{
+		"github_pat": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			_, err := credential.NewFileStore(a.Layout.CredentialFile).Get(ctx, credential.GatewayTarget)
+			if errors.Is(err, credential.ErrNotFound) {
+				return setupcontract.EffectRequired, "credential file is absent", nil
 			}
-			return setupcontract.EffectFailed, "", err
-		}
-		if !verified {
-			return setupcontract.EffectRequired, "platform CLI version or checksum differs", nil
-		}
-		pathCheck := a.CurrentUserPATHReconciled
-		if pathCheck == nil {
-			pathCheck = workflowhome.CurrentUserPathIsReconciled
-		}
-		reconciled, err := pathCheck(a.Layout.Bin)
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if !reconciled {
-			return setupcontract.EffectRequired, "platform CLI exists but current-user PATH needs reconciliation", nil
-		}
-		return setupcontract.EffectSatisfied, "platform CLI ownership, version, checksum, and PATH match", nil
-	case "workflow_skill_bundle":
-		spec, err := skillBundleSpec(effect)
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		verified, err := (workflowhome.Installation{Layout: a.Layout}).VerifySkillBundle(spec)
-		if err != nil {
-			if strings.Contains(err.Error(), "not owned") {
-				return setupcontract.EffectConflicting, err.Error(), nil
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
 			}
-			return setupcontract.EffectFailed, "", err
-		}
-		if !verified {
-			return setupcontract.EffectRequired, "Workflow Skill Bundle is missing or differs from the exact release", nil
-		}
-		return setupcontract.EffectSatisfied, "Workflow Skill Bundle version and digests match", nil
-	case "docker_desktop":
-		host := a.DockerDesktopHost
-		if host == nil {
-			host = hostsetup.WindowsDockerDesktopHost{}
-		}
-		version, err := host.InstalledVersion(ctx)
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if version != effect.Parameters["version"] {
-			return setupcontract.EffectRequired, fmt.Sprintf("Docker Desktop version %q differs from approved %q", version, effect.Parameters["version"]), nil
-		}
-		if err := host.EngineReady(ctx); err != nil {
-			return setupcontract.EffectRequired, err.Error(), nil
-		}
-		return setupcontract.EffectSatisfied, "exact Docker Desktop version and Linux amd64 engine are ready", nil
-	case "control_plane":
-		record, err := controlplane.ReadRuntimeRecord(a.Layout)
-		if errors.Is(err, os.ErrNotExist) {
-			return setupcontract.EffectRequired, "Control Plane is stopped", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		inspect := a.InspectControlPlane
-		var observation controlplane.Observation
-		if inspect != nil {
-			observation = inspect(ctx, &record)
-		} else {
-			observation = (controlplane.Inspector{}).Inspect(ctx, &record)
-		}
-		if observation.State == controlplane.StateStale {
-			return setupcontract.EffectRequired, observation.Diagnostic, nil
-		}
-		if observation.State != controlplane.StateReady {
-			return setupcontract.EffectConflicting, observation.Diagnostic, nil
-		}
-		if record.PlatformVersion != effect.Parameters["version"] || record.ApprovedPlanDigestSHA256 != a.PlanDigest {
-			if effect.Action == "replace" {
-				return setupcontract.EffectRequired, "approved Control Plane replacement is required", nil
+			return setupcontract.EffectSatisfied, "credential file exists", nil
+		},
+		"platform_cli": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			verified, err := (workflowhome.Installation{Layout: a.Layout}).VerifyVersion(effect.Parameters["version"], effect.Parameters["sha256"])
+			if err != nil {
+				if strings.Contains(err.Error(), "not owned") {
+					return setupcontract.EffectConflicting, err.Error(), nil
+				}
+				return setupcontract.EffectFailed, "", err
 			}
-			return setupcontract.EffectConflicting, "a different approved Control Plane instance is running", nil
-		}
-		return setupcontract.EffectSatisfied, "Control Plane process identity and health are verified", nil
-	case "create_repository":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		repository, err := a.GitHub.RepositoryForOnboarding(ctx, effect.Subject)
-		if github.IsNotFound(err) {
-			return setupcontract.EffectRequired, "GitHub repository is absent", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		wantPrivate := effect.Parameters["private"] == "true"
-		if repository.Private != wantPrivate {
-			return setupcontract.EffectConflicting, "existing GitHub repository visibility differs from approved plan", nil
-		}
-		return setupcontract.EffectSatisfied, "GitHub repository exists with approved identity and visibility", nil
-	case "initial_baseline":
-		head, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
-		if err != nil {
-			return setupcontract.EffectRequired, "Initial Repository Baseline is absent", nil
-		}
-		message, err := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
-		if err != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
-			return setupcontract.EffectConflicting, "existing baseline is not bound to the approved plan", nil
-		}
-		var approved []onboarding.BaselineFile
-		if json.Unmarshal([]byte(effect.Parameters["files_json"]), &approved) != nil {
-			return setupcontract.EffectFailed, "", errors.New("Initial Repository Baseline file contract is invalid")
-		}
-		if err := onboarding.VerifyInitialBaseline(ctx, effect.Subject, head, approved); err != nil {
-			return setupcontract.EffectConflicting, "Initial Repository Baseline tree differs", nil
-		}
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
-		if github.IsNotFound(err) || err == nil && (remote.Name != effect.Parameters["branch"] || remote.Head != head) {
-			return setupcontract.EffectRequired, "Initial Repository Baseline is not published", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		return setupcontract.EffectSatisfied, "approved Initial Repository Baseline is published", nil
-	case "publish_history":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		revision, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
-		if github.IsNotFound(err) {
-			return setupcontract.EffectRequired, "committed history is not published", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if revision.Head != effect.Parameters["head"] {
-			return setupcontract.EffectConflicting, "published default branch differs from approved committed history", nil
-		}
-		return setupcontract.EffectSatisfied, "approved committed history is published", nil
-	case "github_label":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		repository := strings.SplitN(effect.Subject, "#", 2)[0]
-		label, err := a.GitHub.Label(ctx, repository, effect.Parameters["name"])
-		if github.IsNotFound(err) {
-			return setupcontract.EffectRequired, "managed label is absent", nil
-		}
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if !strings.EqualFold(label.Color, effect.Parameters["color"]) || label.Description != effect.Parameters["description"] {
-			return setupcontract.EffectRequired, "managed label metadata differs", nil
-		}
-		return setupcontract.EffectSatisfied, "managed label matches", nil
-	case "repository_features":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		policy, err := a.GitHub.DiscoverPolicy(ctx, effect.Subject, "")
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if !policy.HasIssues || !policy.ActionsEnabled || policy.ActionsAllowed != effect.Parameters["allowed_actions"] {
-			return setupcontract.EffectRequired, "GitHub Issues or Actions is disabled", nil
-		}
-		return setupcontract.EffectSatisfied, "GitHub Issues and Actions are enabled", nil
-	case "repository_contract_pr":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		if a.OnboardingMergeHeads == nil {
-			return setupcontract.EffectFailed, "", errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
-		}
-		var fetchErr error
-		_, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
-			content, fileErr := a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["base_branch"])
-			if fileErr != nil && fetchErr == nil {
-				fetchErr = fileErr
+			if !verified {
+				return setupcontract.EffectRequired, "platform CLI version or checksum differs", nil
 			}
-			return content, fileErr
-		}, effect.Subject, effect.Parameters["base_branch"], effect.Parameters["manifest_digest"])
-		if fetchErr != nil && !github.IsNotFound(fetchErr) {
-			return setupcontract.EffectFailed, "", fetchErr
-		}
-		if err != nil {
-			return setupcontract.EffectRequired, err.Error(), nil
-		}
-		if len(a.PlanDigest) < 12 {
-			return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
-		}
-		owner := strings.SplitN(effect.Subject, "/", 2)[0]
-		branch := "workflow/onboarding-" + a.PlanDigest[:12]
-		pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		body := "Approved Setup Plan SHA-256: " + a.PlanDigest
-		if !found || pull.Body != body || pull.MergedAt == "" || !fullSetupCommitID(pull.MergeCommitSHA) {
-			return setupcontract.EffectConflicting, "merged Onboarding Pull Request is not bound to the approved plan", nil
-		}
-		if persisted := a.OnboardingMergeHeads[effect.ID]; persisted != "" && persisted != pull.MergeCommitSHA {
-			return setupcontract.EffectConflicting, "merged Onboarding Pull Request HEAD differs from persisted Setup evidence", nil
-		}
-		a.OnboardingMergeHeads[effect.ID] = pull.MergeCommitSHA
-		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if remote.Name != effect.Parameters["base_branch"] || remote.Head != pull.MergeCommitSHA {
-			return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + pull.MergeCommitSHA + "; default branch advanced after the approved Onboarding Pull Request merge", nil
-		}
-		return setupcontract.EffectSatisfied, onboardingMergeHeadEvidence + pull.MergeCommitSHA, nil
-	case "repository_admission":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		manifest, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
-			return a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["default_branch"])
-		}, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"])
-		if err != nil {
-			return setupcontract.EffectRequired, err.Error(), nil
-		}
-		if manifest.ContractVersion != effect.Parameters["contract_version"] {
-			return setupcontract.EffectRequired, "Repository Contract version differs", nil
-		}
-		var labels []onboarding.Label
-		if err := json.Unmarshal([]byte(effect.Parameters["labels_json"]), &labels); err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		for _, expected := range labels {
-			actual, err := a.GitHub.Label(ctx, effect.Subject, expected.Name)
-			if err != nil || !strings.EqualFold(actual.Color, expected.Color) || actual.Description != expected.Description {
-				return setupcontract.EffectRequired, "managed GitHub label differs: " + expected.Name, nil
+			pathCheck := a.CurrentUserPATHReconciled
+			if pathCheck == nil {
+				pathCheck = workflowhome.CurrentUserPathIsReconciled
 			}
-		}
-		policy, err := a.GitHub.DiscoverPolicy(ctx, effect.Subject, effect.Parameters["default_branch"])
-		if err != nil || !policy.HasIssues || !policy.ActionsEnabled || effect.Parameters["actions_allowed"] != "" && policy.ActionsAllowed != effect.Parameters["actions_allowed"] {
-			return setupcontract.EffectRequired, "GitHub Issues or Actions is not available", nil
-		}
-		return setupcontract.EffectSatisfied, "Repository Contract and managed GitHub resources are verified", nil
-	case "local_fast_forward":
-		if a.GitHub == nil {
-			return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
-		}
-		mergeEvidenceID := effect.Parameters["merge_head_effect_id"]
-		mergeHead := a.OnboardingMergeHeads[mergeEvidenceID]
-		if mergeEvidenceID == "" || !fullSetupCommitID(mergeHead) {
-			return setupcontract.EffectFailed, "", errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
-		}
-		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
-		if err != nil {
-			return setupcontract.EffectFailed, "", err
-		}
-		if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
-			return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + mergeHead + "; GitHub default branch advanced after the approved onboarding merge", nil
-		}
-		branch, branchErr := onboardingGitBranch(ctx, effect.Subject)
-		if branchErr != nil || branch != effect.Parameters["branch"] {
-			return setupcontract.EffectConflicting, "checked-out branch differs from the approved default branch", nil
-		}
-		local, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", effect.Parameters["branch"])
-		if err == nil && local == mergeHead {
-			return setupcontract.EffectSatisfied, "local default branch matches admitted GitHub branch", nil
-		}
-		expected := effect.Parameters["pre_merge_head"]
-		if expected != "" && local != expected {
-			return setupcontract.EffectConflicting, "local pre-merge HEAD differs from the approved plan", nil
-		}
-		if expected == "" {
-			message, messageErr := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
-			if messageErr != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
-				return setupcontract.EffectConflicting, "local pre-merge baseline is not bound to the approved plan", nil
+			reconciled, err := pathCheck(a.Layout.Bin)
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
 			}
-		}
-		return setupcontract.EffectRequired, "local default branch requires a safe fast-forward", nil
-	default:
-		return setupcontract.EffectConflicting, "unknown effect kind", nil
+			if !reconciled {
+				return setupcontract.EffectRequired, "platform CLI exists but current-user PATH needs reconciliation", nil
+			}
+			return setupcontract.EffectSatisfied, "platform CLI ownership, version, checksum, and PATH match", nil
+		},
+		"workflow_skill_bundle": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			spec, err := skillBundleSpec(effect)
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			verified, err := (workflowhome.Installation{Layout: a.Layout}).VerifySkillBundle(spec)
+			if err != nil {
+				if strings.Contains(err.Error(), "not owned") {
+					return setupcontract.EffectConflicting, err.Error(), nil
+				}
+				return setupcontract.EffectFailed, "", err
+			}
+			if !verified {
+				return setupcontract.EffectRequired, "Workflow Skill Bundle is missing or differs from the exact release", nil
+			}
+			return setupcontract.EffectSatisfied, "Workflow Skill Bundle version and digests match", nil
+		},
+		"docker_desktop": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			host := a.DockerDesktopHost
+			if host == nil {
+				host = hostsetup.WindowsDockerDesktopHost{}
+			}
+			version, err := host.InstalledVersion(ctx)
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if version != effect.Parameters["version"] {
+				return setupcontract.EffectRequired, fmt.Sprintf("Docker Desktop version %q differs from approved %q", version, effect.Parameters["version"]), nil
+			}
+			if err := host.EngineReady(ctx); err != nil {
+				return setupcontract.EffectRequired, err.Error(), nil
+			}
+			return setupcontract.EffectSatisfied, "exact Docker Desktop version and Linux amd64 engine are ready", nil
+		},
+		"control_plane": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			record, err := controlplane.ReadRuntimeRecord(a.Layout)
+			if errors.Is(err, os.ErrNotExist) {
+				return setupcontract.EffectRequired, "Control Plane is stopped", nil
+			}
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			inspect := a.InspectControlPlane
+			var observation controlplane.Observation
+			if inspect != nil {
+				observation = inspect(ctx, &record)
+			} else {
+				observation = (controlplane.Inspector{}).Inspect(ctx, &record)
+			}
+			if observation.State == controlplane.StateStale {
+				return setupcontract.EffectRequired, observation.Diagnostic, nil
+			}
+			if observation.State != controlplane.StateReady {
+				return setupcontract.EffectConflicting, observation.Diagnostic, nil
+			}
+			if record.PlatformVersion != effect.Parameters["version"] || record.ApprovedPlanDigestSHA256 != a.PlanDigest {
+				if effect.Action == "replace" {
+					return setupcontract.EffectRequired, "approved Control Plane replacement is required", nil
+				}
+				return setupcontract.EffectConflicting, "a different approved Control Plane instance is running", nil
+			}
+			return setupcontract.EffectSatisfied, "Control Plane process identity and health are verified", nil
+		},
+		"create_repository": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			repository, err := a.GitHub.RepositoryForOnboarding(ctx, effect.Subject)
+			if github.IsNotFound(err) {
+				return setupcontract.EffectRequired, "GitHub repository is absent", nil
+			}
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			wantPrivate := effect.Parameters["private"] == "true"
+			if repository.Private != wantPrivate {
+				return setupcontract.EffectConflicting, "existing GitHub repository visibility differs from approved plan", nil
+			}
+			return setupcontract.EffectSatisfied, "GitHub repository exists with approved identity and visibility", nil
+		},
+		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			head, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
+			if err != nil {
+				return setupcontract.EffectRequired, "Initial Repository Baseline is absent", nil
+			}
+			message, err := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
+			if err != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
+				return setupcontract.EffectConflicting, "existing baseline is not bound to the approved plan", nil
+			}
+			var approved []onboarding.BaselineFile
+			if json.Unmarshal([]byte(effect.Parameters["files_json"]), &approved) != nil {
+				return setupcontract.EffectFailed, "", errors.New("Initial Repository Baseline file contract is invalid")
+			}
+			if err := onboarding.VerifyInitialBaseline(ctx, effect.Subject, head, approved); err != nil {
+				return setupcontract.EffectConflicting, "Initial Repository Baseline tree differs", nil
+			}
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
+			if github.IsNotFound(err) || err == nil && (remote.Name != effect.Parameters["branch"] || remote.Head != head) {
+				return setupcontract.EffectRequired, "Initial Repository Baseline is not published", nil
+			}
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			return setupcontract.EffectSatisfied, "approved Initial Repository Baseline is published", nil
+		},
+		"publish_history": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			revision, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
+			if github.IsNotFound(err) || github.IsConflict(err) && effect.Parameters["new_repository"] == "true" {
+				return setupcontract.EffectRequired, "committed history is not published", nil
+			}
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if revision.Head != effect.Parameters["head"] {
+				return setupcontract.EffectConflicting, "published default branch differs from approved committed history", nil
+			}
+			return setupcontract.EffectSatisfied, "approved committed history is published", nil
+		},
+		"github_label": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			repository := strings.SplitN(effect.Subject, "#", 2)[0]
+			label, err := a.GitHub.Label(ctx, repository, effect.Parameters["name"])
+			if github.IsNotFound(err) {
+				return setupcontract.EffectRequired, "managed label is absent", nil
+			}
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if !strings.EqualFold(label.Color, effect.Parameters["color"]) || label.Description != effect.Parameters["description"] {
+				return setupcontract.EffectRequired, "managed label metadata differs", nil
+			}
+			return setupcontract.EffectSatisfied, "managed label matches", nil
+		},
+		"repository_features": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			policy, err := a.GitHub.DiscoverPolicy(ctx, effect.Subject, "")
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if !policy.HasIssues || !policy.ActionsEnabled || policy.ActionsAllowed != effect.Parameters["allowed_actions"] {
+				return setupcontract.EffectRequired, "GitHub Issues or Actions is disabled", nil
+			}
+			return setupcontract.EffectSatisfied, "GitHub Issues and Actions are enabled", nil
+		},
+		"repository_contract_pr": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			if a.OnboardingMergeHeads == nil {
+				return setupcontract.EffectFailed, "", errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
+			}
+			var fetchErr error
+			_, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+				content, fileErr := a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["base_branch"])
+				if fileErr != nil && fetchErr == nil {
+					fetchErr = fileErr
+				}
+				return content, fileErr
+			}, effect.Subject, effect.Parameters["base_branch"], effect.Parameters["manifest_digest"])
+			if fetchErr != nil && !github.IsNotFound(fetchErr) {
+				return setupcontract.EffectFailed, "", fetchErr
+			}
+			if err != nil {
+				return setupcontract.EffectRequired, err.Error(), nil
+			}
+			if len(a.PlanDigest) < 12 {
+				return setupcontract.EffectFailed, "", errors.New("approved plan digest is required to read back the Onboarding Pull Request")
+			}
+			owner := strings.SplitN(effect.Subject, "/", 2)[0]
+			branch := "workflow/onboarding-" + a.PlanDigest[:12]
+			pull, found, err := a.GitHub.FindOnboardingPullRequest(ctx, effect.Subject, owner, branch, effect.Parameters["base_branch"])
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			body := "Approved Setup Plan SHA-256: " + a.PlanDigest
+			if !found || pull.Body != body || pull.MergedAt == "" || !fullSetupCommitID(pull.MergeCommitSHA) {
+				return setupcontract.EffectConflicting, "merged Onboarding Pull Request is not bound to the approved plan", nil
+			}
+			if persisted := a.OnboardingMergeHeads[effect.ID]; persisted != "" && persisted != pull.MergeCommitSHA {
+				return setupcontract.EffectConflicting, "merged Onboarding Pull Request HEAD differs from persisted Setup evidence", nil
+			}
+			a.OnboardingMergeHeads[effect.ID] = pull.MergeCommitSHA
+			remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if remote.Name != effect.Parameters["base_branch"] || remote.Head != pull.MergeCommitSHA {
+				return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + pull.MergeCommitSHA + "; default branch advanced after the approved Onboarding Pull Request merge", nil
+			}
+			return setupcontract.EffectSatisfied, onboardingMergeHeadEvidence + pull.MergeCommitSHA, nil
+		},
+		"repository_admission": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			manifest, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+				return a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["default_branch"])
+			}, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"])
+			if err != nil {
+				return setupcontract.EffectRequired, err.Error(), nil
+			}
+			if manifest.ContractVersion != effect.Parameters["contract_version"] {
+				return setupcontract.EffectRequired, "Repository Contract version differs", nil
+			}
+			var labels []onboarding.Label
+			if err := json.Unmarshal([]byte(effect.Parameters["labels_json"]), &labels); err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			for _, expected := range labels {
+				actual, err := a.GitHub.Label(ctx, effect.Subject, expected.Name)
+				if err != nil || !strings.EqualFold(actual.Color, expected.Color) || actual.Description != expected.Description {
+					return setupcontract.EffectRequired, "managed GitHub label differs: " + expected.Name, nil
+				}
+			}
+			policy, err := a.GitHub.DiscoverPolicy(ctx, effect.Subject, effect.Parameters["default_branch"])
+			if err != nil || !policy.HasIssues || !policy.ActionsEnabled || effect.Parameters["actions_allowed"] != "" && policy.ActionsAllowed != effect.Parameters["actions_allowed"] {
+				return setupcontract.EffectRequired, "GitHub Issues or Actions is not available", nil
+			}
+			return setupcontract.EffectSatisfied, "Repository Contract and managed GitHub resources are verified", nil
+		},
+		"local_fast_forward": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			if a.GitHub == nil {
+				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
+			}
+			mergeEvidenceID := effect.Parameters["merge_head_effect_id"]
+			mergeHead := a.OnboardingMergeHeads[mergeEvidenceID]
+			if mergeEvidenceID == "" || !fullSetupCommitID(mergeHead) {
+				return setupcontract.EffectFailed, "", errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
+			}
+			remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
+			if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
+				return setupcontract.EffectConflicting, onboardingMergeHeadEvidence + mergeHead + "; GitHub default branch advanced after the approved onboarding merge", nil
+			}
+			branch, branchErr := onboardingGitBranch(ctx, effect.Subject)
+			if branchErr != nil || branch != effect.Parameters["branch"] {
+				return setupcontract.EffectConflicting, "checked-out branch differs from the approved default branch", nil
+			}
+			local, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", effect.Parameters["branch"])
+			if err == nil && local == mergeHead {
+				return setupcontract.EffectSatisfied, "local default branch matches admitted GitHub branch", nil
+			}
+			expected := effect.Parameters["pre_merge_head"]
+			if expected != "" && local != expected {
+				return setupcontract.EffectConflicting, "local pre-merge HEAD differs from the approved plan", nil
+			}
+			if expected == "" {
+				message, messageErr := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
+				if messageErr != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
+					return setupcontract.EffectConflicting, "local pre-merge baseline is not bound to the approved plan", nil
+				}
+			}
+			return setupcontract.EffectRequired, "local default branch requires a safe fast-forward", nil
+		},
+		"platform_installation": func(HostAdapter, context.Context, setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
+			return setupcontract.EffectFailed, "", errors.New("Platform Installation effects require Engine durable state")
+		},
 	}
 }
 
@@ -372,147 +394,169 @@ func (a HostAdapter) Apply(ctx context.Context, effect setupcontract.Effect, inp
 	if err := setupcontract.ValidateEffectForExecution(effect); err != nil {
 		return err
 	}
-	switch effect.Kind {
-	case "github_pat":
-		secret, err := input.Read()
-		if err != nil {
-			return err
-		}
-		if err := workflowhome.SecureCredentialPath(a.Layout.CredentialFile, true); err != nil {
-			return err
-		}
-		token := strings.TrimSpace(string(secret))
-		if token == "" || strings.ContainsAny(token, " \t\r\n") {
-			return errors.New("classic PAT must be one non-empty token")
-		}
-		return credential.NewFileStore(a.Layout.CredentialFile).Set(ctx, credential.GatewayTarget, token)
-	case "platform_cli":
-		source := a.Executable
-		if source == "" {
-			source, _ = os.Executable()
-		}
-		version := effect.Parameters["version"]
-		expectedSHA256 := effect.Parameters["sha256"]
-		if version == "" || len(expectedSHA256) != 64 {
-			return errors.New("platform CLI effect requires an exact version and checksum")
-		}
-		if err := (workflowhome.Installation{Layout: a.Layout}).InstallVersion(version, source, expectedSHA256); err != nil {
-			return err
-		}
-		persist := a.PersistUserPATH
-		if persist == nil {
-			persist = workflowhome.PersistCurrentUserPath
-		}
-		return persist(a.Layout.Bin)
-	case "workflow_skill_bundle":
-		spec, err := skillBundleSpec(effect)
-		if err != nil {
-			return err
-		}
-		source := a.SkillBundleSource
-		if source == "" {
-			executable := a.Executable
-			if executable == "" {
-				executable, err = os.Executable()
-				if err != nil {
-					return err
-				}
-			}
-			source = filepath.Join(filepath.Dir(filepath.Dir(executable)), "skills")
-		}
-		return (workflowhome.Installation{Layout: a.Layout}).InstallSkillBundle(source, spec)
-	case "docker_desktop":
-		contract := hostsetup.DockerDesktopContract{Version: effect.Parameters["version"], InstallerURL: effect.Parameters["installer_url"], WindowsAMD64SHA256: effect.Parameters["windows_amd64_sha256"]}
-		host := a.DockerDesktopHost
-		if host == nil {
-			host = hostsetup.WindowsDockerDesktopHost{}
-		}
-		return hostsetup.EnsureDockerDesktop(ctx, contract, host, filepath.Join(a.Layout.Workspaces, "setup", "downloads"), 5*time.Minute)
-	case "control_plane":
-		executable := filepath.Join(a.Layout.Bin, workflowhome.ExecutableName)
-		start := a.StartControlPlane
-		if start == nil {
-			start = controlplane.Start
-		}
-		_, err := start(ctx, controlplane.StartOptions{Layout: a.Layout, Executable: executable, PlatformVersion: effect.Parameters["version"], ApprovedPlanDigestSHA256: a.PlanDigest, Timeout: 30 * time.Second, Replace: effect.Action == "replace"})
-		return err
-	case "create_repository":
-		if a.GitHub == nil {
-			return errors.New("GitHub client is required")
-		}
-		_, err := a.GitHub.CreateRepository(ctx, effect.Parameters["owner"], effect.Parameters["authenticated_login"], effect.Parameters["name"], effect.Parameters["private"] == "true")
-		return err
-	case "initial_baseline":
-		var files []onboarding.BaselineFile
-		if err := json.Unmarshal([]byte(effect.Parameters["files_json"]), &files); err != nil {
-			return err
-		}
-		branch := effect.Parameters["branch"]
-		if _, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD"); err != nil {
-			message := "Initial Repository Baseline\n\nSetup-Plan-SHA256: " + a.PlanDigest
-			if _, err := onboarding.CreateInitialBaseline(ctx, effect.Subject, branch, files, message); err != nil {
-				return err
-			}
-		}
-		sourceURL := effect.Parameters["source_url"]
-		if sourceURL == "" || effect.Parameters["repository"] == "" {
-			return errors.New("Initial Repository Baseline requires the approved repository identity and source URL")
-		}
-		return onboarding.PublishDefaultBranch(ctx, effect.Subject, sourceURL, branch, a.GitCredential)
-	case "publish_history":
-		return onboarding.PublishDefaultBranch(ctx, a.RepositoryPath, "https://github.com/"+effect.Subject+".git", effect.Parameters["branch"], a.GitCredential)
-	case "github_label":
-		repository := strings.SplitN(effect.Subject, "#", 2)[0]
-		label := github.ManagedLabel{Name: effect.Parameters["name"], Color: effect.Parameters["color"], Description: effect.Parameters["description"]}
-		existing, err := a.GitHub.Label(ctx, repository, label.Name)
-		if github.IsNotFound(err) {
-			return a.GitHub.CreateLabel(ctx, repository, label)
-		}
-		if err != nil {
-			return err
-		}
-		return a.GitHub.UpdateLabel(ctx, repository, existing.Name, label)
-	case "repository_features":
-		if a.GitHub == nil {
-			return errors.New("GitHub client is required")
-		}
-		return a.GitHub.UpdateRepositoryFeatures(ctx, effect.Subject, effect.Parameters["issues"] == "true", effect.Parameters["actions"] == "true", effect.Parameters["allowed_actions"])
-	case "repository_contract_pr":
-		return a.applyRepositoryContract(ctx, effect)
-	case "repository_admission":
-		// Admission is verification plus a durable Engine record; it has no
-		// independent remote mutation.
-		return nil
-	case "local_fast_forward":
-		if a.GitHub == nil {
-			return errors.New("GitHub client is required")
-		}
-		mergeHead := a.OnboardingMergeHeads[effect.Parameters["merge_head_effect_id"]]
-		if !fullSetupCommitID(mergeHead) {
-			return errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
-		}
-		remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
-		if err != nil {
-			return err
-		}
-		if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
-			return errors.New("GitHub default branch advanced after the approved onboarding merge")
-		}
-		expected := effect.Parameters["pre_merge_head"]
-		if expected == "" {
-			var err error
-			expected, err = gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
+	handler, ok := effectHandlers[effect.Kind]
+	if !ok {
+		return fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
+	}
+	return handler.apply(a, ctx, effect, input)
+}
+
+func hostApplyHandlers() map[string]effectApply {
+	return map[string]effectApply{
+		"github_pat": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			secret, err := input.Read()
 			if err != nil {
 				return err
 			}
-			message, messageErr := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
-			if messageErr != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
-				return errors.New("local pre-merge baseline is not bound to the approved plan")
+			if err := workflowhome.SecureCredentialPath(a.Layout.CredentialFile, true); err != nil {
+				return err
 			}
-		}
-		return onboarding.SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], expected, mergeHead, a.GitCredential)
-	default:
-		return fmt.Errorf("unsupported Setup effect kind %q", effect.Kind)
+			token := strings.TrimSpace(string(secret))
+			if token == "" || strings.ContainsAny(token, " \t\r\n") {
+				return errors.New("classic PAT must be one non-empty token")
+			}
+			return credential.NewFileStore(a.Layout.CredentialFile).Set(ctx, credential.GatewayTarget, token)
+		},
+		"platform_cli": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			source := a.Executable
+			if source == "" {
+				source, _ = os.Executable()
+			}
+			version := effect.Parameters["version"]
+			expectedSHA256 := effect.Parameters["sha256"]
+			if version == "" || len(expectedSHA256) != 64 {
+				return errors.New("platform CLI effect requires an exact version and checksum")
+			}
+			if err := (workflowhome.Installation{Layout: a.Layout}).InstallVersion(version, source, expectedSHA256); err != nil {
+				return err
+			}
+			persist := a.PersistUserPATH
+			if persist == nil {
+				persist = workflowhome.PersistCurrentUserPath
+			}
+			return persist(a.Layout.Bin)
+		},
+		"workflow_skill_bundle": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			spec, err := skillBundleSpec(effect)
+			if err != nil {
+				return err
+			}
+			source := a.SkillBundleSource
+			if source == "" {
+				executable := a.Executable
+				if executable == "" {
+					executable, err = os.Executable()
+					if err != nil {
+						return err
+					}
+				}
+				source = filepath.Join(filepath.Dir(filepath.Dir(executable)), "skills")
+			}
+			return (workflowhome.Installation{Layout: a.Layout}).InstallSkillBundle(source, spec)
+		},
+		"docker_desktop": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			contract := hostsetup.DockerDesktopContract{Version: effect.Parameters["version"], InstallerURL: effect.Parameters["installer_url"], WindowsAMD64SHA256: effect.Parameters["windows_amd64_sha256"]}
+			host := a.DockerDesktopHost
+			if host == nil {
+				host = hostsetup.WindowsDockerDesktopHost{}
+			}
+			return hostsetup.EnsureDockerDesktop(ctx, contract, host, filepath.Join(a.Layout.Workspaces, "setup", "downloads"), 5*time.Minute)
+		},
+		"control_plane": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			executable := filepath.Join(a.Layout.Bin, workflowhome.ExecutableName)
+			start := a.StartControlPlane
+			if start == nil {
+				start = controlplane.Start
+			}
+			_, err := start(ctx, controlplane.StartOptions{Layout: a.Layout, Executable: executable, PlatformVersion: effect.Parameters["version"], ApprovedPlanDigestSHA256: a.PlanDigest, Timeout: 30 * time.Second, Replace: effect.Action == "replace"})
+			return err
+		},
+		"create_repository": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			if a.GitHub == nil {
+				return errors.New("GitHub client is required")
+			}
+			_, err := a.GitHub.CreateRepository(ctx, effect.Parameters["owner"], effect.Parameters["authenticated_login"], effect.Parameters["name"], effect.Parameters["private"] == "true")
+			return err
+		},
+		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			var files []onboarding.BaselineFile
+			if err := json.Unmarshal([]byte(effect.Parameters["files_json"]), &files); err != nil {
+				return err
+			}
+			branch := effect.Parameters["branch"]
+			if _, err := gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD"); err != nil {
+				message := "Initial Repository Baseline\n\nSetup-Plan-SHA256: " + a.PlanDigest
+				if _, err := onboarding.CreateInitialBaseline(ctx, effect.Subject, branch, files, message); err != nil {
+					return err
+				}
+			}
+			sourceURL := effect.Parameters["source_url"]
+			if sourceURL == "" || effect.Parameters["repository"] == "" {
+				return errors.New("Initial Repository Baseline requires the approved repository identity and source URL")
+			}
+			return onboarding.PublishDefaultBranch(ctx, effect.Subject, sourceURL, branch, a.GitCredential)
+		},
+		"publish_history": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			return onboarding.PublishDefaultBranch(ctx, a.RepositoryPath, "https://github.com/"+effect.Subject+".git", effect.Parameters["branch"], a.GitCredential)
+		},
+		"github_label": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			repository := strings.SplitN(effect.Subject, "#", 2)[0]
+			label := github.ManagedLabel{Name: effect.Parameters["name"], Color: effect.Parameters["color"], Description: effect.Parameters["description"]}
+			existing, err := a.GitHub.Label(ctx, repository, label.Name)
+			if github.IsNotFound(err) {
+				return a.GitHub.CreateLabel(ctx, repository, label)
+			}
+			if err != nil {
+				return err
+			}
+			return a.GitHub.UpdateLabel(ctx, repository, existing.Name, label)
+		},
+		"repository_features": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			if a.GitHub == nil {
+				return errors.New("GitHub client is required")
+			}
+			return a.GitHub.UpdateRepositoryFeatures(ctx, effect.Subject, effect.Parameters["issues"] == "true", effect.Parameters["actions"] == "true", effect.Parameters["allowed_actions"])
+		},
+		"repository_contract_pr": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			return a.applyRepositoryContract(ctx, effect)
+		},
+		"repository_admission": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			// Admission is verification plus a durable Engine record; it has no
+			// independent remote mutation.
+			return nil
+		},
+		"local_fast_forward": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect, input *SecretInput) error {
+			if a.GitHub == nil {
+				return errors.New("GitHub client is required")
+			}
+			mergeHead := a.OnboardingMergeHeads[effect.Parameters["merge_head_effect_id"]]
+			if !fullSetupCommitID(mergeHead) {
+				return errors.New("persisted Onboarding Pull Request merge HEAD is required for local synchronization")
+			}
+			remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
+			if err != nil {
+				return err
+			}
+			if remote.Name != effect.Parameters["branch"] || remote.Head != mergeHead {
+				return errors.New("GitHub default branch advanced after the approved onboarding merge")
+			}
+			expected := effect.Parameters["pre_merge_head"]
+			if expected == "" {
+				var err error
+				expected, err = gitCommandOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
+				if err != nil {
+					return err
+				}
+				message, messageErr := gitCommandOutput(ctx, effect.Subject, "log", "-1", "--format=%B")
+				if messageErr != nil || !strings.Contains(message, "Setup-Plan-SHA256: "+a.PlanDigest) {
+					return errors.New("local pre-merge baseline is not bound to the approved plan")
+				}
+			}
+			return onboarding.SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], expected, mergeHead, a.GitCredential)
+		},
+		"platform_installation": func(HostAdapter, context.Context, setupcontract.Effect, *SecretInput) error {
+			return errors.New("Platform Installation effects require Engine durable state")
+		},
 	}
 }
 
@@ -562,6 +606,9 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 			}
 		}
 		return errors.New("GitHub default-branch HEAD drifted from the approved onboarding base")
+	}
+	if value.Kind == "onboarding_snapshot" {
+		return onboarding.VerifyApprovalSnapshot(ctx, value.Expected)
 	}
 	if value.Kind == "github_policy" {
 		if a.GitHub == nil {

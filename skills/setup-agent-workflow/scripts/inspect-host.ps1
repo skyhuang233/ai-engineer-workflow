@@ -78,7 +78,32 @@ $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow 
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
 $workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 $platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
-$githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; owner = ""; scopes = @() }
+$githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; owner = ""; scopes = @(); fingerprint_sha256 = "" }
+$codexAuth = [ordered]@{ verified = $false; source = ""; fingerprint_sha256 = "" }
+if ($codex.installed) {
+    $doctor = Invoke-ObservedCommand "codex" @("doctor", "--json")
+    $loginStatus = Invoke-ObservedCommand "codex" @("login", "status")
+    try {
+        # Codex doctor may exit nonzero because of unrelated terminal checks;
+        # the two required redacted checks remain authoritative when valid.
+        $report = $doctor.output | ConvertFrom-Json
+        $authCheck = $report.checks."auth.credentials"
+        $configCheck = $report.checks."config.load"
+        if ([int]$report.schemaVersion -ne 1 -or [string]::IsNullOrWhiteSpace([string]$report.codexVersion) -or [string]$authCheck.status -ne "ok" -or [string]$configCheck.status -ne "ok") { throw "unsupported Codex doctor report" }
+        if ([string]$authCheck.details."stored ChatGPT tokens" -ne "true" -or -not [string]::Equals([string]$authCheck.details."stored auth mode", "chatgpt", [StringComparison]::OrdinalIgnoreCase)) { throw "Codex doctor did not verify ChatGPT tokens" }
+        $discoveredSource = [string]$authCheck.details."auth file"
+        $reportedHome = [string]$configCheck.details.CODEX_HOME
+        if (-not [IO.Path]::IsPathRooted($discoveredSource) -or -not [IO.Path]::IsPathRooted($reportedHome) -or -not [string]::Equals([IO.Path]::GetFullPath((Split-Path -Parent $discoveredSource)), [IO.Path]::GetFullPath($reportedHome), [StringComparison]::OrdinalIgnoreCase)) { throw "Codex doctor returned an invalid authentication source boundary" }
+        $source = $(if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_CODEX_AUTH_FILE)) { $discoveredSource } else { $env:WORKFLOW_CODEX_AUTH_FILE })
+        if (-not [IO.Path]::IsPathRooted($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Codex authentication source is unavailable" }
+        if ($loginStatus.exit_code -ne 0 -or -not ([string]$loginStatus.output).ToLowerInvariant().Contains("logged in using chatgpt")) { throw "Codex login status is not ChatGPT" }
+        $cache = [IO.File]::ReadAllText($source) | ConvertFrom-Json
+        if ([string]$cache.auth_mode -ne "chatgpt" -or [string]::IsNullOrWhiteSpace([string]$cache.tokens.access_token) -or [string]::IsNullOrWhiteSpace([string]$cache.tokens.account_id) -or [string]::IsNullOrWhiteSpace([string]$cache.tokens.id_token) -or [string]::IsNullOrWhiteSpace([string]$cache.tokens.refresh_token)) { throw "Codex authentication cache is invalid" }
+        $codexAuth.verified = $true
+        $codexAuth.source = [IO.Path]::GetFullPath($source)
+        $codexAuth.fingerprint_sha256 = Get-SHA256File $source
+    } catch { }
+}
 if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     $installedVersion = Invoke-ObservedCommand $installedWorkflow @("--version")
     $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
@@ -96,6 +121,10 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
                 $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified
                 $githubCredential.owner = [string]$inspectionJSON.result.github_credential.owner
                 $githubCredential.scopes = @($inspectionJSON.result.github_credential.scopes | ForEach-Object { [string]$_ })
+				$githubCredential.fingerprint_sha256 = [string]$inspectionJSON.result.github_credential.fingerprint_sha256
+				$codexAuth.verified = [bool]$inspectionJSON.result.codex_auth.verified
+				$codexAuth.source = [string]$inspectionJSON.result.codex_auth.source
+				$codexAuth.fingerprint_sha256 = [string]$inspectionJSON.result.codex_auth.fingerprint_sha256
             }
         } catch { }
     }
@@ -121,6 +150,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     git = $gitFacts
     docker = $docker
     codex = $codex
+	codex_auth = $codexAuth
     codex_skills_root = $codexSkillsRoot
     workflow = $workflow
     platform = $platform

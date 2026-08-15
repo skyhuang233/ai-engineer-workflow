@@ -276,6 +276,38 @@ func TestOnboardingCheckWaiterTimeoutReportsRequiredObservedState(t *testing.T) 
 	}
 }
 
+func TestPublishHistoryTreatsRefConflictAsRequiredOnlyForApprovedNewRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/owner/repo/git/ref/heads/main":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"message":"Git Repository is empty."}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client())}
+	for _, test := range []struct {
+		name, newlyCreated string
+		want               setupcontract.EffectStatus
+	}{
+		{name: "approved unpublished", newlyCreated: "true", want: setupcontract.EffectRequired},
+		{name: "existing repository", newlyCreated: "false", want: setupcontract.EffectFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			effect := setupcontract.Effect{ID: "publish", Kind: "publish_history", Subject: "owner/repo", Action: "push", Parameters: map[string]string{"branch": "main", "head": strings.Repeat("a", 40), "new_repository": test.newlyCreated}}
+			status, _, err := adapter.Readback(context.Background(), effect)
+			if status != test.want || test.want == setupcontract.EffectFailed && err == nil {
+				t.Fatalf("409 readback = %s, %v; want %s", status, err, test.want)
+			}
+		})
+	}
+}
+
 func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "source")
 	hostGit(t, "", "init", "-b", "main", source)
@@ -637,7 +669,7 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_secret")}, ExpectedResultVerifier: passingExpectedResultVerifier}
+	engine := Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_secret")}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
 	result, err := engine.Apply(context.Background(), raw, digest)
 	if err != nil {
 		t.Fatal(err)
@@ -683,7 +715,7 @@ func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}, ExpectedResultVerifier: passingExpectedResultVerifier}).Apply(context.Background(), raw, digest)
+	result, err := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(context.Background(), raw, digest)
 	if err != nil || result.Status != setupcontract.ExecutionSucceeded {
 		t.Fatalf("replacement result=%#v err=%v", result, err)
 	}

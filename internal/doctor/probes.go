@@ -161,7 +161,11 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 			return Result{Status: Fail, Summary: err.Error()}
 		}
 	}
-	initial, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
+	initialName, err := workerCodexContainerName()
+	if err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	initial, err := runWorkerCodexContainer(ctx, c.Executor, initialName, workerCodexCommand(initialName, c.Image, workspace, codexState,
 		"exec", "--sandbox", "read-only", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check",
 		"Remember this nonce for the next turn: "+nonce+`. Return the required JSON with summary "phase-one", commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
@@ -174,7 +178,11 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	if sessionID == "" {
 		return Result{Status: Fail, Summary: "Worker Codex did not emit a persistent session ID"}
 	}
-	resumed, err := c.Executor.Run(ctx, workerCodexCommand(c.Image, workspace, codexState,
+	resumeName, err := workerCodexContainerName()
+	if err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	resumed, err := runWorkerCodexContainer(ctx, c.Executor, resumeName, workerCodexCommand(resumeName, c.Image, workspace, codexState,
 		"exec", "--sandbox", "read-only", "resume", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check", sessionID,
 		`Return the required JSON with the nonce from the previous turn as summary, commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
@@ -193,8 +201,28 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	return Result{Status: Pass, Summary: "pinned Worker accepted the Candidate schema, authenticated, and resumed persisted context"}
 }
 
-func workerCodexCommand(image, workspace, codexState string, command ...string) []string {
-	args := []string{"docker", "run", "--rm"}
+func workerCodexContainerName() (string, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	return "workflow-doctor-codex-" + strings.ToLower(token), nil
+}
+
+func runWorkerCodexContainer(ctx context.Context, executor Executor, name string, command []string) (output []byte, resultErr error) {
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cleanupOutput, cleanupErr := executor.Run(cleanupCtx, []string{"docker", "rm", "-f", name})
+		if cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove Worker Codex probe container %q: %w (%s)", name, cleanupErr, strings.TrimSpace(string(cleanupOutput))))
+		}
+	}()
+	return executor.Run(ctx, command)
+}
+
+func workerCodexCommand(name, image, workspace, codexState string, command ...string) []string {
+	args := []string{"docker", "run", "--name", name, "--label", "com.skyhuang233.workflow.setup-probe=true"}
 	args = append(args, worker.CodexSandboxDockerArgs()...)
 	args = append(args,
 		"--workdir", "/workspace",

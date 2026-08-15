@@ -30,6 +30,50 @@ func TestOpenFileURIHoldsCanonicalRestoreBarrier(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations(version,applied_at) VALUES(59,'old')`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenReadOnly(ctx, path)
+	if opened != nil {
+		opened.Close()
+	}
+	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 60") {
+		t.Fatalf("read-only old schema err=%v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+		t.Fatalf("planning changed old database: before=%#v after=%#v err=%v", before, after, err)
+	}
+	matches, err := filepath.Glob(path + ".backup*")
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("planning created migration backup: %v err=%v", matches, err)
+	}
+	raw, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var version int
+	if err := raw.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
+		t.Fatalf("schema changed: version=%d err=%v", version, err)
+	}
+}
+
 func TestOpenForRuntimeSkipsMigrationDiscoveryAndHoldsRestoreBarrier(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "workflow.db")

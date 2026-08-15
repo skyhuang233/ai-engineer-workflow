@@ -88,6 +88,12 @@ func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
 			t.Fatalf("setup harness does not preserve primary failure while completing cleanup: missing %q", required)
 		}
 	}
+	prior := strings.Index(harness, "$prior = @{")
+	firstMutation := strings.Index(harness, "$env:GH_TOKEN = $cleanupToken")
+	outerTry := strings.Index(harness, "try {")
+	if prior < 0 || firstMutation < 0 || outerTry < 0 || prior > firstMutation || outerTry > firstMutation {
+		t.Fatalf("outer environment was not captured before the full cleanup-protected mutation boundary")
+	}
 }
 
 func TestPowerShellHarnessAndDriverParse(t *testing.T) {

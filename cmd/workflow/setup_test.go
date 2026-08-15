@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -85,6 +86,94 @@ func TestSetupPlanReportsBootstrapBlockerWithoutMutatingRepository(t *testing.T)
 	}
 }
 
+func TestPlatformStateSnapshotChangesForAnotherValidPATOrCodexSource(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	record := func(fingerprint string) {
+		t.Helper()
+		if err := database.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: fingerprint, Login: "owner", UserID: 7, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(strings.Repeat("a", 64))
+	auth := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"one"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := resolveCodexAuthForSetup
+	resolveCodexAuthForSetup = func(context.Context) (string, error) { return auth, nil }
+	t.Cleanup(func() { resolveCodexAuthForSetup = previous })
+	approved, err := currentPlatformStateDigest(ctx, database, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"two"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedCodex, err := currentPlatformStateDigest(ctx, database, true)
+	if err != nil || changedCodex == approved {
+		t.Fatalf("changed Codex snapshot=%q err=%v", changedCodex, err)
+	}
+	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"one"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record(strings.Repeat("b", 64))
+	changedPAT, err := currentPlatformStateDigest(ctx, database, true)
+	if err != nil || changedPAT == approved {
+		t.Fatalf("changed PAT snapshot=%q err=%v", changedPAT, err)
+	}
+}
+
+func TestSetupPlanReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(layout.State, "workflow.db")
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations(version,applied_at) VALUES(59,'old')`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := runSetupPlan([]string{"--repo", t.TempDir(), "--workflow-home", layout.Root}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var response setupResponse
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "blocked" || !strings.Contains(response.Blocker, "approved Platform repair") {
+		t.Fatalf("old schema response=%s err=%v", output.String(), err)
+	}
+	raw, err = sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var version int
+	if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
+		t.Fatalf("setup plan migrated schema: version=%d err=%v", version, err)
+	}
+}
+
 func TestSetupPlanAdmissionInspectionDoesNotRefreshOrSuspendStoredAdmission(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
@@ -116,6 +205,13 @@ func TestSetupPlanAdmissionInspectionDoesNotRefreshOrSuspendStoredAdmission(t *t
 }
 
 func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T) {
+	auth := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","account_id":"account","id_token":"id","refresh_token":"refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousResolver := resolveCodexAuthForSetup
+	resolveCodexAuthForSetup = func(context.Context) (string, error) { return auth, nil }
+	t.Cleanup(func() { resolveCodexAuthForSetup = previousResolver })
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer ghp_persisted" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -191,7 +287,7 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 		Status string             `json:"status"`
 		Result platformInspection `json:"result"`
 	}
-	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "ready" || response.Result.Platform.WorkflowCLISHA256 != cliDigest || response.Result.Platform.ControlPlanePlanDigest != cpDigest || !response.Result.GitHubCredential.Verified || strings.Join(response.Result.GitHubCredential.Scopes, ",") != "repo,workflow" || !response.Result.WorkflowCLI.Verified {
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "ready" || response.Result.Platform.WorkflowCLISHA256 != cliDigest || response.Result.Platform.ControlPlanePlanDigest != cpDigest || !response.Result.GitHubCredential.Verified || response.Result.GitHubCredential.FingerprintSHA256 != credential.Fingerprint(token) || strings.Join(response.Result.GitHubCredential.Scopes, ",") != "repo,workflow" || !response.Result.WorkflowCLI.Verified || !response.Result.CodexAuth.Verified || response.Result.CodexAuth.Source != auth {
 		t.Fatalf("inspection=%s err=%v", output.String(), err)
 	}
 	if err := os.WriteFile(filepath.Join(layout.Bin, workflowhome.ExecutableName), []byte("drifted-cli"), 0o700); err != nil {
