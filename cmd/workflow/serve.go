@@ -177,6 +177,13 @@ func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) (
 	if err := admissions.VerifyAll(ctx); err != nil {
 		return fail(err)
 	}
-	loop := func(loopCtx context.Context) error { return admissions.Run(loopCtx, time.Minute) }
-	return []controlplane.Loop{loop}, database.Close, nil
+	executable, err := os.Executable()
+	if err != nil {
+		return fail(err)
+	}
+	admissionLoop := func(loopCtx context.Context) error { return admissions.Run(loopCtx, time.Minute) }
+	repositoryLoop := func(loopCtx context.Context) error {
+		return (controlplane.RepositorySupervisor{Store: database, Runner: commandRepositoryRunner{Executable: executable, Layout: layout, Owner: verification.Owner}, Interval: time.Second}).Run(loopCtx)
+	}
+	return []controlplane.Loop{admissionLoop, repositoryLoop}, database.Close, nil
 }

@@ -96,6 +96,10 @@ func main() {
 		if err := runtimeStopCommand(os.Args[2:], os.Stdout); err != nil {
 			fail(err)
 		}
+	case "runtime-configure":
+		if err := runtimeConfigureCommand(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
 	case "doctor":
 		runDoctor(os.Args[2:])
 	case "run-ticket":
@@ -133,6 +137,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow status [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow logs [--workflow-home <absolute>] [--lines 200] [--follow]")
 	fmt.Fprintln(os.Stderr, "  workflow stop [--workflow-home <absolute>]")
+	fmt.Fprintln(os.Stderr, "  workflow runtime-configure --repository owner/repo --root <plan-root-issue> [--source <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
@@ -656,6 +661,9 @@ func runPollGitHub(args []string) {
 	once := flags.Bool("once", false, "perform one durable reconciliation pass")
 	interval := flags.Duration("interval", time.Minute, "continuous polling interval")
 	maxParallelRuns := flags.Int("max-parallel-runs", 1, "maximum concurrent Worker Runs")
+	runtimeOwner := flags.String("owner", "", "verified Workflow Home owner (internal runtime mode)")
+	runtimeCredentialPath := flags.String("credential-relative-path", `state\credentials\github.pat`, "Workflow Home relative PAT path (internal runtime mode)")
+	runtimeMaxWorkerAttempts := flags.Int("max-worker-attempts", 3, "maximum attempts in internal runtime mode")
 	_ = flags.Parse(args)
 	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *codexAuthFile == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
 		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and ChatGPT authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
@@ -677,9 +685,15 @@ func runPollGitHub(args []string) {
 	if err := db.Migrate(context.Background()); err != nil {
 		fail(err)
 	}
-	config, err := doctor.LoadConfig(*configPath)
-	if err != nil {
-		fail(err)
+	var config doctor.Config
+	if *runtimeOwner != "" {
+		config.Runtime.MaxWorkerAttempts = *runtimeMaxWorkerAttempts
+		config.GitHub.Credential = doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: *runtimeOwner, PlaintextRelativePath: *runtimeCredentialPath}
+	} else {
+		config, err = doctor.LoadConfig(*configPath)
+		if err != nil {
+			fail(err)
+		}
 	}
 	provider := &verifiedGitHubPATSource{Database: db, Config: config}
 	workspaceManager := agent.WorkspaceManager{
@@ -1199,14 +1213,22 @@ func runGateway(args []string) {
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	pushURL := flags.String("push-url", "", "optional HTTPS Git push URL")
 	outboxInterval := flags.Duration("outbox-interval", time.Second, "durable outbox recovery interval")
+	runtimeOwner := flags.String("owner", "", "verified Workflow Home owner (internal runtime mode)")
+	runtimeCredentialPath := flags.String("credential-relative-path", `state\credentials\github.pat`, "Workflow Home relative PAT path (internal runtime mode)")
 	_ = flags.Parse(args)
 	if *listen == "" || *controlToken == "" || *outboxInterval <= 0 {
 		fmt.Fprintln(os.Stderr, "gateway requires listen address and control-plane credential")
 		os.Exit(2)
 	}
-	config, err := doctor.LoadConfig(*configPath)
-	if err != nil {
-		fail(err)
+	var config doctor.Config
+	var err error
+	if *runtimeOwner != "" {
+		config.GitHub.Credential = doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: *runtimeOwner, PlaintextRelativePath: *runtimeCredentialPath}
+	} else {
+		config, err = doctor.LoadConfig(*configPath)
+		if err != nil {
+			fail(err)
+		}
 	}
 	gateway, err := newRestoreFencedGateway(*databasePath, config, *githubURL, *pushURL)
 	if err != nil {

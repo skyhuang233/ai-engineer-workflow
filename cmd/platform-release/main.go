@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -22,6 +23,9 @@ func main() {
 }
 
 func run(arguments []string) error {
+	if len(arguments) > 0 && arguments[0] == "trust-key" {
+		return runTrustKey(arguments[1:], os.Stdout)
+	}
 	flags := flag.NewFlagSet("platform-release", flag.ContinueOnError)
 	templatePath := flags.String("template", "deploy/platform/release-manifest.json", "Platform Release Manifest source template")
 	executable := flags.String("workflow-exe", "", "Windows amd64 workflow.exe")
@@ -66,6 +70,30 @@ func run(arguments []string) error {
 	}
 	_, err = platformrelease.Assemble(platformrelease.AssembleOptions{OutputDirectory: *output, WorkflowExecutable: *executable, PayloadDirectory: *payload, Manifest: manifest, SigningKey: key})
 	return err
+}
+
+func runTrustKey(arguments []string, output io.Writer) error {
+	flags := flag.NewFlagSet("platform-release trust-key", flag.ContinueOnError)
+	repositoryRoot := flags.String("repository-root", "", "absolute repository root that will own the public artifact")
+	privateKeyPath := flags.String("private-key", "", "offline ECDSA P-256 PEM private key path outside the repository")
+	publicKeyPath := flags.String("public-key", "", "public trust artifact path inside the repository")
+	generate := flags.Bool("generate", false, "generate a new offline private key; refuses to overwrite")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("platform-release trust-key does not accept positional arguments")
+	}
+	result, err := platformrelease.PrepareTrustKey(platformrelease.TrustKeyOptions{
+		RepositoryRoot: *repositoryRoot,
+		PrivateKeyPath: *privateKeyPath,
+		PublicKeyPath:  *publicKeyPath,
+		Generate:       *generate,
+	})
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(result)
 }
 
 func loadTemplate(path string) (platformrelease.Manifest, error) {

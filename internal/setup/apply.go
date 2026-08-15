@@ -12,8 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
@@ -99,7 +101,8 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	}
 	if plan.Kind == setupcontract.RepositoryOnboarding && len(prior) > 0 && prior[len(prior)-1].Status == string(setupcontract.ExecutionSucceeded) {
 		admission, admissionErr := database.RepositoryAdmission(ctx, plan.Target.GitHubRepository)
-		if admissionErr == nil && admission.Eligible && admission.OnboardingPlanDigestSHA256 == digest {
+		_, runtimeErr := database.RepositoryRuntimeConfiguration(ctx, plan.Target.GitHubRepository)
+		if admissionErr == nil && runtimeErr == nil && admission.Eligible && admission.OnboardingPlanDigestSHA256 == digest {
 			for _, effect := range plan.Effects {
 				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectSatisfied, Evidence: "matching eligible Repository Admission already exists"})
 			}
@@ -175,7 +178,7 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 				}
 			}
 			if effect.Kind == "repository_admission" {
-				if admissionErr := recordRepositoryAdmission(ctx, database, effect, digest, now); admissionErr != nil {
+				if admissionErr := recordRepositoryAdmission(ctx, database, layout, plan.Target.RepositoryPath, effect, digest, now); admissionErr != nil {
 					result.Status = setupcontract.ExecutionIncomplete
 					result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
 					err = admissionErr
@@ -210,7 +213,7 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			}
 		}
 		if effect.Kind == "repository_admission" {
-			if admissionErr := recordRepositoryAdmission(ctx, database, effect, digest, now); admissionErr != nil {
+			if admissionErr := recordRepositoryAdmission(ctx, database, layout, plan.Target.RepositoryPath, effect, digest, now); admissionErr != nil {
 				result.Status = setupcontract.ExecutionIncomplete
 				result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: admissionErr.Error()})
 				err = admissionErr
@@ -228,11 +231,25 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	return result, errors.Join(err, recordErr)
 }
 
-func recordRepositoryAdmission(ctx context.Context, database *store.Store, effect setupcontract.Effect, planDigest string, now time.Time) error {
-	return database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{
+func recordRepositoryAdmission(ctx context.Context, database *store.Store, layout workflowhome.Layout, repositoryPath string, effect setupcontract.Effect, planDigest string, now time.Time) error {
+	if err := database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{
 		Repository: effect.Subject, OnboardingPlanDigestSHA256: planDigest,
 		ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"],
 		Eligible: true, VerifiedAt: now,
+	}); err != nil {
+		return err
+	}
+	authFile := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if authFile != "" {
+		authFile = filepath.Join(authFile, codexauth.FileName)
+	} else if home, err := os.UserHomeDir(); err == nil {
+		authFile = filepath.Join(home, ".codex", codexauth.FileName)
+	}
+	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(effect.Subject))
+	return database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{
+		Repository: effect.Subject, DefaultBranch: effect.Parameters["default_branch"], SourcePath: repositoryPath,
+		WorkspaceRoot: filepath.Join(layout.Workspaces, repositoryKey), StateRoot: filepath.Join(layout.State, "codex", repositoryKey), CodexAuthFile: authFile,
+		GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now,
 	})
 }
 

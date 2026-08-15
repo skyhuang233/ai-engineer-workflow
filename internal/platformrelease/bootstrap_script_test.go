@@ -87,7 +87,21 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	write(hostFactsPath, hostFacts)
 	planScript := filepath.Join(filepath.Dir(script), "new-platform-bootstrap-plan.ps1")
 	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
-	if err != nil || !strings.Contains(output, `"kind":  "workflow_skill_bundle"`) {
+	var planned struct {
+		Plan struct {
+			Effects []struct {
+				Kind string `json:"kind"`
+			} `json:"effects"`
+		} `json:"plan"`
+	}
+	if decodeErr := json.Unmarshal([]byte(output), &planned); decodeErr != nil {
+		t.Fatalf("decode Platform Bootstrap Plan output: %v (%q)", decodeErr, output)
+	}
+	hasSkillBundle := false
+	for _, effect := range planned.Plan.Effects {
+		hasSkillBundle = hasSkillBundle || effect.Kind == "workflow_skill_bundle"
+	}
+	if err != nil || !hasSkillBundle {
 		t.Fatalf("verified Platform Bootstrap Plan omitted exact Workflow Skill Bundle: %q, %v", output, err)
 	}
 	if _, err := os.Stat(workflowHome); !os.IsNotExist(err) {

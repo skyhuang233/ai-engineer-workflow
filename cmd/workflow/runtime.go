@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
@@ -94,6 +95,58 @@ func runtimeLogsCommand(args []string, output io.Writer) error {
 		return nil
 	}
 	return followLogs(context.Background(), output, []string{stdout, stderr})
+}
+
+func runtimeConfigureCommand(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("runtime-configure", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	homeOverride := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
+	repository := flags.String("repository", "", "canonical owner/repository")
+	root := flags.Int64("root", 0, "approved Plan Root issue number")
+	source := flags.String("source", "", "absolute local repository path")
+	defaultBranch := flags.String("default-branch", "", "canonical default branch")
+	maxParallel := flags.Int("max-parallel-runs", 0, "optional maximum parallel Worker Runs")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *repository == "" || *root <= 0 {
+		return errors.New("runtime-configure requires repository and a positive Plan Root issue number")
+	}
+	layout, err := workflowhome.Resolve(*homeOverride)
+	if err != nil {
+		return err
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	config, err := database.RepositoryRuntimeConfiguration(context.Background(), *repository)
+	if err != nil {
+		return fmt.Errorf("read admitted repository runtime configuration: %w", err)
+	}
+	config.RootIssueNumber = *root
+	if *source != "" {
+		config.SourcePath = *source
+	}
+	if *defaultBranch != "" {
+		config.DefaultBranch = *defaultBranch
+	}
+	if *maxParallel > 0 {
+		config.MaxParallelRuns = *maxParallel
+	}
+	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(config.Repository))
+	if config.WorkspaceRoot == "" { config.WorkspaceRoot = filepath.Join(layout.Workspaces, repositoryKey) }
+	if config.StateRoot == "" { config.StateRoot = filepath.Join(layout.State, "codex", repositoryKey) }
+	if config.CodexAuthFile == "" { config.CodexAuthFile = defaultCodexAuthFile() }
+	config.UpdatedAt = time.Now().UTC()
+	if err := config.Ready(); err != nil {
+		return fmt.Errorf("complete repository runtime configuration: %w", err)
+	}
+	if err := database.RecordRepositoryRuntimeConfiguration(context.Background(), config); err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(map[string]any{"status": "configured", "repository": config.Repository, "root_issue_number": config.RootIssueNumber})
 }
 
 func runtimeLayout(args []string, name string) (workflowhome.Layout, error) {

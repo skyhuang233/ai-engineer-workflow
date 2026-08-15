@@ -65,6 +65,55 @@ func TestForegroundChildCannotRecursivelyDetach(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: strings.Repeat("a", 64), ContractVersion: "1", ManifestDigestSHA256: strings.Repeat("b", 64), Eligible: true, VerifiedAt: now}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "repo")
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: source, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	codexHome := filepath.Join(t.TempDir(), "codex")
+	t.Setenv("CODEX_HOME", codexHome)
+	var output bytes.Buffer
+	if err := runtimeConfigureCommand([]string{"--workflow-home", layout.Root, "--repository", "owner/repo", "--root", "42", "--max-parallel-runs", "2"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	config, err := database.RepositoryRuntimeConfiguration(ctx, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Ready(); err != nil {
+		t.Fatalf("configured runtime is not ready: %#v, %v", config, err)
+	}
+	if config.RootIssueNumber != 42 || config.MaxParallelRuns != 2 || config.SourcePath != source || config.CodexAuthFile != filepath.Join(codexHome, "auth.json") {
+		t.Fatalf("configured runtime = %#v", config)
+	}
+}
+
 func TestWindowsDetachedServeSurvivesLauncherAndDoesNotRestartAfterStop(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows process lifetime contract")

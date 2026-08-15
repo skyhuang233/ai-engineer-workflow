@@ -17,6 +17,28 @@ manifest before extraction. A missing trust key, mutable release, prerelease,
 checksum mismatch, extra subject, or incompatible bootstrap schema fails before
 host mutation.
 
+### Maintainer trust-key ceremony
+
+Create the production signing key only on an offline maintainer-controlled path
+outside this Git repository. The command refuses to place private material under
+the repository, refuses to overwrite an existing private key, and emits only the
+public artifact path and SHA-256—not the private key:
+
+```powershell
+go run ./cmd/platform-release trust-key `
+  --repository-root (git rev-parse --show-toplevel) `
+  --private-key D:\offline-workflow-keys\platform-release-private-key.pem `
+  --public-key .\skills\setup-agent-workflow\trust\platform-release-public-key.pem `
+  --generate
+```
+
+To reproduce the public artifact later, omit `--generate` and supply the same
+offline private-key path. Derivation is deterministic and succeeds when the
+existing repository public artifact is byte-identical; a different existing
+artifact fails closed. Review and commit only the public PEM. Never commit,
+upload, paste, or log the private PEM. Until the reviewed public artifact exists,
+the entry skill intentionally rejects every Platform Release.
+
 The verified release contract is the sole source for the exact Docker Desktop
 installer/version/checksum, Worker image digest, Repository Contract, managed
 labels, and user-level Workflow Skill Bundle. An existing same-name Codex skill
@@ -28,6 +50,24 @@ Docker Desktop must expose a Linux `amd64` engine. Production readiness runs a
 real temporary container with the selected Workflow Home state/workspace mounts
 and network path. Codex readiness uses a temporary copy of the invoking user's
 existing ChatGPT login to prove Worker create-and-resume, then removes the copy.
+
+## Repository runtime
+
+Each admitted repository has one durable `repository_runtime_configurations`
+record. Onboarding supplies its canonical GitHub identity, default branch, local
+source path, repository-scoped Workspace/Codex state roots, and polling policy.
+After `to-tickets` publishes a Plan Root, bind its issue number without copying
+the remaining loop inputs into a shell command:
+
+```powershell
+workflow runtime-configure --repository owner/repository --root 123
+```
+
+`workflow serve` owns a cancellable Gateway plus the existing GitHub polling,
+reconciliation, delivery, and scheduler loop for every eligible and complete
+record. Admission verification is periodic; drift cancels only the affected
+repository. Runtime configuration migrated from an older database is retained
+but remains fail-closed until missing host paths are explicitly completed.
 
 ## Worker toolchain
 
