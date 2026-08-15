@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,6 +104,55 @@ func TestForegroundChildRejectsDurablePlatformVersionDifferentFromBuild(t *testi
 	}
 }
 
+func TestServeLauncherAndChildRejectSameVersionExecutableWithDifferentChecksum(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	bundleJSON, bundleDigest := testReleaseBundle(strings.Repeat("d", 64))
+	installation := store.PlatformInstallation{PlatformVersion: Version, ReleaseManifestDigestSHA256: strings.Repeat("b", 64), PlatformSetupContractDigestSHA256: strings.Repeat("c", 64), WorkflowCLISHA256: strings.Repeat("1", 64), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: digest, WorkflowHome: layout.Root, InstalledAt: time.Now().UTC(), VerifiedAt: time.Now().UTC()}
+	if err := database.RecordPlatformInstallation(context.Background(), installation); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	previousDigest := workflowExecutableSHA256
+	workflowExecutableSHA256 = func() (string, error) { return strings.Repeat("2", 64), nil }
+	t.Cleanup(func() { workflowExecutableSHA256 = previousDigest })
+
+	for _, invoke := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "launcher", run: func() error {
+			return serveCommand([]string{"--workflow-home", layout.Root, "--approved-plan-digest", digest}, io.Discard)
+		}},
+		{name: "child", run: func() error {
+			return serveChildCommand([]string{"--workflow-home", layout.Root, "--listen", "127.0.0.1:0", "--approved-plan-digest", digest})
+		}},
+	} {
+		t.Run(invoke.name, func(t *testing.T) {
+			err := invoke.run()
+			if err == nil || !strings.Contains(err.Error(), "checksum differs") {
+				t.Fatalf("same-version executable checksum mismatch was accepted: %v", err)
+			}
+			if _, recordErr := controlplane.ReadRuntimeRecord(layout); !errors.Is(recordErr, os.ErrNotExist) {
+				t.Fatalf("checksum mismatch wrote a runtime record: %v", recordErr)
+			}
+		})
+	}
+}
+
 func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
 	ctx := context.Background()
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
@@ -161,6 +214,11 @@ func TestWindowsDetachedServeSurvivesLauncherAndDoesNotRestartAfterStop(t *testi
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build workflow: %v\n%s", err, output)
 	}
+	executableBytes, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executableDigest := sha256.Sum256(executableBytes)
 	layout, err := workflowhome.Resolve(filepath.Join(directory, "home"))
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +233,7 @@ func TestWindowsDetachedServeSurvivesLauncherAndDoesNotRestartAfterStop(t *testi
 	now := time.Now().UTC()
 	digest := strings.Repeat("a", 64)
 	bundleJSON, bundleDigest := testReleaseBundle(strings.Repeat("d", 64))
-	if err := database.RecordPlatformInstallation(context.Background(), store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: strings.Repeat("b", 64), PlatformSetupContractDigestSHA256: strings.Repeat("c", 64), WorkflowCLISHA256: strings.Repeat("d", 64), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: digest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
+	if err := database.RecordPlatformInstallation(context.Background(), store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: strings.Repeat("b", 64), PlatformSetupContractDigestSHA256: strings.Repeat("c", 64), WorkflowCLISHA256: hex.EncodeToString(executableDigest[:]), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: digest, WorkflowHome: layout.Root, InstalledAt: now, VerifiedAt: now}); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}

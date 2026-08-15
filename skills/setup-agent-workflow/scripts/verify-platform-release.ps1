@@ -18,7 +18,7 @@ function Get-RequiredProperty($Object, [string]$Name) {
 }
 
 function Get-SemanticVersion([string]$Value) {
-    Assert-PlatformRelease ($Value -match '^v?(\d+)\.(\d+)\.(\d+)$') "Stable Platform Release version is invalid"
+    Assert-PlatformRelease ($Value -match '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Platform Release version must be a bare semantic version core (X.Y.Z) without leading zeros"
     return [Version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
 }
 

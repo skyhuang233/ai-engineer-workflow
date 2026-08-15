@@ -18,13 +18,37 @@ func TestPlatformPublisherBuildInjectsTheExactManifestAndTagVersion(t *testing.T
 	workflow := string(body)
 	for _, required := range []string{
 		`PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}`,
+		`$env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'`,
 		`-X main.Version=$env:PLATFORM_VERSION`,
 		`-version $env:PLATFORM_VERSION`,
-		`tag="platform-v${PLATFORM_VERSION#v}"`,
+		`tag="platform-v${PLATFORM_VERSION}"`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Platform publisher does not bind the Workflow CLI, manifest, and tag through %q", required)
 		}
+	}
+}
+
+func TestPlatformPublisherRejectsNonCanonicalPlatformVersionInput(t *testing.T) {
+	for _, version := range []string{"v1.2.3", "01.2.3", "1.2.3-rc.1", "1.2.3+build.1"} {
+		t.Run(version, func(t *testing.T) {
+			err := run([]string{
+				"-workflow-exe", "missing-workflow.exe",
+				"-payload", "missing-payload",
+				"-output", "missing-output",
+				"-version", version,
+				"-source-commit", strings.Repeat("a", 40),
+				"-github-actions-run-id", "1",
+				"-docker-version", "1",
+				"-docker-installer-url", "https://example.invalid/docker.exe",
+				"-docker-installer-sha256", strings.Repeat("b", 64),
+				"-worker-image", "ghcr.io/owner/worker@sha256:" + strings.Repeat("c", 64),
+				"-signing-key", "missing-key.pem",
+			})
+			if err == nil || !strings.Contains(err.Error(), "bare semantic version core") {
+				t.Fatalf("publisher accepted version %q: %v", version, err)
+			}
+		})
 	}
 }
 

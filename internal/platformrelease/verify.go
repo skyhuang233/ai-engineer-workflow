@@ -20,7 +20,7 @@ var (
 	shaPattern         = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	sha256Pattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	repositoryPattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	versionPattern     = regexp.MustCompile(`^(?:v)?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?$`)
+	versionPattern     = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	workerImagePattern = regexp.MustCompile(`^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_./-]+@sha256:[0-9a-f]{64}$`)
 )
 
@@ -42,17 +42,13 @@ func (m Manifest) Validate() error {
 	if m.SchemaVersion != ManifestSchemaVersion {
 		return fmt.Errorf("unsupported Platform Release Manifest schema version %d", m.SchemaVersion)
 	}
-	versionMatch := versionPattern.FindStringSubmatch(m.Release.Version)
-	if versionMatch == nil {
-		return errors.New("Platform Release version must be semantic")
+	if err := ValidatePlatformVersion(m.Release.Version); err != nil {
+		return err
 	}
-	if (m.Release.Channel == "stable") == (versionMatch[4] != "") {
-		return errors.New("Platform Release channel does not match semantic version")
+	if m.Release.Channel != "stable" {
+		return errors.New("Platform Release channel must be stable")
 	}
-	if m.Release.Channel != "stable" && m.Release.Channel != "prerelease" {
-		return errors.New("Platform Release channel is invalid")
-	}
-	if !repositoryPattern.MatchString(m.Release.Repository) || !shaPattern.MatchString(m.Release.SourceCommit) || m.Release.Tag != "platform-v"+strings.TrimPrefix(m.Release.Version, "v") || m.Release.GitHubActionsRunID <= 0 {
+	if !repositoryPattern.MatchString(m.Release.Repository) || !shaPattern.MatchString(m.Release.SourceCommit) || m.Release.Tag != "platform-v"+m.Release.Version || m.Release.GitHubActionsRunID <= 0 {
 		return errors.New("Platform Release identity is incomplete")
 	}
 	if m.BootstrapContract.MinimumSchema <= 0 || m.BootstrapContract.MaximumSchema < m.BootstrapContract.MinimumSchema {
@@ -89,6 +85,15 @@ func (m Manifest) Validate() error {
 	}
 	if m.Signature.Algorithm != "ecdsa-p256-sha256" || strings.TrimSpace(m.Signature.KeyID) == "" || m.Signature.SignatureAsset != "platform-release.json.sig" {
 		return errors.New("Platform Release signature metadata is invalid")
+	}
+	return nil
+}
+
+// ValidatePlatformVersion accepts only the canonical bare SemVer core used by
+// every Platform Release identity boundary.
+func ValidatePlatformVersion(value string) error {
+	if !versionPattern.MatchString(value) {
+		return errors.New("Platform Release version must be a bare semantic version core (X.Y.Z) without leading zeros")
 	}
 	return nil
 }
@@ -279,7 +284,7 @@ func parseSemver(value string) ([3]int, bool) {
 	for index := range parsed {
 		parsed[index], _ = strconv.Atoi(match[index+1])
 	}
-	return parsed, match[4] == ""
+	return parsed, true
 }
 
 func compareSemver(left, right string) int {

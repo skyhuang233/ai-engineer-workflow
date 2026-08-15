@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -49,7 +50,7 @@ func serveCommand(args []string, output io.Writer) error {
 		database.Close()
 		return fmt.Errorf("read Platform Installation: %w", err)
 	}
-	if err := requireInstalledWorkflowVersion(installation.PlatformVersion); err != nil {
+	if err := requireInstalledWorkflowIdentity(installation.PlatformVersion, installation.WorkflowCLISHA256); err != nil {
 		database.Close()
 		return err
 	}
@@ -103,7 +104,7 @@ func serveChildCommand(args []string) error {
 		return fmt.Errorf("read Platform Installation: %w", err)
 	}
 	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
-	if err := requireInstalledWorkflowVersion(installation.PlatformVersion); err != nil {
+	if err := requireInstalledWorkflowIdentity(installation.PlatformVersion, installation.WorkflowCLISHA256); err != nil {
 		database.Close()
 		return err
 	}
@@ -168,6 +169,47 @@ func requireInstalledWorkflowVersion(installed string) error {
 		return fmt.Errorf("Workflow CLI published version %q differs from durable Platform Installation version %q", Version, installed)
 	}
 	return nil
+}
+
+var workflowExecutableSHA256 = currentWorkflowExecutableSHA256
+
+func requireInstalledWorkflowIdentity(installedVersion, installedSHA256 string) error {
+	if err := requireInstalledWorkflowVersion(installedVersion); err != nil {
+		return err
+	}
+	if len(installedSHA256) != 64 || strings.ToLower(installedSHA256) != installedSHA256 {
+		return errors.New("durable Workflow CLI checksum identity is invalid")
+	}
+	for _, character := range installedSHA256 {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return errors.New("durable Workflow CLI checksum identity is invalid")
+		}
+	}
+	liveSHA256, err := workflowExecutableSHA256()
+	if err != nil {
+		return errors.New("cannot verify the current Workflow CLI executable checksum")
+	}
+	if liveSHA256 != installedSHA256 {
+		return errors.New("Workflow CLI executable checksum differs from durable Platform Installation")
+	}
+	return nil
+}
+
+func currentWorkflowExecutableSHA256() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	file, err := os.Open(executable)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
 func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) ([]controlplane.Loop, func() error, error) {

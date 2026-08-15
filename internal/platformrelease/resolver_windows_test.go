@@ -98,6 +98,41 @@ func TestResolvePlatformReleaseAllowsFreshInstallToSelectExactVersionWithoutUpgr
 	}
 }
 
+func TestResolvePlatformReleaseRequiresCanonicalBareSemanticVersionCore(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	for _, test := range []struct {
+		version string
+		accept  bool
+	}{
+		{version: "1.2.3", accept: true},
+		{version: "v1.2.3"},
+		{version: "01.2.3"},
+	} {
+		t.Run(test.version, func(t *testing.T) {
+			fixture := newResolverFixture(t, "1.2.3")
+			factsPath := filepath.Join(fixture.directory, "host-facts.json")
+			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+			output, runErr := fixture.run(t, powershell, factsPath, test.version, false)
+			if test.accept {
+				if runErr != nil {
+					t.Fatalf("canonical version rejected: %v\n%s", runErr, output)
+				}
+				return
+			}
+			if runErr == nil || !strings.Contains(output, "bare semantic version core") {
+				t.Fatalf("non-canonical version accepted: err=%v output=%s", runErr, output)
+			}
+			if requests, err := os.ReadFile(fixture.requestLog); err == nil && len(requests) != 0 {
+				t.Fatalf("resolver used network before rejecting version: %q", requests)
+			}
+		})
+	}
+}
+
 func TestResolvePlatformReleaseRequiresExactVersionWhenExistingInstallLostBothPins(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {

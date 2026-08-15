@@ -14,7 +14,7 @@ function Assert-ReleaseResolver([bool]$Condition, [string]$Message) {
 }
 
 function Get-StableVersion([string]$Value, [string]$Description) {
-    Assert-ReleaseResolver ($Value -match '^(\d+)\.(\d+)\.(\d+)$') "$Description must be a stable semantic version"
+    Assert-ReleaseResolver ($Value -match '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "$Description must be a bare semantic version core (X.Y.Z) without leading zeros"
     return [Version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
 }
 
@@ -91,7 +91,7 @@ $release = [string]$releaseResponse.Content | ConvertFrom-Json
 Assert-ReleaseResolver (-not [bool]$release.draft -and -not [bool]$release.prerelease) "Selected GitHub Release is not stable"
 Assert-ReleaseResolver ($release.immutable -is [bool] -and [bool]$release.immutable) "Selected GitHub Release is not immutable"
 $tag = [string]$release.tag_name
-Assert-ReleaseResolver ($tag -match '^platform-v(\d+\.\d+\.\d+)$') "Selected GitHub Release tag is not a stable Platform Release"
+Assert-ReleaseResolver ($tag -match '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') "Selected GitHub Release tag is not a canonical stable Platform Release"
 $metadataVersionText = [string]$Matches[1]
 if (-not [string]::IsNullOrWhiteSpace($selectedVersionText)) {
     Assert-ReleaseResolver ($metadataVersionText -eq $selectedVersionText) "GitHub Release tag does not match the selected Platform Release version"

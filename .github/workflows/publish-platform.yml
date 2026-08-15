@@ -51,6 +51,7 @@ jobs:
           PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:PLATFORM_VERSION)) { throw "WORKFLOW_PLATFORM_VERSION is required" }
+          if ($env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" }
           New-Item -ItemType Directory -Force build | Out-Null
           go build -trimpath -ldflags "-buildid= -X main.Version=$env:PLATFORM_VERSION" -o build/workflow.exe ./cmd/workflow
           if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from WORKFLOW_PLATFORM_VERSION" }
@@ -97,7 +98,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
         run: |
-          tag="platform-v${PLATFORM_VERSION#v}"
+          [[ "$PLATFORM_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" >&2
+            exit 1
+          }
+          tag="platform-v${PLATFORM_VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Refusing to replace existing Platform Release $tag" >&2
             exit 1

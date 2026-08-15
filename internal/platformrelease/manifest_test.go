@@ -116,6 +116,23 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 			m.Release.Version = "dev"
 			m.Release.Tag = "platform-vdev"
 		},
+		"v-prefixed platform version": func(m *Manifest) {
+			m.Release.Version = "v1.0.0"
+			m.Release.Tag = "platform-v1.0.0"
+		},
+		"zero-padded platform version": func(m *Manifest) {
+			m.Release.Version = "01.0.0"
+			m.Release.Tag = "platform-v01.0.0"
+		},
+		"prerelease platform version": func(m *Manifest) {
+			m.Release.Version = "1.0.0-rc.1"
+			m.Release.Channel = "prerelease"
+			m.Release.Tag = "platform-v1.0.0-rc.1"
+		},
+		"build platform version": func(m *Manifest) {
+			m.Release.Version = "1.0.0+build.1"
+			m.Release.Tag = "platform-v1.0.0+build.1"
+		},
 		"provenance mismatch": func(m *Manifest) { m.Provenance.SourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
 	}
 	for name, mutate := range tests {

@@ -27,6 +27,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/plan"
+	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -74,6 +75,9 @@ type githubTokenProvider interface {
 }
 
 func main() {
+	if err := validateWorkflowBuildVersion(); err != nil {
+		fail(err)
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -139,6 +143,16 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+func validateWorkflowBuildVersion() error {
+	if Version == "dev" {
+		return nil
+	}
+	if err := platformrelease.ValidatePlatformVersion(Version); err != nil {
+		return fmt.Errorf("invalid published Workflow CLI version: %w", err)
+	}
+	return nil
 }
 
 func usage() {

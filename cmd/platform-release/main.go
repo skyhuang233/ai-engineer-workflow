@@ -53,6 +53,9 @@ func run(arguments []string) error {
 	if *runID <= 0 {
 		return errors.New("-github-actions-run-id must be positive")
 	}
+	if err := platformrelease.ValidatePlatformVersion(*version); err != nil {
+		return fmt.Errorf("-version: %w", err)
+	}
 	if err := verifyWorkflowExecutableVersion(*executable, *version); err != nil {
 		return err
 	}
@@ -61,7 +64,7 @@ func run(arguments []string) error {
 		return err
 	}
 	manifest.Release.Version = *version
-	manifest.Release.Tag = "platform-v" + strings.TrimPrefix(*version, "v")
+	manifest.Release.Tag = "platform-v" + *version
 	manifest.Release.SourceCommit = strings.ToLower(*sourceCommit)
 	manifest.Release.GitHubActionsRunID = *runID
 	manifest.Provenance.SourceCommit = manifest.Release.SourceCommit
