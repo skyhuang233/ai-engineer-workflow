@@ -38,6 +38,9 @@ func Discover(ctx context.Context, repository string, resolver RemoteHead) (Disc
 	if _, _, err := currentHostProxyEnvironment(); err != nil {
 		return Discovery{}, err
 	}
+	if err := ValidateLocalGitReadConfiguration(ctx, repository); err != nil {
+		return Discovery{}, err
+	}
 	root, err := gitOutput(ctx, repository, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return Discovery{}, errors.New("current directory is not a Git repository")

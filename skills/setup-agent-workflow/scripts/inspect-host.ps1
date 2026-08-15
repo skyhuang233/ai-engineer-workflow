@@ -123,7 +123,7 @@ function Test-UnsafeRepositoryGitKey([string]$Key) {
         ($keyLower.StartsWith('merge.') -and $keyLower.EndsWith('.driver')) -or
         ($keyLower.StartsWith('url.') -and ($keyLower.EndsWith('.insteadof') -or $keyLower.EndsWith('.pushinsteadof'))) -or
         ($keyLower.StartsWith('remote.') -and ($keyLower.EndsWith('.vcs') -or $keyLower.EndsWith('.proxy') -or $keyLower.EndsWith('.uploadpack') -or $keyLower.EndsWith('.receivepack'))) -or
-        @('core.gitproxy', 'core.sshcommand', 'core.fsmonitor', 'core.attributesfile', 'core.hookspath') -contains $keyLower
+        @('core.gitproxy', 'core.sshcommand', 'core.fsmonitor', 'core.attributesfile', 'core.hookspath', 'core.worktree', 'core.alternaterefscommand') -contains $keyLower
 }
 
 function Read-GitConfigNames([string]$Path, [string]$Scope) {
@@ -138,36 +138,70 @@ function Assert-SafeRepositoryGitConfiguration([string]$Path) {
     foreach ($name in $localNames) {
         if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
     }
-    $worktreeEnabled = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get', 'extensions.worktreeConfig')
-    if ($worktreeEnabled.exit_code -eq 0 -and ([string]$worktreeEnabled.output).Trim() -eq 'true') {
+    $worktreeEnabled = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get-all', 'extensions.worktreeConfig')
+    $worktreeOutput = [string]$worktreeEnabled.output
+    if ($worktreeEnabled.exit_code -eq 1 -and $worktreeOutput.Length -eq 0) { return }
+    if ($worktreeEnabled.exit_code -ne 0) {
+        throw "Unable to inspect repository worktree Git configuration: $($worktreeEnabled.error.Trim())"
+    }
+    if ($worktreeOutput.EndsWith("`r`n")) {
+        $worktreeOutput = $worktreeOutput.Substring(0, $worktreeOutput.Length - 2)
+    } elseif ($worktreeOutput.EndsWith("`n")) {
+        $worktreeOutput = $worktreeOutput.Substring(0, $worktreeOutput.Length - 1)
+    }
+    $worktreeValues = @($worktreeOutput -split "`r?`n")
+    if ($worktreeValues.Count -ne 1) {
+        throw "Unable to inspect repository worktree Git configuration: expected zero or exactly one extensions.worktreeConfig value"
+    }
+    if ([string]::Equals($worktreeValues[0], 'true', [StringComparison]::OrdinalIgnoreCase)) {
         foreach ($name in @(Read-GitConfigNames $Path '--worktree')) {
             if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
         }
-    } elseif ($worktreeEnabled.exit_code -ne 1) {
-        throw "Unable to inspect repository worktree Git configuration: $($worktreeEnabled.error.Trim())"
+    } elseif (-not [string]::Equals($worktreeValues[0], 'false', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Unable to inspect repository worktree Git configuration: extensions.worktreeConfig must be true or false"
     }
 }
 
 function Read-RawLocalOrigin([string]$Path) {
-    $result = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get-all', 'remote.origin.url')
-    $values = @(([string]$result.output -split "`r?`n") | Where-Object { $_ -ne '' })
-    if ($result.exit_code -eq 1 -and $values.Count -eq 0) { return "" }
+    $result = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get-all', '-z', 'remote.origin.url')
+    $raw = [string]$result.output
+    if ($result.exit_code -eq 1 -and $raw.Length -eq 0) { return "" }
     if ($result.exit_code -ne 0) { throw "Unable to read local remote.origin.url exactly: $($result.error.Trim())" }
-    if ($values.Count -ne 1 -or [string]::IsNullOrWhiteSpace($values[0])) {
+    $terminator = $raw.IndexOf([char]0)
+    if ($terminator -lt 0 -or $terminator -ne ($raw.Length - 1)) {
         throw "A Git repository must have zero or exactly one local remote.origin.url"
     }
-    return $values[0]
+    $value = $raw.Substring(0, $terminator)
+    if ([string]::IsNullOrWhiteSpace($value) -or
+        -not [string]::Equals($value, $value.Trim(), [StringComparison]::Ordinal)) {
+        throw "A Git repository must have zero or exactly one local remote.origin.url"
+    }
+    return $value
 }
 
 $gitCommand = Get-Command "git" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-$git = $(if ($null -eq $gitCommand) { [ordered]@{ installed = $false; output = ""; exit_code = $null } } else {
-    $result = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--show-toplevel')
-    [ordered]@{ installed = $true; output = ([string]$result.output).Trim(); exit_code = $result.exit_code }
-})
-$isRepository = $git.installed -and $git.exit_code -eq 0
+$git = [ordered]@{ installed = ($null -ne $gitCommand); output = ""; exit_code = $null }
+$isRepository = $false
+if ($git.installed) {
+    # `git config --local` reads only the repository config file and does not
+    # resolve the worktree or refs. It is therefore the only safe repository
+    # discriminator before the denylist has been enforced.
+    $repositoryProbe = Invoke-IsolatedGit @('-C', $repoPath, 'config', '--local', '--no-includes', '--list')
+    if ($repositoryProbe.exit_code -eq 0) {
+        Assert-SafeRepositoryGitConfiguration $repoPath
+        $rootResult = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--show-toplevel')
+        if ($rootResult.exit_code -ne 0) { throw "Unable to inspect repository root: $($rootResult.error.Trim())" }
+        $git.output = ([string]$rootResult.output).Trim()
+        $git.exit_code = 0
+        $isRepository = $true
+    } elseif (([string]$repositoryProbe.error) -match 'not a git repository') {
+        $git.exit_code = $repositoryProbe.exit_code
+    } else {
+        throw "Unable to inspect repository-local Git configuration: $($repositoryProbe.error.Trim())"
+    }
+}
 $gitFacts = [ordered]@{ installed = $git.installed; is_repository = $isRepository }
 if ($isRepository) {
-    Assert-SafeRepositoryGitConfiguration $repoPath
     $gitFacts.root = $git.output
     $branchResult = Invoke-IsolatedGit @('-C', $repoPath, 'branch', '--show-current')
     $headResult = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--verify', '--quiet', 'HEAD')
@@ -385,7 +419,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
                 $controlPlane = [ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI returned invalid status JSON" }
             }
         } else {
-            $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI status command failed" }
+            $controlPlane = [ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI status command failed" }
         }
     }
 }

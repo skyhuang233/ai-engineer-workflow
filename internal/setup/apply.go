@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
+	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
@@ -69,6 +71,22 @@ func (s *SecretInput) Read() ([]byte, error) {
 	return io.ReadAll(io.LimitReader(s.Reader, 1024*1024))
 }
 
+func (s *SecretInput) boundToken() ([]byte, error) {
+	if s == nil || s.Reader == nil || s.consumed {
+		return nil, errors.New("approved GitHub PAT effect requires available secret input")
+	}
+	raw, err := io.ReadAll(io.LimitReader(s.Reader, 1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	token := bytes.TrimSpace(raw)
+	s.Reader = bytes.NewReader(token)
+	if len(token) == 0 {
+		return nil, errors.New("approved GitHub PAT effect requires a non-empty token")
+	}
+	return append([]byte(nil), token...), nil
+}
+
 type EffectAdapter interface {
 	Readback(context.Context, setupcontract.Effect) (setupcontract.EffectStatus, string, error)
 	Apply(context.Context, setupcontract.Effect, *SecretInput) error
@@ -97,6 +115,12 @@ type CleanupObligationReconciler interface {
 }
 type CleanupObligationValidator interface {
 	ValidateCleanupObligation(setupcontract.Plan, store.SetupCleanupObligation) error
+}
+type CleanupObligationRecorderBinder interface {
+	BindCleanupObligationRecorder(func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error)
+}
+type ApprovedCleanupCredentialBinder interface {
+	BindApprovedCleanupCredential(*workflowgithub.Client)
 }
 type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
 type PlatformPreconditionVerifier func(context.Context, setupcontract.Plan) error
@@ -162,10 +186,30 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		return setupcontract.ExecutionResult{}, err
 	}
 	defer database.Close()
+	if binder, ok := e.Adapter.(CleanupObligationRecorderBinder); ok {
+		binder.BindCleanupObligationRecorder(func(recordContext context.Context, effect setupcontract.Effect, obligation store.SetupCleanupObligation) error {
+			obligation.PlanID, obligation.PlanDigestSHA256, obligation.EffectID = plan.PlanID, digest, effect.ID
+			obligation.Status, obligation.UpdatedAt = store.CleanupPending, time.Now().UTC()
+			if e.Now != nil {
+				obligation.UpdatedAt = e.Now().UTC()
+			}
+			return database.RecordSetupCleanupObligation(recordContext, obligation)
+		})
+		defer binder.BindCleanupObligationRecorder(nil)
+	}
 	projection := Project(plan, digest)
 	now := time.Now().UTC()
 	if e.Now != nil {
 		now = e.Now().UTC()
+	}
+	pendingCleanup, err := database.PendingSetupCleanupObligationsAll(ctx)
+	if err != nil {
+		return setupcontract.ExecutionResult{}, err
+	}
+	if len(pendingCleanup) != 0 {
+		if err := e.preflightApprovedCleanupCredential(ctx, plan); err != nil {
+			return setupcontract.ExecutionResult{}, err
+		}
 	}
 	// Cleanup from any previously trusted Setup Plan precedes recording or
 	// verifying the replacement plan, so a new plan can never strand Plan A.
@@ -471,6 +515,54 @@ func (e *Engine) preflightGitHubPATFingerprint(plan setupcontract.Plan) error {
 		return nil
 	}
 	return e.SecretInput.bindFingerprint(expected)
+}
+
+func (e *Engine) preflightApprovedCleanupCredential(ctx context.Context, plan setupcontract.Plan) error {
+	var patEffect *setupcontract.Effect
+	for index := range plan.Effects {
+		if plan.Effects[index].Kind != "github_pat" {
+			continue
+		}
+		patEffect = &plan.Effects[index]
+		break
+	}
+	if patEffect == nil {
+		return nil
+	}
+	binder, ok := e.Adapter.(ApprovedCleanupCredentialBinder)
+	if !ok {
+		return errors.New("Setup adapter cannot bind the approved replacement PAT for pending cleanup")
+	}
+	token, err := e.SecretInput.boundToken()
+	if err != nil {
+		return err
+	}
+	verifier := githubcredential.Verifier{}
+	baseURL := ""
+	var httpClient *http.Client
+	if e.GitHubCredentialVerifier != nil {
+		verifier = *e.GitHubCredentialVerifier
+		baseURL = verifier.APIBase
+		httpClient = verifier.Client
+	}
+	verification, err := verifier.Verify(ctx, string(token), patEffect.Parameters["owner"])
+	if err != nil {
+		return fmt.Errorf("preflight approved replacement PAT for pending cleanup: %w", err)
+	}
+	if verification.Owner != patEffect.Parameters["owner"] || verification.FingerprintSHA256 != patEffect.Parameters["fingerprint_sha256"] {
+		return errors.New("approved replacement PAT cleanup identity differs from the Setup Plan")
+	}
+	observedScopes := map[string]bool{}
+	for _, scope := range verification.Scopes {
+		observedScopes[scope] = true
+	}
+	for _, scope := range strings.Split(patEffect.Parameters["required_scopes"], ",") {
+		if !observedScopes[scope] {
+			return errors.New("approved replacement PAT cleanup scopes differ from the Setup Plan")
+		}
+	}
+	binder.BindApprovedCleanupCredential(workflowgithub.NewClient(baseURL, string(token), httpClient).WithRepositoryOwner(verification.Owner))
+	return nil
 }
 
 func verifyOnboardingIdentityFence(ctx context.Context, database *store.Store, layout workflowhome.Layout, plan setupcontract.Plan) error {

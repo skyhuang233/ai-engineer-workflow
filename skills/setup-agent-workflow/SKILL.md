@@ -5,15 +5,25 @@ description: Prepare the current Windows machine and repository for Agent Workfl
 
 # Setup Agent Workflow
 
-Treat the current directory as the target. Keep discovery read-only and use the bundled scripts instead of reproducing host checks by hand. Before discovery, run `codex doctor --json` and `codex login status`. Parse the redacted doctor JSON even when the command exits nonzero: unrelated terminal checks may fail and must not override valid required checks. Continue only when the machine-readable doctor report has schema 1, an `ok` `auth.credentials` check with `stored ChatGPT tokens=true`, `stored auth mode=chatgpt`, and an absolute `auth file` beneath the `CODEX_HOME` reported by the `ok` `config.load` check, and login status reports ChatGPT. The Workflow CLI performs the same checks and resolves the source automatically; never ask an ordinary user to locate or configure a private Codex file.
+Treat the current directory as the target. Keep discovery read-only and use the bundled scripts instead of reproducing host checks by hand.
 
-1. Confirm the absolute local Workflow Home once before the first host inspection. Use `%LOCALAPPDATA%\AgentWorkflow` only when the user did not select another absolute local path; reject relative and UNC paths. Keep this exact `$confirmedWorkflowHome` for every inspection, plan, apply, verify, and serve operation. Create a task-temporary directory, then run host inspection once and read its saved JSON:
+1. Confirm the absolute local Workflow Home once before the first host inspection. Use `%LOCALAPPDATA%\AgentWorkflow` only when the user did not select another absolute local path; reject relative and UNC paths. Keep this exact `$confirmedWorkflowHome` for every inspection, plan, apply, verify, and serve operation. Create a task-temporary directory, then run only the Git probe:
 
    ```powershell
    $confirmedWorkflowHome = [IO.Path]::GetFullPath(<confirmed-absolute-local-workflow-home>)
    $setupTaskRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-setup-" + [Guid]::NewGuid().ToString("N"))
    New-Item -ItemType Directory -Path $setupTaskRoot | Out-Null
    $hostFactsPath = Join-Path $setupTaskRoot "host-facts.json"
+   $gitFacts = & scripts/inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome -GitProbeOnly | ConvertFrom-Json
+   ```
+
+   Stop immediately if Git is unavailable. If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop immediately if declined. If accepted, run `git init`, then rerun the Git-only probe and require it to report `installed=true` and `is_repository=true`. Do not run full host inspection, Docker inspection, Control Plane inspection, release resolution, or `workflow.exe serve` until the Git-only probe confirms a repository. An unsafe or ambiguous repository probe is a rejection, not a reason to continue into Platform discovery.
+
+   After the Git-only gate succeeds and before full host inspection, run `codex doctor --json` and `codex login status`. Parse the redacted doctor JSON even when the command exits nonzero: unrelated terminal checks may fail and must not override valid required checks. Continue only when the machine-readable doctor report has schema 1, an `ok` `auth.credentials` check with `stored ChatGPT tokens=true`, `stored auth mode=chatgpt`, and an absolute `auth file` beneath the `CODEX_HOME` reported by the `ok` `config.load` check, and login status reports ChatGPT. The Workflow CLI performs the same checks and resolves the source automatically; never ask an ordinary user to locate or configure a private Codex file.
+
+   Only after that Git gate succeeds, run full host inspection once and read its saved JSON:
+
+   ```powershell
    $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome | Out-String
    [IO.File]::WriteAllText($hostFactsPath, $hostFactsJSON, (New-Object Text.UTF8Encoding($false)))
    $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
@@ -21,7 +31,35 @@ Treat the current directory as the target. Keep discovery read-only and use the 
 
    Resolve both paths and require `$hostFacts.workflow_home` to equal `$confirmedWorkflowHome`; otherwise fail closed. Every later reinspection must pass `-WorkflowHome $confirmedWorkflowHome` again; never recover the default from process environment after this choice.
 
-   Before release resolution, handle an already-authorized stopped runtime as an existing-authorization Control Plane restart. Authority is complete only when `$hostFacts.workflow.trust_state -eq "pinned"`, `$hostFacts.workflow.owned`, `$hostFacts.platform.installation_recorded`, every durable release/contract/CLI/bundle digest is a lowercase SHA-256, `$hostFacts.platform.control_plane_plan_digest_sha256` is a lowercase SHA-256, and `$hostFacts.control_plane.state -eq "stopped"`. In that exact case run the installed `workflow.exe serve --workflow-home` command using the same confirmed home:
+   Before release resolution, handle an already-authorized absent Control Plane process as an existing-authorization Control Plane restart. Use an explicit exact predicate; do not infer restart authority from a state label alone:
+
+   ```powershell
+   $sha256Pattern = '^[0-9a-f]{64}$'
+   $durableAuthorityExact =
+       $hostFacts.workflow.trust_state -eq "pinned" -and
+       [bool]$hostFacts.workflow.owned -and
+       [bool]$hostFacts.platform.installation_recorded -and
+       -not [string]::IsNullOrWhiteSpace([string]$hostFacts.platform.version) -and
+       [string]$hostFacts.workflow.version -ceq [string]$hostFacts.platform.version -and
+       $hostFacts.platform.release_manifest_digest -cmatch $sha256Pattern -and
+       $hostFacts.platform.platform_setup_contract_digest -cmatch $sha256Pattern -and
+       $hostFacts.platform.workflow_cli_sha256 -cmatch $sha256Pattern -and
+       [string]$hostFacts.workflow.sha256 -ceq [string]$hostFacts.platform.workflow_cli_sha256 -and
+       -not [string]::IsNullOrWhiteSpace([string]$hostFacts.platform.release_bundled_files_json) -and
+       $hostFacts.platform.release_bundled_files_digest -cmatch $sha256Pattern -and
+       $hostFacts.platform.control_plane_plan_digest_sha256 -cmatch $sha256Pattern
+   $staleNonLiveRecord =
+       $hostFacts.control_plane.state -eq "stale" -and
+       $null -ne $hostFacts.control_plane.runtime -and
+       [string]$hostFacts.control_plane.runtime.platform_version -ceq [string]$hostFacts.platform.version -and
+       [string]$hostFacts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256 -ceq [string]$hostFacts.platform.control_plane_plan_digest_sha256
+   $stoppedWithoutRecord =
+       $hostFacts.control_plane.state -eq "stopped" -and
+       $null -eq $hostFacts.control_plane.runtime
+   $restartEligible = $durableAuthorityExact -and ($staleNonLiveRecord -or $stoppedWithoutRecord)
+   ```
+
+   Only when `$restartEligible` is true, run the installed `workflow.exe serve --workflow-home` command using the same confirmed home:
 
    ```powershell
    & (Join-Path $confirmedWorkflowHome "bin\workflow.exe") serve --workflow-home $confirmedWorkflowHome --approved-plan-digest $hostFacts.platform.control_plane_plan_digest_sha256
@@ -29,9 +67,8 @@ Treat the current directory as the target. Keep discovery read-only and use the 
 
    Then rerun host inspection for `$confirmedWorkflowHome` and require `ready` runtime identity bound to that same version and digest. This restart reuses durable authorization and must not produce a new Platform Bootstrap Plan or ask for a new approval. Continue repository intent and credential discovery, but skip Platform release resolution, planning, and installation when the restarted Platform is ready.
 
-   Incomplete or conflicting durable trust fails closed: never execute the installed Workflow CLI, guess a digest, or treat `stopped` alone as restart authority. Continue only through the exact verified pin-repair path below; the restart shortcut remains unavailable until inspection proves the complete authorization identity.
+   Incomplete or conflicting durable trust fails closed: never execute the installed Workflow CLI, guess a digest, or treat a Control Plane state alone as restart authority. Never restart `stopped` with a Runtime Record: that represents a live process whose health is unavailable. Never restart `ready` or `mismatched`. A `stale` record is eligible only because inspection proved its recorded process is not live and its exact runtime identity still matches the durable authorization. Continue only through the exact verified pin-repair path below; the restart shortcut remains unavailable until inspection proves the complete authorization identity and process absence.
 
-   If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop if declined, then rerun inspection into the same file if accepted.
    Record the confirmed owner, repository name, visibility, publication state, and domain layout once; pass these same values to every subsequent plan command without asking again.
    Require the already-approved classic PAT scopes `repo,workflow` for a personal owner. Organization ownership remains supported in the design but must stop with `requires an approved organization scope contract` until that additional credential contract is explicitly approved; do not infer or request extra scopes. Capture the verifier's redacted JSON result and pass its `owner_type` and `fingerprint_sha256` unchanged to the bootstrap planner. When the persisted credential is already live-verified, reuse those two fields from `$hostFacts.github_credential`; never calculate a fingerprint from an unverified value.
 2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. When no verified credential exists, ask for the classic PAT and pipe it to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`. A personal owner must verify personal identity, exact `repo,workflow` scopes, repository access or absence, Actions checkout feasibility, and review/merge-queue policy read-only. An organization owner stops pending the approved organization scope contract. If any fact cannot be proved, stop before producing a Platform Bootstrap Plan. Never fall back to another owner after rejection.

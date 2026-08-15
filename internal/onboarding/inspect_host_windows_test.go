@@ -108,12 +108,69 @@ func TestPowerShellHostInspectionRequiresExactlyOneRawLocalOrigin(t *testing.T) 
 		}
 	})
 
+	t.Run("raw local whitespace blocks", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "remote.origin.url", " https://github.com/owner/repo.git ")
+		output, err := run(t, repo)
+		if err == nil || !strings.Contains(string(output), "exactly one local remote.origin.url") {
+			t.Fatalf("whitespace-bearing raw origin was normalized: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("raw local newline whitespace blocks", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "remote.origin.url", "\nhttps://github.com/owner/repo.git")
+		output, err := run(t, repo)
+		if err == nil || !strings.Contains(string(output), "exactly one local remote.origin.url") {
+			t.Fatalf("newline-bearing raw origin was normalized: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("disabled worktree config is absent", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "extensions.worktreeConfig", "true")
+		git(t, repo, "config", "--worktree", "credential.helper", "stale-helper")
+		git(t, repo, "config", "--local", "extensions.worktreeConfig", "false")
+		output, err := run(t, repo)
+		if err != nil {
+			t.Fatalf("disabled worktree config was not treated as absent: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("multiple worktree config declarations block", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "true")
+		git(t, repo, "config", "--local", "--add", "extensions.worktreeConfig", "")
+		output, err := run(t, repo)
+		if err == nil || !strings.Contains(string(output), "expected zero or exactly one extensions.worktreeConfig value") {
+			t.Fatalf("multiple worktree config declarations were not blocked: %v\n%s", err, output)
+		}
+	})
+
+	t.Run("noncanonical worktree config declaration blocks", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		git(t, repo, "config", "--local", "extensions.worktreeConfig", "yes")
+		output, err := run(t, repo)
+		if err == nil || !strings.Contains(string(output), "extensions.worktreeConfig must be true or false") {
+			t.Fatalf("noncanonical worktree config declaration was not blocked: %v\n%s", err, output)
+		}
+	})
+
 	for _, test := range []struct {
 		name, scope, key, value string
 	}{
 		{name: "dangerous local config", scope: "--local", key: "core.hooksPath", value: filepath.Join(t.TempDir(), "hooks")},
+		{name: "dangerous local worktree redirect", scope: "--local", key: "core.worktree", value: t.TempDir()},
+		{name: "dangerous local alternate refs command", scope: "--local", key: "core.alternateRefsCommand", value: "attacker-command"},
 		{name: "dangerous local includeIf", scope: "--local", key: "includeIf.gitdir:C:/attacker.path", value: filepath.Join(t.TempDir(), "attacker.config")},
 		{name: "dangerous worktree config", scope: "--worktree", key: "credential.helper", value: "attacker-helper"},
+		{name: "dangerous worktree redirect", scope: "--worktree", key: "core.worktree", value: t.TempDir()},
+		{name: "dangerous worktree alternate refs command", scope: "--worktree", key: "core.alternateRefsCommand", value: "attacker-command"},
 		{name: "dangerous worktree includeIf", scope: "--worktree", key: "includeIf.gitdir:C:/attacker.path", value: filepath.Join(t.TempDir(), "attacker.config")},
 	} {
 		t.Run(test.name, func(t *testing.T) {

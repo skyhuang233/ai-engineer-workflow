@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -249,6 +252,90 @@ func TestReplacementPlanDrainsPendingCleanupFromEarlierTrustedPlan(t *testing.T)
 	pending, err := db.PendingSetupCleanupObligationsAll(context.Background())
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+}
+
+func TestApprovedPATReplacementPreflightsNewCredentialForEarlierRemoteCleanup(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	contractDigest := writeTestPlatformSetupContract(t, layout)
+	const repository = "owner/repo"
+	branch := ""
+	head := strings.Repeat("a", 40)
+	planA := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "cleanup-plan-a", Kind: setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: filepath.Join(t.TempDir(), "repo"), GitHubRepository: repository},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: filepath.Join(t.TempDir(), "repo"), Expected: head}},
+		Effects: []setupcontract.Effect{
+			{ID: "contract", Kind: "repository_contract_pr", Subject: repository, Action: "create_check_merge", Parameters: map[string]string{"base_branch": "main", "base_head": head, "source_url": "https://github.com/owner/repo.git", "before_files_json": `{}`, "files_json": `{}`, "manifest_digest": repeat("b", 64), "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}},
+			{ID: "admit", Kind: "repository_admission", Subject: repository, Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1", "labels_json": `[]`, "actions_allowed": "all"}},
+		},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: repository, Expected: repeat("b", 64)}},
+	}
+	rawA, _ := json.Marshal(planA)
+	_, canonicalA, digestA, err := setupcontract.ParsePlan(rawA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch = "workflow/onboarding-" + digestA[:12]
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordSetupPlan(context.Background(), store.SetupPlanRecord{PlanID: planA.PlanID, Kind: string(planA.Kind), SchemaVersion: planA.SchemaVersion, Target: repository, DigestSHA256: digestA, CanonicalJSON: string(canonicalA), Projection: Project(planA, digestA), CreatedAt: testTime()}); err != nil {
+		t.Fatal(err)
+	}
+	resource, _ := json.Marshal(remoteBranchCleanupResource{Repository: repository, Branch: branch, Head: head})
+	if err := database.RecordSetupCleanupObligation(context.Background(), store.SetupCleanupObligation{PlanID: planA.PlanID, PlanDigestSHA256: digestA, EffectID: "contract", ObligationID: "contract:remote-branch", Kind: "remote_onboarding_branch", Resource: string(resource), Status: store.CleanupPending, UpdatedAt: testTime()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
+		t.Fatal(err)
+	}
+	deletes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") != "Bearer ghp_replacement" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+			_, _ = w.Write([]byte(`{"login":"owner","id":7}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/"):
+			_, _ = fmt.Fprintf(w, `{"object":{"sha":"%s"}}`, head)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/git/refs/heads/"):
+			deletes++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	planB := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "replace-pat-and-clean", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root},
+		Preconditions:   []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}},
+		Effects:         []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_replacement"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}},
+	}
+	rawB, _ := json.Marshal(planB)
+	_, canonicalB, digestB, err := setupcontract.ParsePlan(rawB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &HostAdapter{Layout: layout}
+	result, applyErr := (&Engine{Adapter: adapter, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}, GitHubCredentialVerifier: &githubcredential.Verifier{APIBase: server.URL, Client: server.Client()}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(context.Background(), canonicalB, digestB)
+	if applyErr != nil || result.Status != setupcontract.ExecutionSucceeded || deletes != 1 {
+		t.Fatalf("replacement result=%#v err=%v deletes=%d", result, applyErr, deletes)
 	}
 }
 

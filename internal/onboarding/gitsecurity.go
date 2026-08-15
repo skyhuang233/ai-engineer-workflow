@@ -14,7 +14,11 @@ import (
 )
 
 var errUnsafeRepositoryGitConfig = errors.New("unsafe repository-local Git configuration")
-var errRepositoryOriginAbsent = errors.New("repository has no local origin URL")
+
+// ErrRepositoryOriginAbsent distinguishes an exact missing local origin from
+// malformed or unsafe repository configuration.
+var ErrRepositoryOriginAbsent = errors.New("repository has no local origin URL")
+var errRepositoryOriginAbsent = ErrRepositoryOriginAbsent
 
 // ValidateAuthenticatedGitRepository rejects repository-owned configuration
 // that could redirect or weaken a later PAT-bearing Git transport operation.
@@ -90,7 +94,8 @@ func unsafeRepositoryGitKey(key string) bool {
 		strings.HasPrefix(key, "merge.") && strings.HasSuffix(key, ".driver") ||
 		strings.HasPrefix(key, "url.") && (strings.HasSuffix(key, ".insteadof") || strings.HasSuffix(key, ".pushinsteadof")) ||
 		strings.HasPrefix(key, "remote.") && (strings.HasSuffix(key, ".vcs") || strings.HasSuffix(key, ".proxy") || strings.HasSuffix(key, ".uploadpack") || strings.HasSuffix(key, ".receivepack")) ||
-		key == "core.gitproxy" || key == "core.sshcommand" || key == "core.fsmonitor" || key == "core.attributesfile" || key == "core.hookspath"
+		key == "core.gitproxy" || key == "core.sshcommand" || key == "core.fsmonitor" || key == "core.attributesfile" || key == "core.hookspath" ||
+		key == "core.worktree" || key == "core.alternaterefscommand"
 }
 
 // ReadLocalOriginURL returns exactly one repository-local origin without
@@ -99,21 +104,21 @@ func ReadLocalOriginURL(ctx context.Context, repository string) (string, error) 
 	if err := rejectRepositoryURLAliases(ctx, repository); err != nil {
 		return "", err
 	}
-	command := exec.CommandContext(ctx, "git", "config", "--local", "--get-all", "--no-includes", "remote.origin.url")
+	command := exec.CommandContext(ctx, "git", "config", "--local", "--get-all", "--no-includes", "-z", "remote.origin.url")
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	output, err := command.Output()
 	if err != nil {
 		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
-			return "", errRepositoryOriginAbsent
+			return "", ErrRepositoryOriginAbsent
 		}
 		return "", err
 	}
-	values := strings.FieldsFunc(string(output), func(r rune) bool { return r == '\n' || r == '\r' })
-	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+	values := strings.Split(string(output), "\x00")
+	if len(values) != 2 || values[1] != "" || values[0] == "" || values[0] != strings.TrimSpace(values[0]) {
 		return "", errors.New("origin must have one exact repository-local URL")
 	}
-	return strings.TrimSpace(values[0]), nil
+	return values[0], nil
 }
 
 func rawOriginURL(ctx context.Context, repository string) (string, error) {

@@ -307,8 +307,11 @@ func runSetupPlan(args []string, output io.Writer) error {
 	}
 	private := *visibility == "private"
 	if *publicationState != "auto" {
-		_, originErr := readOnlyGitOutput(context.Background(), *repository, "remote", "get-url", "origin")
+		_, originErr := onboarding.ReadLocalOriginURL(context.Background(), *repository)
 		originPresent := originErr == nil
+		if originErr != nil && !errors.Is(originErr, onboarding.ErrRepositoryOriginAbsent) {
+			return originErr
+		}
 		if (*publicationState == "published") != originPresent {
 			return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "current origin differs from the confirmed publication state"})
 		}
@@ -614,7 +617,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 			return readErr
 		}
 	}
-	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
+	engine := setupengine.Engine{Adapter: &adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
 		database, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
 		if openErr != nil {
 			return openErr

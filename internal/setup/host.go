@@ -50,6 +50,7 @@ type HostAdapter struct {
 	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
 	RemoveCleanupPath          func(string) error
 	RemoveCleanupContainer     func(context.Context, string) error
+	RecordCleanupObligation    func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
@@ -69,6 +70,7 @@ const publishedHistoryHeadEvidence = "published_history_head="
 type remoteBranchCleanupResource struct {
 	Repository string `json:"repository"`
 	Branch     string `json:"branch"`
+	Head       string `json:"head"`
 }
 type temporaryCloneCleanupResource struct {
 	Root string `json:"root"`
@@ -93,14 +95,19 @@ func (a HostAdapter) CleanupObligations(effect setupcontract.Effect, digest stri
 	if err != nil || !filepath.IsAbs(root) {
 		return nil, errors.New("Repository Contract temporary root is invalid")
 	}
-	branch := "workflow/onboarding-" + digest[:12]
 	path := filepath.Join(root, "workflow-onboarding-"+digest[:12])
-	remote, _ := json.Marshal(remoteBranchCleanupResource{Repository: effect.Subject, Branch: branch})
 	temporary, _ := json.Marshal(temporaryCloneCleanupResource{Root: root, Path: path})
 	return []store.SetupCleanupObligation{
-		{ObligationID: effect.ID + ":remote-branch", Kind: "remote_onboarding_branch", Resource: string(remote)},
 		{ObligationID: effect.ID + ":temporary-clone", Kind: "temporary_clone", Resource: string(temporary)},
 	}, nil
+}
+
+func (a *HostAdapter) BindCleanupObligationRecorder(recorder func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error) {
+	a.RecordCleanupObligation = recorder
+}
+
+func (a *HostAdapter) BindApprovedCleanupCredential(client *github.Client) {
+	a.CleanupGitHub = client
 }
 
 func (a HostAdapter) ValidateCleanupObligation(plan setupcontract.Plan, obligation store.SetupCleanupObligation) error {
@@ -115,7 +122,20 @@ func (a HostAdapter) ValidateCleanupObligation(plan setupcontract.Plan, obligati
 	if err != nil || digest != obligation.PlanDigestSHA256 || len(digest) < 12 {
 		return errors.New("cleanup obligation Plan digest is invalid")
 	}
-	if obligation.Kind == "remote_onboarding_branch" || obligation.Kind == "temporary_clone" {
+	if obligation.Kind == "remote_onboarding_branch" {
+		for _, effect := range plan.Effects {
+			if effect.ID != obligation.EffectID || effect.Kind != "repository_contract_pr" {
+				continue
+			}
+			var resource remoteBranchCleanupResource
+			if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository != effect.Subject || resource.Branch != "workflow/onboarding-"+digest[:12] || !fullSetupCommitID(resource.Head) || obligation.ObligationID != effect.ID+":remote-branch" {
+				return errors.New("remote branch cleanup is not bound to its approved deterministic head")
+			}
+			return nil
+		}
+		return errors.New("remote branch cleanup lacks its approved Repository Contract effect")
+	}
+	if obligation.Kind == "temporary_clone" {
 		for _, effect := range plan.Effects {
 			if effect.ID != obligation.EffectID || effect.Kind != "repository_contract_pr" {
 				continue
@@ -181,14 +201,20 @@ func (a HostAdapter) ReconcileCleanupObligation(ctx context.Context, obligation 
 			return errors.New("GitHub client is required to clean the onboarding branch")
 		}
 		var resource remoteBranchCleanupResource
-		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository == "" || !strings.HasPrefix(resource.Branch, "workflow/onboarding-") {
+		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository == "" || !strings.HasPrefix(resource.Branch, "workflow/onboarding-") || !fullSetupCommitID(resource.Head) {
 			return errors.New("remote onboarding branch cleanup resource is invalid")
 		}
-		err := client.DeleteBranch(ctx, resource.Repository, resource.Branch)
+		liveHead, err := client.CleanupBranchHead(ctx, resource.Repository, resource.Branch)
 		if github.IsNotFound(err) {
 			return nil
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		if liveHead != resource.Head {
+			return errors.New("remote onboarding branch head differs from the approved deterministic cleanup head")
+		}
+		return client.DeleteCleanupBranch(ctx, resource.Repository, resource.Branch)
 	case "temporary_clone":
 		var resource temporaryCloneCleanupResource
 		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || !filepath.IsAbs(resource.Root) || !filepath.IsAbs(resource.Path) {
@@ -1242,18 +1268,27 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	if err != nil {
 		return err
 	}
-	remoteBranchOwned := false
 	cleanupWorkspace := a.CleanupOnboardingWorkspace
 	if cleanupWorkspace == nil {
 		cleanupWorkspace = func(workspace onboarding.GitWorkspace) error { return workspace.Cleanup() }
 	}
+	if a.RecordCleanupObligation != nil {
+		resource, marshalErr := json.Marshal(remoteBranchCleanupResource{Repository: effect.Subject, Branch: workspace.Branch, Head: workspace.Head})
+		if marshalErr != nil {
+			return errors.Join(marshalErr, cleanupWorkspace(workspace))
+		}
+		if recordErr := a.RecordCleanupObligation(ctx, effect, store.SetupCleanupObligation{ObligationID: effect.ID + ":remote-branch", Kind: "remote_onboarding_branch", Resource: string(resource)}); recordErr != nil {
+			return errors.Join(fmt.Errorf("record remote onboarding branch cleanup obligation: %w", recordErr), cleanupWorkspace(workspace))
+		}
+	}
+	remoteBranchOwned := false
 	defer func() {
 		var branchErr error
 		if remoteBranchOwned {
-			branchErr = a.GitHub.DeleteBranch(context.Background(), effect.Subject, workspace.Branch)
-			if github.IsNotFound(branchErr) {
-				branchErr = nil
-			}
+			resource, _ := json.Marshal(remoteBranchCleanupResource{Repository: effect.Subject, Branch: workspace.Branch, Head: workspace.Head})
+			cleanupAdapter := a
+			cleanupAdapter.CleanupGitHub = a.GitHub
+			branchErr = cleanupAdapter.ReconcileCleanupObligation(context.Background(), store.SetupCleanupObligation{Kind: "remote_onboarding_branch", Resource: string(resource)})
 			if branchErr != nil {
 				branchErr = fmt.Errorf("cleanup remote onboarding branch: %w", branchErr)
 			}
@@ -1271,7 +1306,10 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 		}
 	}
 	if priorState == onboardingPullClosed {
-		if err := a.GitHub.DeleteBranch(ctx, effect.Subject, branch); err != nil && !github.IsNotFound(err) {
+		resource, _ := json.Marshal(remoteBranchCleanupResource{Repository: effect.Subject, Branch: branch, Head: workspace.Head})
+		cleanupAdapter := a
+		cleanupAdapter.CleanupGitHub = a.GitHub
+		if err := cleanupAdapter.ReconcileCleanupObligation(ctx, store.SetupCleanupObligation{Kind: "remote_onboarding_branch", Resource: string(resource)}); err != nil {
 			return fmt.Errorf("clean closed Onboarding Pull Request branch before replacement: %w", err)
 		}
 	}

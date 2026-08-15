@@ -3,6 +3,7 @@ package onboarding
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -217,6 +218,71 @@ func TestDiscoverRejectsExecutableWorktreeGitConfigurationWithoutExecutingIt(t *
 	}
 	if _, statErr := os.Stat(sideEffect); !os.IsNotExist(statErr) {
 		t.Fatalf("unsafe worktree configuration executed: %v", statErr)
+	}
+}
+
+func TestValidateLocalGitReadConfigurationRejectsWorktreeRedirectsInEveryRepositoryScope(t *testing.T) {
+	for _, test := range []struct {
+		name, scope, key, value string
+	}{
+		{name: "local core worktree", scope: "--local", key: "core.worktree", value: t.TempDir()},
+		{name: "local alternate refs command", scope: "--local", key: "core.alternateRefsCommand", value: "malicious-command"},
+		{name: "worktree core worktree", scope: "--worktree", key: "core.worktree", value: t.TempDir()},
+		{name: "worktree alternate refs command", scope: "--worktree", key: "core.alternateRefsCommand", value: "malicious-command"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := newRepo(t)
+			if test.scope == "--worktree" {
+				git(t, repo, "config", "--local", "extensions.worktreeConfig", "true")
+			}
+			git(t, repo, "config", test.scope, test.key, test.value)
+			if err := ValidateLocalGitReadConfiguration(context.Background(), repo); err == nil || !strings.Contains(err.Error(), "unsafe repository-local Git configuration") {
+				t.Fatalf("%s %s was accepted: %v", test.scope, test.key, err)
+			}
+		})
+	}
+}
+
+func TestDiscoverRejectsCoreWorktreeBeforeRevParseCanEscapeRepository(t *testing.T) {
+	repo := newRepo(t)
+	externalWorktree := t.TempDir()
+	git(t, repo, "config", "--local", "core.worktree", externalWorktree)
+
+	unsafe := exec.Command("git", "-C", repo, "rev-parse", "--show-toplevel")
+	unsafeOutput, err := unsafe.Output()
+	if err != nil {
+		t.Fatalf("prove hostile core.worktree redirect: %v", err)
+	}
+	unsafeRoot := strings.TrimSpace(string(unsafeOutput))
+	externalRoot, err := filepath.Abs(externalWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(filepath.Clean(unsafeRoot), filepath.Clean(externalRoot)) {
+		t.Fatalf("test precondition did not redirect rev-parse: got %q want %q", unsafeRoot, externalRoot)
+	}
+
+	discovery, err := Discover(context.Background(), repo, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsafe repository-local Git configuration") {
+		t.Fatalf("Discover escaped to %#v instead of rejecting core.worktree: %v", discovery, err)
+	}
+}
+
+func TestReadLocalOriginURLRejectsLeadingOrTrailingWhitespace(t *testing.T) {
+	for _, origin := range []string{
+		" https://github.com/owner/repo.git",
+		"https://github.com/owner/repo.git ",
+		"\thttps://github.com/owner/repo.git",
+		"\nhttps://github.com/owner/repo.git",
+		"https://github.com/owner/repo.git\n",
+	} {
+		t.Run(fmt.Sprintf("%q", origin), func(t *testing.T) {
+			repo := newRepo(t)
+			git(t, repo, "config", "--local", "remote.origin.url", origin)
+			if got, err := ReadLocalOriginURL(context.Background(), repo); err == nil {
+				t.Fatalf("whitespace-bearing raw origin was normalized to %q", got)
+			}
+		})
 	}
 }
 

@@ -136,6 +136,100 @@ func TestSetupPlanBindsConfirmedPublicationStateBeforePlatformReadback(t *testin
 	}
 }
 
+func TestSetupPlanPublicationStateIgnoresHostileGitDirectory(t *testing.T) {
+	repository := t.TempDir()
+	command := exec.Command("git", "-C", repository, "init")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init target: %v: %s", err, output)
+	}
+	attacker := t.TempDir()
+	command = exec.Command("git", "-C", attacker, "init")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init attacker: %v: %s", err, output)
+	}
+	command = exec.Command("git", "-C", attacker, "remote", "add", "origin", "https://github.com/attacker/repo.git")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v: %s", err, output)
+	}
+	t.Setenv("GIT_DIR", filepath.Join(attacker, ".git"))
+
+	var output bytes.Buffer
+	if err := runSetupPlan([]string{"--repo", repository, "--publication-state", "published", "--repository-name", "repo", "--visibility", "private", "--domain-layout", "single-context"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "confirmed publication state") {
+		t.Fatalf("hostile GIT_DIR changed publication state: %s", output.String())
+	}
+}
+
+func TestSetupPlanPublicationStateUsesOnlyExactSafeLocalOrigin(t *testing.T) {
+	newRepository := func(t *testing.T) string {
+		t.Helper()
+		repository := t.TempDir()
+		command := exec.Command("git", "-C", repository, "init")
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git init: %v: %s", err, output)
+		}
+		return repository
+	}
+	run := func(repository, state string) (string, error) {
+		var output bytes.Buffer
+		err := runSetupPlan([]string{"--repo", repository, "--publication-state", state, "--repository-name", "repo", "--visibility", "private", "--domain-layout", "single-context"}, &output)
+		return output.String(), err
+	}
+
+	t.Run("ignores injected Git config", func(t *testing.T) {
+		repository := newRepository(t)
+		hostileConfig := filepath.Join(t.TempDir(), "hostile.gitconfig")
+		if err := os.WriteFile(hostileConfig, []byte("[remote \"origin\"]\n\turl = https://github.com/attacker/repo.git\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GIT_CONFIG", hostileConfig)
+		t.Setenv("GIT_CONFIG_GLOBAL", hostileConfig)
+		t.Setenv("GIT_CONFIG_COUNT", "1")
+		t.Setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+		t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/attacker/injected.git")
+		output, err := run(repository, "published")
+		if err != nil || !strings.Contains(output, "confirmed publication state") {
+			t.Fatalf("injected Git config changed publication state: err=%v output=%s", err, output)
+		}
+	})
+
+	t.Run("rejects repository rewrite instead of resolving it", func(t *testing.T) {
+		repository := newRepository(t)
+		for _, args := range [][]string{
+			{"remote", "add", "origin", "owner-shortcut:repo"},
+			{"config", "--local", "url.https://github.com/owner/.insteadOf", "owner-shortcut:"},
+		} {
+			command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, output)
+			}
+		}
+		output, err := run(repository, "published")
+		if err == nil || !strings.Contains(err.Error(), "unsafe repository-local Git configuration") || output != "" {
+			t.Fatalf("repository rewrite was not an exact read error: err=%v output=%s", err, output)
+		}
+	})
+
+	t.Run("does not classify ambiguous origin as absent", func(t *testing.T) {
+		repository := newRepository(t)
+		for _, args := range [][]string{
+			{"remote", "add", "origin", "https://github.com/owner/one.git"},
+			{"config", "--local", "--add", "remote.origin.url", "https://github.com/owner/two.git"},
+		} {
+			command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, output)
+			}
+		}
+		output, err := run(repository, "unpublished")
+		if err == nil || !strings.Contains(err.Error(), "one exact repository-local URL") || output != "" {
+			t.Fatalf("ambiguous origin was classified as absent: err=%v output=%s", err, output)
+		}
+	})
+}
+
 func TestPlatformStateSnapshotChangesForAnotherValidPATOrCodexSource(t *testing.T) {
 	ctx := context.Background()
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))

@@ -206,6 +206,54 @@ func TestBootstrapSkillRestartsStoppedControlPlaneWithDurableAuthorization(t *te
 	}
 }
 
+func TestBootstrapSkillRestartsOnlyWhenControlPlaneProcessAbsenceIsProven(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	skillPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "SKILL.md")
+	raw, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	for _, required := range []string{
+		`$durableAuthorityExact`,
+		`$staleNonLiveRecord`,
+		`$stoppedWithoutRecord`,
+		`$restartEligible`,
+		`$hostFacts.control_plane.state -eq "stale"`,
+		`$hostFacts.control_plane.state -eq "stopped"`,
+		`$null -eq $hostFacts.control_plane.runtime`,
+		`[string]$hostFacts.workflow.version -ceq [string]$hostFacts.platform.version`,
+		`[string]$hostFacts.workflow.sha256 -ceq [string]$hostFacts.platform.workflow_cli_sha256`,
+		`[string]$hostFacts.control_plane.runtime.platform_version -ceq [string]$hostFacts.platform.version`,
+		`[string]$hostFacts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256 -ceq [string]$hostFacts.platform.control_plane_plan_digest_sha256`,
+		"Never restart `stopped` with a Runtime Record",
+		"`mismatched`",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("bootstrap skill lacks process-absence restart contract %q", required)
+		}
+	}
+	for _, field := range []string{"release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest", "control_plane_plan_digest_sha256"} {
+		if !strings.Contains(content, `$hostFacts.platform.`+field+` -cmatch $sha256Pattern`) {
+			t.Fatalf("bootstrap skill restart does not require exact durable pin %q", field)
+		}
+	}
+}
+
+func TestHostInspectionDoesNotDescribeStatusFailureAsNoRuntimeRecord(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	scriptPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1")
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	want := `[ordered]@{ state = "mismatched"; diagnostic = "installed Workflow CLI status command failed" }`
+	if !strings.Contains(content, want) {
+		t.Fatalf("inspect-host must fail closed when Control Plane status cannot prove process absence")
+	}
+}
+
 func TestBootstrapSkillChoosesWorkflowHomeBeforeFirstInspection(t *testing.T) {
 	_, current, _, _ := runtime.Caller(0)
 	skillPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "SKILL.md")
@@ -221,6 +269,34 @@ func TestBootstrapSkillChoosesWorkflowHomeBeforeFirstInspection(t *testing.T) {
 	} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks first-inspection Workflow Home contract %q", required)
+		}
+	}
+}
+
+func TestBootstrapSkillObtainsGitConsentBeforeFullHostInspection(t *testing.T) {
+	_, current, _, _ := runtime.Caller(0)
+	skillPath := filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "SKILL.md")
+	raw, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(raw)
+	probe := `inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome -GitProbeOnly`
+	full := `inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome | Out-String`
+	doctor := "codex doctor --json"
+	probeIndex, doctorIndex, fullIndex := strings.Index(content, probe), strings.Index(content, doctor), strings.Index(content, full)
+	if probeIndex < 0 || doctorIndex < 0 || fullIndex < 0 || probeIndex >= doctorIndex || doctorIndex >= fullIndex {
+		t.Fatalf("bootstrap skill must gate Codex and full host inspection behind GitProbeOnly: probe=%d doctor=%d full=%d", probeIndex, doctorIndex, fullIndex)
+	}
+	for _, required := range []string{
+		"Stop immediately if Git is unavailable",
+		"ask once whether to run `git init`",
+		"Stop immediately if declined",
+		"rerun the Git-only probe",
+		"Do not run full host inspection, Docker inspection, Control Plane inspection, release resolution, or `workflow.exe serve` until the Git-only probe confirms a repository",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("bootstrap skill lacks pre-platform Git gate %q", required)
 		}
 	}
 }

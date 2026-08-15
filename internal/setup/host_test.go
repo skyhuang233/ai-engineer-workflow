@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -215,6 +216,9 @@ func TestRepositoryContractApplyPreservesPrimaryAndCleanupFailures(t *testing.T)
 			_, _ = w.Write([]byte(`[]`))
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
 			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/workflow"):
+			head := hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/workflow/onboarding-aaaaaaaaaaaa")
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + head + `"}}`))
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
 			deleted = true
 			w.WriteHeader(http.StatusInternalServerError)
@@ -230,6 +234,7 @@ func TestRepositoryContractApplyPreservesPrimaryAndCleanupFailures(t *testing.T)
 		t.Fatal(err)
 	}
 	cleanupCalled := false
+	recordedCleanupHead := ""
 	adapter := HostAdapter{
 		GitHub:               workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"),
 		PlanDigest:           strings.Repeat("a", 64),
@@ -238,6 +243,14 @@ func TestRepositoryContractApplyPreservesPrimaryAndCleanupFailures(t *testing.T)
 		CleanupOnboardingWorkspace: func(onboarding.GitWorkspace) error {
 			cleanupCalled = true
 			return errors.New("temporary clone cleanup failed")
+		},
+		RecordCleanupObligation: func(_ context.Context, _ setupcontract.Effect, obligation store.SetupCleanupObligation) error {
+			var resource remoteBranchCleanupResource
+			if obligation.Kind != "remote_onboarding_branch" || json.Unmarshal([]byte(obligation.Resource), &resource) != nil {
+				return errors.New("invalid remote cleanup obligation")
+			}
+			recordedCleanupHead = resource.Head
+			return nil
 		},
 	}
 	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
@@ -252,8 +265,8 @@ func TestRepositoryContractApplyPreservesPrimaryAndCleanupFailures(t *testing.T)
 			t.Fatalf("combined error %q lacks %q", err, wanted)
 		}
 	}
-	if !deleted || !cleanupCalled {
-		t.Fatalf("cleanup attempts: remote=%t workspace=%t", deleted, cleanupCalled)
+	if !deleted || !cleanupCalled || !fullSetupCommitID(recordedCleanupHead) {
+		t.Fatalf("cleanup attempts: remote=%t workspace=%t approved_head=%q", deleted, cleanupCalled, recordedCleanupHead)
 	}
 }
 
@@ -307,6 +320,8 @@ func TestRepositoryContractApplyFailsWhenSuccessfulMutationCannotCleanUp(t *test
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
 			merged = true
 			_, _ = w.Write([]byte(`{"merged":true,"sha":"` + mergeHead + `"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/workflow"):
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + workspaceHead() + `"}}`))
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"message":"remote branch cleanup denied"}`))
@@ -394,6 +409,8 @@ func TestRepositoryContractApplyRechecksApprovedPolicyImmediatelyBeforeMerge(t *
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
 			merged = true
 			_, _ = w.Write([]byte(`{"merged":true,"sha":"` + strings.Repeat("c", 40) + `"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/workflow"):
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + workspaceHead() + `"}}`))
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -744,6 +761,9 @@ func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *tes
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
 			created = true
 			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/workflow"):
+			head := hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/workflow/onboarding-aaaaaaaaaaaa")
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + head + `"}}`))
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -892,6 +912,8 @@ func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
 			_, _ = w.Write([]byte(`[{"number":6,"state":"closed","body":"Approved Setup Plan SHA-256: ` + digest + `","head":{"sha":"` + approvedHead + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/workflow"):
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + approvedHead + `"}}`))
 		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/git/refs/heads/"):
 			deleted = true
 			w.WriteHeader(http.StatusNoContent)
@@ -1124,6 +1146,48 @@ func TestHostAdapterReconcilesPersistedProbeCleanupResources(t *testing.T) {
 	bad := store.SetupCleanupObligation{Kind: "docker_container", Resource: resource("unowned")}
 	if err := adapter.ReconcileCleanupObligation(context.Background(), bad); err == nil {
 		t.Fatal("unowned container cleanup accepted")
+	}
+}
+
+func TestRemoteOnboardingBranchCleanupRequiresExactApprovedHead(t *testing.T) {
+	const repository = "owner/repo"
+	const branch = "workflow/onboarding-aaaaaaaaaaaa"
+	approvedHead := strings.Repeat("a", 40)
+	for _, test := range []struct {
+		name       string
+		resource   remoteBranchCleanupResource
+		liveHead   string
+		wantDelete bool
+	}{
+		{name: "exact approved head", resource: remoteBranchCleanupResource{Repository: repository, Branch: branch, Head: approvedHead}, liveHead: approvedHead, wantDelete: true},
+		{name: "externally advanced head", resource: remoteBranchCleanupResource{Repository: repository, Branch: branch, Head: approvedHead}, liveHead: strings.Repeat("b", 40)},
+		{name: "legacy obligation without head", resource: remoteBranchCleanupResource{Repository: repository, Branch: branch}, liveHead: approvedHead},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deletes := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method {
+				case http.MethodGet:
+					_, _ = fmt.Fprintf(w, `{"ref":"refs/heads/%s","object":{"sha":"%s"}}`, branch, test.liveHead)
+				case http.MethodDelete:
+					deletes++
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			raw, _ := json.Marshal(test.resource)
+			adapter := HostAdapter{CleanupGitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner")}
+			err := adapter.ReconcileCleanupObligation(context.Background(), store.SetupCleanupObligation{Kind: "remote_onboarding_branch", Resource: string(raw)})
+			if test.wantDelete && (err != nil || deletes != 1) {
+				t.Fatalf("exact cleanup err=%v deletes=%d", err, deletes)
+			}
+			if !test.wantDelete && (err == nil || deletes != 0) {
+				t.Fatalf("unsafe cleanup err=%v deletes=%d", err, deletes)
+			}
+		})
 	}
 }
 
