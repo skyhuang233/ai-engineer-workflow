@@ -85,3 +85,56 @@ func TestDockerWorkerVerifierAggregatesPrimaryAndEveryCleanupFailure(t *testing.
 		t.Fatalf("aggregated err=%v", err)
 	}
 }
+
+func TestDockerWorkerVerifierTracksDeterministicCleanupResources(t *testing.T) {
+	state, workspace := t.TempDir(), t.TempDir()
+	var begun, completed []string
+	verifier := DockerWorkerVerifier{
+		ProbeID: "abcdef123456",
+		BeginCleanup: func(kind, id, resource string) error {
+			begun = append(begun, kind+"|"+id+"|"+resource)
+			return nil
+		},
+		CompleteCleanup: func(id string) error {
+			completed = append(completed, id)
+			return nil
+		},
+		Executor: commandExecutorFunc(func(_ context.Context, args []string) ([]byte, error) {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, " info ") {
+				return []byte("linux/amd64"), nil
+			}
+			if strings.Contains(joined, " run ") {
+				if !strings.Contains(joined, "--name workflow-setup-docker-abcdef123456") || !strings.Contains(joined, "setup-probe-id=abcdef123456") {
+					t.Fatalf("nondeterministic probe command: %s", joined)
+				}
+				for _, root := range []string{state, workspace} {
+					if err := os.WriteFile(filepath.Join(root, ".setup-readiness-abcdef123456", "container-marker"), []byte("worker\n"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			return nil, nil
+		}),
+	}
+	if err := verifier.Verify(context.Background(), "worker@sha256:"+strings.Repeat("a", 64), state, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if len(begun) != 3 || len(completed) != 3 {
+		t.Fatalf("cleanup tracking begun=%#v completed=%#v", begun, completed)
+	}
+	for _, want := range []string{"docker-state-probe", "docker-workspace-probe", "docker-container"} {
+		if !strings.Contains(strings.Join(begun, "\n"), want) || !containsString(completed, want) {
+			t.Fatalf("missing %s: begun=%#v completed=%#v", want, begun, completed)
+		}
+	}
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}

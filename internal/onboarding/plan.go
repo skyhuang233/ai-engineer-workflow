@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
@@ -164,7 +165,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 				return setupcontract.Plan{}, errors.New("repository required check lacks an App identity")
 			}
 		}
-		policy.RequiredChecks = uniqueRequiredChecks(policy.RequiredChecks)
+		policy.RequiredChecks = CanonicalRequiredChecks(policy.RequiredChecks)
 		checkApps := map[string]int64{repositorycontract.RequiredCheckName: repositorycontract.GitHubActionsAppID}
 		for _, required := range policy.RequiredChecks {
 			if existing := checkApps[required.Context]; existing != 0 && existing != required.AppID {
@@ -218,7 +219,7 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	if err != nil {
 		return setupcontract.Plan{}, err
 	}
-	requiredChecks := uniqueRequiredChecks(append([]RequiredCheck{{Context: repositorycontract.RequiredCheckName, AppID: repositorycontract.GitHubActionsAppID}}, policy.RequiredChecks...))
+	requiredChecks := CanonicalRequiredChecks(append([]RequiredCheck{{Context: repositorycontract.RequiredCheckName, AppID: repositorycontract.GitHubActionsAppID}}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	if !state.ContractSatisfied {
 		parameters := map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}
@@ -250,7 +251,7 @@ func uniqueStrings(values []string) []string {
 	}
 	return result
 }
-func uniqueRequiredChecks(values []RequiredCheck) []RequiredCheck {
+func CanonicalRequiredChecks(values []RequiredCheck) []RequiredCheck {
 	seen := map[string]bool{}
 	result := make([]RequiredCheck, 0, len(values))
 	for _, value := range values {
@@ -261,6 +262,12 @@ func uniqueRequiredChecks(values []RequiredCheck) []RequiredCheck {
 		seen[value.Context+":"+fmt.Sprint(value.AppID)] = true
 		result = append(result, value)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Context != result[j].Context {
+			return result[i].Context < result[j].Context
+		}
+		return result[i].AppID < result[j].AppID
+	})
 	return result
 }
 func defaultPrivate(options PlanOptions) bool {

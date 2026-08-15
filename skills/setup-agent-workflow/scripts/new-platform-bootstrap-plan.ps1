@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)][string]$GitHubOwner,
     [ValidateSet("", "personal", "organization")][string]$GitHubOwnerType = "",
+    [ValidatePattern('^[0-9a-f]{64}$')][string]$GitHubPATFingerprintSHA256 = "",
     [switch]$AllowUpgrade
 )
 
@@ -151,7 +152,8 @@ $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credent
 if (-not $credentialCurrent) {
     if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
-    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $expectedCredentialPath; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner; required_scopes = ($requiredCredentialScopes -join ",") })) })
+    if ($GitHubPATFingerprintSHA256 -notmatch '^[0-9a-f]{64}$') { throw "A verified GitHub PAT fingerprint is required before planning credential persistence" }
+    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $expectedCredentialPath; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner; required_scopes = ($requiredCredentialScopes -join ","); fingerprint_sha256 = $GitHubPATFingerprintSHA256 })) })
 }
 $platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256 -and [string]$facts.platform.release_bundled_files_digest -eq $releaseBundledFilesDigest -and [string]$facts.platform.release_bundled_files_json -eq $releaseBundledFilesJSON)
 $controlPlaneAuthorizationCurrent = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.control_plane_plan_digest_sha256) -and [string]$facts.platform.control_plane_plan_digest_sha256 -eq [string]$facts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256)

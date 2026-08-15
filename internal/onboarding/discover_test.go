@@ -151,6 +151,33 @@ func TestDiscoverRejectsNonGitHubOriginWrongBranchAndHeadDrift(t *testing.T) {
 	}
 }
 
+func TestDiscoverRejectsRepositoryLocalInsteadOfOriginAlias(t *testing.T) {
+	repo := newRepo(t)
+	git(t, repo, "remote", "set-url", "origin", "workflow-alias:owner/repo.git")
+	git(t, repo, "config", "url.https://github.com/.insteadOf", "workflow-alias:")
+	called := false
+	_, err := Discover(context.Background(), repo, remoteHeadFunc(func(context.Context, string) (string, string, error) {
+		called = true
+		return "main", testGitOutput(t, repo, "rev-parse", "HEAD"), nil
+	}))
+	if err == nil || called {
+		t.Fatalf("repository-local insteadOf alias reached remote discovery: called=%t err=%v", called, err)
+	}
+}
+
+func TestDiscoverRejectsAmbiguousRepositoryLocalOrigin(t *testing.T) {
+	repo := newRepo(t)
+	git(t, repo, "config", "--add", "remote.origin.url", "https://github.com/owner/other.git")
+	called := false
+	_, err := Discover(context.Background(), repo, remoteHeadFunc(func(context.Context, string) (string, string, error) {
+		called = true
+		return "main", testGitOutput(t, repo, "rev-parse", "HEAD"), nil
+	}))
+	if err == nil || called {
+		t.Fatalf("ambiguous local origin was treated as absent: called=%t err=%v", called, err)
+	}
+}
+
 func TestGitHubOriginAcceptsOnlyCanonicalTransportForms(t *testing.T) {
 	for _, accepted := range []string{
 		"https://github.com/owner/repo",

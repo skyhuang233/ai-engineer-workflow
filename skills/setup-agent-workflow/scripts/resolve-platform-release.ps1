@@ -43,10 +43,18 @@ $durableVersion = $null
 $durableDigest = ""
 $selection = "latest-stable"
 $selectedVersionText = $Version.Trim()
+$pinlessExistingInstall = (-not $installed -and $null -ne $facts.workflow -and [bool]$facts.workflow.installed)
 
 if (-not $installed) {
     Assert-ReleaseResolver (-not $AllowUpgrade) "AllowUpgrade applies only when upgrading an existing Platform Installation"
-    if ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
+    if ($pinlessExistingInstall -and [string]::IsNullOrWhiteSpace($selectedVersionText)) {
+        throw "An existing Workflow CLI has no verified Platform Release primary or backup pin. Recover it with -Version <exact-installed-version>; latest selection is allowed only for a true fresh install"
+    }
+    if ($pinlessExistingInstall) {
+        Get-StableVersion $selectedVersionText "Exact recovery Platform Release version" | Out-Null
+        $selection = "exact-version-recovery"
+        $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
+    } elseif ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
         $releaseAPI = "https://api.github.com/repos/$repository/releases/latest"
     } else {
         Get-StableVersion $selectedVersionText "Requested Platform Release version" | Out-Null

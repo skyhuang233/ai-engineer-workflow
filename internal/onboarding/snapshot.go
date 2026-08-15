@@ -24,6 +24,8 @@ type ApprovalSnapshot struct {
 	StatusSHA256          string         `json:"status_sha256"`
 	ManagedBoundarySHA256 string         `json:"managed_boundary_sha256"`
 	ZeroBaseline          []BaselineFile `json:"zero_baseline,omitempty"`
+	GlobalExcludesPath    string         `json:"global_excludes_path,omitempty"`
+	GlobalExcludesSHA256  string         `json:"global_excludes_sha256,omitempty"`
 }
 
 // ApprovalTransitions contains only effect results durably recorded for this
@@ -56,6 +58,13 @@ func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedR
 		Origin: discovery.Origin, Repository: discovery.Repository, AuthenticatedCloneURL: cloneURL,
 		StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: zeroBaseline,
 	}
+	if !discovery.HasCommits {
+		binding, bindingErr := resolveGlobalExcludes(ctx, discovery.Root)
+		if bindingErr != nil {
+			return "", bindingErr
+		}
+		snapshot.GlobalExcludesPath, snapshot.GlobalExcludesSHA256 = binding.Path, binding.SHA256
+	}
 	encoded, err := json.Marshal(snapshot)
 	return string(encoded), err
 }
@@ -77,8 +86,11 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 	branch, _ := gitOutput(ctx, root, "branch", "--show-current")
 	head, headErr := gitOutput(ctx, root, "rev-parse", "--verify", "HEAD")
 	hasCommits := headErr == nil
-	origin, originErr := gitOutput(ctx, root, "remote", "get-url", "origin")
-	if originErr != nil {
+	origin, originErr := rawOriginURL(ctx, root)
+	if originErr != nil && !errors.Is(originErr, errRepositoryOriginAbsent) {
+		return originErr
+	}
+	if errors.Is(originErr, errRepositoryOriginAbsent) {
 		origin = ""
 	}
 	repository := ""
@@ -111,6 +123,15 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 	actual := ApprovalSnapshot{Root: root, Branch: branch, Head: head, HasCommits: hasCommits, Origin: origin, Repository: repository, AuthenticatedCloneURL: cloneURL, StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: baseline}
 	if actual.Root != expected.Root || actual.Branch != expected.Branch {
 		return errors.New("onboarding discovery drifted from the approved snapshot")
+	}
+	if !expected.HasCommits {
+		binding, bindingErr := resolveGlobalExcludes(ctx, root)
+		if bindingErr != nil {
+			return bindingErr
+		}
+		if binding.Path != expected.GlobalExcludesPath || binding.SHA256 != expected.GlobalExcludesSHA256 {
+			return errors.New("global excludes binding drifted from the approved snapshot")
+		}
 	}
 	forwardHead := head == transitions.InitialBaselineHead && fullSHA.MatchString(transitions.InitialBaselineHead) || head == transitions.MergedHead && fullSHA.MatchString(transitions.MergedHead)
 	if head != expected.Head && !forwardHead || hasCommits != expected.HasCommits && !forwardHead {

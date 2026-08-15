@@ -3,8 +3,11 @@
 package setup
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +34,28 @@ var ErrDigestMismatch = errors.New("approved Setup Plan digest does not match ca
 type SecretInput struct {
 	Reader   io.Reader
 	consumed bool
+}
+
+func (s *SecretInput) bindFingerprint(expected string) error {
+	if s == nil || s.Reader == nil || s.consumed {
+		return errors.New("approved GitHub PAT effect requires secret input on standard input")
+	}
+	raw, err := io.ReadAll(io.LimitReader(s.Reader, 1024*1024))
+	if err != nil {
+		return err
+	}
+	token := bytes.TrimSpace(raw)
+	sum := sha256.Sum256(token)
+	actual := hex.EncodeToString(sum[:])
+	if len(expected) != len(actual) || subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) != 1 {
+		s.Reader = nil
+		s.consumed = true
+		return errors.New("GitHub PAT input fingerprint differs from the approved Setup Plan")
+	}
+	// Replay only the normalized secret to the approved persistence effect.
+	s.Reader = bytes.NewReader(token)
+	s.consumed = false
+	return nil
 }
 
 func (s *SecretInput) Read() ([]byte, error) {
@@ -64,6 +89,12 @@ type RepositoryCreateAttemptRestorer interface {
 type RepositoryCreateOutcomeClassifier interface {
 	RepositoryCreateOutcomeUnknown(error) bool
 }
+type CleanupObligationPlanner interface {
+	CleanupObligations(setupcontract.Effect, string) ([]store.SetupCleanupObligation, error)
+}
+type CleanupObligationReconciler interface {
+	ReconcileCleanupObligation(context.Context, store.SetupCleanupObligation) error
+}
 type ExpectedResultVerifier func(context.Context, setupcontract.Plan, setupcontract.ExpectedResult) error
 type PlatformPreconditionVerifier func(context.Context, setupcontract.Plan) error
 type Engine struct {
@@ -95,6 +126,9 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		return setupcontract.ExecutionResult{}, errors.New("Setup effect adapter is required")
 	}
 	if err := preflightGitHubPATBindings(layout, plan); err != nil {
+		return setupcontract.ExecutionResult{}, err
+	}
+	if err := e.preflightGitHubPATFingerprint(plan); err != nil {
 		return setupcontract.ExecutionResult{}, err
 	}
 	// Fence a generated Platform Plan to its approved Windows user before even
@@ -168,6 +202,17 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 				return result, err
 			}
 		}
+	}
+	// Cleanup belongs to an already-approved mutation and must not be stranded
+	// by later host or repository drift. Reconcile it after restoring exact
+	// same-plan evidence, before evaluating unrelated preconditions.
+	if err := reconcilePendingCleanupObligations(ctx, database, e.Adapter, plan.PlanID, now); err != nil {
+		result.Status = setupcontract.ExecutionIncomplete
+		result.Blocker = err.Error()
+		result.FinishedAt = time.Now().UTC()
+		encoded, _ := json.Marshal(result.Effects)
+		recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
+		return result, errors.Join(err, recordErr)
 	}
 	for _, precondition := range plan.Preconditions {
 		var checkErr error
@@ -246,6 +291,12 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 				break
 			}
 		}
+		if obligationErr := recordEffectCleanupObligations(ctx, database, e.Adapter, plan, digest, effect, now); obligationErr != nil {
+			result.Status = setupcontract.ExecutionIncomplete
+			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: obligationErr.Error()})
+			err = obligationErr
+			break
+		}
 		if applyErr := handler.engineApply(run, effect); applyErr != nil {
 			if effect.Kind == "create_repository" {
 				outcome := store.RepositoryCreateDefinitiveFailure
@@ -257,6 +308,12 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 			result.Status = setupcontract.ExecutionIncomplete
 			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: applyErr.Error()})
 			err = applyErr
+			break
+		}
+		if cleanupErr := reconcilePendingCleanupObligations(ctx, database, e.Adapter, plan.PlanID, now); cleanupErr != nil {
+			result.Status = setupcontract.ExecutionIncomplete
+			result.Effects = append(result.Effects, setupcontract.EffectResult{EffectID: effect.ID, Status: setupcontract.EffectFailed, Evidence: cleanupErr.Error()})
+			err = cleanupErr
 			break
 		}
 		if effect.Kind == "create_repository" {
@@ -323,6 +380,68 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	encoded, _ := json.Marshal(result.Effects)
 	recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
 	return result, errors.Join(err, recordErr)
+}
+
+func recordEffectCleanupObligations(ctx context.Context, database *store.Store, adapter EffectAdapter, plan setupcontract.Plan, digest string, effect setupcontract.Effect, now time.Time) error {
+	planner, ok := adapter.(CleanupObligationPlanner)
+	if !ok {
+		if effect.Kind == "repository_contract_pr" {
+			return errors.New("Setup adapter cannot persist Repository Contract cleanup obligations")
+		}
+		return nil
+	}
+	obligations, err := planner.CleanupObligations(effect, digest)
+	if err != nil {
+		return err
+	}
+	for _, obligation := range obligations {
+		obligation.PlanID, obligation.PlanDigestSHA256, obligation.EffectID = plan.PlanID, digest, effect.ID
+		obligation.Status, obligation.UpdatedAt = store.CleanupPending, now
+		if err := database.RecordSetupCleanupObligation(ctx, obligation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func reconcilePendingCleanupObligations(ctx context.Context, database *store.Store, adapter EffectAdapter, planID string, now time.Time) error {
+	pending, err := database.PendingSetupCleanupObligations(ctx, planID)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	reconciler, ok := adapter.(CleanupObligationReconciler)
+	if !ok {
+		return errors.New("Setup adapter cannot reconcile pending cleanup obligations")
+	}
+	for _, obligation := range pending {
+		if err := reconciler.ReconcileCleanupObligation(ctx, obligation); err != nil {
+			return fmt.Errorf("cleanup obligation %q remains pending: %w", obligation.ObligationID, err)
+		}
+		if err := database.CompleteSetupCleanupObligation(ctx, planID, obligation.ObligationID, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) preflightGitHubPATFingerprint(plan setupcontract.Plan) error {
+	var expected string
+	for _, effect := range plan.Effects {
+		if effect.Kind != "github_pat" {
+			continue
+		}
+		if expected != "" {
+			return errors.New("Setup Plan contains multiple GitHub PAT effects")
+		}
+		expected = effect.Parameters["fingerprint_sha256"]
+	}
+	if expected == "" {
+		return nil
+	}
+	return e.SecretInput.bindFingerprint(expected)
 }
 
 func verifyOnboardingIdentityFence(ctx context.Context, database *store.Store, layout workflowhome.Layout, plan setupcontract.Plan) error {

@@ -98,6 +98,38 @@ func TestResolvePlatformReleaseAllowsFreshInstallToSelectExactVersionWithoutUpgr
 	}
 }
 
+func TestResolvePlatformReleaseRequiresExactVersionWhenExistingInstallLostBothPins(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"workflow":{"installed":true,"trust_state":"repair_required","diagnostic":"Bootstrap Platform Release primary and backup pins are missing"},"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr == nil || !strings.Contains(output, "-Version <exact-installed-version>") || strings.Contains(output, `"manifest_path"`) {
+		t.Fatalf("pinless existing installation was not blocked with actionable exact-version recovery: err=%v output=%s", runErr, output)
+	}
+	if requests, err := os.ReadFile(fixture.requestLog); err == nil && len(requests) != 0 {
+		t.Fatalf("pinless existing installation resolved a mutable release before exact recovery authorization: %q", requests)
+	}
+
+	output, runErr = fixture.run(t, powershell, factsPath, "1.2.3", false)
+	var result struct {
+		Selection      string `json:"selection"`
+		ReleaseVersion string `json:"release_version"`
+	}
+	if decodeErr := json.Unmarshal([]byte(output), &result); runErr != nil || decodeErr != nil || result.Selection != "exact-version-recovery" || result.ReleaseVersion != "1.2.3" {
+		t.Fatalf("explicit exact-version recovery failed: err=%v decode=%v output=%s", runErr, decodeErr, output)
+	}
+	requests, err := os.ReadFile(fixture.requestLog)
+	wantMetadataURL := "https://api.github.com/repos/owner/platform/releases/tags/platform-v1.2.3"
+	if err != nil || !strings.Contains(string(requests), wantMetadataURL) || strings.Contains(string(requests), "/releases/latest") {
+		t.Fatalf("exact-version recovery did not stay on the immutable requested tag: err=%v requests=%q", err, requests)
+	}
+}
+
 func TestResolvePlatformReleaseEnforcesDurableVersionTransitions(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {

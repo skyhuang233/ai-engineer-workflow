@@ -26,11 +26,100 @@ type BaselineFile struct {
 }
 
 func BaselineFiles(ctx context.Context, repository string) ([]string, error) {
-	output, err := baselineGitBytes(ctx, repository, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	binding, err := resolveGlobalExcludes(ctx, repository)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"ls-files", "-z", "--cached", "--others", "--exclude-standard"}
+	prefix := baselineGitArgs()
+	prefix = append(prefix, "-c", "core.excludesFile="+binding.Path)
+	command := exec.CommandContext(ctx, "git", append(prefix, args...)...)
+	command.Dir = repository
+	command.Env = isolatedGitEnvironment(nil)
+	output, err := command.Output()
 	if err != nil {
 		return nil, err
 	}
 	return parseNULTerminatedGitPaths(output)
+}
+
+type globalExcludesBinding struct {
+	Path, SHA256 string
+}
+
+func resolveGlobalExcludes(ctx context.Context, repository string) (globalExcludesBinding, error) {
+	command := exec.CommandContext(ctx, "git", "config", "--global", "--path", "--get", "core.excludesFile")
+	command.Dir = repository
+	command.Env = hostGlobalGitEnvironment()
+	output, err := command.Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			path := defaultGlobalExcludesPath()
+			if path == "" {
+				return globalExcludesBinding{}, nil
+			}
+			if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+				return globalExcludesBinding{}, nil
+			} else if statErr != nil {
+				return globalExcludesBinding{}, fmt.Errorf("inspect default global Git excludesFile %q: %w", path, statErr)
+			}
+			return bindGlobalExcludes(path)
+		}
+		return globalExcludesBinding{}, fmt.Errorf("read global Git excludesFile: %w", err)
+	}
+	path := strings.TrimSpace(string(output))
+	if path == "" {
+		return globalExcludesBinding{}, nil
+	}
+	if !filepath.IsAbs(path) {
+		home := globalGitHome()
+		if home == "" {
+			return globalExcludesBinding{}, errors.New("relative global Git excludesFile lacks a trusted home directory")
+		}
+		path, err = filepath.Abs(filepath.Join(home, path))
+		if err != nil {
+			return globalExcludesBinding{}, err
+		}
+	}
+	return bindGlobalExcludes(path)
+}
+
+func bindGlobalExcludes(path string) (globalExcludesBinding, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return globalExcludesBinding{}, fmt.Errorf("read global Git excludesFile %q: %w", path, err)
+	}
+	sum := sha256.Sum256(data)
+	return globalExcludesBinding{Path: filepath.Clean(path), SHA256: hex.EncodeToString(sum[:])}, nil
+}
+
+func globalGitHome() string {
+	if value := strings.TrimSpace(os.Getenv("HOME")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv("USERPROFILE"))
+}
+
+func defaultGlobalExcludesPath() string {
+	if root := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); root != "" {
+		return filepath.Join(root, "git", "ignore")
+	}
+	if home := globalGitHome(); home != "" {
+		return filepath.Join(home, ".config", "git", "ignore")
+	}
+	return ""
+}
+
+func hostGlobalGitEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "GIT_CONFIG_NOSYSTEM=1")
 }
 
 func parseNULTerminatedGitPaths(output []byte) ([]string, error) {

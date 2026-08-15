@@ -545,6 +545,11 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	}
 	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}, CreatedRepositories: map[string]bool{}, InitialBaselineHeads: map[string]string{}, PublishedHistoryHeads: map[string]string{}, ApprovedGitHubPolicies: map[string]string{}}
 	if plan.Kind == setupcontract.RepositoryOnboarding {
+		// Repository-owned Git transport configuration must be rejected before
+		// the persistent PAT is read into this process.
+		if err := onboarding.ValidateAuthenticatedGitRepository(context.Background(), plan.Target.RepositoryPath); err != nil {
+			return err
+		}
 		for _, precondition := range plan.Preconditions {
 			if precondition.Kind == "github_policy" {
 				adapter.ApprovedGitHubPolicies[precondition.Subject] = precondition.Expected
@@ -575,7 +580,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 		}
 		defer database.Close()
 		return verifyPlatformPreconditionsForSetup(ctx, database, layout, adapter, plan)
-	}, ExpectedResultVerifier: func(ctx context.Context, _ setupcontract.Plan, expected setupcontract.ExpectedResult) error {
+	}, ExpectedResultVerifier: func(ctx context.Context, currentPlan setupcontract.Plan, expected setupcontract.ExpectedResult) error {
 		if expected.Kind != "platform_readiness" {
 			return nil
 		}
@@ -584,7 +589,8 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 			return openErr
 		}
 		defer database.Close()
-		return verifyPlatformReadyForSetup(ctx, database, layout)
+		tracker := &platformCleanupTracker{database: database, plan: currentPlan, digest: digest, effectID: expected.ID}
+		return verifyPlatformReadyTracked(ctx, database, layout, tracker)
 	}}
 	result, applyErr := engine.Apply(context.Background(), raw, *approved)
 	writeErr := writeSetupResponse(output, setupResponse{Status: string(result.Status), Result: result})
@@ -782,7 +788,11 @@ func runSetupVerify(args []string, output io.Writer) error {
 		return err
 	}
 	defer database.Close()
-	platformErr := verifyPlatformReady(context.Background(), database, layout)
+	tracker, trackerErr := durablePlatformCleanupTracker(context.Background(), database)
+	platformErr := trackerErr
+	if platformErr == nil {
+		platformErr = verifyPlatformReadyTracked(context.Background(), database, layout, tracker)
+	}
 	platformReady := platformErr == nil
 	report := &setupVerificationReport{}
 	report.Readiness.PlatformReady = platformReady
@@ -854,6 +864,50 @@ func runSetupVerify(args []string, output io.Writer) error {
 }
 
 func verifyPlatformReady(ctx context.Context, database *store.Store, layout workflowhome.Layout) error {
+	return verifyPlatformReadyTracked(ctx, database, layout, nil)
+}
+
+type platformCleanupTracker struct {
+	database         *store.Store
+	plan             setupcontract.Plan
+	digest, effectID string
+}
+
+func durablePlatformCleanupTracker(ctx context.Context, database *store.Store) (*platformCleanupTracker, error) {
+	installation, err := database.PlatformInstallation(ctx)
+	if err != nil || installation.ControlPlanePlanDigestSHA256 == "" {
+		return nil, errors.Join(errors.New("Platform cleanup authorization is unavailable"), err)
+	}
+	archived, err := database.SetupPlanByDigest(ctx, installation.ControlPlanePlanDigestSHA256)
+	if err != nil {
+		return nil, errors.Join(errors.New("Platform cleanup authorization plan is unavailable"), err)
+	}
+	plan, canonical, digest, err := setupcontract.ParsePlan([]byte(archived.CanonicalJSON))
+	if err != nil || digest != archived.DigestSHA256 || string(canonical) != archived.CanonicalJSON || plan.PlanID != archived.PlanID || plan.Kind != setupcontract.PlatformBootstrap {
+		return nil, errors.New("Platform cleanup authorization plan is invalid")
+	}
+	return &platformCleanupTracker{database: database, plan: plan, digest: digest, effectID: "platform-verify"}, nil
+}
+
+func (t *platformCleanupTracker) begin(kind, id, resource string) error {
+	if t == nil {
+		return nil
+	}
+	return t.database.RecordSetupCleanupObligation(context.Background(), store.SetupCleanupObligation{
+		PlanID: t.plan.PlanID, PlanDigestSHA256: t.digest, EffectID: t.effectID,
+		ObligationID: t.effectID + ":" + id, Kind: kind, Resource: resource,
+		Status: store.CleanupPending, UpdatedAt: time.Now().UTC(),
+	})
+}
+
+func (t *platformCleanupTracker) complete(id string) error {
+	if t == nil {
+		return nil
+	}
+	return t.database.CompleteSetupCleanupObligation(context.Background(), t.plan.PlanID, t.effectID+":"+id, time.Now().UTC())
+}
+
+func verifyPlatformReadyTracked(ctx context.Context, database *store.Store, layout workflowhome.Layout, tracker *platformCleanupTracker) error {
 	installation, err := database.PlatformInstallation(ctx)
 	if err != nil {
 		return err
@@ -933,18 +987,38 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	if err := hostsetup.VerifyDockerWorker(probeCtx, nil, contract.Worker.Image, layout.State, layout.Workspaces); err != nil {
+	dockerVerifier := hostsetup.DockerWorkerVerifier{ProbeID: digestPrefix(tracker), BeginCleanup: cleanupBegin(tracker), CompleteCleanup: cleanupComplete(tracker)}
+	if err := dockerVerifier.Verify(probeCtx, contract.Worker.Image, layout.State, layout.Workspaces); err != nil {
 		return err
 	}
 	authFile, err := codexauth.ResolveChatGPT(probeCtx)
 	if err != nil {
 		return err
 	}
-	result := (doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: contract.Worker.Image, AuthFile: authFile}).Run(probeCtx)
+	result := (doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: contract.Worker.Image, AuthFile: authFile, ProbeID: digestPrefix(tracker), BeginCleanup: cleanupBegin(tracker), CompleteCleanup: cleanupComplete(tracker)}).Run(probeCtx)
 	if result.Status != doctor.Pass {
 		return errors.New(result.Summary)
 	}
 	return nil
+}
+
+func digestPrefix(tracker *platformCleanupTracker) string {
+	if tracker == nil || len(tracker.digest) < 12 {
+		return ""
+	}
+	return tracker.digest[:12]
+}
+func cleanupBegin(tracker *platformCleanupTracker) func(string, string, string) error {
+	if tracker == nil {
+		return nil
+	}
+	return tracker.begin
+}
+func cleanupComplete(tracker *platformCleanupTracker) func(string) error {
+	if tracker == nil {
+		return nil
+	}
+	return tracker.complete
 }
 
 func durableReleaseBundle(installation store.PlatformInstallation) ([]platformrelease.BundledFile, error) {

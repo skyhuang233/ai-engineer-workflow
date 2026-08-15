@@ -37,9 +37,11 @@ func runCapturedGit() int {
 	}
 	args := append([]string{}, os.Args[1:]...)
 	canonicalURL := os.Getenv("WORKFLOW_TEST_CANONICAL_URL")
+	replacedTransport := false
 	for index := range args {
 		if args[index] == canonicalURL {
 			args[index] = os.Getenv("WORKFLOW_TEST_LOCAL_REMOTE")
+			replacedTransport = true
 		}
 	}
 	if capturedGitSubcommand(args) == "push" {
@@ -48,6 +50,9 @@ func runCapturedGit() int {
 				args[index] = os.Getenv("WORKFLOW_TEST_LOCAL_REMOTE")
 			}
 		}
+	}
+	if replacedTransport {
+		args = append([]string{"-c", "protocol.file.allow=always"}, args...)
 	}
 	command := exec.Command(os.Getenv("WORKFLOW_TEST_REAL_GIT"), args...)
 	command.Stdin = os.Stdin
@@ -58,6 +63,13 @@ func runCapturedGit() int {
 			return exitErr.ExitCode()
 		}
 		return 125
+	}
+	if capturedGitSubcommand(args) == "fetch" {
+		if path := os.Getenv("WORKFLOW_TEST_DIRTY_AFTER_FETCH"); path != "" {
+			if err := os.WriteFile(path, []byte("user edit during fetch\n"), 0o600); err != nil {
+				return 125
+			}
+		}
 	}
 	if capturedGitSubcommand(args) == "clone" {
 		cloneRoot := args[len(args)-1]

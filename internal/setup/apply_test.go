@@ -33,6 +33,28 @@ type fakeAdapter struct {
 	fail     string
 }
 
+type cleanupRetryAdapter struct {
+	*fakeAdapter
+	failCleanup bool
+	reconciles  int
+}
+
+func (a *cleanupRetryAdapter) CleanupObligations(effect setupcontract.Effect, _ string) ([]store.SetupCleanupObligation, error) {
+	if effect.ID != "first" {
+		return nil, nil
+	}
+	return []store.SetupCleanupObligation{{ObligationID: "first:temporary", Kind: "temporary_clone", Resource: `{"root":"C:/tmp","prefix":"C:/tmp/workflow-onboarding-a-"}`}}, nil
+}
+
+func (a *cleanupRetryAdapter) ReconcileCleanupObligation(context.Context, store.SetupCleanupObligation) error {
+	a.reconciles++
+	if a.failCleanup {
+		a.failCleanup = false
+		return errors.New("injected cleanup failure")
+	}
+	return nil
+}
+
 type repositoryCreateAttemptAdapter struct {
 	*fakeAdapter
 	databasePath string
@@ -151,6 +173,26 @@ func TestEngineAppliesRequiredEffectsAndRetriesSatisfiedOnes(t *testing.T) {
 	}
 	if len(adapter.applied) != 2 || adapter.applied[0] != "first" || adapter.applied[1] != "second" {
 		t.Fatalf("applied=%v", adapter.applied)
+	}
+}
+
+func TestEngineRetriesPendingCleanupBeforeSatisfiedEffectReadback(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "WorkflowHome")
+	plan := testPlan(home)
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &cleanupRetryAdapter{fakeAdapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, failCleanup: true}
+	engine := Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
+	first, err := engine.Apply(context.Background(), raw, digest)
+	if err == nil || first.Status != setupcontract.ExecutionIncomplete || !strings.Contains(err.Error(), "cleanup") || len(adapter.applied) != 1 {
+		t.Fatalf("first=%#v err=%v applied=%v", first, err, adapter.applied)
+	}
+	second, err := engine.Apply(context.Background(), raw, digest)
+	if err != nil || second.Status != setupcontract.ExecutionSucceeded || len(adapter.applied) != 2 || adapter.applied[0] != "first" || adapter.applied[1] != "second" || adapter.reconciles < 2 {
+		t.Fatalf("second=%#v err=%v applied=%v reconciles=%d", second, err, adapter.applied, adapter.reconciles)
 	}
 }
 

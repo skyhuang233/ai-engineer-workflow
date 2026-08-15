@@ -99,17 +99,20 @@ $installedWorkflow = Join-Path $workflowBin "workflow.exe"
 $workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; trust_state = "absent"; diagnostic = "installed Workflow CLI is absent"; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 $platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
 $bootstrapPinPath = Join-Path $WorkflowHome "config\bootstrap-platform-release-pin.json"
+$bootstrapPinBackupPath = Join-Path $WorkflowHome "backups\bootstrap-platform-release-pin.json"
 $bootstrapPinLoaded = $false
 $bootstrapPinConflictDiagnostic = ""
-if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
+$bootstrapPinRepairDiagnostic = ""
+function Read-VerifiedBootstrapPin([string]$Path, [string]$Description) {
     $pinScratch = Join-Path ([IO.Path]::GetTempPath()) ("workflow-bootstrap-pin-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $pinScratch | Out-Null
     try {
-        $pin = Get-Content -LiteralPath $bootstrapPinPath -Raw | ConvertFrom-Json
+        $pinRaw = Get-Content -LiteralPath $Path -Raw
+        $pin = $pinRaw | ConvertFrom-Json
         $pinPropertyNames = @($pin.PSObject.Properties.Name | Sort-Object)
         $expectedPinPropertyNames = @("schema_version", "release_version", "release_manifest_digest_sha256", "platform_setup_contract_digest_sha256", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest_sha256", "control_plane_plan_digest_sha256", "manifest_base64", "signature_base64" | Sort-Object)
-        if (($pinPropertyNames -join "`n") -cne ($expectedPinPropertyNames -join "`n")) { throw "pin contains missing or unknown fields" }
-        if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.release_bundled_files_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.control_plane_plan_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "invalid pin metadata" }
+        if (($pinPropertyNames -join "`n") -cne ($expectedPinPropertyNames -join "`n")) { throw "$Description contains missing or unknown fields" }
+        if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.release_bundled_files_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.control_plane_plan_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "$Description has invalid metadata" }
         $pinnedManifestPath = Join-Path $pinScratch "platform-release.json"
         $pinnedSignaturePath = Join-Path $pinScratch "platform-release.json.sig"
         [IO.File]::WriteAllBytes($pinnedManifestPath, [Convert]::FromBase64String([string]$pin.manifest_base64))
@@ -127,14 +130,43 @@ if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
         $actualBundledFilesDigest = (& (Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1") -InputPath $bundledFilesInput -OutputPath $bundledFilesCanonical | Select-Object -Last 1).Trim()
         $actualBundledFilesJSON = [IO.File]::ReadAllText($bundledFilesCanonical, (New-Object Text.UTF8Encoding($false, $true)))
         $workflowPins = @($pinnedManifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" })
-        if ($actualPinnedDigest -cne [string]$pin.release_manifest_digest_sha256 -or [string]$pinnedManifest.release.version -cne [string]$pin.release_version -or $actualContractDigest -cne [string]$pin.platform_setup_contract_digest_sha256 -or $actualBundledFilesDigest -cne [string]$pin.release_bundled_files_digest_sha256 -or $actualBundledFilesJSON -cne [string]$pin.release_bundled_files_json -or $workflowPins.Count -ne 1 -or [string]$workflowPins[0].sha256 -cne [string]$pin.workflow_cli_sha256) { throw "pin identity differs from its verified manifest" }
-        $platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256; release_bundled_files_json = $actualBundledFilesJSON; release_bundled_files_digest = $actualBundledFilesDigest; control_plane_plan_digest_sha256 = [string]$pin.control_plane_plan_digest_sha256 }
-        $bootstrapPinLoaded = $true
-    } catch {
-        $bootstrapPinConflictDiagnostic = "Bootstrap Platform Release pin conflict: $($_.Exception.Message)"
+        if ($actualPinnedDigest -cne [string]$pin.release_manifest_digest_sha256 -or [string]$pinnedManifest.release.version -cne [string]$pin.release_version -or $actualContractDigest -cne [string]$pin.platform_setup_contract_digest_sha256 -or $actualBundledFilesDigest -cne [string]$pin.release_bundled_files_digest_sha256 -or $actualBundledFilesJSON -cne [string]$pin.release_bundled_files_json -or $workflowPins.Count -ne 1 -or [string]$workflowPins[0].sha256 -cne [string]$pin.workflow_cli_sha256) { throw "$Description identity differs from its verified manifest" }
+        return [pscustomobject]@{
+            raw = $pinRaw
+            platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256; release_bundled_files_json = $actualBundledFilesJSON; release_bundled_files_digest = $actualBundledFilesDigest; control_plane_plan_digest_sha256 = [string]$pin.control_plane_plan_digest_sha256 }
+        }
     } finally {
         Remove-Item -LiteralPath $pinScratch -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+$primaryPin = $null
+$backupPin = $null
+$primaryPinError = ""
+$backupPinError = ""
+if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
+    try { $primaryPin = Read-VerifiedBootstrapPin $bootstrapPinPath "primary Bootstrap Platform Release pin" } catch { $primaryPinError = $_.Exception.Message }
+}
+if (Test-Path -LiteralPath $bootstrapPinBackupPath -PathType Leaf) {
+    try { $backupPin = Read-VerifiedBootstrapPin $bootstrapPinBackupPath "backup Bootstrap Platform Release pin" } catch { $backupPinError = $_.Exception.Message }
+}
+if ($null -ne $primaryPin -and $null -ne $backupPin) {
+    if ([string]$primaryPin.raw -cne [string]$backupPin.raw) {
+        $bootstrapPinConflictDiagnostic = "Bootstrap Platform Release pin conflict: verified primary and backup pins differ"
+    } else {
+        $platform = $primaryPin.platform
+        $bootstrapPinLoaded = $true
+    }
+} elseif ($null -ne $backupPin) {
+    $platform = $backupPin.platform
+    $bootstrapPinLoaded = $true
+    $bootstrapPinRepairDiagnostic = "Bootstrap Platform Release primary pin requires repair; exact release authority was recovered from the verified read-only backup"
+} elseif ($null -ne $primaryPin) {
+    $platform = $primaryPin.platform
+    $bootstrapPinLoaded = $true
+    $bootstrapPinRepairDiagnostic = "Bootstrap Platform Release backup pin requires repair from the verified primary"
+} elseif (-not [string]::IsNullOrWhiteSpace($primaryPinError) -or -not [string]::IsNullOrWhiteSpace($backupPinError)) {
+    $pinErrors = @($primaryPinError, $backupPinError) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $bootstrapPinConflictDiagnostic = "Bootstrap Platform Release pin conflict: $pinErrors"
 }
 if (-not [string]::IsNullOrWhiteSpace($bootstrapPinConflictDiagnostic)) {
     $workflow.trust_state = "conflict"
@@ -173,9 +205,12 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     if (-not [string]::IsNullOrWhiteSpace($bootstrapPinConflictDiagnostic)) {
         $workflow.trust_state = "conflict"
         $workflow.diagnostic = $bootstrapPinConflictDiagnostic
+    } elseif (-not [string]::IsNullOrWhiteSpace($bootstrapPinRepairDiagnostic)) {
+        $workflow.trust_state = "repair_required"
+        $workflow.diagnostic = $bootstrapPinRepairDiagnostic
     } elseif (-not $bootstrapPinLoaded) {
         $workflow.trust_state = "repair_required"
-        $workflow.diagnostic = "Bootstrap Platform Release pin is missing; repair the installed Workflow CLI before execution"
+        $workflow.diagnostic = "Bootstrap Platform Release primary and backup pins are missing; recover the exact installed version before repairing the Workflow CLI"
     } elseif (-not [string]::Equals([IO.Path]::GetFullPath($installedWorkflow), [IO.Path]::GetFullPath((Join-Path $WorkflowHome "bin\workflow.exe")), [StringComparison]::OrdinalIgnoreCase)) {
         $workflow.trust_state = "conflict"
         $workflow.diagnostic = "Installed Workflow CLI path differs from the fixed Workflow Home path"

@@ -21,25 +21,29 @@ func PublishDefaultBranch(ctx context.Context, repository, remoteURL, branch str
 	if err != nil {
 		return err
 	}
-	pushTarget := canonicalURL
-	origin, originErr := gitOutput(ctx, repository, "remote", "get-url", "origin")
-	if originErr != nil {
-		if _, err := gitOutput(ctx, repository, "remote", "add", "origin", canonicalURL); err != nil {
+	if err := ValidateAuthenticatedGitRepository(ctx, repository); err != nil {
+		return err
+	}
+	origin, originErr := rawOriginURL(ctx, repository)
+	if errors.Is(originErr, errRepositoryOriginAbsent) {
+		command := exec.CommandContext(ctx, "git", hardenedLocalGitArgs("remote", "add", "origin", canonicalURL)...)
+		command.Dir = repository
+		command.Env = isolatedGitEnvironment(nil)
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf("add canonical origin: %w (%s)", err, strings.TrimSpace(string(output)))
+		}
+		if _, err := rawOriginURL(ctx, repository); err != nil {
 			return err
 		}
-		pushTarget = "origin"
+	} else if originErr != nil {
+		return originErr
 	} else {
 		originRepository, parseErr := parseGitHubOrigin(origin)
 		if parseErr != nil || !strings.EqualFold(originRepository, repositoryID) {
 			return errors.New("origin differs from the approved GitHub repository")
 		}
 	}
-	args := []string{"push"}
-	if pushTarget == "origin" {
-		args = append(args, "-u")
-	}
-	args = append(args, pushTarget, "refs/heads/"+branch+":refs/heads/"+branch)
-	args = hardenedAuthenticatedGitArgs(args...)
+	args := hardenedAuthenticatedGitArgs(canonicalURL, "push", canonicalURL, "refs/heads/"+branch+":refs/heads/"+branch)
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
@@ -50,6 +54,9 @@ func PublishDefaultBranch(ctx context.Context, repository, remoteURL, branch str
 }
 
 func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expectedPreMergeHead, expectedMergeHead string, credential GitCredential) error {
+	if err := ValidateAuthenticatedGitRepository(ctx, repository); err != nil {
+		return err
+	}
 	currentBranch, err := gitOutput(ctx, repository, "branch", "--show-current")
 	if err != nil || currentBranch != branch {
 		return fmt.Errorf("safe fast-forward requires checked-out branch %q", branch)
@@ -61,11 +68,18 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	if !fullSHA.MatchString(expectedMergeHead) {
 		return errors.New("persisted onboarding merge HEAD is invalid")
 	}
+	status, err := gitBytes(ctx, repository, "status", "--porcelain=v2", "-z", "--untracked-files=all")
+	if err != nil {
+		return err
+	}
+	if len(status) != 0 {
+		return errors.New("safe fast-forward requires a clean working tree")
+	}
 	remoteURL, err := GitHubHTTPSURL(repositoryID)
 	if err != nil {
 		return err
 	}
-	command := exec.CommandContext(ctx, "git", hardenedAuthenticatedGitArgs("fetch", remoteURL, expectedMergeHead)...)
+	command := exec.CommandContext(ctx, "git", hardenedAuthenticatedGitArgs(remoteURL, "fetch", remoteURL, expectedMergeHead)...)
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, remoteURL))
 	if output, err := command.CombinedOutput(); err != nil {
@@ -83,7 +97,11 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	if err != nil || currentHead != expectedPreMergeHead {
 		return errors.New("local HEAD changed before safe fast-forward")
 	}
-	command = exec.CommandContext(ctx, "git", "merge", "--ff-only", "FETCH_HEAD")
+	status, err = gitBytes(ctx, repository, "status", "--porcelain=v2", "-z", "--untracked-files=all")
+	if err != nil || len(status) != 0 {
+		return errors.Join(errors.New("working tree changed before safe fast-forward"), err)
+	}
+	command = exec.CommandContext(ctx, "git", hardenedLocalGitArgs("merge", "--ff-only", "--no-autostash", "FETCH_HEAD")...)
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment(nil)
 	if output, err := command.CombinedOutput(); err != nil {
@@ -96,12 +114,30 @@ func SafeFastForward(ctx context.Context, repository, repositoryID, branch, expe
 	return nil
 }
 
-func hardenedAuthenticatedGitArgs(args ...string) []string {
+func hardenedAuthenticatedGitArgs(canonicalURL string, args ...string) []string {
+	prefix := hardenedLocalGitArgs()
+	prefix = append(prefix,
+		"-c", "http.proxy=",
+		"-c", "https.proxy=",
+		"-c", "http.sslVerify=true",
+		"-c", "http."+canonicalURL+".proxy=",
+		"-c", "http."+canonicalURL+".sslVerify=true",
+		"-c", "protocol.allow=never",
+		"-c", "protocol.https.allow=always",
+	)
+	return append(prefix, args...)
+}
+
+func hardenedLocalGitArgs(args ...string) []string {
 	prefix := []string{
 		"-c", "core.hooksPath=" + os.DevNull,
 		"-c", "credential.helper=",
 		"-c", "credential.interactive=never",
 		"-c", "core.fsmonitor=false",
+		"-c", "commit.gpgSign=false",
+		"-c", "tag.gpgSign=false",
+		"-c", "merge.autoStash=false",
+		"-c", "merge.verifySignatures=false",
 	}
 	return append(prefix, args...)
 }

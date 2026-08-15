@@ -319,6 +319,35 @@ func TestWorkerCodexSessionCheckAuthenticatesAndResumesInPinnedImage(t *testing.
 	t.Logf("Doctor result: %s\ncreate: %s\nresume: %s", result.Summary, initial, resumed)
 }
 
+func TestWorkerCodexSessionCheckTracksDeterministicCleanupResources(t *testing.T) {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &recordingExecutor{outputs: [][]byte{
+		workerCodexTestOutput("worker-session-7", strictCandidate("phase-one")),
+		workerCodexTestOutput("", strictCandidate("worker-nonce-7")),
+	}}
+	var begun, completed []string
+	result := (WorkerCodexSessionCheck{
+		Executor: executor, Image: "sha256:image", AuthFile: authFile, Nonce: "worker-nonce-7", ProbeID: "abcdef123456",
+		BeginCleanup:    func(kind, id, resource string) error { begun = append(begun, kind+"|"+id+"|"+resource); return nil },
+		CompleteCleanup: func(id string) error { completed = append(completed, id); return nil },
+	}).Run(context.Background())
+	if result.Status != Pass {
+		t.Fatalf("result=%#v", result)
+	}
+	commands := strings.Join([]string{strings.Join(executor.commands[0], " "), strings.Join(executor.commands[2], " ")}, "\n")
+	for _, want := range []string{"workflow-doctor-codex-abcdef123456-initial", "workflow-doctor-codex-abcdef123456-resume", "setup-probe-id=abcdef123456"} {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("commands lack %q: %s", want, commands)
+		}
+	}
+	if len(begun) != 3 || len(completed) != 3 {
+		t.Fatalf("begun=%#v completed=%#v", begun, completed)
+	}
+}
+
 func TestWorkerCodexSessionCheckFailsWhenTemporaryAuthCleanupFails(t *testing.T) {
 	authFile := filepath.Join(t.TempDir(), "auth.json")
 	if err := os.WriteFile(authFile, doctorTestChatGPTAuth("test-only"), 0o600); err != nil {

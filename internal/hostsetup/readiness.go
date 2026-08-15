@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,9 +23,14 @@ type CommandExecutor interface {
 type OSCommandExecutor struct{}
 
 type DockerWorkerVerifier struct {
-	Executor  CommandExecutor
-	RemoveAll func(string) error
+	Executor        CommandExecutor
+	RemoveAll       func(string) error
+	ProbeID         string
+	BeginCleanup    func(kind, id, resource string) error
+	CompleteCleanup func(id string) error
 }
+
+var cleanupProbeIDPattern = regexp.MustCompile(`^[a-f0-9]{12}$`)
 
 func (OSCommandExecutor) Run(ctx context.Context, args []string) ([]byte, error) {
 	if len(args) == 0 {
@@ -51,27 +58,48 @@ func (v DockerWorkerVerifier) Verify(ctx context.Context, image, stateRoot, work
 	if image == "" || !filepath.IsAbs(stateRoot) || !filepath.IsAbs(workspaceRoot) {
 		return errors.New("Docker readiness requires an immutable image and absolute state/workspace roots")
 	}
+	if v.ProbeID != "" && !cleanupProbeIDPattern.MatchString(v.ProbeID) {
+		return errors.New("Docker readiness cleanup identity is invalid")
+	}
 	info, err := executor.Run(ctx, []string{"docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"})
 	engine := strings.TrimSpace(string(info))
 	if err != nil || engine != "linux/x86_64" && engine != "linux/amd64" {
 		return fmt.Errorf("Docker Engine must be Linux amd64: %w (%s)", err, engine)
 	}
-	stateProbe, err := os.MkdirTemp(stateRoot, ".setup-readiness-")
+	stateProbe := filepath.Join(stateRoot, ".setup-readiness-"+v.ProbeID)
+	if v.ProbeID == "" {
+		stateProbe, err = os.MkdirTemp(stateRoot, ".setup-readiness-")
+	} else {
+		if err = beginProbeCleanup(v.BeginCleanup, "docker_state_probe", "docker-state-probe", stateProbe); err == nil {
+			err = os.Mkdir(stateProbe, 0o700)
+		}
+	}
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if cleanupErr := removeAll(stateProbe); cleanupErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove Docker state readiness probe %q: %w", stateProbe, cleanupErr))
+		} else if cleanupErr := completeProbeCleanup(v.CompleteCleanup, "docker-state-probe"); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, cleanupErr)
 		}
 	}()
-	workspaceProbe, err := os.MkdirTemp(workspaceRoot, ".setup-readiness-")
+	workspaceProbe := filepath.Join(workspaceRoot, ".setup-readiness-"+v.ProbeID)
+	if v.ProbeID == "" {
+		workspaceProbe, err = os.MkdirTemp(workspaceRoot, ".setup-readiness-")
+	} else {
+		if err = beginProbeCleanup(v.BeginCleanup, "docker_workspace_probe", "docker-workspace-probe", workspaceProbe); err == nil {
+			err = os.Mkdir(workspaceProbe, 0o700)
+		}
+	}
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if cleanupErr := removeAll(workspaceProbe); cleanupErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove Docker workspace readiness probe %q: %w", workspaceProbe, cleanupErr))
+		} else if cleanupErr := completeProbeCleanup(v.CompleteCleanup, "docker-workspace-probe"); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, cleanupErr)
 		}
 	}()
 	marker := []byte("agent-workflow-readiness\n")
@@ -86,17 +114,24 @@ func (v DockerWorkerVerifier) Verify(ctx context.Context, image, stateRoot, work
 		return err
 	}
 	token := hex.EncodeToString(tokenBytes)
-	containerBytes := make([]byte, 12)
-	if _, err := rand.Read(containerBytes); err != nil {
+	containerName := "workflow-setup-docker-" + v.ProbeID
+	if v.ProbeID == "" {
+		containerBytes := make([]byte, 12)
+		if _, err := rand.Read(containerBytes); err != nil {
+			return err
+		}
+		containerName = "workflow-setup-docker-" + hex.EncodeToString(containerBytes)
+	} else if err := beginProbeCleanup(v.BeginCleanup, "docker_container", "docker-container", containerName); err != nil {
 		return err
 	}
-	containerName := "workflow-setup-docker-" + hex.EncodeToString(containerBytes)
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		output, cleanupErr := executor.Run(cleanupCtx, []string{"docker", "rm", "-f", containerName})
 		if cleanupErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove Docker readiness container %q: %w (%s)", containerName, cleanupErr, strings.TrimSpace(string(output))))
+		} else if cleanupErr := completeProbeCleanup(v.CompleteCleanup, "docker-container"); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, cleanupErr)
 		}
 	}()
 	listener, err := net.Listen("tcp4", "0.0.0.0:0")
@@ -125,12 +160,16 @@ test "$(cat /workspace/marker)" = agent-workflow-readiness
 printf 'worker\n' > /workflow-state/container-marker
 printf 'worker\n' > /workspace/container-marker
 curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_PROBE_TOKEN}" "http://host.docker.internal:${WORKFLOW_GATEWAY_PROBE_PORT}/health"`
-	args := []string{"docker", "run", "--name", containerName, "--label", "com.skyhuang233.workflow.setup-probe=true", "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
-		"--mount", "type=bind,source=" + stateProbe + ",target=/workflow-state",
-		"--mount", "type=bind,source=" + workspaceProbe + ",target=/workspace",
-		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN=" + token,
+	args := []string{"docker", "run", "--name", containerName, "--label", "com.skyhuang233.workflow.setup-probe=true"}
+	if v.ProbeID != "" {
+		args = append(args, "--label", "com.skyhuang233.workflow.setup-probe-id="+v.ProbeID)
+	}
+	args = append(args, "--network", "bridge", "--add-host", "host.docker.internal:host-gateway",
+		"--mount", "type=bind,source="+stateProbe+",target=/workflow-state",
+		"--mount", "type=bind,source="+workspaceProbe+",target=/workspace",
+		"--env", "WORKFLOW_GATEWAY_PROBE_TOKEN="+token,
 		"--env", fmt.Sprintf("WORKFLOW_GATEWAY_PROBE_PORT=%d", port),
-		image, "sh", "-lc", script}
+		image, "sh", "-lc", script)
 	output, err := executor.Run(ctx, args)
 	if err != nil {
 		return fmt.Errorf("Docker Worker mount/connectivity probe: %w (%s)", err, strings.TrimSpace(string(output)))
@@ -140,6 +179,24 @@ curl --fail --silent --show-error -H "Authorization: Bearer ${WORKFLOW_GATEWAY_P
 		if readErr != nil || string(marker) != "worker\n" {
 			return errors.Join(fmt.Errorf("Docker Worker %s mount is not writable", name), readErr)
 		}
+	}
+	return nil
+}
+
+func beginProbeCleanup(begin func(kind, id, resource string) error, kind, id, value string) error {
+	if begin == nil {
+		return nil
+	}
+	resource, _ := json.Marshal(map[string]string{"value": value})
+	return begin(kind, id, string(resource))
+}
+
+func completeProbeCleanup(complete func(id string) error, id string) error {
+	if complete == nil {
+		return nil
+	}
+	if err := complete(id); err != nil {
+		return fmt.Errorf("complete cleanup obligation %q: %w", id, err)
 	}
 	return nil
 }

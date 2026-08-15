@@ -137,7 +137,7 @@ func main() {
 	}
 	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
-	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal")
+	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
 	planOutput, err := planCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh plan on powershell.exe: %v (%s)", err, planOutput)
@@ -176,6 +176,7 @@ func main() {
 	stdinCapture, argsCapture, callsCapture := filepath.Join(directory, "stdin.txt"), filepath.Join(directory, "args.txt"), filepath.Join(directory, "calls.txt")
 	token := "ghp_fresh_bootstrap_must_not_leak"
 	pinPath := filepath.Join(workflowHome, "config", "bootstrap-platform-release-pin.json")
+	pinBackupPath := filepath.Join(workflowHome, "backups", "bootstrap-platform-release-pin.json")
 	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	failedDownload := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", failedDownloadWrapper)
 	failedDownload.Env = append(os.Environ(), "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
@@ -184,6 +185,9 @@ func main() {
 	}
 	if _, err := os.Stat(pinPath); !os.IsNotExist(err) {
 		t.Fatalf("failed download advanced the bootstrap release pin: %v", err)
+	}
+	if _, err := os.Stat(pinBackupPath); !os.IsNotExist(err) {
+		t.Fatalf("failed download advanced the bootstrap release pin backup: %v", err)
 	}
 	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
@@ -243,6 +247,10 @@ func main() {
 	}
 	if _, err := os.Stat(pinPath); err != nil {
 		t.Fatalf("bootstrap did not durably pin the approved release: %v", err)
+	}
+	pinBackup, err := os.ReadFile(pinBackupPath)
+	if err != nil || !bytes.Equal(cliRepairPin, pinBackup) {
+		t.Fatalf("bootstrap did not retain an independent exact pin backup: err=%v primary=%s backup=%s", err, cliRepairPin, pinBackup)
 	}
 	inspectWrapper := `function Get-Acl { param([string]$LiteralPath) [pscustomobject]@{ Owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
 	inspectPinned := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
@@ -331,16 +339,59 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 		t.Fatal(err)
 	}
 	missingPinInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	missingPinInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs)
+	backupRecoveryCalls := filepath.Join(directory, "backup-recovery-calls.txt")
+	missingPinInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs, "WORKFLOW_TEST_CALLS="+backupRecoveryCalls)
 	missingPinOutput, missingPinErr := missingPinInspect.CombinedOutput()
 	var missingPinFacts struct {
 		Workflow struct {
 			TrustState string `json:"trust_state"`
 			Diagnostic string `json:"diagnostic"`
 		} `json:"workflow"`
+		Platform struct {
+			InstallationRecorded  bool   `json:"installation_recorded"`
+			Version               string `json:"version"`
+			ReleaseManifestDigest string `json:"release_manifest_digest"`
+		} `json:"platform"`
 	}
-	if decodeErr := json.Unmarshal(missingPinOutput, &missingPinFacts); missingPinErr != nil || decodeErr != nil || missingPinFacts.Workflow.TrustState != "repair_required" || !strings.Contains(missingPinFacts.Workflow.Diagnostic, "pin is missing") {
-		t.Fatalf("missing bootstrap pin was not reported as a non-executed repair: err=%v decode=%v output=%s", missingPinErr, decodeErr, missingPinOutput)
+	if decodeErr := json.Unmarshal(missingPinOutput, &missingPinFacts); missingPinErr != nil || decodeErr != nil || missingPinFacts.Workflow.TrustState != "repair_required" || !strings.Contains(missingPinFacts.Workflow.Diagnostic, "primary") || !strings.Contains(missingPinFacts.Workflow.Diagnostic, "backup") || !missingPinFacts.Platform.InstallationRecorded || missingPinFacts.Platform.Version != manifest.Release.Version || missingPinFacts.Platform.ReleaseManifestDigest != hex.EncodeToString(manifestDigest[:]) {
+		t.Fatalf("verified backup did not recover exact pins and require primary repair: err=%v decode=%v output=%s", missingPinErr, decodeErr, missingPinOutput)
+	}
+	if _, err := os.Stat(backupRecoveryCalls); !os.IsNotExist(err) {
+		t.Fatalf("inspect-host executed workflow.exe while recovering authority from the read-only backup: %v", err)
+	}
+	var recoveredFacts map[string]any
+	if err := json.Unmarshal(missingPinOutput, &recoveredFacts); err != nil {
+		t.Fatal(err)
+	}
+	recoveredFacts["docker"] = map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}
+	recoveredFacts["codex_auth"] = map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}
+	recoveredFacts["codex_skills_root"] = filepath.Join(directory, "recovery-skills")
+	recoveredFacts["github_credential"] = map[string]any{"exists": true, "verified": true, "login": "owner", "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}
+	recoveryFactsRaw, _ := json.Marshal(recoveredFacts)
+	recoveryFactsPath := filepath.Join(directory, "backup-recovery-facts.json")
+	recoveryPlanPath := filepath.Join(directory, "backup-recovery-plan.json")
+	write(recoveryFactsPath, recoveryFactsRaw)
+	recoveryPlanCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", recoveryFactsPath, "-OutputPath", recoveryPlanPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
+	recoveryPlanOutput, recoveryPlanErr := recoveryPlanCommand.CombinedOutput()
+	var recoveryEnvelope struct {
+		CanonicalJSON string `json:"canonical_json"`
+	}
+	var recoveryPlan setupcontract.Plan
+	decodeEnvelopeErr := json.Unmarshal(recoveryPlanOutput, &recoveryEnvelope)
+	decodePlanErr := json.Unmarshal([]byte(recoveryEnvelope.CanonicalJSON), &recoveryPlan)
+	var recoveredCLI *setupcontract.Effect
+	hasPlatformRecord := false
+	for index := range recoveryPlan.Effects {
+		effect := &recoveryPlan.Effects[index]
+		if effect.Kind == "platform_cli" {
+			recoveredCLI = effect
+		}
+		if effect.Kind == "platform_installation" {
+			hasPlatformRecord = true
+		}
+	}
+	if recoveryPlanErr != nil || decodeEnvelopeErr != nil || decodePlanErr != nil || recoveredCLI == nil || recoveredCLI.Parameters["version"] != manifest.Release.Version || recoveredCLI.Parameters["release_manifest_digest"] != hex.EncodeToString(manifestDigest[:]) || hasPlatformRecord {
+		t.Fatalf("backup recovery did not plan exact CLI/primary repair from recovered pins: run=%v envelope=%v plan=%v output=%s plan=%#v", recoveryPlanErr, decodeEnvelopeErr, decodePlanErr, recoveryPlanOutput, recoveryPlan)
 	}
 	for _, path := range []string{ownerSideEffectStdin, ownerSideEffectArgs} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -368,11 +419,29 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 			Diagnostic string `json:"diagnostic"`
 		} `json:"workflow"`
 	}
-	if decodeErr := json.Unmarshal(tamperedOutput, &tamperedFacts); tamperedErr != nil || decodeErr != nil || tamperedFacts.Workflow.TrustState != "conflict" || !strings.Contains(tamperedFacts.Workflow.Diagnostic, "missing or unknown fields") {
-		t.Fatalf("tampered bootstrap pin was not reported as a non-executed conflict: err=%v decode=%v output=%s", tamperedErr, decodeErr, tamperedOutput)
+	if decodeErr := json.Unmarshal(tamperedOutput, &tamperedFacts); tamperedErr != nil || decodeErr != nil || tamperedFacts.Workflow.TrustState != "repair_required" || !strings.Contains(tamperedFacts.Workflow.Diagnostic, "verified read-only backup") {
+		t.Fatalf("tampered primary bootstrap pin did not recover from its verified backup: err=%v decode=%v output=%s", tamperedErr, decodeErr, tamperedOutput)
 	}
 	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
-		t.Fatalf("inspect-host executed workflow.exe after a bootstrap pin conflict: %v", err)
+		t.Fatalf("inspect-host executed workflow.exe after recovering a tampered primary pin: %v", err)
+	}
+	if err := os.WriteFile(pinBackupPath, tamperedPin, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bothTamperedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
+	bothTamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
+	bothTamperedOutput, bothTamperedErr := bothTamperedInspect.CombinedOutput()
+	var bothTamperedFacts struct {
+		Workflow struct {
+			TrustState string `json:"trust_state"`
+			Diagnostic string `json:"diagnostic"`
+		} `json:"workflow"`
+	}
+	if decodeErr := json.Unmarshal(bothTamperedOutput, &bothTamperedFacts); bothTamperedErr != nil || decodeErr != nil || bothTamperedFacts.Workflow.TrustState != "conflict" || !strings.Contains(bothTamperedFacts.Workflow.Diagnostic, "missing or unknown fields") {
+		t.Fatalf("tampered primary and backup pins were not rejected: err=%v decode=%v output=%s", bothTamperedErr, decodeErr, bothTamperedOutput)
+	}
+	if _, err := os.Stat(sideEffectPath); !os.IsNotExist(err) {
+		t.Fatalf("inspect-host executed workflow.exe after both pin copies failed validation: %v", err)
 	}
 }
 

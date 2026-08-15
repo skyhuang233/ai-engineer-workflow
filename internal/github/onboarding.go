@@ -184,21 +184,8 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 			}
 		}
 	}
-	result.RequiredChecks = uniquePolicyChecks(result.RequiredChecks)
+	result.RequiredChecks = onboarding.CanonicalRequiredChecks(result.RequiredChecks)
 	return result, nil
-}
-
-func uniquePolicyChecks(values []onboarding.RequiredCheck) []onboarding.RequiredCheck {
-	seen := map[string]bool{}
-	result := make([]onboarding.RequiredCheck, 0, len(values))
-	for _, value := range values {
-		key := value.Context + ":" + strconv.FormatInt(value.AppID, 10)
-		if value.Context != "" && value.AppID > 0 && !seen[key] {
-			seen[key] = true
-			result = append(result, value)
-		}
-	}
-	return result
 }
 
 func IsNotFound(err error) bool {

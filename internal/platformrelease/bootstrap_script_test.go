@@ -78,6 +78,9 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	script := filepath.Join(scriptRoot, "verify-platform-release.ps1")
 	run := func(scriptPath string, extra ...string) (string, error) {
 		arguments := []string{"-NoProfile", "-File", scriptPath, "-ManifestPath", manifestPath, "-SignaturePath", signaturePath}
+		if filepath.Base(scriptPath) == "new-platform-bootstrap-plan.ps1" {
+			arguments = append(arguments, "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
+		}
 		arguments = append(arguments, extra...)
 		output, err := exec.Command(pwsh, arguments...).CombinedOutput()
 		return string(output), err

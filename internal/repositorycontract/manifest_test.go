@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestRenderAndVerifyPreservesAgentContentOutsideManagedBlock(t *testing.T) {
@@ -43,6 +45,37 @@ func TestRenderAndVerifyPreservesAgentContentOutsideManagedBlock(t *testing.T) {
 	}
 	if _, err := Verify(root); err == nil {
 		t.Fatal("managed file drift accepted")
+	}
+}
+
+func TestRenderedWorkflowQuotesDefaultBranchAsOneYAMLScalar(t *testing.T) {
+	for _, branch := range []string{"release,#1", "feature/{alpha,beta}", "true"} {
+		t.Run(branch, func(t *testing.T) {
+			files, _, _, err := Render("single-context", nil, "owner/repo", branch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document yaml.Node
+			if err := yaml.Unmarshal(files[".github/workflows/workflow-contract.yml"], &document); err != nil {
+				t.Fatalf("rendered workflow is invalid YAML: %v\n%s", err, files[".github/workflows/workflow-contract.yml"])
+			}
+			var decoded map[string]any
+			if err := yaml.Unmarshal(files[".github/workflows/workflow-contract.yml"], &decoded); err != nil {
+				t.Fatal(err)
+			}
+			on, ok := decoded["on"].(map[string]any)
+			if !ok {
+				t.Fatalf("workflow on node = %#v", decoded["on"])
+			}
+			push, ok := on["push"].(map[string]any)
+			if !ok {
+				t.Fatalf("workflow push node = %#v", on["push"])
+			}
+			branches, ok := push["branches"].([]any)
+			if !ok || len(branches) != 1 || branches[0] != branch {
+				t.Fatalf("workflow branches = %#v, want one scalar %q", push["branches"], branch)
+			}
+		})
 	}
 }
 

@@ -46,7 +46,8 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 			return GitWorkspace{}, err
 		}
 	}
-	root, err := os.MkdirTemp(temporaryRoot, "workflow-onboarding-*")
+	root := filepath.Join(temporaryRoot, "workflow-onboarding-"+planDigest[:12])
+	err := os.Mkdir(root, 0o700)
 	if err != nil {
 		return GitWorkspace{}, err
 	}
@@ -109,7 +110,15 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 		return runInputWithEnvironment(dir, input, nil, args...)
 	}
 	runNetwork := func(dir string, args ...string) (string, error) {
-		return runWithEnvironment(dir, gitCredentialEnvironmentForURL(credential, cloneURL), args...)
+		if credential.Token != "" && dir == clone {
+			if err := ValidateAuthenticatedGitRepository(ctx, dir); err != nil {
+				return "", err
+			}
+		}
+		if credential.Token == "" {
+			return runWithEnvironment(dir, nil, args...)
+		}
+		return runWithEnvironment(dir, gitCredentialEnvironmentForURL(credential, cloneURL), hardenedAuthenticatedGitArgs(cloneURL, args...)...)
 	}
 	if _, err := runNetwork(root, "clone", "--no-checkout", "--origin", "origin", cloneURL, clone); err != nil {
 		return GitWorkspace{}, err
@@ -165,7 +174,11 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	if _, err := run(clone, "update-ref", "refs/heads/"+result.Branch, head, baseCommit); err != nil {
 		return GitWorkspace{}, err
 	}
-	if _, err := runNetwork(clone, "push", "origin", "HEAD:refs/heads/"+result.Branch); err != nil {
+	pushTarget := "origin"
+	if credential.Token != "" {
+		pushTarget = cloneURL
+	}
+	if _, err := runNetwork(clone, "push", pushTarget, "HEAD:refs/heads/"+result.Branch); err != nil {
 		return GitWorkspace{}, err
 	}
 	result.Root = clone
@@ -179,7 +192,8 @@ func isolatedGitEnvironment(extra []string) []string {
 	environment := make([]string, 0, len(os.Environ())+len(extra)+3)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+		upper := strings.ToUpper(key)
+		if strings.HasPrefix(upper, "GIT_") || upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" || upper == "SSH_ASKPASS" || upper == "SSH_AUTH_SOCK" || upper == "GCM_INTERACTIVE" {
 			continue
 		}
 		environment = append(environment, entry)
@@ -188,6 +202,7 @@ func isolatedGitEnvironment(extra []string) []string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_ATTR_NOSYSTEM=1",
+		"GIT_TERMINAL_PROMPT=0",
 	)
 	return append(environment, extra...)
 }

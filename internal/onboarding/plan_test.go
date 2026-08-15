@@ -301,7 +301,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		if repository != "owner/repo" || branch != "main" {
 			t.Fatalf("policy target=%s branch=%s", repository, branch)
 		}
-		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, RequiredChecks: []RequiredCheck{{Context: "build", AppID: 42}}}, nil
+		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", GitHubOwnedActionsAllowed: true, RequiredChecks: []RequiredCheck{{Context: "zeta", AppID: 9}, {Context: "build", AppID: 42}, {Context: "build", AppID: 42}}}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy})
 	if err != nil {
@@ -313,7 +313,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		case "repository_features":
 			features = effect.Parameters["allowed_actions"] == "selected"
 		case "repository_contract_pr":
-			contract = effect.Parameters["required_checks_json"] == `[{"context":"workflow-contract","app_id":15368},{"context":"build","app_id":42}]`
+			contract = effect.Parameters["required_checks_json"] == `[{"context":"build","app_id":42},{"context":"workflow-contract","app_id":15368},{"context":"zeta","app_id":9}]`
 		}
 	}
 	if !features || !contract {

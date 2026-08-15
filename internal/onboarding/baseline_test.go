@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -245,5 +246,87 @@ func TestInitialBaselineGitPlumbingIsDeterministicUnderHostileGitEnvironment(t *
 		if err != nil || string(output) != first+" HEAD\n"+first+" refs/heads/main\n" {
 			t.Fatalf("baseline refs for %s = %q, %v", repo, output, err)
 		}
+	}
+}
+
+func TestInitialBaselineHonorsAndBindsGlobalExcludesFile(t *testing.T) {
+	home := t.TempDir()
+	excludes := filepath.Join(home, "workflow-global-excludes")
+	if err := os.WriteFile(excludes, []byte("*.secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\texcludesFile = "+filepath.ToSlash(excludes)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	for name, contents := range map[string]string{"visible.txt": "approved\n", "omitted.secret": "ignored\n"} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := BaselineSnapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].Path != "visible.txt" {
+		t.Fatalf("global excludes semantics not preserved: %#v", snapshot)
+	}
+	discovery, err := Discover(context.Background(), repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := CaptureApprovalSnapshot(context.Background(), discovery, "owner/repo", snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var binding ApprovalSnapshot
+	if err := json.Unmarshal([]byte(approved), &binding); err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(binding.GlobalExcludesPath) != filepath.Clean(excludes) || binding.GlobalExcludesSHA256 == "" {
+		t.Fatalf("global excludes binding = %#v", binding)
+	}
+	if err := os.WriteFile(excludes, []byte("*.secret\n# approval-time semantics changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyApprovalSnapshot(context.Background(), approved); err == nil || !strings.Contains(err.Error(), "global excludes") {
+		t.Fatalf("global excludes drift accepted: %v", err)
+	}
+}
+
+func TestInitialBaselineHonorsImplicitGlobalExcludesFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	excludes := filepath.Join(home, ".config", "git", "ignore")
+	if err := os.MkdirAll(filepath.Dir(excludes), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(excludes, []byte("*.secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	for name, contents := range map[string]string{"visible.txt": "approved\n", "omitted.secret": "ignored\n"} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := BaselineSnapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].Path != "visible.txt" {
+		t.Fatalf("implicit global excludes semantics not preserved: %#v", snapshot)
+	}
+	binding, err := resolveGlobalExcludes(context.Background(), repo)
+	if err != nil || filepath.Clean(binding.Path) != filepath.Clean(excludes) || binding.SHA256 == "" {
+		t.Fatalf("implicit binding=%#v err=%v", binding, err)
 	}
 }

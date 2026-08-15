@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -58,6 +59,95 @@ type SetupRepositoryCreateAttemptEvent struct {
 	Private                  bool
 	ApprovalAbsentRepository string
 	RecordedAt               time.Time
+}
+
+type SetupCleanupStatus string
+
+const (
+	CleanupPending  SetupCleanupStatus = "pending"
+	CleanupComplete SetupCleanupStatus = "complete"
+)
+
+type SetupCleanupObligation struct {
+	PlanID, PlanDigestSHA256, EffectID, ObligationID, Kind, Resource string
+	Status                                                           SetupCleanupStatus
+	UpdatedAt                                                        time.Time
+}
+
+var setupCleanupKinds = map[string]bool{
+	"remote_onboarding_branch": true, "temporary_clone": true,
+	"docker_container": true, "docker_state_probe": true, "docker_workspace_probe": true,
+	"codex_temp_dir": true, "codex_container": true,
+}
+
+func (s *Store) RecordSetupCleanupObligation(ctx context.Context, value SetupCleanupObligation) error {
+	if value.PlanID == "" || !fingerprintPattern.MatchString(value.PlanDigestSHA256) || value.EffectID == "" || value.ObligationID == "" || !setupCleanupKinds[value.Kind] || !json.Valid([]byte(value.Resource)) || value.Status != CleanupPending || value.UpdatedAt.IsZero() {
+		return errors.New("invalid Setup cleanup obligation")
+	}
+	var digest string
+	if err := s.db.QueryRowContext(ctx, `SELECT digest_sha256 FROM setup_plans WHERE plan_id=?`, value.PlanID).Scan(&digest); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if digest != value.PlanDigestSHA256 {
+		return ErrSetupPlanConflict
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO setup_cleanup_obligations(plan_id,plan_digest_sha256,effect_id,obligation_id,kind,resource_json,status,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(plan_id,obligation_id) DO NOTHING`, value.PlanID, value.PlanDigestSHA256, value.EffectID, value.ObligationID, value.Kind, value.Resource, string(value.Status), formatTimestamp(value.UpdatedAt))
+	if err != nil {
+		return err
+	}
+	if inserted, _ := result.RowsAffected(); inserted == 1 {
+		return nil
+	}
+	var existing SetupCleanupObligation
+	if err := s.db.QueryRowContext(ctx, `SELECT plan_digest_sha256,effect_id,kind,resource_json,status FROM setup_cleanup_obligations WHERE plan_id=? AND obligation_id=?`, value.PlanID, value.ObligationID).Scan(&existing.PlanDigestSHA256, &existing.EffectID, &existing.Kind, &existing.Resource, &existing.Status); err != nil {
+		return err
+	}
+	if existing.PlanDigestSHA256 != value.PlanDigestSHA256 || existing.EffectID != value.EffectID || existing.Kind != value.Kind || existing.Resource != value.Resource {
+		return ErrSetupPlanConflict
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE setup_cleanup_obligations SET status='pending',updated_at=? WHERE plan_id=? AND obligation_id=?`, formatTimestamp(value.UpdatedAt), value.PlanID, value.ObligationID)
+	return err
+}
+
+func (s *Store) CompleteSetupCleanupObligation(ctx context.Context, planID, obligationID string, completedAt time.Time) error {
+	if planID == "" || obligationID == "" || completedAt.IsZero() {
+		return errors.New("Setup cleanup obligation completion is invalid")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE setup_cleanup_obligations SET status='complete',updated_at=? WHERE plan_id=? AND obligation_id=?`, formatTimestamp(completedAt), planID, obligationID)
+	if err != nil {
+		return err
+	}
+	if updated, _ := result.RowsAffected(); updated != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) PendingSetupCleanupObligations(ctx context.Context, planID string) ([]SetupCleanupObligation, error) {
+	if planID == "" {
+		return nil, errors.New("Setup cleanup plan identity is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT plan_id,plan_digest_sha256,effect_id,obligation_id,kind,resource_json,status,updated_at FROM setup_cleanup_obligations WHERE plan_id=? AND status='pending' ORDER BY obligation_id`, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var values []SetupCleanupObligation
+	for rows.Next() {
+		var value SetupCleanupObligation
+		var updated string
+		if err := rows.Scan(&value.PlanID, &value.PlanDigestSHA256, &value.EffectID, &value.ObligationID, &value.Kind, &value.Resource, &value.Status, &updated); err != nil {
+			return nil, err
+		}
+		value.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+		if err != nil || value.Status != CleanupPending || !setupCleanupKinds[value.Kind] || !json.Valid([]byte(value.Resource)) {
+			return nil, errors.New("persisted Setup cleanup obligation is invalid")
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
 }
 
 func (s *Store) RecordSetupPlan(ctx context.Context, plan SetupPlanRecord) error {

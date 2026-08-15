@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 const (
@@ -63,8 +64,8 @@ func Render(domainLayout string, existingAgents []byte, repository, defaultBranc
 	paths := make([]string, 0, len(wholeFiles))
 	for path, data := range whole {
 		copyData := append([]byte(nil), data...)
-		if path == ".github/workflows/workflow-contract.yml" {
-			copyData = bytes.ReplaceAll(copyData, []byte("branches: [main]"), []byte("branches: ["+defaultBranch+"]"))
+		if path == ".github/workflows/workflow-contract.yml" && defaultBranch != "main" {
+			copyData = bytes.ReplaceAll(copyData, []byte("branches: [main]"), []byte("branches: ["+strconv.Quote(defaultBranch)+"]"))
 		}
 		files[path] = copyData
 		paths = append(paths, path)

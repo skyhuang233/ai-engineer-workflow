@@ -393,6 +393,12 @@ func TestApprovedRepositoryPolicyComparisonDoesNotNormalizeLiveFeatureDrift(t *t
 	if err := compareApprovedRepositoryPolicy(actual, approved); err == nil {
 		t.Fatal("live Actions disablement was normalized to the approved post-transition value")
 	}
+	approved.RequiredChecks = []onboarding.RequiredCheck{{Context: "build", AppID: 7}, {Context: "test", AppID: 9}}
+	actual = approved
+	actual.RequiredChecks = []onboarding.RequiredCheck{{Context: "test", AppID: 9}, {Context: "build", AppID: 7}, {Context: "build", AppID: 7}}
+	if err := compareApprovedRepositoryPolicy(actual, approved); err != nil {
+		t.Fatalf("required check response order caused false policy drift: %v", err)
+	}
 }
 
 func TestOnboardingCheckWaiterIgnoresOptionalFailuresAndPendingRuns(t *testing.T) {
@@ -873,6 +879,46 @@ func approvedPolicyJSON(t *testing.T, policy onboarding.RepositoryPolicy) string
 	return string(raw)
 }
 
+func patFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestHostAdapterReconcilesPersistedProbeCleanupResources(t *testing.T) {
+	root := t.TempDir()
+	stateRoot, workspaceRoot := filepath.Join(root, "state"), filepath.Join(root, "workspaces")
+	dockerProbe := filepath.Join(stateRoot, ".setup-readiness-abcdef123456")
+	codexProbe := filepath.Join(os.TempDir(), "workflow-doctor-codex-abcdef123456")
+	var paths, containers []string
+	resource := func(value string) string {
+		raw, _ := json.Marshal(map[string]string{"value": value})
+		return string(raw)
+	}
+	adapter := HostAdapter{
+		Layout:                 workflowhome.Layout{State: stateRoot, Workspaces: workspaceRoot},
+		RemoveCleanupPath:      func(path string) error { paths = append(paths, path); return nil },
+		RemoveCleanupContainer: func(_ context.Context, name string) error { containers = append(containers, name); return nil },
+	}
+	for _, obligation := range []store.SetupCleanupObligation{
+		{Kind: "docker_state_probe", Resource: resource(dockerProbe)},
+		{Kind: "docker_workspace_probe", Resource: resource(filepath.Join(workspaceRoot, ".setup-readiness-abcdef123456"))},
+		{Kind: "codex_temp_dir", Resource: resource(codexProbe)},
+		{Kind: "docker_container", Resource: resource("workflow-setup-docker-abcdef123456")},
+		{Kind: "codex_container", Resource: resource("workflow-doctor-codex-abcdef123456-initial")},
+	} {
+		if err := adapter.ReconcileCleanupObligation(context.Background(), obligation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(paths) != 3 || len(containers) != 2 {
+		t.Fatalf("paths=%#v containers=%#v", paths, containers)
+	}
+	bad := store.SetupCleanupObligation{Kind: "docker_container", Resource: resource("unowned")}
+	if err := adapter.ReconcileCleanupObligation(context.Background(), bad); err == nil {
+		t.Fatal("unowned container cleanup accepted")
+	}
+}
+
 func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
@@ -1040,7 +1086,7 @@ func TestHostAdapterPersistsPATOnlyThroughSecretInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := HostAdapter{Layout: layout}
-	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}
+	effect := setupcontract.Effect{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_secret"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectRequired {
 		t.Fatalf("initial=%s %v", status, err)
@@ -1067,7 +1113,7 @@ func TestEngineRejectsPlanSelectedGitHubEndpointBeforeSecretOrNetwork(t *testing
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
 	defer server.Close()
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "untrusted-github-endpoint", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "untrusted-github-endpoint", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_must_not_be_read"), "api_base": server.URL, "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	raw, _ := json.Marshal(plan)
 	secret := &SecretInput{Reader: bytes.NewBufferString("ghp_must_not_be_read")}
 	_, applyErr := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: secret, GitHubCredentialVerifier: &githubcredential.Verifier{APIBase: server.URL}}).Apply(context.Background(), raw, repeat("0", 64))
@@ -1085,7 +1131,7 @@ func TestEngineRejectsPATOutsideExactWorkflowHomeCredentialPathBeforeSecret(t *t
 		t.Fatal(err)
 	}
 	contractDigest := writeTestPlatformSetupContract(t, layout)
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "wrong-pat-path", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: filepath.Join(t.TempDir(), "github.pat"), Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "wrong-pat-path", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: filepath.Join(t.TempDir(), "github.pat"), Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_must_not_be_read"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	plan.Effects[0].Parameters["platform_setup_contract_digest"] = contractDigest
 	encoded, _ := json.Marshal(plan)
 	_, raw, digest, err := setupcontract.ParsePlan(encoded)
@@ -1105,7 +1151,7 @@ func TestEngineRejectsPATScopesNotBoundToInstalledSignedContractBeforeSecret(t *
 		t.Fatal(err)
 	}
 	_ = writeTestPlatformSetupContract(t, layout)
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "wrong-pat-contract", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "wrong-pat-contract", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_must_not_be_read"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	encoded, _ := json.Marshal(plan)
 	_, raw, digest, err := setupcontract.ParsePlan(encoded)
 	if err != nil {
@@ -1135,6 +1181,31 @@ func writeTestPlatformSetupContract(t *testing.T, layout workflowhome.Layout) st
 	return digest
 }
 
+func TestEngineRejectsPATFingerprintMismatchBeforeMutationOrNetwork(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractDigest := writeTestPlatformSetupContract(t, layout)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-fingerprint-fence", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_approved"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	raw, _ := json.Marshal(plan)
+	_, canonical, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := &SecretInput{Reader: bytes.NewBufferString("ghp_different\n")}
+	_, applyErr := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: secret, GitHubCredentialVerifier: &githubcredential.Verifier{APIBase: server.URL}}).Apply(context.Background(), canonical, digest)
+	if applyErr == nil || !strings.Contains(applyErr.Error(), "fingerprint differs") || requests != 0 {
+		t.Fatalf("fingerprint fence err=%v requests=%d", applyErr, requests)
+	}
+	if _, err := os.Stat(layout.CredentialFile); !os.IsNotExist(err) {
+		t.Fatalf("mismatched PAT mutated credential file: %v", err)
+	}
+}
+
 func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-OAuth-Scopes", "repo, workflow")
@@ -1146,7 +1217,7 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	contractDigest := writeTestPlatformSetupContract(t, layout)
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "pat-plan", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_secret"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	plan.Effects[0].Parameters["platform_setup_contract_digest"] = contractDigest
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)
@@ -1194,7 +1265,7 @@ func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
 	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
 		t.Fatal(err)
 	}
-	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "platform_release", Subject: "v1", Expected: repeat("a", 64)}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "fingerprint_sha256": patFingerprint("ghp_replacement"), "release_manifest_digest": repeat("a", 64), "platform_setup_contract_digest": repeat("b", 64), "workflow_cli_sha256": repeat("c", 64), "release_bundled_files_digest": repeat("d", 64)}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
 	plan.Effects[0].Parameters["platform_setup_contract_digest"] = contractDigest
 	raw, _ := json.Marshal(plan)
 	_, _, digest, err := setupcontract.ParsePlan(raw)

@@ -76,8 +76,8 @@ try {
                 $expectedCredentialPath = [IO.Path]::GetFullPath((Join-Path ([string]$approvedPlan.target.workflow_home) ([string]$credentialContract.plaintext_relative_path)))
                 $requiredScopes = @($credentialContract.required_scopes | ForEach-Object { [string]$_ }) -join ","
                 $actualParameterNames = @($effect.parameters.PSObject.Properties.Name | Sort-Object)
-                $expectedParameterNames = @("input", "owner", "platform_setup_contract_digest", "release_bundled_files_digest", "release_manifest_digest", "required_scopes", "workflow_cli_sha256" | Sort-Object)
-                if (@("persist", "replace") -notcontains [string]$effect.action -or [string]$effect.subject -cne $expectedCredentialPath -or [string]$effect.parameters.input -cne "stdin" -or [string]::IsNullOrWhiteSpace([string]$effect.parameters.owner) -or [string]$effect.parameters.owner -cne ([string]$effect.parameters.owner).Trim() -or [string]$effect.parameters.required_scopes -cne $requiredScopes -or ($actualParameterNames -join "`n") -cne ($expectedParameterNames -join "`n")) { throw "Approved Setup Plan GitHub PAT binding differs from the verified manifest" }
+                $expectedParameterNames = @("fingerprint_sha256", "input", "owner", "platform_setup_contract_digest", "release_bundled_files_digest", "release_manifest_digest", "required_scopes", "workflow_cli_sha256" | Sort-Object)
+                if (@("persist", "replace") -notcontains [string]$effect.action -or [string]$effect.subject -cne $expectedCredentialPath -or [string]$effect.parameters.input -cne "stdin" -or [string]::IsNullOrWhiteSpace([string]$effect.parameters.owner) -or [string]$effect.parameters.owner -cne ([string]$effect.parameters.owner).Trim() -or [string]$effect.parameters.required_scopes -cne $requiredScopes -or [string]$effect.parameters.fingerprint_sha256 -notmatch '^[0-9a-f]{64}$' -or ($actualParameterNames -join "`n") -cne ($expectedParameterNames -join "`n")) { throw "Approved Setup Plan GitHub PAT binding differs from the verified manifest" }
             }
             "platform_installation" {
                 if ([string]$effect.action -ne "record" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.platform_setup_contract_json -ne [IO.File]::ReadAllText($contractCanonical) -or [string]$effect.parameters.release_bundled_files_json -ne $releaseBundledFilesJSON) { throw "Approved Setup Plan Platform Installation effect differs from the verified manifest" }
@@ -126,10 +126,11 @@ try {
     $controlPlaneEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "control_plane" })
     if ($controlPlaneEffects.Count -gt 1 -or ($controlPlaneEffects.Count -eq 1 -and $controlPlaneAuthorizationDigest -cne $ApprovedDigest)) { throw "post-apply Control Plane authorization differs from the approved replacement" }
     $pinDirectory = Join-Path $workflowHome "config"
+    $pinBackupDirectory = Join-Path $workflowHome "backups"
     New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $pinBackupDirectory -Force | Out-Null
     $pinPath = Join-Path $pinDirectory "bootstrap-platform-release-pin.json"
-    $pinTemporaryPath = $pinPath + ".tmp-" + [Guid]::NewGuid().ToString("N")
-    $pinBackupPath = $pinPath + ".bak-" + [Guid]::NewGuid().ToString("N")
+    $pinBackupPath = Join-Path $pinBackupDirectory "bootstrap-platform-release-pin.json"
     $pin = [ordered]@{
         schema_version = 1
         release_version = [string]$manifest.release.version
@@ -142,16 +143,21 @@ try {
         manifest_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath)))
         signature_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($SignaturePath)))
     }
-    try {
-        [IO.File]::WriteAllText($pinTemporaryPath, ($pin | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
-        if (Test-Path -LiteralPath $pinPath -PathType Leaf) {
-            [IO.File]::Replace($pinTemporaryPath, $pinPath, $pinBackupPath)
-        } else {
-            [IO.File]::Move($pinTemporaryPath, $pinPath)
+    $pinJSON = $pin | ConvertTo-Json -Compress
+    foreach ($durablePinPath in @($pinBackupPath, $pinPath)) {
+        $pinTemporaryPath = $durablePinPath + ".tmp-" + [Guid]::NewGuid().ToString("N")
+        $replacedPinPath = $durablePinPath + ".replaced-" + [Guid]::NewGuid().ToString("N")
+        try {
+            [IO.File]::WriteAllText($pinTemporaryPath, $pinJSON, (New-Object Text.UTF8Encoding($false)))
+            if (Test-Path -LiteralPath $durablePinPath -PathType Leaf) {
+                [IO.File]::Replace($pinTemporaryPath, $durablePinPath, $replacedPinPath)
+            } else {
+                [IO.File]::Move($pinTemporaryPath, $durablePinPath)
+            }
+        } finally {
+            Remove-Item -LiteralPath $pinTemporaryPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $replacedPinPath -Force -ErrorAction SilentlyContinue
         }
-    } finally {
-        Remove-Item -LiteralPath $pinTemporaryPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $pinBackupPath -Force -ErrorAction SilentlyContinue
     }
 } finally {
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue

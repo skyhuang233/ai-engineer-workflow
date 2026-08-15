@@ -46,7 +46,10 @@ func Discover(ctx context.Context, repository string, resolver RemoteHead) (Disc
 	}
 	head, headErr := gitOutput(ctx, root, "rev-parse", "--verify", "HEAD")
 	hasCommits := headErr == nil
-	origin, originErr := gitOutput(ctx, root, "remote", "get-url", "origin")
+	origin, originErr := rawOriginURL(ctx, root)
+	if originErr != nil && !errors.Is(originErr, errRepositoryOriginAbsent) {
+		return Discovery{}, originErr
+	}
 	published := originErr == nil && strings.TrimSpace(origin) != ""
 	repositoryID := ""
 	defaultBranch := branch
@@ -238,7 +241,11 @@ func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
 type LSRemoteHead struct{}
 
 func (LSRemoteHead) Resolve(ctx context.Context, origin string) (string, string, error) {
-	command := exec.CommandContext(ctx, "git", "ls-remote", "--symref", origin, "HEAD")
+	if _, err := parseGitHubOrigin(origin); err != nil {
+		return "", "", err
+	}
+	command := exec.CommandContext(ctx, "git", hardenedAuthenticatedGitArgs(origin, "ls-remote", "--symref", origin, "HEAD")...)
+	command.Env = isolatedGitEnvironment(nil)
 	output, err := command.Output()
 	if err != nil {
 		return "", "", err

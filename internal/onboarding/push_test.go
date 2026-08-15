@@ -3,6 +3,8 @@ package onboarding
 import (
 	"context"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,21 +24,65 @@ func TestPublishDefaultBranchScopesPATToCanonicalPushOnly(t *testing.T) {
 	if err := os.WriteFile(hook, []byte("#!/bin/sh\nenv > \"$WORKFLOW_TEST_PRE_PUSH_CAPTURE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	helperCapture := filepath.Join(t.TempDir(), "credential-helper-environment")
-	git(t, repo, "config", "credential.helper", "!env > \"$WORKFLOW_TEST_CREDENTIAL_HELPER_CAPTURE\"")
 	t.Setenv("WORKFLOW_TEST_PRE_PUSH_CAPTURE", hookCapture)
-	t.Setenv("WORKFLOW_TEST_CREDENTIAL_HELPER_CAPTURE", helperCapture)
 	credential := GitCredential{Username: "publisher", Token: "github_pat_publish_scope_secret"}
 	if err := PublishDefaultBranch(context.Background(), repo, canonicalURL, "main", credential); err != nil {
 		t.Fatal(err)
 	}
 	assertScopedNetworkCredential(t, capture, "push", canonicalURL, credential)
-	for name, path := range map[string]string{"pre-push hook": hookCapture, "credential helper": helperCapture} {
+	for name, path := range map[string]string{"pre-push hook": hookCapture} {
 		if data, err := os.ReadFile(path); err == nil {
 			t.Fatalf("untrusted %s executed with authenticated push environment: %s", name, data)
 		} else if !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestAuthenticatedGitRejectsRepositoryLocalTransportOverridesWithoutNetwork(t *testing.T) {
+	for _, test := range []struct{ name, key, value string }{
+		{name: "proxy", key: "http.proxy"},
+		{name: "ssl verify", key: "http.sslVerify", value: "false"},
+		{name: "extra header", key: "http.extraHeader", value: "Authorization: Basic attacker"},
+		{name: "credential helper", key: "credential.helper", value: "!echo attacker"},
+		{name: "instead of", key: "url.http://127.0.0.1/.insteadOf", value: "https://github.com/"},
+		{name: "remote helper", key: "remote.origin.vcs", value: "ext"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests int
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+			defer server.Close()
+			repo := newRepo(t)
+			value := test.value
+			if value == "" {
+				value = server.URL
+			}
+			git(t, repo, "config", test.key, value)
+			token := "github_pat_round14_must_never_reach_transport"
+			err := PublishDefaultBranch(context.Background(), repo, "https://github.com/owner/repo.git", "main", GitCredential{Username: "x-access-token", Token: token})
+			if err == nil || !strings.Contains(err.Error(), "unsafe") || requests != 0 {
+				t.Fatalf("unsafe local transport config was used: requests=%d err=%v", requests, err)
+			}
+		})
+	}
+}
+
+func TestSafeFastForwardRejectsDirtyTreeWithoutMutation(t *testing.T) {
+	repo := newRepo(t)
+	before := testGitOutput(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("dirty\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := SafeFastForward(context.Background(), repo, "owner/repo", "main", before, strings.Repeat("b", 40), GitCredential{Token: "github_pat_not_used"})
+	if err == nil {
+		t.Fatal("dirty repository was fast-forwarded")
+	}
+	if after := testGitOutput(t, repo, "rev-parse", "HEAD"); after != before {
+		t.Fatalf("dirty rejection mutated HEAD from %s to %s", before, after)
+	}
+	data, readErr := os.ReadFile(filepath.Join(repo, "README.md"))
+	if readErr != nil || string(data) != "dirty\n" {
+		t.Fatalf("dirty rejection mutated worktree: %q %v", data, readErr)
 	}
 }
 
@@ -59,6 +105,33 @@ func TestSafeFastForwardScopesPATToCanonicalFetchOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertScopedNetworkCredential(t, capture, "fetch", canonicalURL, credential)
+}
+
+func TestSafeFastForwardRejectsWorktreeChangeDuringFetch(t *testing.T) {
+	repo := newRepo(t)
+	preMerge := testGitOutput(t, repo, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	git(t, "", "clone", "--bare", repo, bare)
+	advance := filepath.Join(t.TempDir(), "advance")
+	git(t, "", "clone", bare, advance)
+	git(t, advance, "config", "user.name", "Test")
+	git(t, advance, "config", "user.email", "test@example.com")
+	git(t, advance, "commit", "--allow-empty", "-m", "approved onboarding merge")
+	mergeHead := testGitOutput(t, advance, "rev-parse", "HEAD")
+	git(t, advance, "push", "origin", "main")
+	installCapturedGitForPushTest(t, "https://github.com/owner/repo.git", bare)
+	dirtyPath := filepath.Join(repo, "README.md")
+	t.Setenv("WORKFLOW_TEST_DIRTY_AFTER_FETCH", dirtyPath)
+	err := SafeFastForward(context.Background(), repo, "owner/repo", "main", preMerge, mergeHead, GitCredential{})
+	if err == nil || !strings.Contains(err.Error(), "working tree changed") {
+		t.Fatalf("fetch-time dirty drift accepted: %v", err)
+	}
+	if got := testGitOutput(t, repo, "rev-parse", "HEAD"); got != preMerge {
+		t.Fatalf("dirty drift mutated HEAD to %s", got)
+	}
+	if data, _ := os.ReadFile(dirtyPath); string(data) != "user edit during fetch\n" {
+		t.Fatalf("dirty content changed: %q", data)
+	}
 }
 
 func installCapturedGitForPushTest(t *testing.T, canonicalURL, localRemote string) string {
@@ -157,8 +230,7 @@ func TestSafeFastForwardFetchesPersistedMergeSHAInsteadOfLatestRemoteBranch(t *t
 	git(t, advance, "commit", "--allow-empty", "-m", "unapproved later commit")
 	extraHead := testGitOutput(t, advance, "rev-parse", "HEAD")
 	git(t, advance, "push", "origin", "main")
-	fileURL := "file:///" + strings.TrimPrefix(filepath.ToSlash(bare), "/")
-	git(t, repo, "config", "url."+fileURL+".insteadOf", "https://github.com/owner/repo.git")
+	installCapturedGitForPushTest(t, "https://github.com/owner/repo.git", bare)
 	if err := SafeFastForward(context.Background(), repo, "owner/repo", "main", preMerge, mergeHead, GitCredential{}); err != nil {
 		t.Fatal(err)
 	}

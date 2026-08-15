@@ -196,6 +196,51 @@ func TestPlatformAndRuntimeObservationReadBack(t *testing.T) {
 	}
 }
 
+func TestSetupCleanupObligationsRemainPendingUntilExactCleanupCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	plan := SetupPlanRecord{PlanID: "cleanup-plan", Kind: "repository_onboarding", SchemaVersion: 1, Target: "owner/repo", DigestSHA256: repeatHex('a'), CanonicalJSON: `{}`, Projection: "cleanup", CreatedAt: now}
+	if err := db.RecordSetupPlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	value := SetupCleanupObligation{PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "contract", ObligationID: "contract:remote-branch", Kind: "remote_onboarding_branch", Resource: `{"repository":"owner/repo","branch":"workflow/onboarding-aaaa"}`, Status: CleanupPending, UpdatedAt: now}
+	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
+		t.Fatalf("exact pending retry was not idempotent: %v", err)
+	}
+	drift := value
+	drift.Resource = `{"repository":"owner/other"}`
+	if err := db.RecordSetupCleanupObligation(ctx, drift); !errors.Is(err, ErrSetupPlanConflict) {
+		t.Fatalf("cleanup identity drift = %v", err)
+	}
+	pending, err := db.PendingSetupCleanupObligations(ctx, plan.PlanID)
+	if err != nil || len(pending) != 1 || pending[0].Resource != value.Resource {
+		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+	if err := db.CompleteSetupCleanupObligation(ctx, plan.PlanID, value.ObligationID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = db.PendingSetupCleanupObligations(ctx, plan.PlanID)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("completed obligation remains pending: %#v err=%v", pending, err)
+	}
+	value.UpdatedAt = now.Add(2 * time.Second)
+	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
+		t.Fatalf("reopen exact cleanup obligation before recreating resource: %v", err)
+	}
+	pending, err = db.PendingSetupCleanupObligations(ctx, plan.PlanID)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("reopened cleanup obligation = %#v, %v", pending, err)
+	}
+}
+
 func repeatHex(value byte) string {
 	result := make([]byte, 64)
 	for i := range result {

@@ -295,7 +295,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			return fmt.Errorf("parameter %q is required", key)
 		}
 	}
-	for _, key := range []string{"sha256", "windows_amd64_sha256", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest", "manifest_digest"} {
+	for _, key := range []string{"sha256", "windows_amd64_sha256", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest", "manifest_digest", "fingerprint_sha256"} {
 		if value, exists := effect.Parameters[key]; exists && !sha256Pattern.MatchString(value) {
 			return fmt.Errorf("parameter %q must be a lowercase SHA-256", key)
 		}

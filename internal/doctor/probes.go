@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -102,11 +103,14 @@ func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
 }
 
 type WorkerCodexSessionCheck struct {
-	Executor  Executor
-	Image     string
-	AuthFile  string
-	Nonce     string
-	RemoveAll func(string) error
+	Executor        Executor
+	Image           string
+	AuthFile        string
+	Nonce           string
+	RemoveAll       func(string) error
+	ProbeID         string
+	BeginCleanup    func(kind, id, resource string) error
+	CompleteCleanup func(id string) error
 }
 
 func (WorkerCodexSessionCheck) Name() string { return "Worker Codex authentication and session resume" }
@@ -115,7 +119,19 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	if c.Executor == nil || strings.TrimSpace(c.Image) == "" || strings.TrimSpace(c.AuthFile) == "" {
 		return Result{Status: Fail, Summary: "Worker Codex authentication check is incomplete"}
 	}
-	root, err := os.MkdirTemp("", "workflow-doctor-codex-*")
+	if c.ProbeID != "" && !cleanupProbeIDPattern.MatchString(c.ProbeID) {
+		return Result{Status: Fail, Summary: "Worker Codex cleanup identity is invalid"}
+	}
+	root := filepath.Join(os.TempDir(), "workflow-doctor-codex-"+c.ProbeID)
+	var err error
+	if c.ProbeID == "" {
+		root, err = os.MkdirTemp("", "workflow-doctor-codex-*")
+	} else {
+		err = beginWorkerCleanup(c.BeginCleanup, "codex_temp_dir", "codex-temp-dir", root)
+		if err == nil {
+			err = os.Mkdir(root, 0o700)
+		}
+	}
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
@@ -137,6 +153,10 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 			}
 			result.Status = Fail
 			result.Err = errors.Join(primaryErr, cleanupErr)
+		} else if cleanupErr := completeWorkerCleanup(c.CompleteCleanup, "codex-temp-dir"); cleanupErr != nil {
+			result.Status = Fail
+			result.Summary = strings.TrimSpace(result.Summary + "; " + cleanupErr.Error())
+			result.Err = errors.Join(result.Err, cleanupErr)
 		}
 	}()
 	workspace := filepath.Join(root, "workspace")
@@ -161,11 +181,14 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 			return Result{Status: Fail, Summary: err.Error()}
 		}
 	}
-	initialName, err := workerCodexContainerName()
+	initialName, err := workerCodexContainerName(c.ProbeID, "initial")
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	initial, err := runWorkerCodexContainer(ctx, c.Executor, initialName, workerCodexCommand(initialName, c.Image, workspace, codexState,
+	if err := beginWorkerCleanup(c.BeginCleanup, "codex_container", "codex-container-initial", initialName); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	initial, err := runWorkerCodexContainer(ctx, c.Executor, initialName, "codex-container-initial", c.CompleteCleanup, workerCodexCommand(initialName, c.ProbeID, c.Image, workspace, codexState,
 		"exec", "--sandbox", "read-only", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check",
 		"Remember this nonce for the next turn: "+nonce+`. Return the required JSON with summary "phase-one", commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
@@ -178,11 +201,14 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	if sessionID == "" {
 		return Result{Status: Fail, Summary: "Worker Codex did not emit a persistent session ID"}
 	}
-	resumeName, err := workerCodexContainerName()
+	resumeName, err := workerCodexContainerName(c.ProbeID, "resume")
 	if err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
-	resumed, err := runWorkerCodexContainer(ctx, c.Executor, resumeName, workerCodexCommand(resumeName, c.Image, workspace, codexState,
+	if err := beginWorkerCleanup(c.BeginCleanup, "codex_container", "codex-container-resume", resumeName); err != nil {
+		return Result{Status: Fail, Summary: err.Error()}
+	}
+	resumed, err := runWorkerCodexContainer(ctx, c.Executor, resumeName, "codex-container-resume", c.CompleteCleanup, workerCodexCommand(resumeName, c.ProbeID, c.Image, workspace, codexState,
 		"exec", "--sandbox", "read-only", "resume", "--json", "--output-schema", "/codex-state/output-schema.json", "--skip-git-repo-check", sessionID,
 		`Return the required JSON with the nonce from the previous turn as summary, commit null, one passed check named "doctor schema probe", and plan_amendment null.`))
 	if err != nil {
@@ -201,7 +227,10 @@ func (c WorkerCodexSessionCheck) Run(ctx context.Context) (result Result) {
 	return Result{Status: Pass, Summary: "pinned Worker accepted the Candidate schema, authenticated, and resumed persisted context"}
 }
 
-func workerCodexContainerName() (string, error) {
+func workerCodexContainerName(probeID, phase string) (string, error) {
+	if probeID != "" {
+		return "workflow-doctor-codex-" + probeID + "-" + phase, nil
+	}
 	token, err := randomToken()
 	if err != nil {
 		return "", err
@@ -209,20 +238,25 @@ func workerCodexContainerName() (string, error) {
 	return "workflow-doctor-codex-" + strings.ToLower(token), nil
 }
 
-func runWorkerCodexContainer(ctx context.Context, executor Executor, name string, command []string) (output []byte, resultErr error) {
+func runWorkerCodexContainer(ctx context.Context, executor Executor, name, cleanupID string, complete func(string) error, command []string) (output []byte, resultErr error) {
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		cleanupOutput, cleanupErr := executor.Run(cleanupCtx, []string{"docker", "rm", "-f", name})
 		if cleanupErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove Worker Codex probe container %q: %w (%s)", name, cleanupErr, strings.TrimSpace(string(cleanupOutput))))
+		} else if cleanupErr := completeWorkerCleanup(complete, cleanupID); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, cleanupErr)
 		}
 	}()
 	return executor.Run(ctx, command)
 }
 
-func workerCodexCommand(name, image, workspace, codexState string, command ...string) []string {
+func workerCodexCommand(name, probeID, image, workspace, codexState string, command ...string) []string {
 	args := []string{"docker", "run", "--name", name, "--label", "com.skyhuang233.workflow.setup-probe=true"}
+	if probeID != "" {
+		args = append(args, "--label", "com.skyhuang233.workflow.setup-probe-id="+probeID)
+	}
 	args = append(args, worker.CodexSandboxDockerArgs()...)
 	args = append(args,
 		"--workdir", "/workspace",
@@ -231,6 +265,26 @@ func workerCodexCommand(name, image, workspace, codexState string, command ...st
 		"--env", "CODEX_HOME=/codex-state", image, "codex",
 	)
 	return append(args, command...)
+}
+
+var cleanupProbeIDPattern = regexp.MustCompile(`^[a-f0-9]{12}$`)
+
+func beginWorkerCleanup(begin func(kind, id, resource string) error, kind, id, value string) error {
+	if begin == nil {
+		return nil
+	}
+	resource, _ := json.Marshal(map[string]string{"value": value})
+	return begin(kind, id, string(resource))
+}
+
+func completeWorkerCleanup(complete func(string) error, id string) error {
+	if complete == nil {
+		return nil
+	}
+	if err := complete(id); err != nil {
+		return fmt.Errorf("complete cleanup obligation %q: %w", id, err)
+	}
+	return nil
 }
 
 func workerCodexFailure(action string, output []byte, err error) Result {

@@ -47,6 +47,8 @@ type HostAdapter struct {
 	OnboardingCheckDiagnostics map[string][]string
 	ApprovedGitHubPolicies     map[string]string
 	CleanupOnboardingWorkspace func(onboarding.GitWorkspace) error
+	RemoveCleanupPath          func(string) error
+	RemoveCleanupContainer     func(context.Context, string) error
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
@@ -62,6 +64,119 @@ const repositoryCreatedEvidence = "repository_created="
 const repositoryCreatedPolicyEvidence = "repository_created_policy_base64="
 const initialBaselineHeadEvidence = "initial_baseline_head="
 const publishedHistoryHeadEvidence = "published_history_head="
+
+type remoteBranchCleanupResource struct {
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+}
+type temporaryCloneCleanupResource struct {
+	Root string `json:"root"`
+	Path string `json:"path"`
+}
+type probeCleanupResource struct {
+	Value string `json:"value"`
+}
+
+func (a HostAdapter) CleanupObligations(effect setupcontract.Effect, digest string) ([]store.SetupCleanupObligation, error) {
+	if effect.Kind != "repository_contract_pr" {
+		return nil, nil
+	}
+	if len(digest) < 12 || effect.Subject == "" {
+		return nil, errors.New("Repository Contract cleanup identity is incomplete")
+	}
+	root := a.TemporaryRoot
+	if root == "" {
+		root = a.Layout.Workspaces
+	}
+	root, err := filepath.Abs(root)
+	if err != nil || !filepath.IsAbs(root) {
+		return nil, errors.New("Repository Contract temporary root is invalid")
+	}
+	branch := "workflow/onboarding-" + digest[:12]
+	path := filepath.Join(root, "workflow-onboarding-"+digest[:12])
+	remote, _ := json.Marshal(remoteBranchCleanupResource{Repository: effect.Subject, Branch: branch})
+	temporary, _ := json.Marshal(temporaryCloneCleanupResource{Root: root, Path: path})
+	return []store.SetupCleanupObligation{
+		{ObligationID: effect.ID + ":remote-branch", Kind: "remote_onboarding_branch", Resource: string(remote)},
+		{ObligationID: effect.ID + ":temporary-clone", Kind: "temporary_clone", Resource: string(temporary)},
+	}, nil
+}
+
+func (a HostAdapter) ReconcileCleanupObligation(ctx context.Context, obligation store.SetupCleanupObligation) error {
+	switch obligation.Kind {
+	case "remote_onboarding_branch":
+		if a.GitHub == nil {
+			return errors.New("GitHub client is required to clean the onboarding branch")
+		}
+		var resource remoteBranchCleanupResource
+		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || resource.Repository == "" || !strings.HasPrefix(resource.Branch, "workflow/onboarding-") {
+			return errors.New("remote onboarding branch cleanup resource is invalid")
+		}
+		err := a.GitHub.DeleteBranch(ctx, resource.Repository, resource.Branch)
+		if github.IsNotFound(err) {
+			return nil
+		}
+		return err
+	case "temporary_clone":
+		var resource temporaryCloneCleanupResource
+		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || !filepath.IsAbs(resource.Root) || !filepath.IsAbs(resource.Path) {
+			return errors.New("temporary clone cleanup resource is invalid")
+		}
+		relative, err := filepath.Rel(resource.Root, resource.Path)
+		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || !strings.HasPrefix(filepath.Base(resource.Path), "workflow-onboarding-") {
+			return errors.New("temporary clone cleanup escaped its approved root")
+		}
+		remove := a.RemoveCleanupPath
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		return remove(resource.Path)
+	case "docker_state_probe", "docker_workspace_probe", "codex_temp_dir":
+		var resource probeCleanupResource
+		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil || !filepath.IsAbs(resource.Value) {
+			return errors.New("probe directory cleanup resource is invalid")
+		}
+		base := filepath.Base(resource.Value)
+		valid := obligation.Kind == "codex_temp_dir" && strings.HasPrefix(base, "workflow-doctor-codex-") || obligation.Kind != "codex_temp_dir" && strings.HasPrefix(base, ".setup-readiness-")
+		if !valid {
+			return errors.New("probe directory cleanup resource lacks its owned prefix")
+		}
+		expectedParent := os.TempDir()
+		if obligation.Kind == "docker_state_probe" {
+			expectedParent = a.Layout.State
+		} else if obligation.Kind == "docker_workspace_probe" {
+			expectedParent = a.Layout.Workspaces
+		}
+		if expectedParent == "" || !strings.EqualFold(filepath.Clean(filepath.Dir(resource.Value)), filepath.Clean(expectedParent)) {
+			return errors.New("probe directory cleanup escaped its owned root")
+		}
+		remove := a.RemoveCleanupPath
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		return remove(resource.Value)
+	case "docker_container", "codex_container":
+		var resource probeCleanupResource
+		if json.Unmarshal([]byte(obligation.Resource), &resource) != nil {
+			return errors.New("probe container cleanup resource is invalid")
+		}
+		valid := obligation.Kind == "docker_container" && strings.HasPrefix(resource.Value, "workflow-setup-docker-") || obligation.Kind == "codex_container" && strings.HasPrefix(resource.Value, "workflow-doctor-codex-")
+		if !valid {
+			return errors.New("probe container cleanup resource lacks its owned prefix")
+		}
+		if a.RemoveCleanupContainer != nil {
+			return a.RemoveCleanupContainer(ctx, resource.Value)
+		}
+		command := exec.CommandContext(ctx, "docker", "rm", "-f", resource.Value)
+		output, err := command.CombinedOutput()
+		if err != nil && !strings.Contains(strings.ToLower(string(output)), "no such container") {
+			return fmt.Errorf("remove probe container %q: %w (%s)", resource.Value, err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported cleanup obligation kind %q", obligation.Kind)
+	}
+}
 
 func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
 	for _, result := range results {
@@ -1119,6 +1234,8 @@ func compareApprovedRepositoryPolicy(actual, approved onboarding.RepositoryPolic
 	// not an observable GitHub setting, so bind it from the approval while
 	// comparing every live post-transition policy value byte-for-byte.
 	actual.AllowFeatureEnable = approved.AllowFeatureEnable
+	actual.RequiredChecks = onboarding.CanonicalRequiredChecks(actual.RequiredChecks)
+	approved.RequiredChecks = onboarding.CanonicalRequiredChecks(approved.RequiredChecks)
 	want, _ := json.Marshal(approved)
 	got, _ := json.Marshal(actual)
 	if !bytes.Equal(want, got) {

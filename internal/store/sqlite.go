@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 61
+	latestSchemaVersion = 62
 )
 
 var (
@@ -1754,6 +1754,24 @@ FROM repository_admissions r`,
 			return fmt.Errorf("migration 61: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (61, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 62 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS setup_cleanup_obligations (
+    plan_id TEXT NOT NULL REFERENCES setup_plans(plan_id),
+    plan_digest_sha256 TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    obligation_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('remote_onboarding_branch','temporary_clone','docker_container','docker_state_probe','docker_workspace_probe','codex_temp_dir','codex_container')),
+    resource_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','complete')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(plan_id, obligation_id)
+)`); err != nil {
+			return fmt.Errorf("migration 62: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (62, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
