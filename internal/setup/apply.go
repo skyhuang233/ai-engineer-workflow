@@ -73,6 +73,10 @@ type Engine struct {
 	ResolveCodexAuth             func(context.Context) (string, error)
 	ExpectedResultVerifier       ExpectedResultVerifier
 	PlatformPreconditionVerifier PlatformPreconditionVerifier
+	// GitHubCredentialVerifier is a trusted process-level test/integration seam.
+	// Production leaves it nil so credential verification uses GitHub's fixed
+	// public API endpoint; it is never selected by Setup Plan input.
+	GitHubCredentialVerifier *githubcredential.Verifier
 }
 
 func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (setupcontract.ExecutionResult, error) {
@@ -89,6 +93,9 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	}
 	if e.Adapter == nil {
 		return setupcontract.ExecutionResult{}, errors.New("Setup effect adapter is required")
+	}
+	if err := preflightGitHubPATBindings(layout, plan); err != nil {
+		return setupcontract.ExecutionResult{}, err
 	}
 	// Fence a generated Platform Plan to its approved Windows user before even
 	// creating Workflow Home. The ordinary precondition pass repeats the check
@@ -129,6 +136,11 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	prior, err := database.SetupExecutionResults(ctx, plan.PlanID)
 	if err != nil {
 		return setupcontract.ExecutionResult{}, err
+	}
+	if plan.Kind == setupcontract.RepositoryOnboarding {
+		if err := verifyOnboardingIdentityFence(ctx, database, layout, plan); err != nil {
+			return setupcontract.ExecutionResult{}, err
+		}
 	}
 	attempt := len(prior) + 1
 	result := setupcontract.ExecutionResult{SchemaVersion: 1, PlanID: plan.PlanID, PlanDigest: digest, AttemptID: "attempt-" + strconv.Itoa(attempt), StartedAt: now, Status: setupcontract.ExecutionSucceeded}
@@ -311,6 +323,26 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	encoded, _ := json.Marshal(result.Effects)
 	recordErr := database.AppendSetupExecutionResult(ctx, store.SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt, Status: string(result.Status), EffectsJSON: string(encoded), Diagnostic: result.Blocker, StartedAt: result.StartedAt, CompletedAt: result.FinishedAt})
 	return result, errors.Join(err, recordErr)
+}
+
+func verifyOnboardingIdentityFence(ctx context.Context, database *store.Store, layout workflowhome.Layout, plan setupcontract.Plan) error {
+	verification, err := database.GitHubPATVerification(ctx)
+	if err != nil {
+		return fmt.Errorf("read persisted GitHub credential identity: %w", err)
+	}
+	if verification.Status != "verified" || !strings.EqualFold(filepath.Clean(verification.CredentialPath), filepath.Clean(layout.CredentialFile)) {
+		return errors.New("persisted GitHub credential identity is not verified for this Workflow Home")
+	}
+	targetOwner, _, found := strings.Cut(plan.Target.GitHubRepository, "/")
+	if !found || !strings.EqualFold(targetOwner, verification.Owner) {
+		return errors.New("Repository Onboarding target owner differs from the persisted GitHub credential owner")
+	}
+	for _, effect := range plan.Effects {
+		if effect.Kind == "create_repository" && !strings.EqualFold(effect.Parameters["authenticated_login"], verification.Login) {
+			return errors.New("repository creation login differs from the persisted verified GitHub identity")
+		}
+	}
+	return nil
 }
 
 func appendRepositoryCreateAttemptEvent(run *effectExecution, effect setupcontract.Effect, executionAttempt int, event store.RepositoryCreateAttemptEvent) error {
@@ -515,7 +547,55 @@ func isPlatformMutationEffect(kind string) bool {
 	return ok && handler.contract.PlatformMutation
 }
 
-func verifyAndRecordPAT(ctx context.Context, database *store.Store, layout workflowhome.Layout, effect setupcontract.Effect) error {
+func preflightGitHubPATBindings(layout workflowhome.Layout, plan setupcontract.Plan) error {
+	for _, effect := range plan.Effects {
+		if effect.Kind != "github_pat" {
+			continue
+		}
+		owner := strings.TrimSpace(effect.Parameters["owner"])
+		if owner == "" || owner != effect.Parameters["owner"] || len(owner) > 39 || strings.HasPrefix(owner, "-") || strings.HasSuffix(owner, "-") {
+			return errors.New("GitHub PAT effect has an invalid intended owner binding")
+		}
+		for _, character := range owner {
+			if character != '-' && (character < '0' || character > '9') && (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') {
+				return errors.New("GitHub PAT effect has an invalid intended owner binding")
+			}
+		}
+		contractDigest := effect.Parameters["platform_setup_contract_digest"]
+		var contractRaw []byte
+		for _, candidate := range plan.Effects {
+			if candidate.Kind != "platform_installation" {
+				continue
+			}
+			if len(contractRaw) != 0 || candidate.Parameters["platform_setup_contract_digest"] != contractDigest {
+				return errors.New("GitHub PAT effect is not bound to one exact signed Platform Setup Contract")
+			}
+			contractRaw = []byte(candidate.Parameters["platform_setup_contract_json"])
+		}
+		if len(contractRaw) == 0 {
+			var err error
+			contractRaw, err = os.ReadFile(filepath.Join(layout.Root, "config", "platform-setup-contract.json"))
+			if err != nil {
+				return fmt.Errorf("read installed Platform Setup Contract for GitHub PAT preflight: %w", err)
+			}
+		}
+		_, actualContractDigest, err := setupcontract.Canonicalize(contractRaw)
+		var contract platformrelease.PlatformSetupContract
+		if err != nil || actualContractDigest != contractDigest || json.Unmarshal(contractRaw, &contract) != nil || contract.Validate() != nil {
+			return errors.New("GitHub PAT effect is not bound to the exact signed Platform Setup Contract")
+		}
+		expectedCredentialPath := filepath.Join(layout.Root, filepath.FromSlash(strings.ReplaceAll(contract.Credential.PlaintextRelativePath, `\`, "/")))
+		if effect.Subject != layout.CredentialFile || !strings.EqualFold(filepath.Clean(expectedCredentialPath), filepath.Clean(layout.CredentialFile)) {
+			return errors.New("GitHub PAT effect is not bound to the exact Workflow Home credential path")
+		}
+		if effect.Parameters["required_scopes"] != strings.Join(contract.Credential.RequiredScopes, ",") {
+			return errors.New("GitHub PAT effect is not bound to the exact signed credential scopes")
+		}
+	}
+	return nil
+}
+
+func verifyAndRecordPAT(ctx context.Context, database *store.Store, layout workflowhome.Layout, effect setupcontract.Effect, trustedVerifier *githubcredential.Verifier) error {
 	owner := effect.Parameters["owner"]
 	if owner == "" {
 		return errors.New("GitHub PAT effect requires an owner binding")
@@ -524,7 +604,11 @@ func verifyAndRecordPAT(ctx context.Context, database *store.Store, layout workf
 	if err != nil {
 		return err
 	}
-	verification, err := (githubcredential.Verifier{APIBase: effect.Parameters["api_base"]}).Verify(ctx, token, owner)
+	verifier := githubcredential.Verifier{}
+	if trustedVerifier != nil {
+		verifier = *trustedVerifier
+	}
+	verification, err := verifier.Verify(ctx, token, owner)
 	if err != nil {
 		return err
 	}

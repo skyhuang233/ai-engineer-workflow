@@ -112,7 +112,7 @@ func engineBehaviors() map[setupeffect.EngineSemantics]engineBehavior {
 			readback: standardReadback,
 			apply:    standardApply,
 			afterSatisfied: func(run *effectExecution, effect setupcontract.Effect, allowRepair bool) error {
-				verifyErr := verifyAndRecordPAT(run.ctx, run.database, run.layout, effect)
+				verifyErr := verifyAndRecordPAT(run.ctx, run.database, run.layout, effect, run.engine.GitHubCredentialVerifier)
 				if verifyErr == nil || !allowRepair {
 					return verifyErr
 				}
@@ -122,7 +122,7 @@ func engineBehaviors() map[setupeffect.EngineSemantics]engineBehavior {
 				if replaceErr := standardApply(run, effect); replaceErr != nil {
 					return replaceErr
 				}
-				return verifyAndRecordPAT(run.ctx, run.database, run.layout, effect)
+				return verifyAndRecordPAT(run.ctx, run.database, run.layout, effect, run.engine.GitHubCredentialVerifier)
 			},
 			finalize: noFinalize,
 			conflict: standardConflict,

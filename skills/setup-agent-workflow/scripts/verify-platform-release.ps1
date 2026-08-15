@@ -1,12 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
-    [Parameter(Mandatory = $true)][string]$SignaturePath,
-    [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
-    [string]$PublicKeyPath = ""
+    [Parameter(Mandatory = $true)][string]$SignaturePath
 )
 
 $ErrorActionPreference = "Stop"
+$PolicyPath = Join-Path $PSScriptRoot "..\trust\release-policy.json"
 
 function Assert-PlatformRelease([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -77,9 +76,7 @@ foreach ($path in @($ManifestPath, $SignaturePath, $PolicyPath)) {
 }
 $policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 Assert-PlatformRelease ($policy.schema_version -eq 1) "Unsupported Platform Release trust policy"
-if ([string]::IsNullOrWhiteSpace($PublicKeyPath)) {
-    $PublicKeyPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($PolicyPath))) ([string]$policy.public_key_file)
-}
+$PublicKeyPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($PolicyPath))) ([string]$policy.public_key_file)
 Assert-PlatformRelease (Test-Path -LiteralPath $PublicKeyPath -PathType Leaf) "Pinned Platform Release public key is missing: $PublicKeyPath"
 
 $manifestBytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath))

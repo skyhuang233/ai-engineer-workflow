@@ -149,6 +149,9 @@ func (p Plan) Validate() error {
 		}
 	}
 	if p.Kind == RepositoryOnboarding {
+		if err := validateRepositoryOnboardingIdentity(p); err != nil {
+			return err
+		}
 		created := map[string]bool{}
 		effectIndexes := map[string]int{}
 		for index, effect := range p.Effects {
@@ -189,6 +192,55 @@ func (p Plan) Validate() error {
 	_ = json.Unmarshal(encoded, &semantic)
 	if path, found := findSecret(semantic, "$"); found {
 		return fmt.Errorf("Setup Plan contains forbidden secret-shaped content at %s", path)
+	}
+	return nil
+}
+
+func validateRepositoryOnboardingIdentity(plan Plan) error {
+	target := plan.Target.GitHubRepository
+	if !githubRepository.MatchString(target) {
+		return errors.New("Repository Onboarding requires one exact GitHub repository target")
+	}
+	canonicalURL := "https://github.com/" + target + ".git"
+	for _, precondition := range plan.Preconditions {
+		if (precondition.Kind == "github_policy" || precondition.Kind == "github_default_head") && !strings.EqualFold(precondition.Subject, target) {
+			return fmt.Errorf("precondition %q targets a different GitHub repository", precondition.ID)
+		}
+	}
+	for _, effect := range plan.Effects {
+		var repository string
+		switch effect.Kind {
+		case "create_repository", "publish_history", "repository_features", "repository_contract_pr", "repository_admission":
+			repository = effect.Subject
+		case "github_label":
+			repository, _, _ = strings.Cut(effect.Subject, "#")
+		case "initial_baseline":
+			if !strings.EqualFold(effect.Subject, plan.Target.RepositoryPath) {
+				return fmt.Errorf("effect %q targets a different local repository", effect.ID)
+			}
+			repository = effect.Parameters["repository"]
+		case "local_fast_forward":
+			if !strings.EqualFold(effect.Subject, plan.Target.RepositoryPath) {
+				return fmt.Errorf("effect %q targets a different local repository", effect.ID)
+			}
+			repository = effect.Parameters["repository"]
+		default:
+			return fmt.Errorf("effect %q is not a Repository Onboarding effect", effect.ID)
+		}
+		if !strings.EqualFold(repository, target) {
+			return fmt.Errorf("effect %q targets a different GitHub repository", effect.ID)
+		}
+		if effect.Kind == "create_repository" && !strings.EqualFold(effect.Parameters["owner"]+"/"+effect.Parameters["name"], target) {
+			return fmt.Errorf("effect %q creates a different GitHub repository", effect.ID)
+		}
+		if (effect.Kind == "initial_baseline" || effect.Kind == "repository_contract_pr") && !strings.EqualFold(effect.Parameters["source_url"], canonicalURL) {
+			return fmt.Errorf("effect %q uses a source URL outside the GitHub target", effect.ID)
+		}
+	}
+	for _, expected := range plan.ExpectedResults {
+		if !strings.EqualFold(expected.Subject, target) {
+			return fmt.Errorf("expected result %q targets a different GitHub repository", expected.ID)
+		}
 	}
 	return nil
 }
@@ -259,6 +311,9 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 	}
 	if effect.Kind == "github_pat" && effect.Parameters["input"] != "stdin" {
 		return errors.New("GitHub PAT input must be stdin")
+	}
+	if effect.Kind == "github_pat" && effect.Parameters["required_scopes"] != "repo,workflow" {
+		return errors.New("GitHub PAT required scopes must exactly match the approved personal-owner contract")
 	}
 	if effect.Kind == "create_repository" {
 		approvedRepository := effect.Parameters["owner"] + "/" + effect.Parameters["name"]

@@ -3,9 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
     [Parameter(Mandatory = $true)][string]$SignaturePath,
     [Parameter(Mandatory = $true)][string]$PlanPath,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ApprovedDigest,
-    [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
-    [string]$PublicKeyPath = ""
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ApprovedDigest
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,13 +11,7 @@ function Get-SHA256File([string]$Path) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
-$verificationArguments = @{
-    ManifestPath = $ManifestPath
-    SignaturePath = $SignaturePath
-    PolicyPath = $PolicyPath
-}
-if (-not [string]::IsNullOrWhiteSpace($PublicKeyPath)) { $verificationArguments.PublicKeyPath = $PublicKeyPath }
-& (Join-Path $PSScriptRoot "verify-platform-release.ps1") @verificationArguments | Out-Null
+& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath -SignaturePath $SignaturePath | Out-Null
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $planEnvelope = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
@@ -78,7 +70,12 @@ try {
                 if (@("install", "upgrade", "repair") -notcontains [string]$effect.action -or [string]$effect.parameters.version -ne [string]$manifest.platform_setup_contract.docker_desktop.version -or [string]$effect.parameters.installer_url -ne [string]$manifest.platform_setup_contract.docker_desktop.installer_url -or [string]$effect.parameters.windows_amd64_sha256 -ne [string]$manifest.platform_setup_contract.docker_desktop.windows_amd64_sha256) { throw "Approved Setup Plan Docker Desktop effect differs from the verified manifest" }
             }
             "github_pat" {
-                if (@("persist", "replace") -notcontains [string]$effect.action) { throw "Approved Setup Plan GitHub PAT action is invalid" }
+                $credentialContract = $manifest.platform_setup_contract.credential
+                $expectedCredentialPath = [IO.Path]::GetFullPath((Join-Path ([string]$approvedPlan.target.workflow_home) ([string]$credentialContract.plaintext_relative_path)))
+                $requiredScopes = @($credentialContract.required_scopes | ForEach-Object { [string]$_ }) -join ","
+                $actualParameterNames = @($effect.parameters.PSObject.Properties.Name | Sort-Object)
+                $expectedParameterNames = @("input", "owner", "platform_setup_contract_digest", "release_bundled_files_digest", "release_manifest_digest", "required_scopes", "workflow_cli_sha256" | Sort-Object)
+                if (@("persist", "replace") -notcontains [string]$effect.action -or [string]$effect.subject -cne $expectedCredentialPath -or [string]$effect.parameters.input -cne "stdin" -or [string]::IsNullOrWhiteSpace([string]$effect.parameters.owner) -or [string]$effect.parameters.owner -cne ([string]$effect.parameters.owner).Trim() -or [string]$effect.parameters.required_scopes -cne $requiredScopes -or ($actualParameterNames -join "`n") -cne ($expectedParameterNames -join "`n")) { throw "Approved Setup Plan GitHub PAT binding differs from the verified manifest" }
             }
             "platform_installation" {
                 if ([string]$effect.action -ne "record" -or [string]$effect.parameters.version -ne [string]$manifest.release.version -or [string]$effect.parameters.platform_setup_contract_json -ne [IO.File]::ReadAllText($contractCanonical) -or [string]$effect.parameters.release_bundled_files_json -ne $releaseBundledFilesJSON) { throw "Approved Setup Plan Platform Installation effect differs from the verified manifest" }
@@ -107,6 +104,31 @@ try {
         & $executable.FullName setup apply --plan $canonicalPlanPath --approved-digest $ApprovedDigest
     }
     if ($LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }
+    $workflowHome = [IO.Path]::GetFullPath([string]$approvedPlan.target.workflow_home)
+    if (-not [IO.Path]::IsPathRooted($workflowHome) -or $workflowHome.StartsWith("\\")) { throw "Approved Setup Plan Workflow Home is not an absolute local path" }
+    $pinDirectory = Join-Path $workflowHome "config"
+    New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
+    $pinPath = Join-Path $pinDirectory "bootstrap-platform-release-pin.json"
+    $pinTemporaryPath = $pinPath + ".tmp-" + [Guid]::NewGuid().ToString("N")
+    $pin = [ordered]@{
+        schema_version = 1
+        release_version = [string]$manifest.release.version
+        release_manifest_digest_sha256 = $manifestDigest
+        platform_setup_contract_digest_sha256 = $contractDigest
+        workflow_cli_sha256 = [string]$workflowExecutablePins[0].sha256
+        manifest_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath)))
+        signature_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($SignaturePath)))
+    }
+    try {
+        [IO.File]::WriteAllText($pinTemporaryPath, ($pin | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $pinPath -PathType Leaf) {
+            [IO.File]::Replace($pinTemporaryPath, $pinPath, $null)
+        } else {
+            [IO.File]::Move($pinTemporaryPath, $pinPath)
+        }
+    } finally {
+        Remove-Item -LiteralPath $pinTemporaryPath -Force -ErrorAction SilentlyContinue
+    }
 } finally {
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

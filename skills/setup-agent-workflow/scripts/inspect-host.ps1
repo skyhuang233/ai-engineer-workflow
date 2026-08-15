@@ -98,6 +98,35 @@ $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow 
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
 $workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 $platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
+$bootstrapPinPath = Join-Path $WorkflowHome "config\bootstrap-platform-release-pin.json"
+$bootstrapPinLoaded = $false
+if (Test-Path -LiteralPath $bootstrapPinPath -PathType Leaf) {
+    $pinScratch = Join-Path ([IO.Path]::GetTempPath()) ("workflow-bootstrap-pin-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $pinScratch | Out-Null
+    try {
+        $pin = Get-Content -LiteralPath $bootstrapPinPath -Raw | ConvertFrom-Json
+        if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "invalid pin metadata" }
+        $pinnedManifestPath = Join-Path $pinScratch "platform-release.json"
+        $pinnedSignaturePath = Join-Path $pinScratch "platform-release.json.sig"
+        [IO.File]::WriteAllBytes($pinnedManifestPath, [Convert]::FromBase64String([string]$pin.manifest_base64))
+        [IO.File]::WriteAllBytes($pinnedSignaturePath, [Convert]::FromBase64String([string]$pin.signature_base64))
+        & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $pinnedManifestPath -SignaturePath $pinnedSignaturePath | Out-Null
+        $pinnedManifest = Get-Content -LiteralPath $pinnedManifestPath -Raw | ConvertFrom-Json
+        $actualPinnedDigest = Get-SHA256File $pinnedManifestPath
+        $contractInput = Join-Path $pinScratch "platform-contract.input.json"
+        $contractCanonical = Join-Path $pinScratch "platform-contract.canonical.json"
+        [IO.File]::WriteAllText($contractInput, ($pinnedManifest.platform_setup_contract | ConvertTo-Json -Depth 20 -Compress), (New-Object Text.UTF8Encoding($false)))
+        $actualContractDigest = (& (Join-Path $PSScriptRoot "convert-to-setup-canonical-json.ps1") -InputPath $contractInput -OutputPath $contractCanonical | Select-Object -Last 1).Trim()
+        $workflowPins = @($pinnedManifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" })
+        if ($actualPinnedDigest -cne [string]$pin.release_manifest_digest_sha256 -or [string]$pinnedManifest.release.version -cne [string]$pin.release_version -or $actualContractDigest -cne [string]$pin.platform_setup_contract_digest_sha256 -or $workflowPins.Count -ne 1 -or [string]$workflowPins[0].sha256 -cne [string]$pin.workflow_cli_sha256) { throw "pin identity differs from its verified manifest" }
+        $platform = [ordered]@{ installation_recorded = $true; version = [string]$pin.release_version; release_manifest_digest = $actualPinnedDigest; platform_setup_contract_digest = $actualContractDigest; workflow_cli_sha256 = [string]$pin.workflow_cli_sha256 }
+        $bootstrapPinLoaded = $true
+    } catch {
+        throw "Bootstrap Platform Release pin is invalid: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $pinScratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 $githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; login = ""; owner = ""; scopes = @(); fingerprint_sha256 = "" }
 $codexAuth = [ordered]@{ verified = $false; source = ""; fingerprint_sha256 = "" }
 if ($codex.installed) {
@@ -135,7 +164,9 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
         try {
             $inspectionJSON = $inspection.output | ConvertFrom-Json
             if ($null -ne $inspectionJSON.result) {
-                $platform = $inspectionJSON.result.platform
+                $inspectedPlatform = $inspectionJSON.result.platform
+                if ($bootstrapPinLoaded -and (-not [bool]$inspectedPlatform.installation_recorded -or [string]$inspectedPlatform.version -cne [string]$platform.version -or [string]$inspectedPlatform.release_manifest_digest -cne [string]$platform.release_manifest_digest)) { throw "installed Workflow CLI state differs from the verified Bootstrap Platform Release pin" }
+                $platform = $inspectedPlatform
                 $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
                 $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
                 $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified

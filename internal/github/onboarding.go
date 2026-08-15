@@ -245,6 +245,13 @@ func (c *Client) CreateRepository(ctx context.Context, owner, authenticatedLogin
 	if strings.TrimSpace(name) == "" || strings.Contains(name, "/") {
 		return result, errors.New("repository name is invalid")
 	}
+	repository := owner + "/" + name
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return result, err
+	}
+	if c.OnboardingLogin == "" || !strings.EqualFold(authenticatedLogin, c.OnboardingLogin) {
+		return result, errors.New("GitHub repository creation login differs from the approved verified identity")
+	}
 	path := "/user/repos"
 	if !strings.EqualFold(owner, authenticatedLogin) {
 		path = "/orgs/" + url.PathEscape(owner) + "/repos"
@@ -350,6 +357,9 @@ func (c *Client) PreflightCreateRepository(ctx context.Context, owner, authentic
 	return nil
 }
 func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string, issues, actions bool, allowedActions string) error {
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -367,6 +377,9 @@ func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string
 	return nil
 }
 func (c *Client) CreateLabel(ctx context.Context, repository string, label ManagedLabel) error {
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -376,6 +389,9 @@ func (c *Client) CreateLabel(ctx context.Context, repository string, label Manag
 	return c.RequestJSON(ctx, http.MethodPost, "/repos/"+repository+"/labels", label, nil)
 }
 func (c *Client) UpdateLabel(ctx context.Context, repository, current string, label ManagedLabel) error {
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -383,6 +399,9 @@ func (c *Client) UpdateLabel(ctx context.Context, repository, current string, la
 }
 func (c *Client) CreateOnboardingPullRequest(ctx context.Context, repository string, value PullRequestCreate) (OnboardingPullRequest, error) {
 	var result OnboardingPullRequest
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return result, err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return result, err
 	}
@@ -427,6 +446,9 @@ func (c *Client) OnboardingPullRequestReviews(ctx context.Context, repository st
 }
 func (c *Client) MergeOnboardingPullRequest(ctx context.Context, repository string, number int64, expectedHead, method string) (MergeResult, error) {
 	var result MergeResult
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return result, err
+	}
 	if !fullCommitID(expectedHead) {
 		return result, errors.New("expected pull request head must be a full commit")
 	}
@@ -445,6 +467,9 @@ func (c *Client) MergeOnboardingPullRequest(ctx context.Context, repository stri
 	return result, nil
 }
 func (c *Client) DeleteBranch(ctx context.Context, repository, branch string) error {
+	if err := c.validateOnboardingMutationRepository(repository); err != nil {
+		return err
+	}
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}

@@ -37,7 +37,7 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner")
+	client := NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo")
 	policy, err := client.DiscoverPolicy(context.Background(), "owner/repo", "main")
 	if err != nil || policy.ActionsAllowed != "selected" || !policy.GitHubOwnedActionsAllowed {
 		t.Fatalf("policy=%#v err=%v", policy, err)
@@ -47,6 +47,35 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 	}
 	if update["allowed_actions"] != "selected" {
 		t.Fatalf("Actions update = %#v", update)
+	}
+}
+
+func TestOnboardingMutationClientRejectsAnotherRepositoryAndLoginBeforeNetwork(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	client := NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "alice", "owner/repo")
+	errorsFound := []error{}
+	_, err := client.CreateRepository(context.Background(), "owner", "mallory", "repo", true)
+	errorsFound = append(errorsFound, err)
+	_, err = client.CreateRepository(context.Background(), "owner", "alice", "other", true)
+	errorsFound = append(errorsFound, err)
+	errorsFound = append(errorsFound,
+		client.UpdateRepositoryFeatures(context.Background(), "owner/other", true, true, "all"),
+		client.CreateLabel(context.Background(), "owner/other", ManagedLabel{Name: "workflow:plan", Color: "ffffff"}),
+		client.UpdateLabel(context.Background(), "owner/other", "workflow:plan", ManagedLabel{Name: "workflow:plan", Color: "ffffff"}),
+	)
+	_, err = client.CreateOnboardingPullRequest(context.Background(), "owner/other", PullRequestCreate{Title: "onboard", Head: "head", Base: "main"})
+	errorsFound = append(errorsFound, err)
+	_, err = client.MergeOnboardingPullRequest(context.Background(), "owner/other", 7, strings.Repeat("a", 40), "squash")
+	errorsFound = append(errorsFound, err, client.DeleteBranch(context.Background(), "owner/other", "branch"))
+	for index, err := range errorsFound {
+		if err == nil {
+			t.Fatalf("mutation %d accepted an unapproved identity", index)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("unapproved onboarding mutations reached GitHub: %d requests", requests)
 	}
 }
 
@@ -197,7 +226,7 @@ func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner")
+	client := NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo")
 	repo, err := client.CreateRepository(context.Background(), "owner", "owner", "repo", true)
 	if err != nil || repo.FullName != "owner/repo" {
 		t.Fatalf("repo=%#v %v", repo, err)

@@ -23,17 +23,18 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    Require the already-approved classic PAT scopes `repo,workflow` for a personal owner. Organization ownership remains supported in the design but must stop with `requires an approved organization scope contract` until that additional credential contract is explicitly approved; do not infer or request extra scopes. Pass the verifier's `owner_type` unchanged as `-GitHubOwnerType <personal|organization>` to the bootstrap planner.
 2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. When no verified credential exists, ask for the classic PAT and pipe it to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`. A personal owner must verify personal identity, exact `repo,workflow` scopes, repository access or absence, Actions checkout feasibility, and review/merge-queue policy read-only. An organization owner stops pending the approved organization scope contract. If any fact cannot be proved, stop before producing a Platform Bootstrap Plan. Never fall back to another owner after rejection.
 
-   Resolve the trusted Platform Release automatically. Do not accept release paths or URLs from the user or an unverified manifest. Add upgrade arguments only when the user explicitly requested an upgrade, and bind them to the exact confirmed version:
+   Resolve the trusted Platform Release automatically. Do not accept release paths or URLs from the user or an unverified manifest. A fresh host may either use the default latest stable release or the user's explicitly confirmed exact version. `AllowUpgrade` is only for an installed lower version moving to a higher exact version:
 
    ```powershell
    $releaseArguments = @{ HostFactsPath = $hostFactsPath }
-   # Add these two entries only when the user explicitly requested this exact upgrade version:
-   $releaseArguments.Version = <confirmed-upgrade-version>
+   # On a fresh host, add Version alone only when the user explicitly selected an exact version:
+   $releaseArguments.Version = <confirmed-version>
+   # Add AllowUpgrade only when an installed lower version is explicitly moving to that higher version:
    $releaseArguments.AllowUpgrade = $true
    $resolvedRelease = & scripts/resolve-platform-release.ps1 @releaseArguments | ConvertFrom-Json
    ```
 
-   Omit the two upgrade entries for a fresh installation or repair. The resolver selects latest stable only when fresh, otherwise restores the exact durable pin; it verifies the packaged trust policy, pinned public key, fixed GitHub Release assets, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
+   Omit `Version` for a fresh latest-stable installation and omit both entries for an exact repair. The resolver restores the exact durable pin for repairs; it verifies the packaged trust policy, pinned public key, immutable fixed GitHub Release assets, source commit, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
 
    Produce the Platform Plan only from the resolver output:
 

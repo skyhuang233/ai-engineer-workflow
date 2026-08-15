@@ -6,9 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)][string]$GitHubOwner,
     [ValidateSet("", "personal", "organization")][string]$GitHubOwnerType = "",
-    [switch]$AllowUpgrade,
-    [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
-    [string]$PublicKeyPath = ""
+    [switch]$AllowUpgrade
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,13 +17,7 @@ function Get-SHA256Hex([byte[]]$Bytes) {
 function Get-SHA256File([string]$Path) {
     return Get-SHA256Hex ([IO.File]::ReadAllBytes($Path))
 }
-$verificationArguments = @{
-    ManifestPath = $ManifestPath
-    SignaturePath = $SignaturePath
-    PolicyPath = $PolicyPath
-}
-if (-not [string]::IsNullOrWhiteSpace($PublicKeyPath)) { $verificationArguments.PublicKeyPath = $PublicKeyPath }
-& (Join-Path $PSScriptRoot "verify-platform-release.ps1") @verificationArguments | Out-Null
+& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath -SignaturePath $SignaturePath | Out-Null
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
@@ -151,12 +143,14 @@ if ([string]::IsNullOrWhiteSpace($effectiveOwnerType) -and -not [string]::IsNull
 }
 if ([string]::IsNullOrWhiteSpace($effectiveOwnerType)) { throw "GitHubOwnerType must come from the read-only PAT owner verification before Platform planning" }
 $requiredCredentialScopes = @(& (Join-Path $PSScriptRoot "resolve-github-required-scopes.ps1") -OwnerType $effectiveOwnerType)
+$expectedCredentialPath = [IO.Path]::GetFullPath((Join-Path ([string]$facts.workflow_home) ([string]$manifest.platform_setup_contract.credential.plaintext_relative_path)))
+if (-not [string]::Equals([IO.Path]::GetFullPath([string]$facts.github_credential.path), $expectedCredentialPath, [StringComparison]::OrdinalIgnoreCase)) { throw "Host facts GitHub credential path differs from the signed Platform Setup Contract" }
 $credentialScopesMatch = @($requiredCredentialScopes | Where-Object { $observedScopes -notcontains $_ }).Count -eq 0
 $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $credentialScopesMatch)
 if (-not $credentialCurrent) {
     if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
-    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner; required_scopes = ($requiredCredentialScopes -join ",") })) })
+    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $expectedCredentialPath; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner; required_scopes = ($requiredCredentialScopes -join ",") })) })
 }
 $platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256 -and [string]$facts.platform.release_bundled_files_digest -eq $releaseBundledFilesDigest -and [string]$facts.platform.release_bundled_files_json -eq $releaseBundledFilesJSON)
 $controlPlaneAuthorizationCurrent = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.control_plane_plan_digest_sha256) -and [string]$facts.platform.control_plane_plan_digest_sha256 -eq [string]$facts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256)

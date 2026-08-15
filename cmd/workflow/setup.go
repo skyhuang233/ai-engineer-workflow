@@ -451,7 +451,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 		if tokenErr != nil {
 			return tokenErr
 		}
-		adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+		adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
 		adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
 	}
 	engine := setupengine.Engine{Adapter: adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {

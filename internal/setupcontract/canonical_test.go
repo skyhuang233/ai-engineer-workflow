@@ -74,6 +74,7 @@ func TestParsePlanRejectsKindSpecificEffectParameterDrift(t *testing.T) {
 		{"platform CLI missing checksum", Effect{ID: "cli", Kind: "platform_cli", Subject: `C:\Workflow\bin\workflow.exe`, Action: "install", Parameters: map[string]string{"version": "1.0.0"}}},
 		{"Docker unknown parameter", Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "install", Parameters: map[string]string{"version": "4.45.0", "installer_url": "https://example.test/docker.exe", "windows_amd64_sha256": strings.Repeat("a", 64), "surprise": "true"}}},
 		{"PAT invalid input contract", Effect{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "argument", "owner": "owner"}}},
+		{"PAT endpoint override", Effect{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "owner", "required_scopes": "repo,workflow", "api_base": "https://evil.example"}}},
 		{"platform record lacks contract digest", Effect{ID: "record", Kind: "platform_installation", Subject: `C:\Workflow`, Action: "record", Parameters: map[string]string{"version": "1.0.0", "release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_json": `{}`, "workflow_cli_sha256": strings.Repeat("b", 64)}}},
 		{"unknown effect kind", Effect{ID: "unknown", Kind: "surprise", Subject: "target", Action: "mutate", Parameters: map[string]string{}}},
 	}
@@ -123,6 +124,38 @@ func TestValidateCreateRepositoryEffectBindsApprovalAbsenceIdentity(t *testing.T
 	}}
 	if err := ValidateEffectForExecution(effect); err == nil || !strings.Contains(err.Error(), "approval-time absence") {
 		t.Fatalf("mismatched approval absence accepted: %v", err)
+	}
+}
+
+func TestRepositoryOnboardingPlanRejectsCrossRepositoryEffects(t *testing.T) {
+	base := Plan{
+		SchemaVersion: 1, PlanID: "identity-fence", Kind: RepositoryOnboarding,
+		Target:        Target{WorkflowHome: `C:\Workflow`, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"},
+		Preconditions: []Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: strings.Repeat("a", 40)}},
+		Effects: []Effect{
+			{ID: "label", Kind: "github_label", Subject: "owner/repo#workflow:plan", Action: "reconcile", Parameters: map[string]string{"name": "workflow:plan", "color": "ffffff", "description": "plan"}},
+			{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": strings.Repeat("b", 64), "contract_version": "1"}},
+		},
+		ExpectedResults: []ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: strings.Repeat("b", 64)}},
+	}
+	for name, mutate := range map[string]func(*Plan){
+		"label targets another repository": func(p *Plan) { p.Effects[0].Subject = "owner/other#workflow:plan" },
+		"admission targets another repository": func(p *Plan) {
+			p.Effects[1].Subject = "owner/other"
+			p.ExpectedResults[0].Subject = "owner/other"
+		},
+		"target is absent": func(p *Plan) { p.Target.GitHubRepository = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan := base
+			plan.Effects = append([]Effect(nil), base.Effects...)
+			plan.ExpectedResults = append([]ExpectedResult(nil), base.ExpectedResults...)
+			mutate(&plan)
+			raw, _ := json.Marshal(plan)
+			if _, _, _, err := ParsePlan(raw); err == nil {
+				t.Fatalf("accepted cross-repository onboarding plan: %#v", plan)
+			}
+		})
 	}
 }
 

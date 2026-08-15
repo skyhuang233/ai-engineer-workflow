@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -39,6 +42,8 @@ type repositoryCreateAttemptAdapter struct {
 	private      bool
 	created      bool
 	startedSeen  bool
+	applyErr     error
+	applyCalls   int
 }
 
 func (a *repositoryCreateAttemptAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -68,7 +73,13 @@ func (a *repositoryCreateAttemptAdapter) Apply(ctx context.Context, effect setup
 		return errors.Join(readErr, closeErr)
 	}
 	a.startedSeen = len(events) == 1 && events[0].Event == store.RepositoryCreateStarted && events[0].PlanDigestSHA256 == a.digest && events[0].ApprovalAbsentRepository == a.repository && events[0].Private == a.private
-	return context.DeadlineExceeded
+	a.applyCalls++
+	if a.applyErr != nil {
+		return a.applyErr
+	}
+	a.created = true
+	a.states[effect.ID] = setupcontract.EffectSatisfied
+	return nil
 }
 
 func (a *repositoryCreateAttemptAdapter) RestoreRepositoryCreateAttemptEvents(effect setupcontract.Effect, events []store.SetupRepositoryCreateAttemptEvent) error {
@@ -187,6 +198,21 @@ func passingExpectedResultVerifier(context.Context, setupcontract.Plan, setupcon
 
 func passingPlatformPreconditionVerifier(context.Context, setupcontract.Plan) error { return nil }
 
+func recordVerifiedOnboardingIdentity(t *testing.T, layout workflowhome.Layout, owner, login string) {
+	t.Helper()
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.RecordGitHubPATVerification(context.Background(), store.GitHubPATVerification{FingerprintSHA256: repeat("a", 64), Login: login, UserID: 1, Owner: owner, Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: testTime()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEngineRestoresDurableEffectEvidenceBeforeRetryReadback(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
@@ -222,6 +248,7 @@ func TestEnginePersistsRepositoryCreateIntentBeforeUnknownExternalOutcomeAndRest
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordVerifiedOnboardingIdentity(t, layout, "owner", "owner")
 	repositoryPath := filepath.Join(t.TempDir(), "repository")
 	plan := setupcontract.Plan{
 		SchemaVersion: 1, PlanID: "create-uncertain", Kind: setupcontract.RepositoryOnboarding,
@@ -241,6 +268,7 @@ func TestEnginePersistsRepositoryCreateIntentBeforeUnknownExternalOutcomeAndRest
 	adapter := &repositoryCreateAttemptAdapter{
 		fakeAdapter:  &fakeAdapter{states: map[string]setupcontract.EffectStatus{"admit": setupcontract.EffectSatisfied}},
 		databasePath: filepath.Join(layout.State, "workflow.db"), planID: plan.PlanID, digest: digest, repository: "owner/repo", private: true,
+		applyErr: context.DeadlineExceeded,
 	}
 	engine := Engine{Adapter: adapter, ResolveCodexAuth: func(context.Context) (string, error) { return filepath.Join(t.TempDir(), "auth.json"), nil }}
 	first, err := engine.Apply(ctx, raw, digest)
@@ -258,6 +286,56 @@ func TestEnginePersistsRepositoryCreateIntentBeforeUnknownExternalOutcomeAndRest
 	}
 }
 
+func TestEngineResumesCreateAfterCrashImmediatelyFollowingStartedEvidence(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+	if err != nil || layout.Ensure() != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(t.TempDir(), "repository")
+	plan := setupcontract.Plan{
+		SchemaVersion: 1, PlanID: "create-crash-after-started", Kind: setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: repositoryPath, GitHubRepository: "owner/repo"},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: repositoryPath, Expected: "ok"}},
+		Effects: []setupcontract.Effect{
+			{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}},
+			{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
+		},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("b", 64)}},
+	}
+	raw, _ := json.Marshal(plan)
+	_, canonical, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(layout.State, "workflow.db")
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := testTime()
+	if err := database.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: plan.PlanID, Kind: string(plan.Kind), SchemaVersion: plan.SchemaVersion, Target: plan.Target.RepositoryPath, DigestSHA256: digest, CanonicalJSON: string(canonical), Projection: Project(plan, digest), CreatedAt: now}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.AppendSetupRepositoryCreateAttemptEvent(ctx, store.SetupRepositoryCreateAttemptEvent{PlanID: plan.PlanID, PlanDigestSHA256: digest, EffectID: "create-repository", ExecutionAttempt: 1, Event: store.RepositoryCreateStarted, Owner: "owner", Name: "repo", Private: true, ApprovalAbsentRepository: "owner/repo", RecordedAt: now}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: repeat("a", 64), Login: "owner", UserID: 1, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: now}); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &repositoryCreateAttemptAdapter{fakeAdapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{"admit": setupcontract.EffectSatisfied}}, databasePath: databasePath, planID: plan.PlanID, digest: digest, repository: "owner/repo", private: true}
+	result, err := (&Engine{Adapter: adapter, Now: func() time.Time { return now.Add(time.Minute) }, ResolveCodexAuth: func(context.Context) (string, error) { return filepath.Join(t.TempDir(), "auth.json"), nil }}).Apply(ctx, raw, digest)
+	if err != nil || result.Status != setupcontract.ExecutionSucceeded || adapter.applyCalls != 1 {
+		t.Fatalf("crash-after-started resume result=%#v err=%v applyCalls=%d", result, err, adapter.applyCalls)
+	}
+}
+
 func TestEngineRejectsDigestBeforeMutation(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "WorkflowHome")
 	plan := testPlan(home)
@@ -272,12 +350,67 @@ func TestEngineRejectsDigestBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestEngineRejectsOnboardingIdentityDriftBeforeGitHubMutation(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		persistedOwner     string
+		persistedLogin     string
+		authenticatedLogin string
+	}{
+		{name: "target owner differs", persistedOwner: "attacker", persistedLogin: "alice", authenticatedLogin: "alice"},
+		{name: "repository creator login differs", persistedOwner: "owner", persistedLogin: "alice", authenticatedLogin: "mallory"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+			if err != nil || layout.Ensure() != nil {
+				t.Fatal(err)
+			}
+			database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: repeat("a", 64), Login: test.persistedLogin, UserID: 1, Owner: test.persistedOwner, Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: testTime()}); err != nil {
+				database.Close()
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+			defer server.Close()
+			plan := setupcontract.Plan{
+				SchemaVersion: 1, PlanID: "identity-drift", Kind: setupcontract.RepositoryOnboarding,
+				Target:        setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"},
+				Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: "ok"}},
+				Effects: []setupcontract.Effect{
+					{ID: "create", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": test.authenticatedLogin, "name": "repo", "private": "true", "approval_absent_repository": "owner/repo"}},
+					{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
+				},
+				ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: repeat("b", 64)}},
+			}
+			raw, _ := json.Marshal(plan)
+			_, _, digest, err := setupcontract.ParsePlan(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter := HostAdapter{Layout: layout, GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), CreatedRepositories: map[string]bool{}}
+			result, applyErr := (&Engine{Adapter: adapter}).Apply(ctx, raw, digest)
+			if applyErr == nil || result.Status != "" || requests != 0 {
+				t.Fatalf("identity drift reached mutation: result=%#v err=%v requests=%d", result, applyErr, requests)
+			}
+		})
+	}
+}
+
 func TestEngineRecordsAndRepairsRepositoryRuntimeConfiguration(t *testing.T) {
 	ctx := context.Background()
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordVerifiedOnboardingIdentity(t, layout, "owner", "owner")
 	repositoryPath := filepath.Join(t.TempDir(), "repository")
 	plan := setupcontract.Plan{
 		SchemaVersion: 1, PlanID: "onboarding", Kind: setupcontract.RepositoryOnboarding,
@@ -526,6 +659,7 @@ func TestIncompleteOnboardingNeverLeavesEligibleAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordVerifiedOnboardingIdentity(t, layout, "owner", "owner")
 	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "incomplete-onboarding", Kind: setupcontract.RepositoryOnboarding, Target: setupcontract.Target{WorkflowHome: layout.Root, RepositoryPath: `C:\repo`, GitHubRepository: "owner/repo"}, Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: `C:\repo`, Expected: "ok"}}, Effects: []setupcontract.Effect{
 		{ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record", Parameters: map[string]string{"default_branch": "main", "manifest_digest": repeat("b", 64), "contract_version": "1"}},
 		{ID: "later", Kind: "github_label", Subject: "owner/repo#later", Action: "reconcile", Parameters: map[string]string{"name": "later", "color": "ffffff", "description": "later"}},

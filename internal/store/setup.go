@@ -141,13 +141,12 @@ func (s *Store) AppendSetupRepositoryCreateAttemptEvent(ctx context.Context, val
 	}
 	var existing SetupRepositoryCreateAttemptEvent
 	var existingPrivate int
-	var existingRecordedAt string
-	err = s.db.QueryRowContext(ctx, `SELECT plan_digest_sha256,owner,name,private,approval_absent_repository,recorded_at FROM setup_repository_create_attempt_events WHERE plan_id=? AND effect_id=? AND execution_attempt=? AND event=?`,
-		value.PlanID, value.EffectID, value.ExecutionAttempt, string(value.Event)).Scan(&existing.PlanDigestSHA256, &existing.Owner, &existing.Name, &existingPrivate, &existing.ApprovalAbsentRepository, &existingRecordedAt)
+	err = s.db.QueryRowContext(ctx, `SELECT plan_digest_sha256,owner,name,private,approval_absent_repository FROM setup_repository_create_attempt_events WHERE plan_id=? AND effect_id=? AND execution_attempt=? AND event=?`,
+		value.PlanID, value.EffectID, value.ExecutionAttempt, string(value.Event)).Scan(&existing.PlanDigestSHA256, &existing.Owner, &existing.Name, &existingPrivate, &existing.ApprovalAbsentRepository)
 	if err != nil {
 		return err
 	}
-	if existing.PlanDigestSHA256 != value.PlanDigestSHA256 || existing.Owner != value.Owner || existing.Name != value.Name || (existingPrivate == 1) != value.Private || existing.ApprovalAbsentRepository != value.ApprovalAbsentRepository || existingRecordedAt != formatTimestamp(value.RecordedAt) {
+	if existing.PlanDigestSHA256 != value.PlanDigestSHA256 || existing.Owner != value.Owner || existing.Name != value.Name || (existingPrivate == 1) != value.Private || existing.ApprovalAbsentRepository != value.ApprovalAbsentRepository {
 		return ErrSetupPlanConflict
 	}
 	return nil

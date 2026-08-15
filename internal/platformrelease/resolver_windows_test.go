@@ -65,6 +65,39 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 	}
 }
 
+func TestResolvePlatformReleaseAllowsFreshInstallToSelectExactVersionWithoutUpgradeAuthorization(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "1.2.3", false)
+	if runErr != nil {
+		t.Fatalf("resolve selected fresh version: %v\n%s", runErr, output)
+	}
+	var result struct {
+		Selection      string `json:"selection"`
+		ReleaseVersion string `json:"release_version"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode resolver output: %v\n%s", err, output)
+	}
+	if result.Selection != "explicit-version" || result.ReleaseVersion != "1.2.3" {
+		t.Fatalf("unexpected resolver result: %#v", result)
+	}
+	requests, err := os.ReadFile(fixture.requestLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMetadataURL := "https://api.github.com/repos/owner/platform/releases/tags/platform-v1.2.3"
+	if !strings.Contains(string(requests), wantMetadataURL) || strings.Contains(string(requests), "/releases/latest") {
+		t.Fatalf("fresh exact selection did not resolve the requested immutable tag: %q", requests)
+	}
+}
+
 func TestResolvePlatformReleaseEnforcesDurableVersionTransitions(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {
@@ -155,6 +188,53 @@ func TestResolvePlatformReleaseFailsClosedBeforeOutputForMissingKeyOrInvalidCont
 	})
 }
 
+func TestResolvePlatformReleaseRejectsMutableGitHubReleaseMetadata(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+	metadata := resolverMetadata(t, fixture)
+	metadata["immutable"] = false
+	writeResolverJSON(t, fixture.metadataPath, metadata)
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr == nil || !strings.Contains(output, "GitHub Release is not immutable") || strings.Contains(output, `"manifest_path"`) {
+		t.Fatalf("mutable release did not fail closed before emitting paths: err=%v output=%s", runErr, output)
+	}
+}
+
+func TestResolvePlatformReleaseBindsGitHubReleaseTargetToSignedManifestCommit(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "different commit", mutate: func(metadata map[string]any) { metadata["target_commitish"] = strings.Repeat("b", 40) }},
+		{name: "missing commit", mutate: func(metadata map[string]any) { delete(metadata, "target_commitish") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResolverFixture(t, "1.2.3")
+			factsPath := filepath.Join(fixture.directory, "host-facts.json")
+			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+			metadata := resolverMetadata(t, fixture)
+			test.mutate(metadata)
+			writeResolverJSON(t, fixture.metadataPath, metadata)
+
+			output, runErr := fixture.run(t, powershell, factsPath, "", false)
+			if runErr == nil || !strings.Contains(output, "target commit does not match the verified Platform Release manifest") || strings.Contains(output, `"manifest_path"`) {
+				t.Fatalf("unbound release target did not fail closed before emitting paths: err=%v output=%s", runErr, output)
+			}
+		})
+	}
+}
+
 type resolverFixture struct {
 	directory     string
 	scriptPath    string
@@ -225,9 +305,31 @@ func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*M
 	writeResolverFile(t, fixture.publicKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
 	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": "owner/platform", "workflow_path": manifest.Provenance.WorkflowPath, "key_id": manifest.Signature.KeyID, "signature_algorithm": manifest.Signature.Algorithm, "minimum_platform_version": "0.0.0", "public_key_file": filepath.Base(fixture.publicKeyPath)})
 	writeResolverFile(t, fixture.policyPath, policy)
-	metadata, _ := json.Marshal(map[string]any{"tag_name": manifest.Release.Tag, "draft": false, "prerelease": false, "assets": []map[string]string{{"name": "platform-release.json", "browser_download_url": "https://evil.example/manifest"}, {"name": "platform-release.json.sig", "browser_download_url": "https://evil.example/signature"}}})
+	metadata, _ := json.Marshal(map[string]any{"tag_name": manifest.Release.Tag, "draft": false, "prerelease": false, "immutable": true, "target_commitish": manifest.Release.SourceCommit, "assets": []map[string]string{{"name": "platform-release.json", "browser_download_url": "https://evil.example/manifest"}, {"name": "platform-release.json.sig", "browser_download_url": "https://evil.example/signature"}}})
 	writeResolverFile(t, fixture.metadataPath, metadata)
 	return fixture
+}
+
+func resolverMetadata(t *testing.T, fixture resolverFixture) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(fixture.metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	return metadata
+}
+
+func writeResolverJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeResolverFile(t, path, raw)
 }
 
 func (fixture resolverFixture) run(t *testing.T, powershell, factsPath, version string, allowUpgrade bool) (string, error) {

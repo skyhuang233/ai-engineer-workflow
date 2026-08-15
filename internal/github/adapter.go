@@ -22,10 +22,12 @@ const apiVersion = "2022-11-28"
 var ErrRepositoryOwnerMismatch = errors.New("repository owner does not match configured owner")
 
 type Client struct {
-	BaseURL         string
-	Token           string
-	HTTP            *http.Client
-	RepositoryOwner string
+	BaseURL          string
+	Token            string
+	HTTP             *http.Client
+	RepositoryOwner  string
+	OnboardingLogin  string
+	OnboardingTarget string
 }
 
 type RepositoryMetadata struct {
@@ -307,6 +309,28 @@ func (c *Client) WithRepositoryOwner(owner string) *Client {
 	configured := *c
 	configured.RepositoryOwner = strings.TrimSpace(owner)
 	return &configured
+}
+
+// WithOnboardingIdentity narrows the mutation surface to one approved
+// repository and the verified human login that authorized its creation.
+func (c *Client) WithOnboardingIdentity(owner, login, repository string) *Client {
+	configured := *c.WithRepositoryOwner(owner)
+	configured.OnboardingLogin = strings.TrimSpace(login)
+	configured.OnboardingTarget = strings.TrimSpace(repository)
+	return &configured
+}
+
+func (c *Client) validateOnboardingMutationRepository(repository string) error {
+	if err := ValidateOwnerGuardedRepositoryName(repository, c.RepositoryOwner); err != nil {
+		return err
+	}
+	if c.OnboardingTarget == "" {
+		return errors.New("GitHub onboarding mutation requires one approved repository target")
+	}
+	if !strings.EqualFold(repository, c.OnboardingTarget) {
+		return errors.New("GitHub onboarding mutation targets a repository outside the approved Setup Plan")
+	}
+	return nil
 }
 
 func (c *Client) RequireOwnerGuardedRepository(ctx context.Context, repository string) error {

@@ -2,9 +2,7 @@ package setup
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -725,12 +723,11 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 		if actual.Name == expected.Branch && actual.Head == expected.Head {
 			return nil
 		}
-		// A retry after this plan's pull request merged is allowed to resume;
-		// the effect readbacks still verify every managed resource exactly.
-		if actual.Name == expected.Branch && expected.ManifestDigest != "" {
-			manifest, readErr := a.GitHub.RepositoryFile(ctx, value.Subject, repositorycontract.ManifestPath, expected.Branch)
-			sum := sha256.Sum256(manifest)
-			if readErr == nil && hex.EncodeToString(sum[:]) == expected.ManifestDigest {
+		// Only this plan's durable merge result may authorize the exact
+		// post-approval default HEAD. Matching managed content alone is not
+		// evidence that this plan caused the transition.
+		for _, mergeHead := range a.OnboardingMergeHeads {
+			if actual.Name == expected.Branch && fullSetupCommitID(mergeHead) && actual.Head == mergeHead {
 				return nil
 			}
 		}

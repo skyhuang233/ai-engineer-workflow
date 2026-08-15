@@ -74,10 +74,10 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	})
 	write(policyPath, policy)
 
-	_, currentFile, _, _ := runtime.Caller(0)
-	script := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts", "verify-platform-release.ps1"))
+	scriptRoot := copyBootstrapSkillForTest(t, directory, policy, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+	script := filepath.Join(scriptRoot, "verify-platform-release.ps1")
 	run := func(scriptPath string, extra ...string) (string, error) {
-		arguments := []string{"-NoProfile", "-File", scriptPath, "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath}
+		arguments := []string{"-NoProfile", "-File", scriptPath, "-ManifestPath", manifestPath, "-SignaturePath", signaturePath}
 		arguments = append(arguments, extra...)
 		output, err := exec.Command(pwsh, arguments...).CombinedOutput()
 		return string(output), err
@@ -400,4 +400,58 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	if err == nil || !strings.Contains(output, "Platform Release signature") {
 		t.Fatalf("tampered signature was not rejected before plan/download: %q, %v", output, err)
 	}
+}
+
+func TestBootstrapProductionScriptsExposeNoTrustPathOverridesOnPowerShell51(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	_, currentFile, _, _ := runtime.Caller(0)
+	scriptRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts"))
+	for _, name := range []string{"verify-platform-release.ps1", "new-platform-bootstrap-plan.ps1", "install-workflow-cli.ps1"} {
+		t.Run(name, func(t *testing.T) {
+			command := exec.Command(powershell, "-NoProfile", "-Command", `$parameters = (Get-Command $env:WORKFLOW_TEST_SCRIPT).Parameters; if ($parameters.ContainsKey('PolicyPath') -or $parameters.ContainsKey('PublicKeyPath')) { throw 'production trust override is exposed' }`)
+			command.Env = append(os.Environ(), "WORKFLOW_TEST_SCRIPT="+filepath.Join(scriptRoot, name))
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("production script exposes a trust-path override: %v (%s)", err, output)
+			}
+		})
+	}
+}
+
+func copyBootstrapSkillForTest(t *testing.T, directory string, policy, publicKey []byte) string {
+	t.Helper()
+	_, currentFile, _, _ := runtime.Caller(0)
+	sourceRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow"))
+	targetRoot := filepath.Join(directory, "setup-agent-workflow")
+	if err := os.MkdirAll(filepath.Join(targetRoot, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(sourceRoot, "scripts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".ps1" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(sourceRoot, "scripts", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(targetRoot, "scripts", entry.Name()), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(targetRoot, "trust"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, "trust", "release-policy.json"), policy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, "trust", "platform-release-public-key.pem"), publicKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(targetRoot, "scripts")
 }

@@ -70,8 +70,13 @@ func TestRepositoryCreateAttemptEventsAreAppendOnlyAndPlanBound(t *testing.T) {
 	}
 	conflictingDuplicate := started
 	conflictingDuplicate.RecordedAt = now.Add(2 * time.Second)
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, conflictingDuplicate); err != nil {
+		t.Fatalf("idempotent duplicate event with another call timestamp = %v", err)
+	}
+	conflictingDuplicate.Name = "other"
+	conflictingDuplicate.ApprovalAbsentRepository = "owner/other"
 	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, conflictingDuplicate); !errors.Is(err, ErrSetupPlanConflict) {
-		t.Fatalf("duplicate event with another timestamp = %v", err)
+		t.Fatalf("duplicate event with another approved identity = %v", err)
 	}
 	events, err := db.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, started.EffectID)
 	if err != nil || len(events) != 2 || events[0].Event != RepositoryCreateStarted || events[1].Event != RepositoryCreateOutcomeUnknown {

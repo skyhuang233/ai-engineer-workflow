@@ -45,8 +45,14 @@ $selection = "latest-stable"
 $selectedVersionText = $Version.Trim()
 
 if (-not $installed) {
-    Assert-ReleaseResolver ([string]::IsNullOrWhiteSpace($selectedVersionText) -and -not $AllowUpgrade) "A fresh installation resolves only the official latest stable Platform Release"
-    $releaseAPI = "https://api.github.com/repos/$repository/releases/latest"
+    Assert-ReleaseResolver (-not $AllowUpgrade) "AllowUpgrade applies only when upgrading an existing Platform Installation"
+    if ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
+        $releaseAPI = "https://api.github.com/repos/$repository/releases/latest"
+    } else {
+        Get-StableVersion $selectedVersionText "Requested Platform Release version" | Out-Null
+        $selection = "explicit-version"
+        $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
+    }
 } else {
     $durableVersionText = [string]$facts.platform.version
     $durableVersion = Get-StableVersion $durableVersionText "Durable Platform Installation version"
@@ -75,6 +81,7 @@ $headers = @{ Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "
 $releaseResponse = Invoke-WebRequest -Uri $releaseAPI -Headers $headers -UseBasicParsing
 $release = [string]$releaseResponse.Content | ConvertFrom-Json
 Assert-ReleaseResolver (-not [bool]$release.draft -and -not [bool]$release.prerelease) "Selected GitHub Release is not stable"
+Assert-ReleaseResolver ($release.immutable -is [bool] -and [bool]$release.immutable) "Selected GitHub Release is not immutable"
 $tag = [string]$release.tag_name
 Assert-ReleaseResolver ($tag -match '^platform-v(\d+\.\d+\.\d+)$') "Selected GitHub Release tag is not a stable Platform Release"
 $metadataVersionText = [string]$Matches[1]
@@ -95,12 +102,13 @@ try {
     Invoke-WebRequest -Uri "$downloadRoot/platform-release.json" -Headers $headers -OutFile $manifestPath -UseBasicParsing
     Invoke-WebRequest -Uri "$downloadRoot/platform-release.json.sig" -Headers $headers -OutFile $signaturePath -UseBasicParsing
 
-    $verificationArguments = @{ ManifestPath = $manifestPath; SignaturePath = $signaturePath; PolicyPath = $PolicyPath }
+    $verificationArguments = @{ ManifestPath = $manifestPath; SignaturePath = $signaturePath }
     & (Join-Path $PSScriptRoot "verify-platform-release.ps1") @verificationArguments | Out-Null
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $candidateVersionText = [string]$manifest.release.version
     $candidateVersion = Get-StableVersion $candidateVersionText "Verified Platform Release version"
     Assert-ReleaseResolver ([string]$manifest.release.tag -eq $tag -and $candidateVersionText -eq $metadataVersionText) "Verified Platform Release identity does not match the selected GitHub Release"
+    Assert-ReleaseResolver ([string]$release.target_commitish -ceq [string]$manifest.release.source_commit) "GitHub Release target commit does not match the verified Platform Release manifest"
     $manifestDigest = Get-SHA256File $manifestPath
 
     if ($installed) {

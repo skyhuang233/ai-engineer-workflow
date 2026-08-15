@@ -107,8 +107,7 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	write(publicKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
 	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": manifest.Release.Repository, "workflow_path": manifest.Provenance.WorkflowPath, "key_id": manifest.Signature.KeyID, "signature_algorithm": manifest.Signature.Algorithm, "minimum_platform_version": "0.0.0", "public_key_file": filepath.Base(publicKeyPath)})
 	write(policyPath, policy)
-	_, currentFile, _, _ := runtime.Caller(0)
-	scriptRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts"))
+	scriptRoot := copyBootstrapSkillForTest(t, directory, policy, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
 	workflowHome := filepath.Join(directory, "workflow-home")
 	hostFactsPath := filepath.Join(directory, "host-facts.json")
 	planPath := filepath.Join(directory, "platform-plan.json")
@@ -128,7 +127,7 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	}
 	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
-	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath)
+	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal")
 	planOutput, err := planCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh plan on powershell.exe: %v (%s)", err, planOutput)
@@ -141,7 +140,17 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	}
 	stdinCapture, argsCapture := filepath.Join(directory, "stdin.txt"), filepath.Join(directory, "args.txt")
 	token := "ghp_fresh_bootstrap_must_not_leak"
-	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST -PolicyPath $env:WORKFLOW_TEST_POLICY -PublicKeyPath $env:WORKFLOW_TEST_PUBLIC_KEY`
+	pinPath := filepath.Join(workflowHome, "config", "bootstrap-platform-release-pin.json")
+	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	failedDownload := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", failedDownloadWrapper)
+	failedDownload.Env = append(os.Environ(), "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
+	if failedOutput, failedErr := failedDownload.CombinedOutput(); failedErr == nil || !strings.Contains(string(failedOutput), "simulated archive download failure") {
+		t.Fatalf("simulated failed install was not observed: err=%v output=%s", failedErr, failedOutput)
+	}
+	if _, err := os.Stat(pinPath); !os.IsNotExist(err) {
+		t.Fatalf("failed download advanced the bootstrap release pin: %v", err)
+	}
+	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
 	installCommand.Stdin = bytes.NewBufferString(token + "\n")
 	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_PUBLIC_KEY="+publicKeyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture)
@@ -159,6 +168,46 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	args, err := os.ReadFile(argsCapture)
 	if err != nil || strings.Contains(string(args), token) || !strings.Contains(string(args), "setup\napply\n--plan") || !strings.Contains(string(args), "--approved-digest\n"+envelope.Digest) {
 		t.Fatalf("workflow setup apply args=%q err=%v", args, err)
+	}
+	if _, err := os.Stat(pinPath); err != nil {
+		t.Fatalf("bootstrap did not durably pin the approved release: %v", err)
+	}
+	inspectWrapper := `function Get-Acl { param([string]$LiteralPath) [pscustomobject]@{ Owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
+	inspectPinned := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
+	inspectPinned.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome)
+	pinnedOutput, err := inspectPinned.CombinedOutput()
+	var pinnedFacts struct {
+		Workflow struct {
+			Installed bool `json:"installed"`
+		} `json:"workflow"`
+		Platform struct {
+			InstallationRecorded  bool   `json:"installation_recorded"`
+			Version               string `json:"version"`
+			ReleaseManifestDigest string `json:"release_manifest_digest"`
+		} `json:"platform"`
+	}
+	manifestDigest := sha256.Sum256(raw)
+	if decodeErr := json.Unmarshal(pinnedOutput, &pinnedFacts); err != nil || decodeErr != nil || pinnedFacts.Workflow.Installed || !pinnedFacts.Platform.InstallationRecorded || pinnedFacts.Platform.Version != manifest.Release.Version || pinnedFacts.Platform.ReleaseManifestDigest != hex.EncodeToString(manifestDigest[:]) {
+		t.Fatalf("inspect did not preserve the exact release pin without workflow.exe: err=%v decode=%v output=%s", err, decodeErr, pinnedOutput)
+	}
+	pin, err := os.ReadFile(pinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinDocument map[string]any
+	if json.Unmarshal(pin, &pinDocument) != nil {
+		t.Fatal("bootstrap release pin is not JSON")
+	}
+	pinDocument["release_manifest_digest_sha256"] = strings.Repeat("0", 64)
+	tamperedPin, _ := json.Marshal(pinDocument)
+	if err := os.WriteFile(pinPath, tamperedPin, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tamperedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
+	tamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome)
+	tamperedOutput, tamperedErr := tamperedInspect.CombinedOutput()
+	if tamperedErr == nil || !strings.Contains(string(tamperedOutput), "Bootstrap Platform Release pin is invalid") {
+		t.Fatalf("tampered bootstrap pin did not fail closed: err=%v output=%s", tamperedErr, tamperedOutput)
 	}
 }
 
