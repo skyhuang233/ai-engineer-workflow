@@ -27,9 +27,17 @@ func (w GitWorkspace) Cleanup() error {
 	return os.RemoveAll(w.Root)
 }
 
-func PrepareOnboardingBranch(ctx context.Context, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential) (GitWorkspace, error) {
+func PrepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential) (GitWorkspace, error) {
 	if sourceURL == "" || !fullSHA.MatchString(baseCommit) || len(planDigest) < 12 || len(files) == 0 {
 		return GitWorkspace{}, errors.New("onboarding workspace inputs are incomplete")
+	}
+	cloneURL := sourceURL
+	if credential.Token != "" {
+		var err error
+		cloneURL, err = GitHubHTTPSURL(repository)
+		if err != nil {
+			return GitWorkspace{}, err
+		}
 	}
 	root, err := os.MkdirTemp(temporaryRoot, "workflow-onboarding-*")
 	if err != nil {
@@ -54,7 +62,7 @@ func PrepareOnboardingBranch(ctx context.Context, sourceURL, baseCommit, tempora
 		return strings.TrimSpace(string(output)), nil
 	}
 	clone := filepath.Join(root, "repository")
-	if _, err := run(root, "clone", "--no-checkout", "--origin", "origin", sourceURL, clone); err != nil {
+	if _, err := run(root, "clone", "--no-checkout", "--origin", "origin", cloneURL, clone); err != nil {
 		return GitWorkspace{}, err
 	}
 	if _, err := run(clone, "checkout", "--detach", baseCommit); err != nil {

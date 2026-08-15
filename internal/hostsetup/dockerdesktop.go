@@ -30,6 +30,9 @@ func EnsureDockerDesktop(ctx context.Context, contract DockerDesktopContract, ho
 		return err
 	}
 	if installed == contract.Version {
+		if err := host.Start(ctx); err != nil {
+			return err
+		}
 		return waitEngine(ctx, host, timeout)
 	}
 	if err := os.MkdirAll(temporaryRoot, 0o700); err != nil {

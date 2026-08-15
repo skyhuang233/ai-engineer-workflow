@@ -2,10 +2,57 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T) {
+	var update map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","has_issues":false,"permissions":{"admin":true},"allow_squash_merge":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":false,"allowed_actions":"selected"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/branches/main/protection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/rulesets":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/actions/permissions":
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner")
+	policy, err := client.DiscoverPolicy(context.Background(), "owner/repo", "main")
+	if err != nil || policy.ActionsAllowed != "selected" {
+		t.Fatalf("policy=%#v err=%v", policy, err)
+	}
+	if err := client.UpdateRepositoryFeatures(context.Background(), "owner/repo", true, true, policy.ActionsAllowed); err != nil {
+		t.Fatal(err)
+	}
+	if update["allowed_actions"] != "selected" {
+		t.Fatalf("Actions update = %#v", update)
+	}
+}
+
+func TestActionsEnablementRejectsUnplannedAllowedActions(t *testing.T) {
+	client := NewClient("https://api.github.test", "token", nil)
+	if err := client.UpdateRepositoryFeatures(context.Background(), "owner/repo", true, true, ""); err == nil {
+		t.Fatal("empty Actions policy was silently widened")
+	}
+}
 
 func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 	var requests []string

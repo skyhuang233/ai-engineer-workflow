@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -63,6 +64,84 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	}
 }
 
+func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "new-repo")
+	git(t, "", "init", "-b", "main", repo)
+	agents := []byte("# Existing instructions\n\nKeep this byte-for-byte.\n")
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), agents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var baseline, contract setupcontract.Effect
+	for _, effect := range plan.Effects {
+		switch effect.Kind {
+		case "initial_baseline":
+			baseline = effect
+		case "repository_contract_pr":
+			contract = effect
+		}
+	}
+	var snapshot []BaselineFile
+	if err := json.Unmarshal([]byte(baseline.Parameters["files_json"]), &snapshot); err != nil || len(snapshot) != 1 || snapshot[0].Path != "AGENTS.md" || snapshot[0].SHA256 == "" {
+		t.Fatalf("baseline snapshot = %#v, err=%v", snapshot, err)
+	}
+	var encoded map[string]string
+	if err := json.Unmarshal([]byte(contract.Parameters["files_json"]), &encoded); err != nil {
+		t.Fatal(err)
+	}
+	proposed, err := base64.StdEncoding.DecodeString(encoded["AGENTS.md"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(proposed), string(agents)) || !strings.Contains(string(proposed), ManagedBlockStart) {
+		t.Fatalf("proposed AGENTS.md did not preserve zero-commit bytes:\n%s", proposed)
+	}
+}
+
+func TestPlanUsesCanonicalHTTPSForSSHOriginAndBindsRemoteBase(t *testing.T) {
+	repo := newRepo(t)
+	git(t, repo, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	var resolvedURL string
+	remote := remoteHeadFunc(func(_ context.Context, value string) (string, string, error) {
+		resolvedURL = value
+		return "main", head, nil
+	})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: remote, PlatformReleaseDigest: repeatString("c", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedURL != "https://github.com/owner/repo.git" {
+		t.Fatalf("remote discovery URL = %q", resolvedURL)
+	}
+	if origin := testGitOutput(t, repo, "remote", "get-url", "origin"); origin != "git@github.com:owner/repo.git" {
+		t.Fatalf("SSH origin was rewritten to %q", origin)
+	}
+	var foundPrecondition bool
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind == "github_default_head" && strings.Contains(precondition.Expected, head) && strings.Contains(precondition.Expected, "main") {
+			foundPrecondition = true
+		}
+	}
+	for _, effect := range plan.Effects {
+		if effect.Kind == "repository_contract_pr" && effect.Parameters["source_url"] != "https://github.com/owner/repo.git" {
+			t.Fatalf("contract source URL = %q", effect.Parameters["source_url"])
+		}
+	}
+	if !foundPrecondition {
+		t.Fatalf("remote default-head precondition missing: %#v", plan.Preconditions)
+	}
+}
+
+type remoteHeadFunc func(context.Context, string) (string, string, error)
+
+func (f remoteHeadFunc) Resolve(ctx context.Context, origin string) (string, string, error) {
+	return f(ctx, origin)
+}
+
 func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t *testing.T) {
 	repo := newRepo(t)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
@@ -70,7 +149,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		if repository != "owner/repo" || branch != "main" {
 			t.Fatalf("policy target=%s branch=%s", repository, branch)
 		}
-		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, RequiredChecks: []string{"build"}}, nil
+		return RepositoryPolicy{Admin: true, AllowSquashMerge: true, ActionsAllowed: "selected", RequiredChecks: []string{"build"}}, nil
 	})
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("c", 64), Policy: policy})
 	if err != nil {
@@ -80,7 +159,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 	for _, effect := range plan.Effects {
 		switch effect.Kind {
 		case "repository_features":
-			features = true
+			features = effect.Parameters["allowed_actions"] == "selected"
 		case "repository_contract_pr":
 			contract = effect.Parameters["required_checks_json"] == `["workflow-contract","build"]`
 		}

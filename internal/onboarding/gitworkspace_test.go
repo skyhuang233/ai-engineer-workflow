@@ -16,7 +16,7 @@ func TestPrepareOnboardingBranchUsesTemporaryCloneOnly(t *testing.T) {
 	if err := os.WriteFile(dirty, []byte("user owned"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	workspace, err := PrepareOnboardingBranch(context.Background(), bare, base, t.TempDir(), repeatString("a", 64), map[string][]byte{"managed.txt": []byte("contract\n")}, GitCredential{})
+	workspace, err := PrepareOnboardingBranch(context.Background(), "owner/repo", bare, base, t.TempDir(), repeatString("a", 64), map[string][]byte{"managed.txt": []byte("contract\n")}, GitCredential{})
 	if err != nil {
 		t.Fatal(err)
 	}

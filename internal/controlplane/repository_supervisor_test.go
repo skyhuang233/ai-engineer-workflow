@@ -74,6 +74,26 @@ func TestRepositorySupervisorRunsEligibleRepositoriesAndFencesSuspendedOnes(t *t
 	}
 }
 
+func TestRepositorySupervisorDoesNotScheduleEligibleRepositoryUntilRuntimeIsComplete(t *testing.T) {
+	incomplete := store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: `C:\repo`, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: time.Hour, MaxParallelRuns: 1, UpdatedAt: time.Now().UTC()}
+	snapshot := &supervisorSnapshot{admissions: []store.RepositoryAdmission{{Repository: "owner/repo", Eligible: true}}, configs: []store.RepositoryRuntimeConfiguration{incomplete}}
+	runner := recordingRepositoryRunner{started: make(chan string, 1), stopped: make(chan string, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (RepositorySupervisor{Store: snapshot, Runner: runner, Interval: 10 * time.Millisecond}).Run(ctx)
+	}()
+	select {
+	case repository := <-runner.started:
+		t.Fatalf("incomplete repository runtime started: %s", repository)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRepositorySupervisorCancelsAllRepositoriesWithLifecycle(t *testing.T) {
 	config := store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: `C:\repo`, RootIssueNumber: 7, WorkspaceRoot: `C:\workspaces`, StateRoot: `C:\state`, CodexAuthFile: `C:\auth.json`, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: time.Hour, MaxParallelRuns: 1, UpdatedAt: time.Now().UTC()}
 	snapshot := &supervisorSnapshot{admissions: []store.RepositoryAdmission{{Repository: "owner/repo", Eligible: true}}, configs: []store.RepositoryRuntimeConfiguration{config}}

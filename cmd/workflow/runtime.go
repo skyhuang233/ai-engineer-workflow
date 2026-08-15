@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -109,19 +110,43 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *repository == "" || *root <= 0 {
-		return errors.New("runtime-configure requires repository and a positive Plan Root issue number")
+	if flags.NArg() != 0 || (*repository == "" && *source == "") || *root <= 0 {
+		return errors.New("runtime-configure requires a repository identity or source path and a positive Plan Root issue number")
 	}
 	layout, err := workflowhome.Resolve(*homeOverride)
 	if err != nil {
 		return err
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
 	if err != nil {
 		return err
 	}
 	defer database.Close()
-	config, err := database.RepositoryRuntimeConfiguration(context.Background(), *repository)
+	var config store.RepositoryRuntimeConfiguration
+	if *repository != "" {
+		config, err = database.RepositoryRuntimeConfiguration(ctx, *repository)
+	} else {
+		absoluteSource, pathErr := filepath.Abs(*source)
+		if pathErr != nil {
+			return pathErr
+		}
+		configs, listErr := database.RepositoryRuntimeConfigurations(ctx)
+		if listErr != nil {
+			return listErr
+		}
+		for _, candidate := range configs {
+			if strings.EqualFold(filepath.Clean(candidate.SourcePath), filepath.Clean(absoluteSource)) {
+				if config.Repository != "" {
+					return errors.New("source path matches multiple Repository Runtime Configurations")
+				}
+				config = candidate
+			}
+		}
+		if config.Repository == "" {
+			err = store.ErrNotFound
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("read admitted repository runtime configuration: %w", err)
 	}
@@ -136,14 +161,23 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 		config.MaxParallelRuns = *maxParallel
 	}
 	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(config.Repository))
-	if config.WorkspaceRoot == "" { config.WorkspaceRoot = filepath.Join(layout.Workspaces, repositoryKey) }
-	if config.StateRoot == "" { config.StateRoot = filepath.Join(layout.State, "codex", repositoryKey) }
-	if config.CodexAuthFile == "" { config.CodexAuthFile = defaultCodexAuthFile() }
+	if config.WorkspaceRoot == "" {
+		config.WorkspaceRoot = filepath.Join(layout.Workspaces, repositoryKey)
+	}
+	if config.StateRoot == "" {
+		config.StateRoot = filepath.Join(layout.State, "codex", repositoryKey)
+	}
+	if config.CodexAuthFile == "" {
+		config.CodexAuthFile, err = codexauth.ResolveChatGPT(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve invoking Codex login: %w", err)
+		}
+	}
 	config.UpdatedAt = time.Now().UTC()
 	if err := config.Ready(); err != nil {
 		return fmt.Errorf("complete repository runtime configuration: %w", err)
 	}
-	if err := database.RecordRepositoryRuntimeConfiguration(context.Background(), config); err != nil {
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, config); err != nil {
 		return err
 	}
 	return json.NewEncoder(output).Encode(map[string]any{"status": "configured", "repository": config.Repository, "root_issue_number": config.RootIssueNumber})

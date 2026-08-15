@@ -13,9 +13,9 @@ import (
 func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T) {
 	driver := read(t, "codex-driver.ps1")
 	for _, required := range []string{
-		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_SKILL_SOURCE`, `WORKFLOW_SETUP_E2E_PAT`,
+		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
-		`--dangerously-bypass-approvals-and-sandbox`, `temporary_repositories`,
+		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked WORKFLOW_SETUP_E2E_PAT`,
 	} {
 		if !strings.Contains(driver, required) {
@@ -50,7 +50,7 @@ func TestDriverResultSchemaIsStrictAndComplete(t *testing.T) {
 
 func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
-	for _, required := range []string{"sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_SKILL_SOURCE`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`} {
+	for _, required := range []string{"sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("setup harness lacks %q", required)
 		}

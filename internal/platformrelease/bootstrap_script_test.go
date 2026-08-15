@@ -4,7 +4,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"os"
@@ -13,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
 
 func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
@@ -80,17 +84,21 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	skillsRoot := filepath.Join(directory, "codex-skills")
 	hostFacts, _ := json.Marshal(map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
-		"workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true},
-		"github_credential": map[string]any{"exists": true, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
+		"workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
+		"github_credential": map[string]any{"exists": true, "verified": true, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
 		"codex_skills_root": skillsRoot,
 	})
 	write(hostFactsPath, hostFacts)
 	planScript := filepath.Join(filepath.Dir(script), "new-platform-bootstrap-plan.ps1")
 	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath)
 	var planned struct {
-		Plan struct {
-			Effects []struct {
-				Kind string `json:"kind"`
+		DigestSHA256  string `json:"digest_sha256"`
+		CanonicalJSON string `json:"canonical_json"`
+		Plan          struct {
+			Preconditions []setupcontract.Precondition `json:"preconditions"`
+			Effects       []struct {
+				Kind       string            `json:"kind"`
+				Parameters map[string]string `json:"parameters"`
 			} `json:"effects"`
 		} `json:"plan"`
 	}
@@ -98,10 +106,14 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		t.Fatalf("decode Platform Bootstrap Plan output: %v (%q)", decodeErr, output)
 	}
 	hasSkillBundle := false
+	hasExactCLI := false
 	for _, effect := range planned.Plan.Effects {
 		hasSkillBundle = hasSkillBundle || effect.Kind == "workflow_skill_bundle"
+		hasExactCLI = hasExactCLI || effect.Kind == "platform_cli" && effect.Parameters["sha256"] == manifest.BundledFiles[0].SHA256
 	}
-	if err != nil || !hasSkillBundle {
+	parsed, canonical, digest, parseErr := setupcontract.ParsePlan([]byte(planned.CanonicalJSON))
+	manifestDigest := sha256.Sum256(raw)
+	if err != nil || !hasSkillBundle || !hasExactCLI || parseErr != nil || string(canonical) != planned.CanonicalJSON || digest != planned.DigestSHA256 || parsed.Preconditions[0].Kind != "platform_release" || parsed.Preconditions[0].Expected != hex.EncodeToString(manifestDigest[:]) {
 		t.Fatalf("verified Platform Bootstrap Plan omitted exact Workflow Skill Bundle: %q, %v", output, err)
 	}
 	if _, err := os.Stat(workflowHome); !os.IsNotExist(err) {

@@ -145,7 +145,7 @@ func validManifest(artifactData map[string][]byte) Manifest {
 			RepositoryContract:  RepositoryContractPin{Version: "1", ManifestPath: ".workflow/repository.json", CheckName: "workflow-contract", Labels: []RepositoryLabel{{Name: "workflow:plan", Color: "0e8a16", Description: "delivery plan"}}},
 		},
 		Artifacts:    artifacts,
-		BundledFiles: []BundledFile{{Path: "skills/implement/SKILL.md", SHA256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}, {Path: "repository-contract/AGENTS.block.md", SHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}},
+		BundledFiles: []BundledFile{{Path: "bin/workflow.exe", SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, {Path: "skills/implement/SKILL.md", SHA256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}, {Path: "repository-contract/AGENTS.block.md", SHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}},
 		Provenance:   Provenance{Repository: "skyhuang233/ai-engineer-workflow", SourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorkflowPath: ".github/workflows/publish-platform.yml", GitHubActionsRunID: 42, BuilderID: "github-actions", Subjects: artifacts},
 		Signature:    SignatureMetadata{Algorithm: "ecdsa-p256-sha256", KeyID: "platform-release-2026", SignatureAsset: "platform-release.json.sig"},
 	}

@@ -49,19 +49,36 @@ if ($isRepository) {
     $gitFacts.status_porcelain_v2 = @(& git -C $repoPath status --porcelain=v2 --untracked-files=all)
 }
 
-$docker = Invoke-ObservedCommand "docker" @("version", "--format", "{{json .}}")
+$dockerCLI = Invoke-ObservedCommand "docker" @("version", "--format", "{{.Client.Version}}")
+$dockerEngine = Invoke-ObservedCommand "docker" @("info", "--format", "{{.OSType}}/{{.Architecture}}")
+$dockerDesktopVersion = ""
+foreach ($registryPath in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop")) {
+    try { $dockerDesktopVersion = [string](Get-ItemProperty -LiteralPath $registryPath -Name DisplayVersion -ErrorAction Stop).DisplayVersion; break } catch { }
+}
+$engineParts = @($dockerEngine.output -split '/', 2)
+$docker = [ordered]@{
+    installed = (-not [string]::IsNullOrWhiteSpace($dockerDesktopVersion))
+    desktop_version = $dockerDesktopVersion.Trim()
+    cli_version = $dockerCLI.output
+    engine_os = $(if ($dockerEngine.exit_code -eq 0 -and $engineParts.Count -eq 2) { $engineParts[0] } else { "" })
+    engine_arch = $(if ($dockerEngine.exit_code -eq 0 -and $engineParts.Count -eq 2) { $engineParts[1] } else { "" })
+}
 $codex = Invoke-ObservedCommand "codex" @("--version")
-$workflow = Invoke-ObservedCommand "workflow" @("--version")
 $credentialPath = Join-Path $WorkflowHome "state\credentials\github.pat"
 if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) { throw "USERPROFILE is required to resolve Codex user skills" }
 $codexSkillsRoot = Join-Path $env:USERPROFILE ".agents\skills"
 $workflowBin = Join-Path $WorkflowHome "bin"
 $currentUserPath = ""
 try { $currentUserPath = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name Path -ErrorAction Stop).Path } catch { }
-$workflow.path_reconciled = (@($currentUserPath -split ';' | Where-Object { [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1)
 $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow CLI is unavailable" }
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
+$workflow = [ordered]@{ installed = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
+    $installedVersion = Invoke-ObservedCommand $installedWorkflow @("--version")
+    $versionMatch = [regex]::Match([string]$installedVersion.output, '(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
+    $workflow.installed = $true
+    $workflow.version = $(if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { [string]$installedVersion.output })
+    $workflow.sha256 = (Get-FileHash -LiteralPath $installedWorkflow -Algorithm SHA256).Hash.ToLowerInvariant()
     $status = Invoke-ObservedCommand $installedWorkflow @("status", "--workflow-home", $WorkflowHome)
     if ($status.exit_code -eq 0) {
         try {
@@ -87,5 +104,5 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
     codex_skills_root = $codexSkillsRoot
     workflow = $workflow
     control_plane = $controlPlane
-    github_credential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf) }
+    github_credential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false }
 } | ConvertTo-Json -Depth 8

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -30,6 +31,7 @@ type RepositoryPolicy struct {
 	HasIssues, ActionsEnabled, Admin                     bool
 	AllowSquashMerge, AllowMergeCommit, AllowRebaseMerge bool
 	RequiredHumanReviews, MergeQueue                     bool
+	ActionsAllowed                                       string
 	RequiredChecks                                       []string
 	AllowFeatureEnable                                   bool
 }
@@ -60,6 +62,8 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		if data, showErr := gitBytes(ctx, discovery.Root, "show", "HEAD:AGENTS.md"); showErr == nil {
 			baseAgents = data
 		}
+	} else if data, readErr := os.ReadFile(filepath.Join(discovery.Root, "AGENTS.md")); readErr == nil {
+		baseAgents = data
 	}
 	files, _, manifestDigest, err := repositorycontract.Render(options.DomainLayout, baseAgents, repositoryID, discovery.DefaultBranch)
 	if err != nil {
@@ -73,6 +77,8 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			if existing, showErr := gitBytes(ctx, discovery.Root, "show", "HEAD:"+path); showErr == nil {
 				beforePayload[path] = base64.StdEncoding.EncodeToString(existing)
 			}
+		} else if existing, readErr := os.ReadFile(filepath.Join(discovery.Root, filepath.FromSlash(path))); readErr == nil {
+			beforePayload[path] = base64.StdEncoding.EncodeToString(existing)
 		}
 	}
 	encodedFiles, _ := json.Marshal(filePayload)
@@ -97,12 +103,19 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			if !policy.Admin {
 				return setupcontract.Plan{}, errors.New("repository administration is required to enable GitHub Issues and Actions")
 			}
-			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "enable-repository-features", Kind: "repository_features", Subject: repositoryID, Action: "enable", Parameters: map[string]string{"issues": "true", "actions": "true"}})
+			if !policy.ActionsEnabled && policy.ActionsAllowed == "" {
+				return setupcontract.Plan{}, errors.New("repository Actions allowed_actions policy is unavailable")
+			}
+			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "enable-repository-features", Kind: "repository_features", Subject: repositoryID, Action: "enable", Parameters: map[string]string{"issues": "true", "actions": "true", "allowed_actions": policy.ActionsAllowed}})
 			policy.AllowFeatureEnable = true
 		}
 		policy.RequiredChecks = uniqueStrings(policy.RequiredChecks)
 		policyJSON, _ := json.Marshal(policy)
 		plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "github-policy", Kind: "github_policy", Subject: repositoryID, Expected: string(policyJSON)})
+	}
+	if discovery.Published {
+		remoteJSON, _ := json.Marshal(map[string]string{"branch": discovery.DefaultBranch, "head": discovery.RemoteHead, "manifest_digest": manifestDigest})
+		plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "github-default-head", Kind: "github_default_head", Subject: repositoryID, Expected: string(remoteJSON)})
 	}
 	if !discovery.Published {
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: repositoryID, Action: "create", Parameters: map[string]string{"owner": options.Owner, "authenticated_login": options.AuthenticatedLogin, "name": repositoryName, "private": boolString(defaultPrivate(options))}})
@@ -114,7 +127,11 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			if findings := ScanCredentialMaterial(discovery.Root, baselineFiles); len(findings) > 0 {
 				return setupcontract.Plan{}, errors.New("credential material blocks Initial Repository Baseline")
 			}
-			encoded, _ := json.Marshal(baselineFiles)
+			snapshot, snapshotErr := BaselineSnapshot(ctx, discovery.Root)
+			if snapshotErr != nil {
+				return setupcontract.Plan{}, snapshotErr
+			}
+			encoded, _ := json.Marshal(snapshot)
 			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: discovery.Root, Action: "commit_and_push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "files_json": string(encoded), "repository": repositoryID, "source_url": "https://github.com/" + repositoryID + ".git"}})
 		} else {
 			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "publish-history", Kind: "publish_history", Subject: repositoryID, Action: "push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "head": discovery.Head}})
@@ -124,15 +141,15 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "label-" + integer(index), Kind: "github_label", Subject: repositoryID + "#" + label.Name, Action: "reconcile", Parameters: map[string]string{"name": label.Name, "color": label.Color, "description": label.Description}})
 	}
 	labelsJSON, _ := json.Marshal(options.Labels)
-	sourceURL := discovery.Origin
-	if sourceURL == "" {
-		sourceURL = "https://github.com/" + repositoryID + ".git"
+	sourceURL, err := GitHubHTTPSURL(repositoryID)
+	if err != nil {
+		return setupcontract.Plan{}, err
 	}
 	requiredChecks := uniqueStrings(append([]string{"workflow-contract"}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON)}})
-	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch}})
+	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
+	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head}})
 	identityJSON, _ := json.Marshal(plan)
 	identity := sha256.Sum256(identityJSON)
 	plan.PlanID = "onboard-" + hex.EncodeToString(identity[:12])

@@ -57,7 +57,11 @@ func Discover(ctx context.Context, repository string, resolver RemoteHead) (Disc
 		if resolver == nil {
 			resolver = LSRemoteHead{}
 		}
-		defaultBranch, remoteHead, err = resolver.Resolve(ctx, origin)
+		transportURL, urlErr := GitHubHTTPSURL(repositoryID)
+		if urlErr != nil {
+			return Discovery{}, urlErr
+		}
+		defaultBranch, remoteHead, err = resolver.Resolve(ctx, transportURL)
 		if err != nil {
 			return Discovery{}, fmt.Errorf("read GitHub origin default branch without fetch: %w", err)
 		}
@@ -151,6 +155,15 @@ func parseGitHubOrigin(value string) (string, error) {
 func validRepo(value string) bool {
 	parts := strings.Split(value, "/")
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+// GitHubHTTPSURL derives the credential-safe transport endpoint from a
+// validated repository identity. Callers never need to rewrite an SSH origin.
+func GitHubHTTPSURL(repository string) (string, error) {
+	if !validRepo(repository) {
+		return "", errors.New("GitHub repository identity is invalid")
+	}
+	return "https://github.com/" + repository + ".git", nil
 }
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	data, err := gitBytes(ctx, dir, args...)

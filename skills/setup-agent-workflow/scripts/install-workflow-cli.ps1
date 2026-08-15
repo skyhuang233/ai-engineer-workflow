@@ -39,7 +39,8 @@ try {
     $executable = Get-ChildItem -LiteralPath $expanded -Filter workflow.exe -Recurse | Select-Object -First 1
     if ($null -eq $executable) { throw "Workflow CLI archive has no workflow.exe" }
     $canonicalPlanPath = Join-Path $temporaryRoot "approved-plan.json"
-    $canonicalPlan = $planEnvelope.plan | ConvertTo-Json -Depth 20 -Compress
+    $canonicalPlan = [string]$planEnvelope.canonical_json
+    if ([string]::IsNullOrWhiteSpace($canonicalPlan)) { throw "Setup Plan envelope lacks canonical JSON" }
     [IO.File]::WriteAllText($canonicalPlanPath, $canonicalPlan, (New-Object Text.UTF8Encoding($false)))
     & $executable.FullName setup apply --plan $canonicalPlanPath --approved-digest $ApprovedDigest
     if ($LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }

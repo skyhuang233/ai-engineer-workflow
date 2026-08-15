@@ -28,6 +28,35 @@ type ownership struct {
 	InstalledAt  time.Time `json:"installed_at"`
 }
 
+// VerifyVersion reads back both the platform-owned installation record and the
+// executable bytes. A matching version label alone is never sufficient.
+func (i Installation) VerifyVersion(version, expectedSHA256 string) (bool, error) {
+	executable := filepath.Join(i.Layout.Bin, ExecutableName)
+	recordPath := filepath.Join(i.Layout.Bin, OwnershipFile)
+	recordRaw, err := os.ReadFile(recordPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var record ownership
+	if json.Unmarshal(recordRaw, &record) != nil || record.Owner != ownerID {
+		return false, errors.New("existing workflow executable is not owned by Agent Workflow")
+	}
+	data, err := os.ReadFile(executable)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sum := sha256.Sum256(data)
+	actual := hex.EncodeToString(sum[:])
+	wanted := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(expectedSHA256)), "sha256:")
+	return record.Version == strings.TrimSpace(version) && record.SourceSHA256 == actual && wanted != "" && wanted == actual, nil
+}
+
 func ReconcilePath(current, bin string) string {
 	bin = strings.TrimSpace(bin)
 	if bin == "" {

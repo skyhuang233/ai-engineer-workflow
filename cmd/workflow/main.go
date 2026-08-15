@@ -137,7 +137,6 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow status [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow logs [--workflow-home <absolute>] [--lines 200] [--follow]")
 	fmt.Fprintln(os.Stderr, "  workflow stop [--workflow-home <absolute>]")
-	fmt.Fprintln(os.Stderr, "  workflow runtime-configure --repository owner/repo --root <plan-root-issue> [--source <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")

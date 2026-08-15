@@ -56,14 +56,16 @@ existing ChatGPT login to prove Worker create-and-resume, then removes the copy.
 Each admitted repository has one durable `repository_runtime_configurations`
 record. Onboarding supplies its canonical GitHub identity, default branch, local
 source path, repository-scoped Workspace/Codex state roots, and polling policy.
-After `to-tickets` publishes a Plan Root, bind its issue number without copying
-the remaining loop inputs into a shell command:
+After a workflow skill successfully publishes a Plan Root, the installed
+Workflow Skill Bundle automatically binds its issue number without copying the
+remaining loop inputs into a user-facing shell command. Its internal action is:
 
 ```powershell
-workflow runtime-configure --repository owner/repository --root 123
+workflow runtime-configure --source (git rev-parse --show-toplevel) --root 123
 ```
 
-`workflow serve` owns a cancellable Gateway plus the existing GitHub polling,
+Agents must treat a failed binding as an incomplete Plan Root operation rather
+than asking the user to perform another setup step. `workflow serve` owns a cancellable Gateway plus the existing GitHub polling,
 reconciliation, delivery, and scheduler loop for every eligible and complete
 record. Admission verification is periodic; drift cancels only the affected
 repository. Runtime configuration migrated from an older database is retained

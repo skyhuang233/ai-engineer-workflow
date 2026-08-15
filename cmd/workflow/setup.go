@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/admission"
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
@@ -346,11 +347,11 @@ func verifyPlatformReady(ctx context.Context, database *store.Store, layout work
 	if err := hostsetup.VerifyDockerWorker(probeCtx, nil, contract.Worker.Image, layout.State, layout.Workspaces); err != nil {
 		return err
 	}
-	authRoot := os.Getenv("CODEX_HOME")
-	if authRoot == "" {
-		authRoot = filepath.Join(userProfile, ".codex")
+	authFile, err := codexauth.ResolveChatGPT(probeCtx)
+	if err != nil {
+		return err
 	}
-	result := (doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: contract.Worker.Image, AuthFile: filepath.Join(authRoot, "auth.json")}).Run(probeCtx)
+	result := (doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: contract.Worker.Image, AuthFile: authFile}).Run(probeCtx)
 	if result.Status != doctor.Pass {
 		return errors.New(result.Summary)
 	}

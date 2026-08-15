@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,10 +19,85 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/credential"
+	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestRepositoryContractRechecksDefaultHeadImmediatelyBeforePRCreation(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+
+	refReads := 0
+	created := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			refReads++
+			head := base
+			if refReads > 1 {
+				head = strings.Repeat("b", 40)
+			}
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + head + `"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			created = true
+			_, _ = w.Write([]byte(`{"number":7}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/owner/repo/git/refs/heads/workflow/onboarding-"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	effect := setupcontract.Effect{Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{
+		"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `["workflow-contract"]`,
+	}}
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithRepositoryOwner("owner"), PlanDigest: strings.Repeat("a", 64), TemporaryRoot: t.TempDir()}
+	err := adapter.applyRepositoryContract(context.Background(), effect)
+	if err == nil || !strings.Contains(err.Error(), "base drifted") {
+		t.Fatalf("default-head drift accepted: %v", err)
+	}
+	if created {
+		t.Fatal("pull request was created after the approved base drifted")
+	}
+}
+
+func hostGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+}
+
+func hostGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(output))
+}
 
 func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
@@ -35,7 +113,8 @@ func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 		persisted = path
 		return nil
 	}}
-	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0"}}
+	digest := sha256.Sum256([]byte("workflow executable"))
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(digest[:])}}
 	if err := adapter.Apply(context.Background(), effect, &SecretInput{}); err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +122,74 @@ func TestHostAdapterPersistsCurrentUserPathAfterInstallingCLI(t *testing.T) {
 		t.Fatalf("persisted PATH entry = %q, want %q", persisted, layout.Bin)
 	}
 }
+
+func TestHostAdapterReadbackRequiresExactOwnedCLIVersionAndChecksum(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "workflow.exe")
+	contents := []byte("workflow executable")
+	if err := os.WriteFile(source, contents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(contents)
+	adapter := HostAdapter{Layout: layout, Executable: source, PersistUserPATH: func(string) error { return nil }, CurrentUserPATHReconciled: func(string) (bool, error) { return true, nil }}
+	effect := setupcontract.Effect{ID: "install", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, workflowhome.ExecutableName), Action: "install", Parameters: map[string]string{"version": "1.0.0", "sha256": hex.EncodeToString(sum[:])}}
+	if err := adapter.Apply(context.Background(), effect, nil); err != nil {
+		t.Fatal(err)
+	}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("exact readback=%s %v", status, err)
+	}
+	effect.Parameters["version"] = "1.0.1"
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("wrong version readback=%s %v", status, err)
+	}
+	effect.Parameters["version"] = "1.0.0"
+	effect.Parameters["sha256"] = strings.Repeat("0", 64)
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("wrong checksum readback=%s %v", status, err)
+	}
+}
+
+func TestHostAdapterDockerReadbackRequiresExactDesktopAndLinuxAMD64Engine(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &setupDockerHost{version: "4.44.0", engineErr: errors.New("Docker engine is windows/amd64")}
+	adapter := HostAdapter{Layout: layout, DockerDesktopHost: host}
+	effect := setupcontract.Effect{ID: "docker", Kind: "docker_desktop", Subject: "current-host", Action: "repair", Parameters: map[string]string{"version": "4.45.0"}}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("wrong version readback=%s %v", status, err)
+	}
+	host.version = "4.45.0"
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("wrong engine readback=%s %v", status, err)
+	}
+	host.engineErr = nil
+	status, _, err = adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("compatible Docker readback=%s %v", status, err)
+	}
+}
+
+type setupDockerHost struct {
+	version   string
+	engineErr error
+}
+
+func (h *setupDockerHost) InstalledVersion(context.Context) (string, error) { return h.version, nil }
+func (*setupDockerHost) Download(context.Context, string, string) error     { return nil }
+func (*setupDockerHost) InstallElevated(context.Context, string) error      { return nil }
+func (*setupDockerHost) Start(context.Context) error                        { return nil }
+func (h *setupDockerHost) EngineReady(context.Context) error                { return h.engineErr }
 
 func TestHostAdapterStartsAndReadsBackDigestBoundControlPlane(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
@@ -170,5 +317,42 @@ func TestEnginePersistsOnlyVerifiedPATMetadata(t *testing.T) {
 	verification, err := db.GitHubPATVerification(context.Background())
 	if err != nil || verification.Login != "owner" {
 		t.Fatalf("verification=%#v %v", verification, err)
+	}
+}
+
+func TestEngineReplacesPersistedPATThatFailsLiveVerification(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ghp_replacement" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+			return
+		}
+		w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+		_, _ = w.Write([]byte(`{"login":"owner","id":7}`))
+	}))
+	defer server.Close()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.NewFileStore(layout.CredentialFile).Set(context.Background(), credential.GatewayTarget, "ghp_revoked"); err != nil {
+		t.Fatal(err)
+	}
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "replace-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{{ID: "release", Kind: "release", Subject: "v1", Expected: "verified"}}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: layout.CredentialFile, Action: "replace", Parameters: map[string]string{"input": "stdin", "owner": "owner", "api_base": server.URL}}}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform", Subject: layout.Root, Expected: "ready"}}}
+	raw, _ := json.Marshal(plan)
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: &SecretInput{Reader: bytes.NewBufferString("ghp_replacement")}}).Apply(context.Background(), raw, digest)
+	if err != nil || result.Status != setupcontract.ExecutionSucceeded {
+		t.Fatalf("replacement result=%#v err=%v", result, err)
+	}
+	token, err := credential.NewFileStore(layout.CredentialFile).Get(context.Background(), credential.GatewayTarget)
+	if err != nil || token != "ghp_replacement" {
+		t.Fatalf("replacement token=%q err=%v", token, err)
 	}
 }

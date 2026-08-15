@@ -84,17 +84,16 @@ func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := filepath.Join(t.TempDir(), "repo")
-	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: source, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}); err != nil {
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	if err := database.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: source, CodexAuthFile: authFile, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	codexHome := filepath.Join(t.TempDir(), "codex")
-	t.Setenv("CODEX_HOME", codexHome)
 	var output bytes.Buffer
-	if err := runtimeConfigureCommand([]string{"--workflow-home", layout.Root, "--repository", "owner/repo", "--root", "42", "--max-parallel-runs", "2"}, &output); err != nil {
+	if err := runtimeConfigureCommand([]string{"--workflow-home", layout.Root, "--source", source, "--root", "42", "--max-parallel-runs", "2"}, &output); err != nil {
 		t.Fatal(err)
 	}
 	database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
@@ -109,7 +108,7 @@ func TestRuntimeConfigureCompletesDurableRepositoryConfiguration(t *testing.T) {
 	if err := config.Ready(); err != nil {
 		t.Fatalf("configured runtime is not ready: %#v, %v", config, err)
 	}
-	if config.RootIssueNumber != 42 || config.MaxParallelRuns != 2 || config.SourcePath != source || config.CodexAuthFile != filepath.Join(codexHome, "auth.json") {
+	if config.RootIssueNumber != 42 || config.MaxParallelRuns != 2 || config.SourcePath != source || config.CodexAuthFile != authFile {
 		t.Fatalf("configured runtime = %#v", config)
 	}
 }

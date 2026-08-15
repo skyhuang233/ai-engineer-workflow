@@ -49,6 +49,10 @@ type OnboardingPullRequest struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"head"`
+	Base struct {
+		SHA string `json:"sha"`
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 type PullRequestReview struct {
 	State string `json:"state"`
@@ -60,7 +64,8 @@ type MergeResult struct {
 }
 
 type ActionsPermissions struct {
-	Enabled bool `json:"enabled"`
+	Enabled        bool   `json:"enabled"`
+	AllowedActions string `json:"allowed_actions"`
 }
 type BranchProtection struct {
 	RequiredStatusChecks *struct {
@@ -104,7 +109,13 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/actions/permissions", nil, &actions); err != nil {
 		return result, err
 	}
+	switch actions.AllowedActions {
+	case "all", "local_only", "selected":
+	default:
+		return result, errors.New("GitHub Actions allowed_actions policy is unavailable or unsupported")
+	}
 	result.ActionsEnabled = actions.Enabled
+	result.ActionsAllowed = actions.AllowedActions
 	var protection BranchProtection
 	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/branches/"+url.PathEscape(branch)+"/protection", nil, &protection); err != nil && !IsNotFound(err) {
 		return result, err
@@ -210,7 +221,7 @@ func (c *Client) CreateRepository(ctx context.Context, owner, authenticatedLogin
 	}
 	return result, nil
 }
-func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string, issues, actions bool) error {
+func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string, issues, actions bool, allowedActions string) error {
 	if err := ValidateRepository(repository); err != nil {
 		return err
 	}
@@ -218,7 +229,12 @@ func (c *Client) UpdateRepositoryFeatures(ctx context.Context, repository string
 		return err
 	}
 	if actions {
-		return c.RequestJSON(ctx, http.MethodPut, "/repos/"+repository+"/actions/permissions", map[string]any{"enabled": true, "allowed_actions": "all"}, nil)
+		switch allowedActions {
+		case "all", "local_only", "selected":
+		default:
+			return errors.New("approved Actions allowed_actions policy is required")
+		}
+		return c.RequestJSON(ctx, http.MethodPut, "/repos/"+repository+"/actions/permissions", map[string]any{"enabled": true, "allowed_actions": allowedActions}, nil)
 	}
 	return nil
 }
