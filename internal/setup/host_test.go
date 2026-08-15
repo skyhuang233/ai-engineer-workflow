@@ -55,6 +55,38 @@ func TestHostAdapterChecksApprovedCurrentUserIdentity(t *testing.T) {
 	}
 }
 
+func TestHostAdapterGitHeadPreconditionCannotBeRedirectedByProcessGitEnvironment(t *testing.T) {
+	createRepository := func(name, contents string) (string, string) {
+		repository := filepath.Join(t.TempDir(), name)
+		hostGit(t, "", "init", "-b", "main", repository)
+		hostGit(t, repository, "config", "user.name", "Test")
+		hostGit(t, repository, "config", "user.email", "test@example.com")
+		if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hostGit(t, repository, "add", "README.md")
+		hostGit(t, repository, "commit", "-m", name)
+		return repository, hostGitOutput(t, repository, "rev-parse", "HEAD")
+	}
+	target, targetHead := createRepository("target", "target\n")
+	attacker, attackerHead := createRepository("attacker", "attacker\n")
+	if targetHead == attackerHead {
+		t.Fatal("test repositories unexpectedly have the same HEAD")
+	}
+	t.Setenv("GIT_DIR", filepath.Join(attacker, ".git"))
+	t.Setenv("GIT_WORK_TREE", attacker)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.worktree")
+	t.Setenv("GIT_CONFIG_VALUE_0", attacker)
+
+	err := (HostAdapter{}).CheckPrecondition(context.Background(), setupcontract.Precondition{
+		ID: "head", Kind: "git_head", Subject: target, Expected: attackerHead,
+	})
+	if err == nil {
+		t.Fatal("process Git environment redirected the approved repository precondition")
+	}
+}
+
 func TestHostAdapterAllowsMatchingIdentityBeforeCreatingWorkflowHome(t *testing.T) {
 	current, err := user.Current()
 	if err != nil {
@@ -843,6 +875,15 @@ func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.
 	hostGit(t, "", "clone", "--bare", source, bare)
 	digest := strings.Repeat("a", 64)
 	branch := "workflow/onboarding-" + digest[:12]
+	contractFiles := map[string][]byte{"managed.txt": []byte("contract\n")}
+	preview, err := onboarding.PrepareOnboardingCommit(context.Background(), "owner/repo", bare, base, t.TempDir(), digest, contractFiles, onboarding.GitCredential{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvedHead := preview.Head
+	if err := preview.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
 	mergeHead := strings.Repeat("c", 40)
 	deleted, created, merged := false, false, false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -850,7 +891,7 @@ func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.
 		workspaceHead := func() string { return hostGitOutput(t, "", "--git-dir", bare, "rev-parse", "refs/heads/"+branch) }
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
-			_, _ = w.Write([]byte(`[{"number":6,"state":"closed","body":"Approved Setup Plan SHA-256: ` + digest + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
+			_, _ = w.Write([]byte(`[{"number":6,"state":"closed","body":"Approved Setup Plan SHA-256: ` + digest + `","head":{"sha":"` + approvedHead + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
 		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/git/refs/heads/"):
 			deleted = true
 			w.WriteHeader(http.StatusNoContent)
@@ -889,7 +930,7 @@ func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.
 		}
 	}))
 	defer server.Close()
-	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString(contractFiles["managed.txt"])})
 	adapter := HostAdapter{
 		GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"), PlanDigest: digest, TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{},
 		ApprovedGitHubPolicies: map[string]string{"owner/repo": approvedPolicyJSON(t, onboarding.RepositoryPolicy{HasIssues: true, ActionsEnabled: true, ActionsAllowed: "all", GitHubOwnedActionsAllowed: true, AllowSquashMerge: true, AllowFeatureEnable: true})},
@@ -900,6 +941,57 @@ func TestRepositoryContractClosedSamePlanAttemptIsDeletedAndReplaced(t *testing.
 	}
 	if !deleted || !created || !merged {
 		t.Fatalf("replacement lifecycle delete=%t create=%t merge=%t", deleted, created, merged)
+	}
+}
+
+func TestRepositoryContractClosedPlanHeadDriftDoesNotDeleteOrReplace(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	hostGit(t, "", "init", "-b", "main", source)
+	hostGit(t, source, "config", "user.name", "Test")
+	hostGit(t, source, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, source, "add", "README.md")
+	hostGit(t, source, "commit", "-m", "base")
+	base := hostGitOutput(t, source, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	hostGit(t, "", "clone", "--bare", source, bare)
+	digest := strings.Repeat("a", 64)
+	branch := "workflow/onboarding-" + digest[:12]
+	deleted, created := false, false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[{"number":6,"state":"closed","body":"Approved Setup Plan SHA-256: ` + digest + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"` + branch + `"},"base":{"sha":"` + base + `","ref":"main"}}]`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + base + `"}}`))
+		case r.Method == http.MethodDelete:
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost:
+			created = true
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	files, _ := json.Marshal(map[string]string{"managed.txt": base64.StdEncoding.EncodeToString([]byte("contract\n"))})
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()).WithOnboardingIdentity("owner", "owner", "owner/repo"), PlanDigest: digest, TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{}}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{"files_json": string(files), "source_url": bare, "base_head": base, "base_branch": "main", "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
+	if err := adapter.applyRepositoryContract(context.Background(), effect); err == nil {
+		t.Fatal("closed pull request with an unapproved head was accepted")
+	}
+	if deleted || created {
+		t.Fatalf("closed pull request head drift reached mutation: deleted=%t created=%t", deleted, created)
+	}
+	command := exec.Command("git", "--git-dir", bare, "rev-parse", "--verify", "refs/heads/"+branch)
+	if err := command.Run(); err == nil {
+		t.Fatal("closed pull request head drift published an approved replacement branch before conflict")
 	}
 }
 

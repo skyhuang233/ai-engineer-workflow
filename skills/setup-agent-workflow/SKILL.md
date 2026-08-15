@@ -16,7 +16,18 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) | Out-String
    [IO.File]::WriteAllText($hostFactsPath, $hostFactsJSON, (New-Object Text.UTF8Encoding($false)))
    $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
+   $confirmedWorkflowHome = [IO.Path]::GetFullPath([string]$hostFacts.workflow_home)
    ```
+
+   Before release resolution, handle an already-authorized stopped runtime as an existing-authorization Control Plane restart. Authority is complete only when `$hostFacts.workflow.trust_state -eq "pinned"`, `$hostFacts.workflow.owned`, `$hostFacts.platform.installation_recorded`, every durable release/contract/CLI/bundle digest is a lowercase SHA-256, `$hostFacts.platform.control_plane_plan_digest_sha256` is a lowercase SHA-256, and `$hostFacts.control_plane.state -eq "stopped"`. In that exact case run the installed `workflow.exe serve --workflow-home` command using the same confirmed home:
+
+   ```powershell
+   & (Join-Path $confirmedWorkflowHome "bin\workflow.exe") serve --workflow-home $confirmedWorkflowHome --approved-plan-digest $hostFacts.platform.control_plane_plan_digest_sha256
+   ```
+
+   Then rerun host inspection for `$confirmedWorkflowHome` and require `ready` runtime identity bound to that same version and digest. This restart reuses durable authorization and must not produce a new Platform Bootstrap Plan or ask for a new approval. Continue repository intent and credential discovery, but skip Platform release resolution, planning, and installation when the restarted Platform is ready.
+
+   Incomplete or conflicting durable trust fails closed: never execute the installed Workflow CLI, guess a digest, or treat `stopped` alone as restart authority. Continue only through the exact verified pin-repair path below; the restart shortcut remains unavailable until inspection proves the complete authorization identity.
 
    If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop if declined, then rerun inspection into the same file if accepted.
    Record the confirmed owner, repository name, visibility, publication state, and domain layout once; pass these same values to every subsequent plan command without asking again.
@@ -54,12 +65,12 @@ Treat the current directory as the target. Keep discovery read-only and use the 
 4. Use the installed CLI for the remaining deterministic loop:
 
    ```powershell
-   workflow setup plan --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>
+   workflow setup plan --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>
    workflow setup apply --plan <plan-path> --approved-digest <digest>
-   workflow setup verify --repo (Get-Location).Path
+   workflow setup verify --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path
    ```
 
-   Present each complete Onboarding Plan once. An approval authorizes only its exact digest. If facts drift, present the replacement plan rather than expanding the old one.
+   Before approval or apply, parse the emitted Onboarding Plan and confirm its plan target.workflow_home exactly equals `$confirmedWorkflowHome`; `setup apply` intentionally has no Workflow Home override and consumes only that bound target. Present each complete Onboarding Plan once. An approval authorizes only its exact digest. If facts drift, present the replacement plan rather than expanding the old one.
 5. Finish only when verification reports both `platform_ready` and `repository_admitted`. Otherwise report the exact blocker and whether the same digest can continue forward.
 
 Preserve user-owned Git state. Never stage, commit, stash, reset, clean, switch branches, push existing commits, or rewrite `origin` during discovery. The CLI owns approved mutations and safe readback.

@@ -299,6 +299,65 @@ func TestInitialBaselineHonorsAndBindsGlobalExcludesFile(t *testing.T) {
 	}
 }
 
+func TestInitialBaselineHonorsExcludesFileFromTrustedGlobalInclude(t *testing.T) {
+	home := t.TempDir()
+	excludes := filepath.Join(home, "included-global-ignore")
+	included := filepath.Join(home, "included.gitconfig")
+	if err := os.WriteFile(excludes, []byte("*.secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(included, []byte("[core]\n\texcludesFile = "+filepath.ToSlash(excludes)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[include]\n\tpath = "+filepath.ToSlash(included)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	for name := range map[string]bool{"visible.txt": true, "omitted.secret": true} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, err := BaselineFiles(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(files, ",") != "visible.txt" {
+		t.Fatalf("included global excludes semantics not preserved: %#v", files)
+	}
+	binding, err := resolveGlobalExcludes(context.Background(), repo)
+	if err != nil || filepath.Clean(binding.Path) != filepath.Clean(excludes) {
+		t.Fatalf("included global binding=%#v err=%v", binding, err)
+	}
+}
+
+func TestInitialBaselineRejectsMultipleEffectiveGlobalExcludesFiles(t *testing.T) {
+	home := t.TempDir()
+	included := filepath.Join(home, "included.gitconfig")
+	first := filepath.Join(home, "first-ignore")
+	second := filepath.Join(home, "second-ignore")
+	if err := os.WriteFile(included, []byte("[core]\n\texcludesFile = "+filepath.ToSlash(first)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global := "[include]\n\tpath = " + filepath.ToSlash(included) + "\n[core]\n\texcludesFile = " + filepath.ToSlash(second) + "\n"
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(global), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	if _, err := BaselineFiles(context.Background(), repo); err == nil || !strings.Contains(err.Error(), "unsupported core.excludesFile") {
+		t.Fatalf("multiple effective global excludes files were accepted: %v", err)
+	}
+}
+
 func TestInitialBaselineHonorsImplicitGlobalExcludesFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -365,5 +424,57 @@ func TestInitialBaselineHonorsRepositoryLocalExcludesFilePrecedence(t *testing.T
 	binding, err := resolveGlobalExcludes(context.Background(), repo)
 	if err != nil || filepath.Clean(binding.Path) != filepath.Clean(local) {
 		t.Fatalf("local binding=%#v err=%v", binding, err)
+	}
+}
+
+func TestInitialBaselineHonorsWorktreeExcludesFileBeforeLocalAndGlobal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	global := filepath.Join(home, "global-ignore")
+	if err := os.WriteFile(global, []byte("*.global\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\texcludesFile = "+filepath.ToSlash(global)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(t.TempDir(), "main")
+	git(t, "", "init", "-b", "main", main)
+	git(t, main, "config", "user.name", "Test")
+	git(t, main, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(main, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, main, "add", "README.md")
+	git(t, main, "commit", "-m", "base")
+	git(t, main, "config", "extensions.worktreeConfig", "true")
+	local := filepath.Join(main, "local-ignore")
+	if err := os.WriteFile(local, []byte("*.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, main, "config", "core.excludesFile", local)
+	worktree := filepath.Join(t.TempDir(), "linked")
+	git(t, main, "worktree", "add", "-b", "linked", worktree)
+	worktreeIgnore := filepath.Join(worktree, "worktree-ignore")
+	if err := os.WriteFile(worktreeIgnore, []byte("*.worktree\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, worktree, "config", "--worktree", "core.excludesFile", worktreeIgnore)
+	for name := range map[string]bool{"visible.txt": true, "omitted.worktree": true, "kept.local": true, "kept.global": true} {
+		if err := os.WriteFile(filepath.Join(worktree, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, err := BaselineFiles(context.Background(), worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(files, ",") != "README.md,kept.global,kept.local,visible.txt,worktree-ignore" {
+		t.Fatalf("worktree excludes precedence files=%#v", files)
+	}
+	binding, err := resolveGlobalExcludes(context.Background(), worktree)
+	if err != nil || filepath.Clean(binding.Path) != filepath.Clean(worktreeIgnore) {
+		t.Fatalf("worktree binding=%#v err=%v", binding, err)
 	}
 }

@@ -1293,9 +1293,12 @@ func (s *verifiedGitHubPATSource) Token(ctx context.Context) (string, error) {
 	return verifiedClassicPAT(ctx, s.Database, s.Config)
 }
 
-func verifiedClassicPAT(ctx context.Context, database *store.Store, config doctor.Config) (string, error) {
+func verifiedClassicPAT(ctx context.Context, database *store.Store, config doctor.Config, expectedCredentialPath ...string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("%w: Control Plane PAT store is unavailable", delivery.ErrGatewayCredentialRejected)
+	}
+	if len(expectedCredentialPath) > 1 {
+		return "", fmt.Errorf("%w: Control Plane PAT credential path is ambiguous", delivery.ErrGatewayCredentialRejected)
 	}
 	verification, err := database.GitHubPATVerification(ctx)
 	if errors.Is(err, store.ErrNotFound) {
@@ -1304,11 +1307,13 @@ func verifiedClassicPAT(ctx context.Context, database *store.Store, config docto
 	if err != nil {
 		return "", githubCredentialVerificationStoreError{err: fmt.Errorf("read PAT verification: %w", err)}
 	}
-	layout, err := workflowhome.Resolve(os.Getenv("WORKFLOW_HOME"))
-	if err != nil {
-		return "", fmt.Errorf("%w: resolve Workflow Home: %v", delivery.ErrGatewayCredentialRejected, err)
+	path := verification.CredentialPath
+	if len(expectedCredentialPath) == 1 {
+		path = expectedCredentialPath[0]
+		if path == "" || !filepath.IsAbs(path) {
+			return "", fmt.Errorf("%w: Control Plane PAT credential path is invalid", delivery.ErrGatewayCredentialRejected)
+		}
 	}
-	path := filepath.Join(layout.Root, filepath.FromSlash(strings.ReplaceAll(config.GitHub.Credential.PlaintextRelativePath, `\`, "/")))
 	token, err := credential.NewFileStore(path).Get(ctx, credential.GatewayTarget)
 	if err != nil {
 		return "", fmt.Errorf("%w: read Control Plane PAT: %v", delivery.ErrGatewayCredentialRejected, err)

@@ -26,7 +26,7 @@ type BaselineFile struct {
 }
 
 func BaselineFiles(ctx context.Context, repository string) ([]string, error) {
-	if err := validateLocalGitReadConfiguration(ctx, repository); err != nil {
+	if err := ValidateLocalGitReadConfiguration(ctx, repository); err != nil {
 		return nil, err
 	}
 	binding, err := resolveGlobalExcludes(ctx, repository)
@@ -51,7 +51,15 @@ type globalExcludesBinding struct {
 }
 
 func resolveGlobalExcludes(ctx context.Context, repository string) (globalExcludesBinding, error) {
-	for _, scope := range []string{"local", "global", "system"} {
+	scopes := []string{"local", "global", "system"}
+	worktreeConfig, err := repositoryWorktreeConfigEnabled(ctx, repository)
+	if err != nil {
+		return globalExcludesBinding{}, err
+	}
+	if worktreeConfig {
+		scopes = append([]string{"worktree"}, scopes...)
+	}
+	for _, scope := range scopes {
 		paths, err := scopedExcludesPaths(ctx, repository, scope)
 		if err != nil {
 			return globalExcludesBinding{}, err
@@ -86,9 +94,13 @@ func resolveGlobalExcludes(ctx context.Context, repository string) (globalExclud
 }
 
 func scopedExcludesPaths(ctx context.Context, repository, scope string) ([]string, error) {
-	command := exec.CommandContext(ctx, "git", "config", "--"+scope, "--no-includes", "--path", "--get-all", "core.excludesFile")
+	includeMode := "--no-includes"
+	if scope == "global" || scope == "system" {
+		includeMode = "--includes"
+	}
+	command := exec.CommandContext(ctx, "git", "config", "--"+scope, includeMode, "--path", "--get-all", "core.excludesFile")
 	command.Dir = repository
-	if scope == "local" {
+	if scope == "local" || scope == "worktree" {
 		command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	} else {
 		command.Env = hostScopedGitEnvironment(scope == "system")

@@ -31,10 +31,17 @@ func (w GitWorkspace) Cleanup() error {
 }
 
 func PrepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential) (GitWorkspace, error) {
-	return prepareOnboardingBranch(ctx, repository, sourceURL, baseCommit, temporaryRoot, planDigest, files, credential, os.RemoveAll)
+	return prepareOnboardingBranch(ctx, repository, sourceURL, baseCommit, temporaryRoot, planDigest, files, credential, true, os.RemoveAll)
 }
 
-func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential, removeAll func(string) error) (_ GitWorkspace, resultErr error) {
+// PrepareOnboardingCommit computes the exact approved commit in an isolated
+// temporary clone without publishing a remote ref. Callers can therefore
+// compare an existing pull-request head before any replacement mutation.
+func PrepareOnboardingCommit(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential) (GitWorkspace, error) {
+	return prepareOnboardingBranch(ctx, repository, sourceURL, baseCommit, temporaryRoot, planDigest, files, credential, false, os.RemoveAll)
+}
+
+func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCommit, temporaryRoot, planDigest string, files map[string][]byte, credential GitCredential, publish bool, removeAll func(string) error) (_ GitWorkspace, resultErr error) {
 	if sourceURL == "" || !fullSHA.MatchString(baseCommit) || len(planDigest) < 12 || len(files) == 0 {
 		return GitWorkspace{}, errors.New("onboarding workspace inputs are incomplete")
 	}
@@ -182,14 +189,46 @@ func prepareOnboardingBranch(ctx context.Context, repository, sourceURL, baseCom
 	if credential.Token != "" {
 		pushTarget = cloneURL
 	}
-	if _, err := runNetwork(clone, "push", pushTarget, "HEAD:refs/heads/"+result.Branch); err != nil {
-		return GitWorkspace{}, err
+	if publish {
+		if _, err := runNetwork(clone, "push", pushTarget, "HEAD:refs/heads/"+result.Branch); err != nil {
+			return GitWorkspace{}, err
+		}
 	}
 	result.Root = clone
 	result.Head = head
 	result.cleanupRoot = root
 	failed = false
 	return result, nil
+}
+
+// PublishOnboardingBranch publishes only the deterministic commit already
+// prepared in workspace. The PAT remains scoped to this one canonical push.
+func PublishOnboardingBranch(ctx context.Context, workspace GitWorkspace, repository, sourceURL string, credential GitCredential) error {
+	if workspace.Root == "" || !strings.HasPrefix(workspace.Branch, "workflow/onboarding-") || !fullSHA.MatchString(workspace.Head) || sourceURL == "" {
+		return errors.New("prepared onboarding branch identity is incomplete")
+	}
+	if err := ValidateAuthenticatedGitRepository(ctx, workspace.Root); err != nil {
+		return err
+	}
+	pushTarget := sourceURL
+	commandArgs := hardenedLocalGitArgs("push", pushTarget, workspace.Head+":refs/heads/"+workspace.Branch)
+	environment := isolatedGitEnvironment(nil)
+	if credential.Token != "" {
+		canonicalURL, err := GitHubHTTPSURL(repository)
+		if err != nil {
+			return err
+		}
+		pushTarget = canonicalURL
+		commandArgs = hardenedAuthenticatedGitArgs(canonicalURL, "push", pushTarget, workspace.Head+":refs/heads/"+workspace.Branch)
+		environment = isolatedGitEnvironment(gitCredentialEnvironmentForURL(credential, canonicalURL))
+	}
+	command := exec.CommandContext(ctx, "git", commandArgs...)
+	command.Dir = workspace.Root
+	command.Env = environment
+	if output, err := command.CombinedOutput(); err != nil {
+		return fmt.Errorf("publish prepared onboarding branch: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func isolatedGitEnvironment(extra []string) []string {

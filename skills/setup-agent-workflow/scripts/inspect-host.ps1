@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Repository,
-    [string]$WorkflowHome = ""
+    [string]$WorkflowHome = "",
+    [switch]$GitProbeOnly,
+    [ValidateRange(1, 120)]
+    [int]$ExternalCommandTimeoutSeconds = 15
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,71 +43,143 @@ if (Test-Path -LiteralPath $WorkflowHome) {
 }
 $hostIdentity = [ordered]@{ user_id = $currentUserSID; username = [string]$windowsIdentity.Name; workflow_home_owner_id = $workflowHomeOwnerSID }
 
+function ConvertTo-NativeArgument([string]$Value) {
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') { $slashes++; continue }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (2 * $slashes + 1)))
+            [void]$builder.Append('"')
+        } else {
+            if ($slashes -gt 0) { [void]$builder.Append(('\' * $slashes)) }
+            [void]$builder.Append($character)
+        }
+        $slashes = 0
+    }
+    if ($slashes -gt 0) { [void]$builder.Append(('\' * (2 * $slashes))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Invoke-BoundedExecutable([string]$FilePath, [string[]]$Arguments, [bool]$IsolateGit) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $FilePath
+    $start.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    if ($IsolateGit) {
+        foreach ($name in @($start.EnvironmentVariables.Keys | ForEach-Object { [string]$_ })) {
+            if ($name -match '^GIT_') { $start.EnvironmentVariables.Remove($name) }
+        }
+        $start.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+        $start.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
+        $start.EnvironmentVariables['GIT_ATTR_NOSYSTEM'] = '1'
+        $start.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
+        $start.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    }
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw "failed to start external command" }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($ExternalCommandTimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { }
+            throw "external command exceeded the $ExternalCommandTimeoutSeconds second inspection timeout"
+        }
+        $process.WaitForExit()
+        return [ordered]@{ output = [string]$stdout.Result; error = [string]$stderr.Result; exit_code = [int]$process.ExitCode }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-ObservedCommand([string]$Name, [string[]]$Arguments) {
-    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $command) {
         return [ordered]@{ installed = $false; output = ""; exit_code = $null }
     }
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $output = & $command.Source @Arguments 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousPreference
+    $result = Invoke-BoundedExecutable $command.Source $Arguments $false
+    $combined = ([string]$result.output + [string]$result.error).Trim()
+    return [ordered]@{ installed = $true; output = $combined; exit_code = $result.exit_code }
+}
+
+function Invoke-IsolatedGit([string[]]$Arguments) {
+    $gitCommand = Get-Command "git" -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    return Invoke-BoundedExecutable $gitCommand.Source $Arguments $true
+}
+
+function Test-UnsafeRepositoryGitKey([string]$Key) {
+    $keyLower = $Key.Trim().ToLowerInvariant()
+    return $keyLower.StartsWith('http.') -or $keyLower.StartsWith('https.') -or
+        $keyLower.StartsWith('credential.') -or $keyLower.StartsWith('include.') -or $keyLower.StartsWith('includeif.') -or
+        $keyLower.StartsWith('protocol.') -or $keyLower.StartsWith('filter.') -or
+        ($keyLower.StartsWith('diff.') -and ($keyLower.EndsWith('.textconv') -or $keyLower.EndsWith('.external') -or $keyLower.EndsWith('.command'))) -or
+        ($keyLower.StartsWith('merge.') -and $keyLower.EndsWith('.driver')) -or
+        ($keyLower.StartsWith('url.') -and ($keyLower.EndsWith('.insteadof') -or $keyLower.EndsWith('.pushinsteadof'))) -or
+        ($keyLower.StartsWith('remote.') -and ($keyLower.EndsWith('.vcs') -or $keyLower.EndsWith('.proxy') -or $keyLower.EndsWith('.uploadpack') -or $keyLower.EndsWith('.receivepack'))) -or
+        @('core.gitproxy', 'core.sshcommand', 'core.fsmonitor', 'core.attributesfile', 'core.hookspath') -contains $keyLower
+}
+
+function Read-GitConfigNames([string]$Path, [string]$Scope) {
+    $result = Invoke-IsolatedGit @('-C', $Path, 'config', $Scope, '--no-includes', '-z', '--name-only', '--get-regexp', '.*')
+    if ($result.exit_code -eq 1) { return @() }
+    if ($result.exit_code -ne 0) { throw "Unable to inspect $Scope Git configuration: $($result.error.Trim())" }
+    return @(([string]$result.output -split "`0") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Assert-SafeRepositoryGitConfiguration([string]$Path) {
+    $localNames = @(Read-GitConfigNames $Path '--local')
+    foreach ($name in $localNames) {
+        if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
     }
-    return [ordered]@{ installed = $true; output = $output.Trim(); exit_code = $exitCode }
+    $worktreeEnabled = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get', 'extensions.worktreeConfig')
+    if ($worktreeEnabled.exit_code -eq 0 -and ([string]$worktreeEnabled.output).Trim() -eq 'true') {
+        foreach ($name in @(Read-GitConfigNames $Path '--worktree')) {
+            if (Test-UnsafeRepositoryGitKey $name) { throw "unsafe repository-local Git configuration: '$name'" }
+        }
+    } elseif ($worktreeEnabled.exit_code -ne 1) {
+        throw "Unable to inspect repository worktree Git configuration: $($worktreeEnabled.error.Trim())"
+    }
 }
 
 function Read-RawLocalOrigin([string]$Path) {
-    $gitCommand = Get-Command "git" -ErrorAction Stop
-    $savedGitEnvironment = [ordered]@{}
-    $isolatedNames = @(
-        Get-ChildItem Env: |
-            Where-Object { $_.Name -match '^GIT_(CONFIG|DIR|WORK_TREE|COMMON_DIR|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|INDEX_FILE|NAMESPACE|OPTIONAL_LOCKS)(_|$)' } |
-            ForEach-Object { [string]$_.Name }
-    )
-    foreach ($name in $isolatedNames) {
-        $savedGitEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-        [Environment]::SetEnvironmentVariable($name, $null, "Process")
-    }
-    [Environment]::SetEnvironmentVariable("GIT_OPTIONAL_LOCKS", "0", "Process")
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $values = @(& $gitCommand.Source -C $Path config --local --no-includes --get-all remote.origin.url 2>$null | ForEach-Object { [string]$_ })
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousPreference
-        [Environment]::SetEnvironmentVariable("GIT_OPTIONAL_LOCKS", $null, "Process")
-        foreach ($name in $savedGitEnvironment.Keys) {
-            [Environment]::SetEnvironmentVariable([string]$name, [string]$savedGitEnvironment[$name], "Process")
-        }
-    }
-    if ($exitCode -eq 1 -and $values.Count -eq 0) { return "" }
-    if ($exitCode -ne 0) { throw "Unable to read local remote.origin.url exactly" }
+    $result = Invoke-IsolatedGit @('-C', $Path, 'config', '--local', '--no-includes', '--get-all', 'remote.origin.url')
+    $values = @(([string]$result.output -split "`r?`n") | Where-Object { $_ -ne '' })
+    if ($result.exit_code -eq 1 -and $values.Count -eq 0) { return "" }
+    if ($result.exit_code -ne 0) { throw "Unable to read local remote.origin.url exactly: $($result.error.Trim())" }
     if ($values.Count -ne 1 -or [string]::IsNullOrWhiteSpace($values[0])) {
         throw "A Git repository must have zero or exactly one local remote.origin.url"
     }
     return $values[0]
 }
 
-$git = Invoke-ObservedCommand "git" @("-C", $repoPath, "rev-parse", "--show-toplevel")
+$gitCommand = Get-Command "git" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$git = $(if ($null -eq $gitCommand) { [ordered]@{ installed = $false; output = ""; exit_code = $null } } else {
+    $result = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--show-toplevel')
+    [ordered]@{ installed = $true; output = ([string]$result.output).Trim(); exit_code = $result.exit_code }
+})
 $isRepository = $git.installed -and $git.exit_code -eq 0
 $gitFacts = [ordered]@{ installed = $git.installed; is_repository = $isRepository }
 if ($isRepository) {
+    Assert-SafeRepositoryGitConfiguration $repoPath
     $gitFacts.root = $git.output
-    $gitFacts.branch = (& git -C $repoPath branch --show-current 2>$null | Out-String).Trim()
-    $gitFacts.head = (& git -C $repoPath rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    $branchResult = Invoke-IsolatedGit @('-C', $repoPath, 'branch', '--show-current')
+    $headResult = Invoke-IsolatedGit @('-C', $repoPath, 'rev-parse', '--verify', 'HEAD')
+    if ($branchResult.exit_code -ne 0 -or $headResult.exit_code -ne 0) { throw "Unable to inspect repository branch and HEAD" }
+    $gitFacts.branch = ([string]$branchResult.output).Trim()
+    $gitFacts.head = ([string]$headResult.output).Trim()
     $gitFacts.origin = Read-RawLocalOrigin $repoPath
-    $previousOptionalLocks = $env:GIT_OPTIONAL_LOCKS
-    try {
-        $env:GIT_OPTIONAL_LOCKS = "0"
-        $gitFacts.status_porcelain_v2 = @(& git -C $repoPath status --porcelain=v2 -z --untracked-files=all)
-    } finally {
-        $env:GIT_OPTIONAL_LOCKS = $previousOptionalLocks
-    }
+    $statusResult = Invoke-IsolatedGit @('-C', $repoPath, 'status', '--porcelain=v2', '-z', '--untracked-files=all')
+    if ($statusResult.exit_code -ne 0) { throw "Unable to inspect repository status: $($statusResult.error.Trim())" }
+    $gitFacts.status_porcelain_v2 = @([string]$statusResult.output)
 }
+if ($GitProbeOnly) { $gitFacts | ConvertTo-Json -Depth 4; exit 0 }
 
 $dockerCLI = Invoke-ObservedCommand "docker" @("version", "--format", "{{.Client.Version}}")
 $dockerEngine = Invoke-ObservedCommand "docker" @("info", "--format", "{{.OSType}}/{{.Architecture}}")

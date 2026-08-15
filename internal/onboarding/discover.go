@@ -229,7 +229,7 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return strings.TrimSpace(string(data)), err
 }
 func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	if err := validateLocalGitReadConfiguration(ctx, dir); err != nil {
+	if err := ValidateLocalGitReadConfiguration(ctx, dir); err != nil {
 		return nil, err
 	}
 	command := exec.CommandContext(ctx, "git", hardenedLocalGitArgs(args...)...)

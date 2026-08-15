@@ -22,11 +22,41 @@ func ValidateAuthenticatedGitRepository(ctx context.Context, repository string) 
 	if _, _, err := currentHostProxyEnvironment(); err != nil {
 		return err
 	}
-	return validateLocalGitReadConfiguration(ctx, repository)
+	return ValidateLocalGitReadConfiguration(ctx, repository)
 }
 
-func validateLocalGitReadConfiguration(ctx context.Context, repository string) error {
-	command := exec.CommandContext(ctx, "git", "config", "--local", "--no-includes", "-z", "--name-only", "--get-regexp", ".*")
+// ValidateLocalGitReadConfiguration rejects repository-owned Git settings
+// that can execute code or redirect later reads away from repository.
+func ValidateLocalGitReadConfiguration(ctx context.Context, repository string) error {
+	if err := validateRepositoryGitConfigScope(ctx, repository, "local"); err != nil {
+		return err
+	}
+	enabled, err := repositoryWorktreeConfigEnabled(ctx, repository)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	return validateRepositoryGitConfigScope(ctx, repository, "worktree")
+}
+
+func repositoryWorktreeConfigEnabled(ctx context.Context, repository string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "config", "--local", "--no-includes", "--bool", "--get", "extensions.worktreeConfig")
+	command.Dir = repository
+	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
+	output, err := command.Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect repository-local worktree configuration extension: %w", err)
+	}
+	return strings.TrimSpace(string(output)) == "true", nil
+}
+
+func validateRepositoryGitConfigScope(ctx context.Context, repository, scope string) error {
+	command := exec.CommandContext(ctx, "git", "config", "--"+scope, "--no-includes", "-z", "--name-only", "--get-regexp", ".*")
 	command.Dir = repository
 	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	output, err := command.Output()
@@ -34,7 +64,7 @@ func validateLocalGitReadConfiguration(ctx context.Context, repository string) e
 		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
 			return nil
 		}
-		return fmt.Errorf("inspect repository-local Git configuration: %w", err)
+		return fmt.Errorf("inspect repository-%s Git configuration: %w", scope, err)
 	}
 	for _, raw := range strings.Split(string(output), "\x00") {
 		key := strings.ToLower(strings.TrimSpace(raw))
@@ -42,7 +72,7 @@ func validateLocalGitReadConfiguration(ctx context.Context, repository string) e
 			continue
 		}
 		if unsafeRepositoryGitKey(key) {
-			return fmt.Errorf("%w: %q is unsafe for authenticated transport", errUnsafeRepositoryGitConfig, raw)
+			return fmt.Errorf("%w: %s key %q is unsafe for authenticated transport", errUnsafeRepositoryGitConfig, scope, raw)
 		}
 	}
 	return nil
@@ -53,7 +83,7 @@ func unsafeRepositoryGitKey(key string) bool {
 		strings.HasPrefix(key, "https.") ||
 		strings.HasPrefix(key, "credential.") ||
 		strings.HasPrefix(key, "include.") ||
-		strings.HasPrefix(key, "includif.") ||
+		strings.HasPrefix(key, "includeif.") ||
 		strings.HasPrefix(key, "protocol.") ||
 		strings.HasPrefix(key, "filter.") ||
 		strings.HasPrefix(key, "diff.") && (strings.HasSuffix(key, ".textconv") || strings.HasSuffix(key, ".external") || strings.HasSuffix(key, ".command")) ||
@@ -63,13 +93,15 @@ func unsafeRepositoryGitKey(key string) bool {
 		key == "core.gitproxy" || key == "core.sshcommand" || key == "core.fsmonitor" || key == "core.attributesfile" || key == "core.hookspath"
 }
 
-func rawOriginURL(ctx context.Context, repository string) (string, error) {
+// ReadLocalOriginURL returns exactly one repository-local origin without
+// applying URL aliases or inheriting process Git configuration redirects.
+func ReadLocalOriginURL(ctx context.Context, repository string) (string, error) {
 	if err := rejectRepositoryURLAliases(ctx, repository); err != nil {
 		return "", err
 	}
 	command := exec.CommandContext(ctx, "git", "config", "--local", "--get-all", "--no-includes", "remote.origin.url")
 	command.Dir = repository
-	command.Env = isolatedGitEnvironment(nil)
+	command.Env = isolatedGitEnvironment([]string{"GIT_OPTIONAL_LOCKS=0"})
 	output, err := command.Output()
 	if err != nil {
 		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
@@ -84,8 +116,12 @@ func rawOriginURL(ctx context.Context, repository string) (string, error) {
 	return strings.TrimSpace(values[0]), nil
 }
 
+func rawOriginURL(ctx context.Context, repository string) (string, error) {
+	return ReadLocalOriginURL(ctx, repository)
+}
+
 func rejectRepositoryURLAliases(ctx context.Context, repository string) error {
-	return validateLocalGitReadConfiguration(ctx, repository)
+	return ValidateLocalGitReadConfiguration(ctx, repository)
 }
 
 type hostProxySnapshot struct {

@@ -179,7 +179,7 @@ func runSetupInspectPlatform(args []string, output io.Writer) error {
 	var cleanupClient *github.Client
 	if verification, verificationErr := database.GitHubPATVerification(context.Background()); verificationErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		if token, tokenErr := verifiedClassicPAT(context.Background(), database, config); tokenErr == nil {
+		if token, tokenErr := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile); tokenErr == nil {
 			cleanupClient = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 		}
 	}
@@ -346,7 +346,7 @@ func runSetupPlan(args []string, output io.Writer) error {
 	}
 	defer database.Close()
 	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-	token, err := verifiedClassicPAT(context.Background(), database, config)
+	token, err := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
 	if err != nil {
 		return err
 	}
@@ -594,7 +594,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	verification, readErr := database.GitHubPATVerification(context.Background())
 	if readErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		token, tokenErr := verifiedClassicPAT(context.Background(), database, config)
+		token, tokenErr := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
 		database.Close()
 		if tokenErr != nil {
 			if plan.Kind == setupcontract.RepositoryOnboarding {
@@ -735,7 +735,7 @@ func verifySatisfiedPlatformComponents(ctx context.Context, database *store.Stor
 			return errors.Join(errors.New("satisfied GitHub PAT drifted before mutation"), err)
 		}
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		token, err := verifiedClassicPAT(ctx, database, config)
+		token, err := verifiedClassicPAT(ctx, database, config, layout.CredentialFile)
 		if err != nil {
 			return err
 		}
@@ -836,7 +836,7 @@ func runSetupVerify(args []string, output io.Writer) error {
 	var cleanupClient *github.Client
 	if credentialErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		token, tokenErr = verifiedClassicPAT(ctx, database, config)
+		token, tokenErr = verifiedClassicPAT(ctx, database, config, layout.CredentialFile)
 		if tokenErr == nil {
 			cleanupClient = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 		}
@@ -862,7 +862,7 @@ func runSetupVerify(args []string, output io.Writer) error {
 	if credentialErr == nil {
 		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
 		if token == "" && tokenErr == nil {
-			token, tokenErr = verifiedClassicPAT(context.Background(), database, config)
+			token, tokenErr = verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
 		}
 		if tokenErr == nil {
 			report.Credential.setupVerificationCheck = setupVerificationCheck{Status: "verified", Evidence: "persisted PAT fingerprint, login, user ID, owner, scopes, and credential path match the live credential"}
@@ -982,7 +982,7 @@ func verifyPlatformReadyMode(ctx context.Context, database *store.Store, layout 
 		return errors.Join(errors.New("Control Plane PAT verification is unavailable"), err)
 	}
 	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-	token, err := verifiedClassicPAT(ctx, database, config)
+	token, err := verifiedClassicPAT(ctx, database, config, layout.CredentialFile)
 	if err != nil {
 		return err
 	}

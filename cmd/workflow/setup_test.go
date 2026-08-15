@@ -353,6 +353,9 @@ func TestInspectPlatformLiveValidatesPersistedPATWithoutSecretInput(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The explicit command target must remain authoritative even when the
+	// process default points at another Workflow Home.
+	t.Setenv("WORKFLOW_HOME", filepath.Join(t.TempDir(), "wrong-default-home"))
 	if err := layout.Ensure(); err != nil {
 		t.Fatal(err)
 	}

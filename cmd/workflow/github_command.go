@@ -18,6 +18,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
+	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
@@ -94,7 +95,7 @@ type managedGitHubSession struct {
 }
 
 func managedGitHubClient(ctx context.Context, database *store.Store, layout workflowhome.Layout, source, apiBase string, httpClient *http.Client) (managedGitHubSession, error) {
-	origin, err := readOnlyGitOutput(ctx, source, "remote", "get-url", "origin")
+	origin, err := onboarding.ReadLocalOriginURL(ctx, source)
 	if err != nil {
 		return managedGitHubSession{}, fmt.Errorf("read admitted origin: %w", err)
 	}

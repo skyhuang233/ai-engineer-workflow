@@ -62,6 +62,35 @@ func TestVerifiedTokenSourceReadsOwnerBoundClassicPAT(t *testing.T) {
 	}
 }
 
+func TestVerifiedClassicPATUsesExplicitCustomWorkflowHomeCredential(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "custom-home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WORKFLOW_HOME", filepath.Join(t.TempDir(), "wrong-default-home"))
+	token := "ghp_custom-home"
+	if err := credential.NewFileStore(layout.CredentialFile).Set(ctx, credential.GatewayTarget, token); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "user", UserID: 7, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: "owner", PlaintextRelativePath: `state\credentials\github.pat`}}}
+	got, err := verifiedClassicPAT(ctx, db, config, layout.CredentialFile)
+	if err != nil || got != token {
+		t.Fatalf("custom Workflow Home token = %q, %v", got, err)
+	}
+}
+
 type fakeWorkflowInboxAnswerStore struct {
 	target       store.TicketClaim
 	answerCalls  int

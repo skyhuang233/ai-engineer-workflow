@@ -328,6 +328,7 @@ func TestPrepareOnboardingBranchPreservesCloneAndCleanupFailures(t *testing.T) {
 		repeatString("a", 64),
 		map[string][]byte{"managed.txt": []byte("contract\n")},
 		GitCredential{},
+		true,
 		func(string) error {
 			cleanupCalled = true
 			return errors.New("temporary workspace removal denied")

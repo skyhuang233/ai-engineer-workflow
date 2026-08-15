@@ -152,6 +152,20 @@ func TestManagedGitHubIdentityUsesWorkflowHomePATAndAdmittedCanonicalRepository(
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/attacker/redirected.git")
+	if _, err := managedGitHubClient(context.Background(), database, layout, repository, server.URL, server.Client()); err != nil {
+		t.Fatalf("process Git environment redirected workflow github origin: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_COUNT", "0")
+	command := exec.Command("git", "-C", repository, "config", "--local", "url.https://attacker.invalid/.insteadOf", "https://github.com/")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("configure local origin redirect: %v: %s", err, output)
+	}
+	if _, err := managedGitHubClient(context.Background(), database, layout, repository, server.URL, server.Client()); err == nil || !strings.Contains(err.Error(), "unsafe") {
+		t.Fatalf("repository-owned Git URL redirect was not rejected as unsafe: %v", err)
+	}
 	var output strings.Builder
 	if err := writeManagedGitHubIdentity(&output, session.Identity); err != nil {
 		t.Fatal(err)

@@ -179,7 +179,7 @@ func TestDiscoverRejectsAmbiguousRepositoryLocalOrigin(t *testing.T) {
 }
 
 func TestDiscoverRejectsExecutableLocalGitConfigurationWithoutExecutingIt(t *testing.T) {
-	for _, key := range []string{"include.path", "core.fsmonitor", "filter.evil.process", "diff.evil.textconv", "merge.evil.driver", "credential.helper", "http.proxy"} {
+	for _, key := range []string{"include.path", "includeIf.gitdir:/**.path", "core.fsmonitor", "filter.evil.process", "diff.evil.textconv", "merge.evil.driver", "credential.helper", "http.proxy"} {
 		t.Run(key, func(t *testing.T) {
 			repo := newRepo(t)
 			sideEffect := filepath.Join(t.TempDir(), "executed")
@@ -193,6 +193,30 @@ func TestDiscoverRejectsExecutableLocalGitConfigurationWithoutExecutingIt(t *tes
 				t.Fatalf("unsafe %s executed: %v", key, statErr)
 			}
 		})
+	}
+}
+
+func TestDiscoverRejectsExecutableWorktreeGitConfigurationWithoutExecutingIt(t *testing.T) {
+	main := newRepo(t)
+	git(t, main, "config", "extensions.worktreeConfig", "true")
+	worktree := filepath.Join(t.TempDir(), "linked-worktree")
+	git(t, main, "worktree", "add", "-b", "linked", worktree)
+	sideEffect := filepath.Join(t.TempDir(), "executed")
+	included := filepath.Join(t.TempDir(), "included.gitconfig")
+	if err := os.WriteFile(included, []byte("[core]\n\tfsmonitor = malicious-command "+sideEffect+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, worktree, "config", "--worktree", "include.path", included)
+	called := false
+	_, err := Discover(context.Background(), worktree, remoteHeadFunc(func(context.Context, string) (string, string, error) {
+		called = true
+		return "", "", nil
+	}))
+	if err == nil || called {
+		t.Fatalf("unsafe worktree configuration reached discovery: called=%t err=%v", called, err)
+	}
+	if _, statErr := os.Stat(sideEffect); !os.IsNotExist(statErr) {
+		t.Fatalf("unsafe worktree configuration executed: %v", statErr)
 	}
 }
 

@@ -1003,7 +1003,11 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 		}
 		branch := ""
 		if a.RepositoryPath != "" {
-			branch, _ = onboardingGitBranch(ctx, a.RepositoryPath)
+			var branchErr error
+			branch, branchErr = onboardingGitBranch(ctx, a.RepositoryPath)
+			if branchErr != nil {
+				return fmt.Errorf("read approved repository branch: %w", branchErr)
+			}
 		}
 		actual, err := a.GitHub.DiscoverPolicy(ctx, value.Subject, branch)
 		if err != nil {
@@ -1023,12 +1027,9 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 	if value.Kind != "git_head" {
 		return nil
 	}
-	command := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "HEAD")
-	command.Dir = value.Subject
-	output, err := command.Output()
+	actual, err := gitCommandOutput(ctx, value.Subject, "rev-parse", "--verify", "HEAD")
 	if value.Expected == "" {
 		if err == nil {
-			actual := strings.TrimSpace(string(output))
 			for _, head := range a.InitialBaselineHeads {
 				if actual == head {
 					return nil
@@ -1043,8 +1044,7 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 		}
 		return nil
 	}
-	if err != nil || strings.TrimSpace(string(output)) != value.Expected {
-		actual := strings.TrimSpace(string(output))
+	if err != nil || actual != value.Expected {
 		for _, head := range a.InitialBaselineHeads {
 			if actual == head {
 				return nil
@@ -1122,17 +1122,40 @@ func (a HostAdapter) checkHostIdentityBeforeLayout(value setupcontract.Precondit
 }
 
 func gitCommandOutput(ctx context.Context, repository string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", args...)
+	if err := onboarding.ValidateLocalGitReadConfiguration(ctx, repository); err != nil {
+		return "", err
+	}
+	command := exec.CommandContext(ctx, "git", append([]string{
+		"-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.fsmonitor=false",
+		"-c", "credential.helper=",
+	}, args...)...)
 	command.Dir = repository
+	command.Env = isolatedSetupGitEnvironment()
 	output, err := command.Output()
 	return strings.TrimSpace(string(output)), err
 }
 
 func onboardingGitBranch(ctx context.Context, repository string) (string, error) {
-	command := exec.CommandContext(ctx, "git", "branch", "--show-current")
-	command.Dir = repository
-	output, err := command.Output()
-	return strings.TrimSpace(string(output)), err
+	return gitCommandOutput(ctx, repository, "branch", "--show-current")
+}
+
+func isolatedSetupGitEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ())+5)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_ATTR_NOSYSTEM=1",
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
 }
 
 type onboardingPullState int
@@ -1210,30 +1233,30 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 	switch priorState {
 	case onboardingPullMerged:
 		return errors.New("exact Onboarding Pull Request is already merged; readback must bind it before apply")
-	case onboardingPullClosed:
-		if err := a.GitHub.DeleteBranch(ctx, effect.Subject, branch); err != nil && !github.IsNotFound(err) {
-			return fmt.Errorf("clean closed Onboarding Pull Request branch before replacement: %w", err)
-		}
 	}
 	temporary := a.TemporaryRoot
 	if temporary == "" {
 		temporary = a.Layout.Workspaces
 	}
-	workspace, err := onboarding.PrepareOnboardingBranch(ctx, effect.Subject, effect.Parameters["source_url"], baseHead, temporary, a.PlanDigest, files, a.GitCredential)
+	workspace, err := onboarding.PrepareOnboardingCommit(ctx, effect.Subject, effect.Parameters["source_url"], baseHead, temporary, a.PlanDigest, files, a.GitCredential)
 	if err != nil {
 		return err
 	}
+	remoteBranchOwned := false
 	cleanupWorkspace := a.CleanupOnboardingWorkspace
 	if cleanupWorkspace == nil {
 		cleanupWorkspace = func(workspace onboarding.GitWorkspace) error { return workspace.Cleanup() }
 	}
 	defer func() {
-		branchErr := a.GitHub.DeleteBranch(context.Background(), effect.Subject, workspace.Branch)
-		if github.IsNotFound(branchErr) {
-			branchErr = nil
-		}
-		if branchErr != nil {
-			branchErr = fmt.Errorf("cleanup remote onboarding branch: %w", branchErr)
+		var branchErr error
+		if remoteBranchOwned {
+			branchErr = a.GitHub.DeleteBranch(context.Background(), effect.Subject, workspace.Branch)
+			if github.IsNotFound(branchErr) {
+				branchErr = nil
+			}
+			if branchErr != nil {
+				branchErr = fmt.Errorf("cleanup remote onboarding branch: %w", branchErr)
+			}
 		}
 		workspaceErr := cleanupWorkspace(workspace)
 		if workspaceErr != nil {
@@ -1241,6 +1264,23 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 		}
 		resultErr = errors.Join(resultErr, branchErr, workspaceErr)
 	}()
+	switch priorState {
+	case onboardingPullOpen, onboardingPullClosed:
+		if priorPull.Head.SHA != workspace.Head {
+			return errors.New("existing Onboarding Pull Request head differs from the approved deterministic commit")
+		}
+	}
+	if priorState == onboardingPullClosed {
+		if err := a.GitHub.DeleteBranch(ctx, effect.Subject, branch); err != nil && !github.IsNotFound(err) {
+			return fmt.Errorf("clean closed Onboarding Pull Request branch before replacement: %w", err)
+		}
+	}
+	if priorState != onboardingPullOpen {
+		if err := onboarding.PublishOnboardingBranch(ctx, workspace, effect.Subject, effect.Parameters["source_url"], a.GitCredential); err != nil {
+			return err
+		}
+	}
+	remoteBranchOwned = true
 	var pull github.OnboardingPullRequest
 	if priorState == onboardingPullClosed {
 		if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
