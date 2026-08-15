@@ -24,8 +24,11 @@ if ($scopes -notcontains "repo" -or $scopes -notcontains "workflow") { throw "Th
 $identity = $response.Content | ConvertFrom-Json
 if ([string]::IsNullOrWhiteSpace([string]$identity.login) -or [long]$identity.id -le 0) { throw "GitHub returned an invalid credential identity" }
 $boundOwner = $Owner.Trim()
+$ownerType = "personal"
 if ([string]::IsNullOrWhiteSpace($boundOwner)) { throw "A personal account or organization owner is required before Platform planning" }
 if (-not [string]::Equals($boundOwner, [string]$identity.login, [StringComparison]::OrdinalIgnoreCase)) {
+    $ownerType = "organization"
+    if ($scopes -notcontains "admin:org") { throw "An organization-owned repository requires the classic PAT scopes repo, workflow, and admin:org" }
     try {
         $membershipResponse = Invoke-WebRequest -Uri ($APIBase.TrimEnd('/') + "/orgs/" + [Uri]::EscapeDataString($boundOwner) + "/memberships/" + [Uri]::EscapeDataString([string]$identity.login)) -Headers @{
             Authorization = "Bearer $token"
@@ -122,4 +125,4 @@ if ($PublicationState -eq "published") {
 }
 $hasher = [Security.Cryptography.SHA256]::Create()
 try { $digest = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($token)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
-[ordered]@{ login = [string]$identity.login; user_id = [long]$identity.id; owner = $boundOwner; repository = $repositoryID; private = ($Visibility -eq "private"); publication_state = $PublicationState; scopes = $scopes; fingerprint_sha256 = $digest } | ConvertTo-Json -Depth 4
+[ordered]@{ login = [string]$identity.login; user_id = [long]$identity.id; owner = $boundOwner; owner_type = $ownerType; repository = $repositoryID; private = ($Visibility -eq "private"); publication_state = $PublicationState; scopes = $scopes; fingerprint_sha256 = $digest } | ConvertTo-Json -Depth 4

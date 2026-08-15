@@ -87,6 +87,7 @@ type platformInspection struct {
 	GitHubCredential struct {
 		Exists            bool     `json:"exists"`
 		Verified          bool     `json:"verified"`
+		Login             string   `json:"login,omitempty"`
 		Owner             string   `json:"owner,omitempty"`
 		Scopes            []string `json:"scopes,omitempty"`
 		FingerprintSHA256 string   `json:"fingerprint_sha256,omitempty"`
@@ -111,7 +112,7 @@ func runSetupInspectPlatform(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	database, err := store.OpenReadOnly(context.Background(), filepath.Join(layout.State, "workflow.db"))
 	if err != nil {
 		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
 	}
@@ -148,6 +149,7 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	token, tokenErr := credential.NewFileStore(layout.CredentialFile).Get(ctx, credential.GatewayTarget)
 	facts.GitHubCredential.Exists = tokenErr == nil
 	if verificationErr == nil {
+		facts.GitHubCredential.Login = verification.Login
 		facts.GitHubCredential.Owner = verification.Owner
 	}
 	if tokenErr == nil && verificationErr == nil {
@@ -217,6 +219,7 @@ func runSetupPlan(args []string, output io.Writer) error {
 	homeOverride := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
 	repositoryName := flags.String("repository-name", "", "GitHub name for an unpublished repository")
 	visibility := flags.String("visibility", "private", "private or public for an unpublished repository")
+	publicationState := flags.String("publication-state", "auto", "published, unpublished, or auto")
 	domainLayout := flags.String("domain-layout", "single-context", "single-context or multi-context")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -227,10 +230,20 @@ func runSetupPlan(args []string, output io.Writer) error {
 	if *visibility != "private" && *visibility != "public" {
 		return errors.New("setup plan --visibility must be private or public")
 	}
+	if *publicationState != "auto" && *publicationState != "published" && *publicationState != "unpublished" {
+		return errors.New("setup plan --publication-state must be published or unpublished")
+	}
 	if *domainLayout != "single-context" && *domainLayout != "multi-context" {
 		return errors.New("setup plan --domain-layout must be single-context or multi-context")
 	}
 	private := *visibility == "private"
+	if *publicationState != "auto" {
+		_, originErr := readOnlyGitOutput(context.Background(), *repository, "remote", "get-url", "origin")
+		originPresent := originErr == nil
+		if (*publicationState == "published") != originPresent {
+			return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "current origin differs from the confirmed publication state"})
+		}
+	}
 	layout, err := workflowhome.Resolve(*homeOverride)
 	if err != nil {
 		return err

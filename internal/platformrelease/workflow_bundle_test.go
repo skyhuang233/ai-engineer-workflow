@@ -48,12 +48,16 @@ func TestWorkflowSkillBundleUsesConciseOneLevelNavigationAndOperationalReference
 		t.Fatalf("main SKILL.md is %d bytes; keep detailed operations in references", len(main))
 	}
 	references := map[string][]string{
-		"github.md":        {"gh auth status", "nameWithOwner", "sub_issues", "dependencies/blocked_by", "issue_id", "read back", "human-only", "gh pr merge"},
+		"github.md":        {"workflow github", "Repository Admission", "subissues-add", "blocked-by-add", "database `id`", "every API page", "human-only", "no merge operation"},
 		"plans.md":         {"workflow:plan", "workflow:active", "runtime-configure", "Plan Amendment"},
 		"tickets.md":       {"workflow:ticket", "sub-issue", "dependencies", "independently reviewable"},
-		"inbox.md":         {"workflow:inbox", "workflow-answer:<question-id>", "allowed answer", "uncertain"},
+		"inbox.md":         {"workflow:inbox", "workflow answer-inbox", "# Workflow Inbox", "pending field", "allowed answer", "uncertain"},
 		"pull-requests.md": {"one persistent", "required checks", "human", "Review Feedback"},
 		"authority.md":     {"Repository Admission", "Run Lease", "fencing", "cancellation"},
+	}
+	githubReference := readWorkflowBundleFile(t, filepath.Join(skillRoot, "references", "github.md"))
+	if strings.Contains(githubReference, "workflow github inbox-answer") || !strings.Contains(githubReference, "workflow answer-inbox --repository") {
+		t.Fatal("Workflow Inbox answers must use the atomic local transition and managed GitHub only for readback")
 	}
 	for name, required := range references {
 		link := "references/" + name

@@ -128,7 +128,7 @@ func main() { input, _ := io.ReadAll(os.Stdin); _ = os.WriteFile(os.Getenv("WORK
 	}
 	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
-	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath)
+	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-PolicyPath", policyPath, "-PublicKeyPath", publicKeyPath)
 	planOutput, err := planCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh plan on powershell.exe: %v (%s)", err, planOutput)
@@ -213,5 +213,33 @@ func main() {
 	sum := sha256.Sum256(auth)
 	if !facts.CodexAuth.Verified || facts.CodexAuth.Source != authPath || facts.CodexAuth.FingerprintSHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("fresh Codex auth facts=%#v", facts.CodexAuth)
+	}
+}
+
+func TestHostInspectionRejectsExistingWorkflowHomeOwnedByAnotherSIDOnPowerShell51(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell 5.1 is the supported bootstrap shell")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	directory := t.TempDir()
+	workflowHome := filepath.Join(directory, "workflow-home")
+	if err := os.MkdirAll(workflowHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, currentFile, _, _ := runtime.Caller(0)
+	script := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1"))
+	wrapper := `function Get-Acl { param([string]$LiteralPath) [pscustomobject]@{ Owner = $env:WORKFLOW_TEST_OWNER } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
+	for _, owner := range []string{`BUILTIN\Administrators`, `NT AUTHORITY\SYSTEM`} {
+		t.Run(owner, func(t *testing.T) {
+			command := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
+			command.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+script, "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_OWNER="+owner)
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "must be owned by the current Windows user") {
+				t.Fatalf("inspection accepted %s-owned Workflow Home: err=%v output=%s", owner, err, output)
+			}
+		})
 	}
 }

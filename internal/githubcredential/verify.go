@@ -86,6 +86,9 @@ func (v Verifier) Verify(ctx context.Context, token, owner string) (Verification
 		return Verification{}, ErrScopeDeficient
 	}
 	if !strings.EqualFold(user.Login, owner) {
+		if !hasScope(scopes, "admin:org") {
+			return Verification{}, ErrScopeDeficient
+		}
 		membershipURL := base + "/orgs/" + url.PathEscape(owner) + "/memberships/" + url.PathEscape(user.Login)
 		membership, err := http.NewRequestWithContext(ctx, http.MethodGet, membershipURL, nil)
 		if err != nil {

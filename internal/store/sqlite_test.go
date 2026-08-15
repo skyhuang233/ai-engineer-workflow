@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"net/url"
 	"os"
@@ -77,6 +79,50 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	var version int
 	if err := raw.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
 		t.Fatalf("schema changed: version=%d err=%v", version, err)
+	}
+}
+
+func TestOpenReadOnlyObservesCommittedWALStateWithoutCreatingWorkflowLocks(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "workflow.db")
+	writer, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	installedAt := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	bundleJSON := `[{"path":"bin/workflow.exe","sha256":"` + strings.Repeat("c", 64) + `"}]`
+	bundleSum := sha256.Sum256([]byte(bundleJSON))
+	want := PlatformInstallation{
+		PlatformVersion:                   "1.2.3",
+		ReleaseManifestDigestSHA256:       strings.Repeat("a", 64),
+		PlatformSetupContractDigestSHA256: strings.Repeat("b", 64),
+		WorkflowCLISHA256:                 strings.Repeat("c", 64),
+		ReleaseBundledFilesJSON:           bundleJSON,
+		ReleaseBundledFilesDigestSHA256:   hex.EncodeToString(bundleSum[:]),
+		WorkflowHome:                      filepath.Join(root, "home"),
+		InstalledAt:                       installedAt,
+		VerifiedAt:                        installedAt,
+	}
+	if err := writer.RecordPlatformInstallation(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotDirectoryTree(t, root)
+	reader, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("open alongside active WAL writer: %v", err)
+	}
+	defer reader.Close()
+	got, err := reader.PlatformInstallation(ctx)
+	if err != nil || got.PlatformVersion != want.PlatformVersion || got.ReleaseManifestDigestSHA256 != want.ReleaseManifestDigestSHA256 {
+		t.Fatalf("read-only Store returned stale WAL state: got=%#v err=%v", got, err)
+	}
+	after := snapshotDirectoryTree(t, root)
+	for path := range after {
+		if _, existed := before[path]; !existed {
+			t.Fatalf("read-only Store created %q while observing an active database", path)
+		}
 	}
 }
 

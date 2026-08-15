@@ -81,6 +81,10 @@ func main() {
 		if err := setupCommand(os.Args[2:]); err != nil {
 			fail(err)
 		}
+	case "github":
+		if err := githubCommand(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
 	case "serve":
 		if err := serveCommand(os.Args[2:], os.Stdout); err != nil {
 			fail(err)
@@ -138,6 +142,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow setup plan --repo <absolute>")
 	fmt.Fprintln(os.Stderr, "  workflow setup apply --plan <path> --approved-digest <sha256>")
 	fmt.Fprintln(os.Stderr, "  workflow setup verify --repo <absolute>")
+	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
 	fmt.Fprintln(os.Stderr, "  workflow serve [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow status [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow logs [--workflow-home <absolute>] [--lines 200] [--follow]")

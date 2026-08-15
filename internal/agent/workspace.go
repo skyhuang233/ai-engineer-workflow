@@ -1088,6 +1088,9 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	if len(args) > 0 && args[0] == "status" {
+		cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	}
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("git %v: %w", args, err)

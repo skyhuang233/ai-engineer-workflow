@@ -60,7 +60,7 @@ func TestVerifierRequiresActiveOrganizationAdminMembership(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
 				case "/user":
-					w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+					w.Header().Set("X-OAuth-Scopes", "repo, workflow, admin:org")
 					_, _ = w.Write([]byte(`{"login":"member","id":42}`))
 				case "/orgs/acme/memberships/member":
 					_, _ = w.Write([]byte(test.membership))
@@ -77,6 +77,25 @@ func TestVerifierRequiresActiveOrganizationAdminMembership(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestVerifierRequiresAdminOrgScopeBeforeOrganizationMembership(t *testing.T) {
+	membershipCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.Header().Set("X-OAuth-Scopes", "repo, workflow")
+			_, _ = w.Write([]byte(`{"login":"member","id":42}`))
+		case "/orgs/acme/memberships/member":
+			membershipCalled = true
+			_, _ = w.Write([]byte(`{"state":"active","role":"admin"}`))
+		}
+	}))
+	defer server.Close()
+	_, err := (Verifier{APIBase: server.URL, Client: server.Client()}).Verify(context.Background(), "secret", "acme")
+	if !errors.Is(err, ErrScopeDeficient) || membershipCalled {
+		t.Fatalf("error=%v membership_called=%t", err, membershipCalled)
 	}
 }
 

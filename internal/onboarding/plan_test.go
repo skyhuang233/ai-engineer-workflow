@@ -37,6 +37,19 @@ func approvedPublishedPolicy() PolicyDiscovery {
 	})
 }
 
+func approvedPublication() PublicationPreflight {
+	return publicationPreflightFunc(func(context.Context, string, string, string, bool) error { return nil })
+}
+
+func TestPlanRequiresVerifiedRepositoryAbsenceBeforeApprovingCreation(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "new-repo")
+	git(t, "", "init", "-b", "main", repo)
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("a", 64)})
+	if err == nil || !strings.Contains(err.Error(), "absence preflight") {
+		t.Fatalf("repository creation approved without verified absence: %v", err)
+	}
+}
+
 func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	repo := newRepo(t)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
@@ -70,19 +83,29 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64), Publication: approvedPublication()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	kinds := map[string]bool{}
+	var baseline, contract setupcontract.Effect
 	for _, effect := range plan.Effects {
 		kinds[effect.Kind] = true
+		if effect.Kind == "initial_baseline" {
+			baseline = effect
+		}
+		if effect.Kind == "repository_contract_pr" {
+			contract = effect
+		}
 		if effect.Kind == "local_fast_forward" && effect.Parameters["merge_head_effect_id"] != "repository-contract-pr" {
 			t.Fatalf("local fast-forward is not bound to merge evidence: %#v", effect)
 		}
 	}
 	if !kinds["create_repository"] || !kinds["initial_baseline"] || !kinds["repository_contract_pr"] {
 		t.Fatalf("effects=%#v", plan.Effects)
+	}
+	if contract.Parameters["base_head"] != "" || contract.Parameters["base_head_effect_id"] != baseline.ID {
+		t.Fatalf("zero-commit contract base is not bound to Initial Repository Baseline evidence: baseline=%#v contract=%#v", baseline, contract)
 	}
 	raw, _ := json.Marshal(plan)
 	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
@@ -98,7 +121,7 @@ func TestNewRepositoryHistoryPublicationRequiresEarlierApprovedCreation(t *testi
 	}
 	git(t, repo, "add", "README.md")
 	git(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64), Publication: approvedPublication()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +145,7 @@ func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *te
 	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), agents, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64), Publication: approvedPublication()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +182,7 @@ func TestPlanApprovalSnapshotRejectsZeroBaselineDriftBeforeEffects(t *testing.T)
 	if err := os.WriteFile(path, []byte("approved\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", PlatformReleaseDigest: repeatString("b", 64), Publication: approvedPublication()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +314,7 @@ func TestPlanHonorsExplicitPublicVisibility(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "public-repo")
 	git(t, "", "init", "-b", "main", repo)
 	public := false
-	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Private: &public, PlatformReleaseDigest: repeatString("e", 64)})
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Private: &public, PlatformReleaseDigest: repeatString("e", 64), Publication: approvedPublication()})
 	if err != nil {
 		t.Fatal(err)
 	}

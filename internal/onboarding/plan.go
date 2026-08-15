@@ -184,14 +184,11 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 		}
 	}
 	if !discovery.Published {
-		isOrganization := !strings.EqualFold(options.Owner, options.AuthenticatedLogin)
-		if options.Publication == nil && isOrganization {
-			return setupcontract.Plan{}, errors.New("unpublished organization repository requires a read-only creation preflight")
+		if options.Publication == nil {
+			return setupcontract.Plan{}, errors.New("unpublished repository requires a read-only absence preflight")
 		}
-		if options.Publication != nil {
-			if err := options.Publication.PreflightCreateRepository(ctx, options.Owner, options.AuthenticatedLogin, repositoryName, defaultPrivate(options)); err != nil {
-				return setupcontract.Plan{}, fmt.Errorf("preflight GitHub repository publication: %w", err)
-			}
+		if err := options.Publication.PreflightCreateRepository(ctx, options.Owner, options.AuthenticatedLogin, repositoryName, defaultPrivate(options)); err != nil {
+			return setupcontract.Plan{}, fmt.Errorf("preflight GitHub repository publication: %w", err)
 		}
 		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: repositoryID, Action: "create", Parameters: map[string]string{"owner": options.Owner, "authenticated_login": options.AuthenticatedLogin, "name": repositoryName, "private": boolString(defaultPrivate(options))}})
 		if !discovery.HasCommits {
@@ -222,7 +219,11 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	requiredChecks := uniqueRequiredChecks(append([]RequiredCheck{{Context: "workflow-contract", AppID: GitHubActionsAppID}}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	if !state.ContractSatisfied {
-		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}})
+		parameters := map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}
+		if !discovery.HasCommits {
+			parameters["base_head_effect_id"] = "initial-baseline"
+		}
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: repositoryID, Action: "create_check_merge", Parameters: parameters})
 	}
 	// Every approved onboarding plan terminates in a live admission readback.
 	// This also binds label-, feature-, and policy-only repairs to the complete

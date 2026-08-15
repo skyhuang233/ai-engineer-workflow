@@ -70,6 +70,28 @@ func TestHostAdapterAllowsMatchingIdentityBeforeCreatingWorkflowHome(t *testing.
 	}
 }
 
+func TestHostAdapterPreLayoutRejectsOwnerSnapshotNotBoundToExistingWorkflowHome(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	actualOwner, err := workflowHomeOwnerIdentity(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongOwner := "S-1-5-32-544"
+	if strings.EqualFold(actualOwner, wrongOwner) {
+		wrongOwner = "S-1-5-21-other-user"
+	}
+	expected, _ := json.Marshal(hostIdentityPrecondition{UserID: current.Uid, Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: wrongOwner})
+	adapter := HostAdapter{Layout: workflowhome.Layout{Root: root}}
+	err = adapter.CheckPreLayoutPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(expected)})
+	if err == nil || !strings.Contains(err.Error(), "owner") {
+		t.Fatalf("existing Workflow Home accepted an unbound owner snapshot: %v", err)
+	}
+}
+
 func TestRepositoryContractReadbackRequiresRepairForManagedContentDrift(t *testing.T) {
 	files, _, digest, err := repositorycontract.Render("single-context", []byte("# User instructions\n"), "owner/repo", "main")
 	if err != nil {
@@ -350,17 +372,142 @@ func TestPublishHistoryTreatsRefConflictAsRequiredOnlyForApprovedNewRepository(t
 	}
 }
 
+func TestInitialBaselineTreatsEmptyRemoteConflictAsRequiredOnlyWithPlanCreationEvidence(t *testing.T) {
+	planDigest := strings.Repeat("d", 64)
+	repo := filepath.Join(t.TempDir(), "repo")
+	hostGit(t, "", "init", "-b", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("approved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := onboarding.BaselineSnapshot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := onboarding.CreateInitialBaseline(context.Background(), repo, "main", approved, "Initial Repository Baseline\n\nSetup-Plan-SHA256: "+planDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","private":true}`))
+		case "/repos/owner/repo/git/ref/heads/main":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"message":"Git Repository is empty."}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	filesJSON, _ := json.Marshal(approved)
+	effect := setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: repo, Action: "commit_and_push", Parameters: map[string]string{"branch": "main", "files_json": string(filesJSON), "repository": "owner/repo", "source_url": "https://github.com/owner/repo.git"}}
+	for _, test := range []struct {
+		name    string
+		created bool
+		want    setupcontract.EffectStatus
+		wantErr bool
+	}{
+		{name: "no creation evidence", want: setupcontract.EffectFailed, wantErr: true},
+		{name: "same plan creation evidence", created: true, want: setupcontract.EffectRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), PlanDigest: planDigest, CreatedRepositories: map[string]bool{"owner/repo": test.created}, InitialBaselineHeads: map[string]string{}}
+			status, _, readErr := adapter.Readback(context.Background(), effect)
+			if status != test.want || (readErr != nil) != test.wantErr {
+				t.Fatalf("empty remote readback for %s = %s, %v; want %s err=%t (local head %s)", test.name, status, readErr, test.want, test.wantErr, head)
+			}
+		})
+	}
+}
+
+func TestCreateRepositoryReadbackRejectsTakeoverWithoutThisPlanEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name, fullName   string
+		private, created bool
+		want             setupcontract.EffectStatus
+	}{
+		{name: "matching takeover", fullName: "owner/repo", private: true, want: setupcontract.EffectConflicting},
+		{name: "plan-created exact repository", fullName: "owner/repo", private: true, created: true, want: setupcontract.EffectSatisfied},
+		{name: "plan-created visibility drift", fullName: "owner/repo", private: false, created: true, want: setupcontract.EffectConflicting},
+		{name: "plan-created owner drift", fullName: "attacker/repo", private: true, created: true, want: setupcontract.EffectConflicting},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"full_name":"` + test.fullName + `","private":` + boolStringForTest(test.private) + `}`))
+			}))
+			defer server.Close()
+			adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), CreatedRepositories: map[string]bool{"owner/repo": test.created}}
+			effect := setupcontract.Effect{ID: "create-repository", Kind: "create_repository", Subject: "owner/repo", Action: "create", Parameters: map[string]string{"owner": "owner", "authenticated_login": "owner", "name": "repo", "private": "true"}}
+			status, _, err := adapter.Readback(context.Background(), effect)
+			if err != nil || status != test.want {
+				t.Fatalf("create repository readback = %s, %v; want %s", status, err, test.want)
+			}
+		})
+	}
+}
+
+func boolStringForTest(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func TestRepositoryContractZeroCommitBaseComesOnlyFromPersistedBaselineEvidence(t *testing.T) {
+	remoteHead := strings.Repeat("e", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/owner/repo/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"object":{"sha":"` + remoteHead + `"}}`))
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Action: "create_check_merge", Parameters: map[string]string{
+		"base_branch": "main", "base_head": "", "base_head_effect_id": "initial-baseline", "source_url": "https://github.com/owner/repo.git", "before_files_json": `{}`, "files_json": `{}`, "manifest_digest": strings.Repeat("a", 64), "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
+	}}
+	adapter := HostAdapter{GitHub: workflowgithub.NewClient(server.URL, "token", server.Client()), PlanDigest: strings.Repeat("b", 64), TemporaryRoot: t.TempDir(), OnboardingMergeHeads: map[string]string{}, InitialBaselineHeads: map[string]string{}}
+	err := adapter.Apply(context.Background(), effect, &SecretInput{})
+	if err == nil || !strings.Contains(err.Error(), "persisted Initial Repository Baseline HEAD") {
+		t.Fatalf("runtime remote selected without baseline evidence: %v", err)
+	}
+	adapter.InitialBaselineHeads["initial-baseline"] = strings.Repeat("d", 40)
+	err = adapter.Apply(context.Background(), effect, &SecretInput{})
+	if err == nil || !strings.Contains(err.Error(), "base drifted") {
+		t.Fatalf("external remote advance accepted over persisted baseline: %v", err)
+	}
+}
+
 func TestHostAdapterRestoresPlanBoundPublicationEvidence(t *testing.T) {
 	adapter := HostAdapter{CreatedRepositories: map[string]bool{}, PublishedHistoryHeads: map[string]string{}, InitialBaselineHeads: map[string]string{}}
 	published := strings.Repeat("a", 40)
 	baseline := strings.Repeat("b", 40)
 	err := adapter.RestoreEffectResults([]setupcontract.EffectResult{
-		{EffectID: "create", Evidence: "created; " + repositoryCreatedEvidence + "owner/repo"},
+		{EffectID: "create", Status: setupcontract.EffectSatisfied, Evidence: "created; " + repositoryCreatedEvidence + "create:owner/repo"},
 		{EffectID: "publish", Evidence: "published; " + publishedHistoryHeadEvidence + published},
 		{EffectID: "baseline", Evidence: "baseline; " + initialBaselineHeadEvidence + baseline},
 	})
 	if err != nil || !adapter.CreatedRepositories["owner/repo"] || adapter.PublishedHistoryHeads["publish"] != published || adapter.InitialBaselineHeads["baseline"] != baseline {
 		t.Fatalf("restored publication evidence = %#v %#v %#v err=%v", adapter.CreatedRepositories, adapter.PublishedHistoryHeads, adapter.InitialBaselineHeads, err)
+	}
+}
+
+func TestHostAdapterRejectsRepositoryCreationMarkerNotBoundToSatisfiedEffect(t *testing.T) {
+	for _, result := range []setupcontract.EffectResult{
+		{EffectID: "create", Status: setupcontract.EffectFailed, Evidence: repositoryCreatedEvidence + "create:owner/repo"},
+		{EffectID: "other", Status: setupcontract.EffectSatisfied, Evidence: repositoryCreatedEvidence + "create:owner/repo"},
+		{EffectID: "create", Status: setupcontract.EffectSatisfied, Evidence: repositoryCreatedEvidence + "owner/repo"},
+	} {
+		adapter := HostAdapter{CreatedRepositories: map[string]bool{}}
+		if err := adapter.RestoreEffectResults([]setupcontract.EffectResult{result}); err == nil || adapter.CreatedRepositories["owner/repo"] {
+			t.Fatalf("unbound repository creation evidence restored: %#v err=%v", result, err)
+		}
 	}
 }
 
@@ -422,6 +569,7 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	digest := strings.Repeat("d", 64)
 	mergedHead := strings.Repeat("a", 40)
 	defaultHead := mergedHead
+	pullBase := strings.Repeat("c", 40)
 	contractFiles, _, manifestDigest, err := repositorycontract.Render("single-context", nil, "owner/repo", "main")
 	if err != nil {
 		t.Fatal(err)
@@ -440,7 +588,7 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 			if r.URL.Query().Get("state") != "all" {
 				t.Fatalf("pull request readback state = %q", r.URL.Query().Get("state"))
 			}
-			_, _ = w.Write([]byte(`[{"number":7,"body":"Approved Setup Plan SHA-256: ` + digest + `","merged_at":"2026-08-15T00:00:00Z","merge_commit_sha":"` + mergedHead + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"workflow/onboarding-` + digest[:12] + `"},"base":{"sha":"` + strings.Repeat("c", 40) + `","ref":"main"}}]`))
+			_, _ = w.Write([]byte(`[{"number":7,"body":"Approved Setup Plan SHA-256: ` + digest + `","merged_at":"2026-08-15T00:00:00Z","merge_commit_sha":"` + mergedHead + `","head":{"sha":"` + strings.Repeat("b", 40) + `","ref":"workflow/onboarding-` + digest[:12] + `"},"base":{"sha":"` + pullBase + `","ref":"main"}}]`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
 			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/git/ref/heads/main":
@@ -459,12 +607,18 @@ func TestRepositoryContractReadbackBindsMergedDefaultHeadAndRejectsLaterCommit(t
 	if adapter.OnboardingMergeHeads[effect.ID] != mergedHead {
 		t.Fatalf("durable merge binding = %#v", adapter.OnboardingMergeHeads)
 	}
+	pullBase = strings.Repeat("f", 40)
+	status, evidence, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectConflicting || !strings.Contains(evidence, "base") {
+		t.Fatalf("pull request on unapproved base accepted = %s, %q, %v", status, evidence, err)
+	}
+	pullBase = strings.Repeat("c", 40)
 	restored := HostAdapter{OnboardingMergeHeads: map[string]string{}}
 	if err := restored.RestoreEffectResults([]setupcontract.EffectResult{{EffectID: effect.ID, Evidence: onboardingMergeHeadEvidence + mergedHead}}); err != nil || restored.OnboardingMergeHeads[effect.ID] != mergedHead {
 		t.Fatalf("restored merge binding = %#v, %v", restored.OnboardingMergeHeads, err)
 	}
 	defaultHead = strings.Repeat("e", 40)
-	status, evidence, err := adapter.Readback(context.Background(), effect)
+	status, evidence, err = adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectConflicting || !strings.Contains(evidence, "advanced") {
 		t.Fatalf("post-merge extra commit readback = %s, %q, %v", status, evidence, err)
 	}

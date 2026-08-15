@@ -2,6 +2,7 @@
 package onboarding
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -72,12 +73,16 @@ func Discover(ctx context.Context, repository string, resolver RemoteHead) (Disc
 			return Discovery{}, errors.New("local default-branch HEAD must exactly equal GitHub origin default-branch HEAD")
 		}
 	}
-	status, err := gitOutput(ctx, root, "status", "--porcelain=v2", "--untracked-files=all")
+	status, err := gitBytes(ctx, root, "status", "--porcelain=v2", "-z", "--untracked-files=all")
 	if err != nil {
 		return Discovery{}, err
 	}
-	dirty := strings.TrimSpace(status) != ""
-	if conflict := managedConflict(status); conflict != "" {
+	dirty := len(status) != 0
+	conflict, err := managedConflict(status)
+	if err != nil {
+		return Discovery{}, err
+	}
+	if conflict != "" {
 		return Discovery{}, fmt.Errorf("local change overlaps Workflow-managed path %q", conflict)
 	}
 	if err := managedBlockConflict(ctx, root, hasCommits); err != nil {
@@ -86,21 +91,55 @@ func Discover(ctx context.Context, repository string, resolver RemoteHead) (Disc
 	return Discovery{Root: root, Branch: branch, Head: head, Origin: origin, Repository: repositoryID, DefaultBranch: defaultBranch, RemoteHead: remoteHead, Published: published, HasCommits: hasCommits, Dirty: dirty}, nil
 }
 
-func managedConflict(status string) string {
-	for _, line := range strings.Split(status, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+func managedConflict(status []byte) (string, error) {
+	records := bytes.Split(status, []byte{0})
+	for index := 0; index < len(records); index++ {
+		record := string(records[index])
+		if record == "" {
 			continue
 		}
-		path := strings.Trim(strings.ReplaceAll(fields[len(fields)-1], `\\`, `/`), `"`)
-		if path == "AGENTS.md" {
+		var paths []string
+		switch record[0] {
+		case '1':
+			fields := strings.SplitN(record, " ", 9)
+			if len(fields) != 9 {
+				return "", errors.New("Git status returned a malformed ordinary entry")
+			}
+			paths = []string{fields[8]}
+		case '2':
+			fields := strings.SplitN(record, " ", 10)
+			if len(fields) != 10 || index+1 >= len(records) || len(records[index+1]) == 0 {
+				return "", errors.New("Git status returned a malformed rename entry")
+			}
+			index++
+			paths = []string{fields[9], string(records[index])}
+		case 'u':
+			fields := strings.SplitN(record, " ", 11)
+			if len(fields) != 11 {
+				return "", errors.New("Git status returned a malformed unmerged entry")
+			}
+			paths = []string{fields[10]}
+		case '?':
+			if !strings.HasPrefix(record, "? ") {
+				return "", errors.New("Git status returned a malformed untracked entry")
+			}
+			paths = []string{strings.TrimPrefix(record, "? ")}
+		case '!', '#':
 			continue
+		default:
+			return "", errors.New("Git status returned an unsupported porcelain-v2 entry")
 		}
-		if path == ".github/workflows/workflow-contract.yml" || strings.HasPrefix(path, ".workflow/") || strings.HasPrefix(path, "docs/agents/") {
-			return path
+		for _, path := range paths {
+			path = strings.ReplaceAll(path, `\`, "/")
+			if path == "AGENTS.md" {
+				continue
+			}
+			if path == ".github/workflows/workflow-contract.yml" || strings.HasPrefix(path, ".workflow/") || strings.HasPrefix(path, "docs/agents/") {
+				return path, nil
+			}
 		}
 	}
-	return ""
+	return "", nil
 }
 func managedBlockConflict(ctx context.Context, root string, hasCommits bool) error {
 	working, err := os.ReadFile(filepath.Join(root, "AGENTS.md"))
@@ -172,6 +211,9 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = dir
+	if len(args) > 0 && args[0] == "status" {
+		command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	}
 	output, err := command.Output()
 	if err != nil {
 		return nil, err

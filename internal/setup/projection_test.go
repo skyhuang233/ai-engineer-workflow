@@ -28,6 +28,14 @@ func TestProjectShowsExactManagedFileContentsAndRedactsSecretInputs(t *testing.T
 	}
 }
 
+func TestProjectShowsExactOwnerSpecificPATScopes(t *testing.T) {
+	plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "org-pat", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: `C:\Workflow`}, Effects: []setupcontract.Effect{{ID: "pat", Kind: "github_pat", Subject: `C:\Workflow\state\credentials\github.pat`, Action: "persist", Parameters: map[string]string{"input": "stdin", "owner": "acme", "required_scopes": "repo,workflow,admin:org"}}}}
+	projection := Project(plan, strings.Repeat("a", 64))
+	if !strings.Contains(projection, "required_scopes: repo,workflow,admin:org") {
+		t.Fatalf("projection does not show organization PAT scope requirement:\n%s", projection)
+	}
+}
+
 func TestProjectFileDiffMakesTrailingNewlineAndBinaryBytesUnambiguous(t *testing.T) {
 	before, _ := json.Marshal(map[string]string{
 		"newline.txt": base64.StdEncoding.EncodeToString([]byte("x\n")),

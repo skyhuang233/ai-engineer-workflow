@@ -63,8 +63,9 @@ const publishedHistoryHeadEvidence = "published_history_head="
 func (a HostAdapter) RestoreEffectResults(results []setupcontract.EffectResult) error {
 	for _, result := range results {
 		if index := strings.Index(result.Evidence, repositoryCreatedEvidence); index >= 0 && a.CreatedRepositories != nil {
-			repository := strings.TrimSpace(result.Evidence[index+len(repositoryCreatedEvidence):])
-			if !strings.Contains(repository, "/") {
+			binding := strings.TrimSpace(result.Evidence[index+len(repositoryCreatedEvidence):])
+			effectID, repository, bound := strings.Cut(binding, ":")
+			if result.Status != setupcontract.EffectSatisfied || !bound || effectID != result.EffectID || !strings.Contains(repository, "/") {
 				return errors.New("persisted repository-creation evidence is invalid")
 			}
 			a.CreatedRepositories[repository] = true
@@ -227,14 +228,18 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if err != nil {
 				return setupcontract.EffectFailed, "", err
 			}
+			if !a.CreatedRepositories[effect.Subject] {
+				return setupcontract.EffectConflicting, "GitHub repository appeared after approval without this Setup Plan's creation evidence", nil
+			}
 			wantPrivate := effect.Parameters["private"] == "true"
+			approvedRepository := effect.Parameters["owner"] + "/" + effect.Parameters["name"]
+			if !strings.EqualFold(repository.FullName, approvedRepository) || !strings.EqualFold(repository.FullName, effect.Subject) {
+				return setupcontract.EffectConflicting, "created GitHub repository owner or identity differs from approved plan", nil
+			}
 			if repository.Private != wantPrivate {
-				return setupcontract.EffectConflicting, "existing GitHub repository visibility differs from approved plan", nil
+				return setupcontract.EffectConflicting, "created GitHub repository visibility differs from approved plan", nil
 			}
-			evidence := "GitHub repository exists with approved identity and visibility"
-			if a.CreatedRepositories[effect.Subject] {
-				evidence += "; " + repositoryCreatedEvidence + effect.Subject
-			}
+			evidence := "GitHub repository created by this Setup Plan with approved identity and visibility; " + repositoryCreatedEvidence + effect.ID + ":" + effect.Subject
 			return setupcontract.EffectSatisfied, evidence, nil
 		},
 		"initial_baseline": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -257,12 +262,19 @@ func hostReadbackHandlers() map[string]effectReadback {
 				return setupcontract.EffectFailed, "", errors.New("GitHub client is required")
 			}
 			remote, err := a.GitHub.DefaultBranchHead(ctx, effect.Parameters["repository"])
-			if github.IsNotFound(err) || err == nil && (remote.Name != effect.Parameters["branch"] || remote.Head != head) {
-				return setupcontract.EffectRequired, "Initial Repository Baseline is not published", nil
+			if github.IsConflict(err) && a.CreatedRepositories[effect.Parameters["repository"]] {
+				return setupcontract.EffectRequired, "Initial Repository Baseline is not published to the verified newly-created repository", nil
 			}
 			if err != nil {
 				return setupcontract.EffectFailed, "", err
 			}
+			if remote.Name != effect.Parameters["branch"] || remote.Head != head {
+				return setupcontract.EffectConflicting, "GitHub default branch differs from the exact approved Initial Repository Baseline", nil
+			}
+			if a.InitialBaselineHeads == nil {
+				return setupcontract.EffectFailed, "", errors.New("durable Initial Repository Baseline HEAD binding is required")
+			}
+			a.InitialBaselineHeads[effect.ID] = head
 			return setupcontract.EffectSatisfied, "approved Initial Repository Baseline is published; " + initialBaselineHeadEvidence + head, nil
 		},
 		"publish_history": func(a HostAdapter, ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -318,8 +330,12 @@ func hostReadbackHandlers() map[string]effectReadback {
 			if a.OnboardingMergeHeads == nil {
 				return setupcontract.EffectFailed, "", errors.New("durable Onboarding Pull Request merge-HEAD binding is required")
 			}
+			baseHead, err := a.approvedOnboardingBase(effect)
+			if err != nil {
+				return setupcontract.EffectFailed, "", err
+			}
 			var fetchErr error
-			_, err := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+			_, err = repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
 				content, fileErr := a.GitHub.RepositoryFile(ctx, effect.Subject, path, effect.Parameters["base_branch"])
 				if fileErr != nil && fetchErr == nil {
 					fetchErr = fileErr
@@ -344,6 +360,9 @@ func hostReadbackHandlers() map[string]effectReadback {
 			body := "Approved Setup Plan SHA-256: " + a.PlanDigest
 			if !found || pull.Body != body || pull.MergedAt == "" || !fullSetupCommitID(pull.MergeCommitSHA) {
 				return setupcontract.EffectConflicting, "merged Onboarding Pull Request is not bound to the approved plan", nil
+			}
+			if pull.Base.Ref != effect.Parameters["base_branch"] || pull.Base.SHA != baseHead {
+				return setupcontract.EffectConflicting, "merged Onboarding Pull Request base differs from the approved plan", nil
 			}
 			if persisted := a.OnboardingMergeHeads[effect.ID]; persisted != "" && persisted != pull.MergeCommitSHA {
 				return setupcontract.EffectConflicting, "merged Onboarding Pull Request HEAD differs from persisted Setup evidence", nil
@@ -746,8 +765,33 @@ func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupco
 	if value.Kind != "host_identity" {
 		return fmt.Errorf("pre-layout verification is unsupported for precondition kind %q", value.Kind)
 	}
-	_, err := a.checkHostIdentityBeforeLayout(value)
-	return err
+	expected, err := a.checkHostIdentityBeforeLayout(value)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(a.Layout.Root)
+	if errors.Is(err, os.ErrNotExist) {
+		// A fresh Workflow Home has no owner to inspect yet. Layout creation will
+		// make it current-user-owned and the ordinary precondition pass verifies it.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect existing Workflow Home before layout use: %w", err)
+	}
+	if !info.IsDir() {
+		return errors.New("existing Workflow Home is not a directory")
+	}
+	ownerID, err := workflowHomeOwnerIdentity(a.Layout.Root)
+	if err != nil {
+		return fmt.Errorf("read existing Workflow Home owner identity before layout use: %w", err)
+	}
+	if !strings.EqualFold(ownerID, expected.UserID) {
+		return errors.New("existing Workflow Home is not owned by the current Windows user")
+	}
+	if !strings.EqualFold(ownerID, expected.WorkflowHomeOwnerID) {
+		return errors.New("existing Workflow Home owner identity drifted from the approved plan")
+	}
+	return nil
 }
 
 func (a HostAdapter) checkHostIdentityBeforeLayout(value setupcontract.Precondition) (hostIdentityPrecondition, error) {
@@ -804,13 +848,9 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 		}
 		files[path] = data
 	}
-	baseHead := effect.Parameters["base_head"]
-	if baseHead == "" {
-		revision, err := a.GitHub.DefaultBranchHead(ctx, effect.Subject)
-		if err != nil {
-			return err
-		}
-		baseHead = revision.Head
+	baseHead, err := a.approvedOnboardingBase(effect)
+	if err != nil {
+		return err
 	}
 	if err := a.requireOnboardingBase(ctx, effect.Subject, effect.Parameters["base_branch"], baseHead); err != nil {
 		return err
@@ -930,6 +970,21 @@ func (a HostAdapter) applyRepositoryContract(ctx context.Context, effect setupco
 		return fmt.Errorf("%s%s; GitHub default branch advanced before the approved merge HEAD could be bound", onboardingMergeHeadEvidence, merge.SHA)
 	}
 	return nil
+}
+
+func (a HostAdapter) approvedOnboardingBase(effect setupcontract.Effect) (string, error) {
+	baseHead := effect.Parameters["base_head"]
+	if baseHead == "" {
+		baselineEffectID := effect.Parameters["base_head_effect_id"]
+		baseHead = a.InitialBaselineHeads[baselineEffectID]
+		if baselineEffectID == "" || !fullSetupCommitID(baseHead) {
+			return "", errors.New("persisted Initial Repository Baseline HEAD is required as the Onboarding Pull Request base")
+		}
+	}
+	if !fullSetupCommitID(baseHead) {
+		return "", errors.New("approved Onboarding Pull Request base HEAD is invalid")
+	}
+	return baseHead, nil
 }
 
 func fullSetupCommitID(value string) bool {

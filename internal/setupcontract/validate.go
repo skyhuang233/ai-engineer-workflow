@@ -150,12 +150,25 @@ func (p Plan) Validate() error {
 	}
 	if p.Kind == RepositoryOnboarding {
 		created := map[string]bool{}
-		for _, effect := range p.Effects {
+		effectIndexes := map[string]int{}
+		for index, effect := range p.Effects {
+			effectIndexes[effect.ID] = index
 			if effect.Kind == "create_repository" {
 				created[effect.Subject] = true
 			}
 			if effect.Kind == "publish_history" && effect.Parameters["new_repository"] == "true" && !created[effect.Subject] {
 				return fmt.Errorf("publish history effect %q claims a new repository without an earlier approved creation", effect.ID)
+			}
+			if effect.Kind == "repository_contract_pr" && effect.Parameters["base_head"] == "" {
+				baselineID := effect.Parameters["base_head_effect_id"]
+				baselineIndex, found := effectIndexes[baselineID]
+				if !found || baselineIndex >= index {
+					return fmt.Errorf("repository contract effect %q lacks an earlier Initial Repository Baseline binding", effect.ID)
+				}
+				baseline := p.Effects[baselineIndex]
+				if baseline.Kind != "initial_baseline" || baseline.Parameters["repository"] != effect.Subject {
+					return fmt.Errorf("repository contract effect %q has an invalid Initial Repository Baseline binding", effect.ID)
+				}
 			}
 		}
 	}
@@ -246,6 +259,9 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 	}
 	if effect.Kind == "github_pat" && effect.Parameters["input"] != "stdin" {
 		return errors.New("GitHub PAT input must be stdin")
+	}
+	if effect.Kind == "repository_contract_pr" && effect.Parameters["base_head"] != "" && effect.Parameters["base_head_effect_id"] != "" {
+		return errors.New("repository contract base must use either an approved HEAD or Initial Repository Baseline evidence")
 	}
 	if effect.Kind == "docker_desktop" && !strings.HasPrefix(effect.Parameters["installer_url"], "https://") {
 		return errors.New("Docker installer URL must use HTTPS")

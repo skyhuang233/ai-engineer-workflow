@@ -36,7 +36,7 @@ type ApprovalTransitions struct {
 }
 
 func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedRepository string, zeroBaseline []BaselineFile) (string, error) {
-	status, err := gitBytes(ctx, discovery.Root, "status", "--porcelain=v2", "--untracked-files=all")
+	status, err := gitBytes(ctx, discovery.Root, "status", "--porcelain=v2", "-z", "--untracked-files=all")
 	if err != nil {
 		return "", err
 	}
@@ -93,7 +93,7 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 			return err
 		}
 	}
-	status, err := gitBytes(ctx, root, "status", "--porcelain=v2", "--untracked-files=all")
+	status, err := gitBytes(ctx, root, "status", "--porcelain=v2", "-z", "--untracked-files=all")
 	if err != nil {
 		return err
 	}

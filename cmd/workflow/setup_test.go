@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -84,6 +85,21 @@ func TestSetupPlanReportsBootstrapBlockerWithoutMutatingRepository(t *testing.T)
 	}
 	if response.Status != "blocked" || response.Blocker == "" {
 		t.Fatalf("response=%#v", response)
+	}
+}
+
+func TestSetupPlanBindsConfirmedPublicationStateBeforePlatformReadback(t *testing.T) {
+	repository := t.TempDir()
+	command := exec.Command("git", "-C", repository, "init")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	var output bytes.Buffer
+	if err := runSetupPlan([]string{"--repo", repository, "--publication-state", "published", "--repository-name", "repo", "--visibility", "private", "--domain-layout", "single-context"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "confirmed publication state") {
+		t.Fatalf("setup plan did not fence confirmed publication intent: %s", output.String())
 	}
 }
 
@@ -177,6 +193,50 @@ func TestSetupPlanReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
 	var version int
 	if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
 		t.Fatalf("setup plan migrated schema: version=%d err=%v", version, err)
+	}
+}
+
+func TestSetupInspectPlatformReportsOldSchemaRepairBlockerWithoutMigrating(t *testing.T) {
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(layout.State, "workflow.db")
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations(version,applied_at) VALUES(59,'old')`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beforeTree := setupPlanTreeSnapshot(t, layout.Root)
+	var output bytes.Buffer
+	if err := runSetupInspectPlatform([]string{"--workflow-home", layout.Root}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var response setupResponse
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "blocked" || !strings.Contains(response.Blocker, "approved Platform repair") {
+		t.Fatalf("old schema inspection response=%s err=%v", output.String(), err)
+	}
+	afterTree := setupPlanTreeSnapshot(t, layout.Root)
+	if !reflect.DeepEqual(afterTree, beforeTree) {
+		t.Fatalf("setup inspect-platform changed Workflow Home tree:\nbefore=%#v\nafter=%#v", beforeTree, afterTree)
+	}
+	raw, err = sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var version int
+	if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 59 {
+		t.Fatalf("setup inspect-platform migrated schema: version=%d err=%v", version, err)
 	}
 }
 

@@ -34,6 +34,9 @@ $workflowHomeOwnerSID = $currentUserSID
 if (Test-Path -LiteralPath $WorkflowHome) {
     $ownerAccount = New-Object Security.Principal.NTAccount((Get-Acl -LiteralPath $WorkflowHome).Owner)
     $workflowHomeOwnerSID = [string]$ownerAccount.Translate([Security.Principal.SecurityIdentifier]).Value
+    if (-not [string]::Equals($workflowHomeOwnerSID, $currentUserSID, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The existing Workflow Home must be owned by the current Windows user"
+    }
 }
 $hostIdentity = [ordered]@{ user_id = $currentUserSID; username = [string]$windowsIdentity.Name; workflow_home_owner_id = $workflowHomeOwnerSID }
 
@@ -61,7 +64,13 @@ if ($isRepository) {
     $gitFacts.branch = (& git -C $repoPath branch --show-current 2>$null | Out-String).Trim()
     $gitFacts.head = (& git -C $repoPath rev-parse --verify HEAD 2>$null | Out-String).Trim()
     $gitFacts.origin = (& git -C $repoPath remote get-url origin 2>$null | Out-String).Trim()
-    $gitFacts.status_porcelain_v2 = @(& git -C $repoPath status --porcelain=v2 --untracked-files=all)
+    $previousOptionalLocks = $env:GIT_OPTIONAL_LOCKS
+    try {
+        $env:GIT_OPTIONAL_LOCKS = "0"
+        $gitFacts.status_porcelain_v2 = @(& git -C $repoPath status --porcelain=v2 -z --untracked-files=all)
+    } finally {
+        $env:GIT_OPTIONAL_LOCKS = $previousOptionalLocks
+    }
 }
 
 $dockerCLI = Invoke-ObservedCommand "docker" @("version", "--format", "{{.Client.Version}}")
@@ -89,7 +98,7 @@ $controlPlane = [ordered]@{ state = "stopped"; diagnostic = "installed Workflow 
 $installedWorkflow = Join-Path $workflowBin "workflow.exe"
 $workflow = [ordered]@{ installed = $false; owned = $false; version = ""; sha256 = ""; path_reconciled = (@($currentUserPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [string]::Equals(([IO.Path]::GetFullPath($_.Trim())), ([IO.Path]::GetFullPath($workflowBin)), [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) }
 $platform = [ordered]@{ installation_recorded = $false; version = ""; release_manifest_digest = ""; platform_setup_contract_digest = "" }
-$githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; owner = ""; scopes = @(); fingerprint_sha256 = "" }
+$githubCredential = [ordered]@{ path = $credentialPath; exists = (Test-Path -LiteralPath $credentialPath -PathType Leaf); verified = $false; login = ""; owner = ""; scopes = @(); fingerprint_sha256 = "" }
 $codexAuth = [ordered]@{ verified = $false; source = ""; fingerprint_sha256 = "" }
 if ($codex.installed) {
     $doctor = Invoke-ObservedCommand "codex" @("doctor", "--json")
@@ -130,6 +139,7 @@ if (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) {
                 $workflow.owned = [bool]$inspectionJSON.result.workflow_cli.verified
                 $githubCredential.exists = [bool]$inspectionJSON.result.github_credential.exists
                 $githubCredential.verified = [bool]$inspectionJSON.result.github_credential.verified
+                $githubCredential.login = [string]$inspectionJSON.result.github_credential.login
                 $githubCredential.owner = [string]$inspectionJSON.result.github_credential.owner
                 $githubCredential.scopes = @($inspectionJSON.result.github_credential.scopes | ForEach-Object { [string]$_ })
 				$githubCredential.fingerprint_sha256 = [string]$inspectionJSON.result.github_credential.fingerprint_sha256

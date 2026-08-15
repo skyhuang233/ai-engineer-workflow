@@ -1,11 +1,14 @@
 package onboarding
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestDiscoverPublishedRepositoryWithoutMutatingGitMetadata(t *testing.T) {
@@ -61,6 +64,73 @@ func TestDiscoverAllowsUnrelatedDirtyAndBlocksManagedDirty(t *testing.T) {
 	}
 	if _, err := Discover(context.Background(), repo, StaticRemoteHead{DefaultBranch: "main", Head: head}); err == nil {
 		t.Fatal("managed path conflict accepted")
+	}
+}
+
+func TestDiscoverBlocksRenameWhenEitherPathCrossesManagedBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name, source, destination string
+	}{
+		{name: "into managed boundary", source: "notes.txt", destination: "docs/agents/domain.md"},
+		{name: "out of managed boundary", source: "docs/agents/domain.md", destination: "notes.txt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := newRepo(t)
+			source := filepath.Join(repo, filepath.FromSlash(test.source))
+			if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, []byte("tracked\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repo, "add", test.source)
+			git(t, repo, "commit", "-m", "add rename source")
+			destination := filepath.Join(repo, filepath.FromSlash(test.destination))
+			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repo, "mv", test.source, test.destination)
+			head := testGitOutput(t, repo, "rev-parse", "HEAD")
+			_, err := Discover(context.Background(), repo, StaticRemoteHead{DefaultBranch: "main", Head: head})
+			if err == nil || !strings.Contains(err.Error(), "Workflow-managed path") {
+				t.Fatalf("managed rename accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDiscoverStatusDoesNotRefreshOrLockGitIndex(t *testing.T) {
+	repo := newRepo(t)
+	index := filepath.Join(repo, ".git", "index")
+	before, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(index, fixed, fixed); err != nil {
+		t.Fatal(err)
+	}
+	readme := filepath.Join(repo, "README.md")
+	if err := os.Chtimes(readme, fixed.Add(2*time.Hour), fixed.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	if _, err := Discover(context.Background(), repo, StaticRemoteHead{DefaultBranch: "main", Head: head}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) || !info.ModTime().Equal(fixed) {
+		t.Fatalf("read-only discovery refreshed index: bytes_changed=%t mtime=%s", !bytes.Equal(after, before), info.ModTime())
+	}
+	if _, err := os.Stat(index + ".lock"); !os.IsNotExist(err) {
+		t.Fatalf("read-only discovery left index.lock: %v", err)
 	}
 }
 

@@ -90,14 +90,15 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	planPath := filepath.Join(directory, "platform-plan.json")
 	workflowHome := filepath.Join(directory, "workflow-home")
 	skillsRoot := filepath.Join(directory, "codex-skills")
-	hostFacts, _ := json.Marshal(map[string]any{
+	freshHostState := map[string]any{
 		"schema_version": 1, "supported_host": true, "workflow_home": workflowHome,
 		"host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"},
 		"workflow":      map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
-		"github_credential": map[string]any{"exists": true, "verified": true, "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
+		"github_credential": map[string]any{"exists": true, "verified": true, "login": "owner", "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
 		"codex_auth":        map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)},
 		"codex_skills_root": skillsRoot,
-	})
+	}
+	hostFacts, _ := json.Marshal(freshHostState)
 	write(hostFactsPath, hostFacts)
 	planScript := filepath.Join(filepath.Dir(script), "new-platform-bootstrap-plan.ps1")
 	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
@@ -146,6 +147,15 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		t.Fatalf("read-only plan generation created Workflow Home: %v", err)
 	}
 
+	freshHostState["host_identity"].(map[string]any)["workflow_home_owner_id"] = "S-1-5-32-544"
+	ownerMismatchFacts, _ := json.Marshal(freshHostState)
+	write(hostFactsPath, ownerMismatchFacts)
+	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
+	if err == nil || !strings.Contains(output, "owned by the current Windows user") {
+		t.Fatalf("planner accepted an existing Workflow Home owner not matching the current SID: %q, %v", output, err)
+	}
+	freshHostState["host_identity"].(map[string]any)["workflow_home_owner_id"] = "S-1-5-21-planner"
+
 	// Exact readback facts must produce a true no-op rather than another empty
 	// approval cycle. The no-op envelope remains digest-bound for audit display.
 	if err := os.MkdirAll(filepath.Join(skillsRoot, "implement"), 0o700); err != nil {
@@ -173,7 +183,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		"workflow":          map[string]any{"installed": true, "owned": true, "path_reconciled": true, "version": manifest.Release.Version, "sha256": manifest.BundledFiles[0].SHA256},
 		"platform":          map[string]any{"installation_recorded": true, "version": manifest.Release.Version, "release_manifest_digest": hex.EncodeToString(manifestDigest[:]), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": manifest.BundledFiles[0].SHA256, "release_bundled_files_json": string(bundledCanonical), "release_bundled_files_digest": bundledDigest, "control_plane_plan_digest_sha256": controlPlaneDigest},
 		"docker":            map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"},
-		"github_credential": map[string]any{"exists": true, "verified": true, "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
+		"github_credential": map[string]any{"exists": true, "verified": true, "login": "owner", "owner": "owner", "scopes": []string{"repo", "workflow"}, "fingerprint_sha256": strings.Repeat("8", 64), "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")},
 		"codex_auth":        map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)},
 		"control_plane":     map[string]any{"state": "ready", "runtime": map[string]any{"platform_version": manifest.Release.Version, "approved_platform_bootstrap_plan_digest_sha256": controlPlaneDigest}}, "codex_skills_root": skillsRoot,
 	}
@@ -262,20 +272,15 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		if runErr != nil || decodeErr != nil || parseErr != nil || len(repair.Plan.Effects) != 2 || repair.Plan.Effects[0].Kind != "platform_installation" || repair.Plan.Effects[0].Action != "record" || repair.Plan.Effects[1].Kind != "control_plane" || repair.Plan.Effects[1].Action != wantControlPlaneAction {
 			t.Fatalf("%s did not rewrite installation and reauthorize the running Control Plane: %q, %v, %v, %v", name, output, runErr, decodeErr, parseErr)
 		}
-		for _, value := range extra {
-			if value != "-AllowUpgrade" {
-				continue
-			}
-			platform := noOpState["platform"].(map[string]any)
-			priorRaw, _ := json.Marshal(map[string]string{"version": platform["version"].(string), "release_manifest_digest": platform["release_manifest_digest"].(string), "platform_setup_contract_digest": platform["platform_setup_contract_digest"].(string), "workflow_cli_sha256": platform["workflow_cli_sha256"].(string), "release_bundled_files_digest": platform["release_bundled_files_digest"].(string), "control_plane_plan_digest_sha256": platform["control_plane_plan_digest_sha256"].(string)})
-			_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
-			found := false
-			for _, precondition := range repair.Plan.Preconditions {
-				found = found || precondition.Kind == "platform_installation" && precondition.Subject == workflowHome && precondition.Expected == priorDigest
-			}
-			if !found {
-				t.Fatalf("explicit upgrade omitted exact prior Platform Installation transition: %q", output)
-			}
+		platform := noOpState["platform"].(map[string]any)
+		priorRaw, _ := json.Marshal(map[string]string{"version": platform["version"].(string), "release_manifest_digest": platform["release_manifest_digest"].(string), "platform_setup_contract_digest": platform["platform_setup_contract_digest"].(string), "workflow_cli_sha256": platform["workflow_cli_sha256"].(string), "release_bundled_files_digest": platform["release_bundled_files_digest"].(string), "control_plane_plan_digest_sha256": platform["control_plane_plan_digest_sha256"].(string)})
+		_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
+		found := false
+		for _, precondition := range repair.Plan.Preconditions {
+			found = found || precondition.Kind == "platform_installation" && precondition.Subject == workflowHome && precondition.Expected == priorDigest
+		}
+		if !found {
+			t.Fatalf("Platform Installation repair omitted exact prior-state transition: %q", output)
 		}
 	}
 	platformState := noOpState["platform"].(map[string]any)

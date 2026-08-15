@@ -34,7 +34,7 @@ var descriptors = []Descriptor{
 	{Kind: "platform_cli", PlanKind: PlatformBootstrap, Actions: []string{"install"}, Required: []string{"version", "sha256"}, PlatformMutation: true, Engine: StandardEffect},
 	{Kind: "workflow_skill_bundle", PlanKind: PlatformBootstrap, Actions: []string{"install"}, Required: []string{"version", "managed_skills_json", "files_json"}, PlatformMutation: true, Engine: StandardEffect},
 	{Kind: "docker_desktop", PlanKind: PlatformBootstrap, Actions: []string{"install", "upgrade", "repair"}, Required: []string{"version", "installer_url", "windows_amd64_sha256"}, PlatformMutation: true, Engine: StandardEffect},
-	{Kind: "github_pat", PlanKind: PlatformBootstrap, Actions: []string{"persist", "replace"}, Required: []string{"input", "owner"}, Optional: []string{"api_base"}, PlatformMutation: true, Engine: GitHubPATEffect},
+	{Kind: "github_pat", PlanKind: PlatformBootstrap, Actions: []string{"persist", "replace"}, Required: []string{"input", "owner"}, Optional: []string{"api_base", "required_scopes"}, PlatformMutation: true, Engine: GitHubPATEffect},
 	{Kind: "platform_installation", PlanKind: PlatformBootstrap, Actions: []string{"record"}, Required: []string{"version", "release_manifest_digest", "platform_setup_contract_json", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest"}, PlatformMutation: true, Engine: PlatformInstallEffect},
 	{Kind: "control_plane", PlanKind: PlatformBootstrap, Actions: []string{"start", "replace"}, Required: []string{"version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest"}, PlatformMutation: true, Engine: ControlPlaneEffect},
 	{Kind: "create_repository", PlanKind: RepositoryOnboarding, Actions: []string{"create"}, Required: []string{"owner", "authenticated_login", "name", "private"}, Engine: StandardEffect},
@@ -42,7 +42,7 @@ var descriptors = []Descriptor{
 	{Kind: "publish_history", PlanKind: RepositoryOnboarding, Actions: []string{"push"}, Required: []string{"branch", "head"}, Optional: []string{"new_repository"}, Engine: StandardEffect},
 	{Kind: "github_label", PlanKind: RepositoryOnboarding, Actions: []string{"reconcile"}, Required: []string{"name", "color", "description"}, Engine: StandardEffect},
 	{Kind: "repository_features", PlanKind: RepositoryOnboarding, Actions: []string{"enable"}, Required: []string{"issues", "actions", "allowed_actions"}, Engine: StandardEffect},
-	{Kind: "repository_contract_pr", PlanKind: RepositoryOnboarding, Actions: []string{"create_check_merge"}, Required: []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}, Engine: StandardEffect},
+	{Kind: "repository_contract_pr", PlanKind: RepositoryOnboarding, Actions: []string{"create_check_merge"}, Required: []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json"}, Optional: []string{"base_head_effect_id"}, Engine: StandardEffect},
 	{Kind: "repository_admission", PlanKind: RepositoryOnboarding, Actions: []string{"verify_and_record"}, Required: []string{"default_branch", "manifest_digest", "contract_version"}, Optional: []string{"labels_json", "actions_allowed"}, Engine: AdmissionEffect},
 	{Kind: "local_fast_forward", PlanKind: RepositoryOnboarding, Actions: []string{"fast_forward_if_safe"}, Required: []string{"repository", "branch", "pre_merge_head", "merge_head_effect_id"}, Engine: StandardEffect},
 }

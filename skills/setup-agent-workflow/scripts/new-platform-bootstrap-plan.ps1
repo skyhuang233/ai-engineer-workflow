@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$HostFactsPath,
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)][string]$GitHubOwner,
+    [ValidateSet("", "personal", "organization")][string]$GitHubOwnerType = "",
     [switch]$AllowUpgrade,
     [string]$PolicyPath = (Join-Path $PSScriptRoot "..\trust\release-policy.json"),
     [string]$PublicKeyPath = ""
@@ -144,11 +145,19 @@ $credentialOwnerMatches = (-not [string]::IsNullOrWhiteSpace($effectiveGitHubOwn
 if ($facts.github_credential.exists -and -not [string]::IsNullOrWhiteSpace([string]$facts.github_credential.owner) -and -not $credentialOwnerMatches) {
     throw "Existing Workflow Home is already bound to GitHub owner '$([string]$facts.github_credential.owner)' and cannot be rebound to '$effectiveGitHubOwner'"
 }
-$credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $observedScopes -contains "repo" -and $observedScopes -contains "workflow")
+$requiredCredentialScopes = @("repo", "workflow")
+$effectiveOwnerType = $GitHubOwnerType
+if ([string]::IsNullOrWhiteSpace($effectiveOwnerType) -and -not [string]::IsNullOrWhiteSpace([string]$facts.github_credential.login)) {
+    $effectiveOwnerType = $(if ([string]::Equals([string]$facts.github_credential.login, $effectiveGitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { "personal" } else { "organization" })
+}
+if ([string]::IsNullOrWhiteSpace($effectiveOwnerType)) { throw "GitHubOwnerType must come from the read-only PAT owner verification before Platform planning" }
+if ($effectiveOwnerType -eq "organization") { $requiredCredentialScopes += "admin:org" }
+$credentialScopesMatch = @($requiredCredentialScopes | Where-Object { $observedScopes -notcontains $_ }).Count -eq 0
+$credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $credentialScopesMatch)
 if (-not $credentialCurrent) {
     if ([string]::IsNullOrWhiteSpace($effectiveGitHubOwner)) { throw "GitHubOwner is required when the Control Plane PAT is not persisted" }
     $patAction = $(if ($facts.github_credential.exists) { "replace" } else { "persist" })
-    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner })) })
+    $actions.Add([ordered]@{ id = "persist-classic-pat"; kind = "github_pat"; subject = $facts.github_credential.path; action = $patAction; parameters = (Add-PlatformPins ([ordered]@{ input = "stdin"; owner = $effectiveGitHubOwner; required_scopes = ($requiredCredentialScopes -join ",") })) })
 }
 $platformRecordCurrent = ($null -ne $facts.platform -and $facts.platform.installation_recorded -and [string]$facts.platform.version -eq [string]$manifest.release.version -and [string]$facts.platform.release_manifest_digest -eq $manifestDigest -and [string]$facts.platform.platform_setup_contract_digest -eq $platformSetupContractDigest -and [string]$facts.platform.workflow_cli_sha256 -eq [string]$workflowExecutable[0].sha256 -and [string]$facts.platform.release_bundled_files_digest -eq $releaseBundledFilesDigest -and [string]$facts.platform.release_bundled_files_json -eq $releaseBundledFilesJSON)
 $controlPlaneAuthorizationCurrent = ($null -ne $facts.control_plane -and [string]$facts.control_plane.state -eq "ready" -and [string]$facts.control_plane.runtime.platform_version -eq [string]$manifest.release.version -and -not [string]::IsNullOrWhiteSpace([string]$facts.platform.control_plane_plan_digest_sha256) -and [string]$facts.platform.control_plane_plan_digest_sha256 -eq [string]$facts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256)
@@ -171,6 +180,9 @@ $workflowHomeOwnerID = [string]$facts.host_identity.workflow_home_owner_id
 if ([string]::IsNullOrWhiteSpace($hostUserID) -or [string]::IsNullOrWhiteSpace($hostUsername) -or [string]::IsNullOrWhiteSpace($workflowHomeOwnerID)) {
     throw "A complete current-user and Workflow Home owner identity snapshot is required"
 }
+if (-not [string]::Equals($hostUserID, $workflowHomeOwnerID, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The existing Workflow Home must be owned by the current Windows user"
+}
 $approvedHostIdentity = [ordered]@{ user_id = $hostUserID; username = $hostUsername; workflow_home = [IO.Path]::GetFullPath([string]$facts.workflow_home); workflow_home_owner_id = $workflowHomeOwnerID }
 $platformPreconditions += [ordered]@{ id = "windows-user-and-home-owner"; kind = "host_identity"; subject = "current-user"; expected = ($approvedHostIdentity | ConvertTo-Json -Compress) }
 $codexAuthVerified = ($facts.codex_auth.verified -and [IO.Path]::IsPathRooted([string]$facts.codex_auth.source) -and [string]$facts.codex_auth.fingerprint_sha256 -match '^[0-9a-f]{64}$')
@@ -186,7 +198,7 @@ $stateInput = Join-Path $scratchRoot "platform-state.input.json"; $stateCanonica
 [IO.File]::WriteAllText($stateInput, ($platformState | ConvertTo-Json -Depth 8 -Compress), (New-Object Text.UTF8Encoding($false)))
 $platformStateDigest = (& $canonicalizer -InputPath $stateInput -OutputPath $stateCanonical | Select-Object -Last 1).Trim()
 $platformPreconditions += [ordered]@{ id = "satisfied-platform-state"; kind = "platform_state"; subject = $facts.workflow_home; expected = $platformStateDigest }
-if ($AllowUpgrade -and $facts.platform.installation_recorded -and -not $platformRecordCurrent) {
+if ($facts.platform.installation_recorded -and -not $platformRecordCurrent) {
     $priorInstallation = [ordered]@{
         version = [string]$facts.platform.version
         release_manifest_digest = [string]$facts.platform.release_manifest_digest
@@ -195,7 +207,7 @@ if ($AllowUpgrade -and $facts.platform.installation_recorded -and -not $platform
         release_bundled_files_digest = [string]$facts.platform.release_bundled_files_digest
         control_plane_plan_digest_sha256 = [string]$facts.platform.control_plane_plan_digest_sha256
     }
-    foreach ($value in $priorInstallation.Values) { if ([string]::IsNullOrWhiteSpace([string]$value)) { throw "Explicit upgrade requires every durable prior Platform Installation pin" } }
+    foreach ($value in $priorInstallation.Values) { if ([string]::IsNullOrWhiteSpace([string]$value)) { throw "Platform Installation repair requires every durable prior pin" } }
     $priorInput = Join-Path $scratchRoot "prior-installation.input.json"; $priorCanonical = Join-Path $scratchRoot "prior-installation.canonical.json"
     [IO.File]::WriteAllText($priorInput, ($priorInstallation | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
     $priorDigest = (& $canonicalizer -InputPath $priorInput -OutputPath $priorCanonical | Select-Object -Last 1).Trim()

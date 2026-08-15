@@ -77,7 +77,13 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
 		if ($Name -eq "unrelated-dirty-files") {
 			$unrelatedPath = Join-Path $target "unrelated.txt"
 			if (-not (Test-Path -LiteralPath $unrelatedPath -PathType Leaf) -or [IO.File]::ReadAllText($unrelatedPath) -cne "preserve exactly`n") { throw "Published dirty scenario did not preserve unrelated.txt byte-for-byte" }
-			$dirtyStatus = [string](git -C $target status --porcelain=v1 --untracked-files=all -- unrelated.txt)
+			$previousOptionalLocks = $env:GIT_OPTIONAL_LOCKS
+			try {
+				$env:GIT_OPTIONAL_LOCKS = "0"
+				$dirtyStatus = [string](git -C $target status --porcelain=v1 --untracked-files=all -- unrelated.txt)
+			} finally {
+				$env:GIT_OPTIONAL_LOCKS = $previousOptionalLocks
+			}
 			if ($LASTEXITCODE -ne 0 -or $dirtyStatus.Trim() -cne "?? unrelated.txt") { throw "Published dirty scenario no longer preserves unrelated.txt as unrelated dirty state" }
 		}
     } elseif ([string]::IsNullOrWhiteSpace([string]$result.blocker)) {

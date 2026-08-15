@@ -291,103 +291,124 @@ func TestEngineRejectsCrossUserPlatformPlanBeforeCreatingWorkflowHome(t *testing
 	}
 }
 
-func TestEngineAppliesOnlyDigestBoundPlatformInstallationUpgrade(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		authorized bool
-		wantStatus setupcontract.ExecutionStatus
+func TestEngineAppliesOnlyDigestBoundPlatformInstallationTransition(t *testing.T) {
+	for _, transition := range []struct {
+		name          string
+		targetVersion string
 	}{
-		{name: "unapproved changed pins conflict", wantStatus: setupcontract.ExecutionDrifted},
-		{name: "approved old pins transition", authorized: true, wantStatus: setupcontract.ExecutionIncomplete},
+		{name: "version upgrade", targetVersion: "2.0.0"},
+		{name: "same-version pin repair", targetVersion: "1.0.0"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
-			if err != nil || layout.Ensure() != nil {
-				t.Fatal(err)
-			}
-			executable := filepath.Join(t.TempDir(), "workflow.exe")
-			if err := os.WriteFile(executable, []byte("new workflow"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			cliSum := sha256.Sum256([]byte("new workflow"))
-			cliDigest := hex.EncodeToString(cliSum[:])
-			if err := (workflowhome.Installation{Layout: layout}).InstallVersion("2.0.0", executable, cliDigest); err != nil {
-				t.Fatal(err)
-			}
-			bundleRaw, _ := json.Marshal([]platformrelease.BundledFile{{Path: "bin/workflow.exe", SHA256: cliDigest}})
-			bundleCanonical, bundleDigest, _ := setupcontract.Canonicalize(bundleRaw)
-			old := store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: repeat("1", 64), PlatformSetupContractDigestSHA256: repeat("2", 64), WorkflowCLISHA256: repeat("3", 64), ReleaseBundledFilesJSON: string(bundleCanonical), ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: repeat("4", 64), WorkflowHome: layout.Root}
-			old.InstalledAt, old.VerifiedAt = testTime(), testTime()
-			database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
-			if err != nil || database.RecordPlatformInstallation(ctx, old) != nil || database.AuthorizeControlPlane(ctx, old, old.ControlPlanePlanDigestSHA256) != nil {
-				t.Fatalf("record old installation: %v", err)
-			}
-			database.Close()
-			contractRaw := validPlatformSetupContractJSON(t)
-			contractCanonical, contractDigest, _ := setupcontract.Canonicalize(contractRaw)
-			plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "upgrade", Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{
-				{ID: "release", Kind: "platform_release", Subject: "platform-v2.0.0", Expected: repeat("5", 64)},
-				{ID: "contract", Kind: "platform_setup_contract", Subject: "platform-v2.0.0", Expected: contractDigest},
-			}, Effects: []setupcontract.Effect{
-				{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}},
-				{ID: "control-plane", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": "2.0.0", "release_manifest_digest": repeat("5", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
-			}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
-			if test.authorized {
-				priorRaw, _ := json.Marshal(map[string]string{"version": old.PlatformVersion, "release_manifest_digest": old.ReleaseManifestDigestSHA256, "platform_setup_contract_digest": old.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": old.WorkflowCLISHA256, "release_bundled_files_digest": old.ReleaseBundledFilesDigestSHA256, "control_plane_plan_digest_sha256": old.ControlPlanePlanDigestSHA256})
-				_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
-				plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "installed", Kind: "platform_installation", Subject: layout.Root, Expected: priorDigest})
-			}
-			raw, _ := json.Marshal(plan)
-			_, _, digest, err := setupcontract.ParsePlan(raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}, fail: "control-plane"}
-			engine := &Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
-			result, applyErr := engine.Apply(ctx, raw, digest)
-			if result.Status != test.wantStatus || applyErr == nil {
-				t.Fatalf("result=%#v err=%v", result, applyErr)
-			}
-			if test.authorized {
-				database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := database.PlatformInstallation(ctx)
-				if err != nil || got.PlatformVersion != "2.0.0" || got.ReleaseManifestDigestSHA256 != repeat("5", 64) || got.ControlPlanePlanDigestSHA256 != "" {
-					t.Fatalf("upgraded installation=%#v err=%v", got, err)
-				}
-				if err := database.Close(); err != nil {
-					t.Fatal(err)
-				}
-				// A failed later effect may leave the installation effect durably
-				// recorded. The same approved plan must accept its exact new pins
-				// on retry even though its transition precondition names the old pins.
-				adapter.fail = ""
-				result, applyErr = engine.Apply(ctx, raw, digest)
-				if applyErr != nil || result.Status != setupcontract.ExecutionSucceeded {
-					t.Fatalf("Control Plane retry from exact-new installation result=%#v err=%v", result, applyErr)
-				}
-
-				database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				third := got
-				third.PlatformVersion = "3.0.0"
-				third.ReleaseManifestDigestSHA256 = repeat("9", 64)
-				if err := database.RecordPlatformInstallation(ctx, third); err != nil {
+		t.Run(transition.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name       string
+				authorized bool
+				wantStatus setupcontract.ExecutionStatus
+			}{
+				{name: "unapproved changed pins conflict", wantStatus: setupcontract.ExecutionDrifted},
+				{name: "approved old pins transition", authorized: true, wantStatus: setupcontract.ExecutionIncomplete},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					ctx := context.Background()
+					layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
+					if err != nil || layout.Ensure() != nil {
+						t.Fatal(err)
+					}
+					executable := filepath.Join(t.TempDir(), "workflow.exe")
+					if err := os.WriteFile(executable, []byte("new workflow"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					cliSum := sha256.Sum256([]byte("new workflow"))
+					cliDigest := hex.EncodeToString(cliSum[:])
+					if err := (workflowhome.Installation{Layout: layout}).InstallVersion(transition.targetVersion, executable, cliDigest); err != nil {
+						t.Fatal(err)
+					}
+					bundleRaw, _ := json.Marshal([]platformrelease.BundledFile{{Path: "bin/workflow.exe", SHA256: cliDigest}})
+					bundleCanonical, bundleDigest, _ := setupcontract.Canonicalize(bundleRaw)
+					old := store.PlatformInstallation{PlatformVersion: "1.0.0", ReleaseManifestDigestSHA256: repeat("1", 64), PlatformSetupContractDigestSHA256: repeat("2", 64), WorkflowCLISHA256: repeat("3", 64), ReleaseBundledFilesJSON: string(bundleCanonical), ReleaseBundledFilesDigestSHA256: bundleDigest, ControlPlanePlanDigestSHA256: repeat("4", 64), WorkflowHome: layout.Root}
+					old.InstalledAt, old.VerifiedAt = testTime(), testTime()
+					database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+					if err != nil || database.RecordPlatformInstallation(ctx, old) != nil || database.AuthorizeControlPlane(ctx, old, old.ControlPlanePlanDigestSHA256) != nil {
+						t.Fatalf("record old installation: %v", err)
+					}
 					database.Close()
-					t.Fatal(err)
-				}
-				if err := database.Close(); err != nil {
-					t.Fatal(err)
-				}
-				result, applyErr = (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, raw, digest)
-				if applyErr == nil || result.Status != setupcontract.ExecutionDrifted {
-					t.Fatalf("third-state retry result=%#v err=%v", result, applyErr)
-				}
+					contractRaw := validPlatformSetupContractJSON(t)
+					contractCanonical, contractDigest, _ := setupcontract.Canonicalize(contractRaw)
+					plan := setupcontract.Plan{SchemaVersion: 1, PlanID: "transition-" + strings.ReplaceAll(transition.name, " ", "-"), Kind: setupcontract.PlatformBootstrap, Target: setupcontract.Target{WorkflowHome: layout.Root}, Preconditions: []setupcontract.Precondition{
+						{ID: "release", Kind: "platform_release", Subject: "platform-v2.0.0", Expected: repeat("5", 64)},
+						{ID: "contract", Kind: "platform_setup_contract", Subject: "platform-v2.0.0", Expected: contractDigest},
+					}, Effects: []setupcontract.Effect{
+						{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": transition.targetVersion, "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}},
+						{ID: "control-plane", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": transition.targetVersion, "release_manifest_digest": repeat("5", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
+					}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
+					if test.authorized {
+						priorRaw, _ := json.Marshal(map[string]string{"version": old.PlatformVersion, "release_manifest_digest": old.ReleaseManifestDigestSHA256, "platform_setup_contract_digest": old.PlatformSetupContractDigestSHA256, "workflow_cli_sha256": old.WorkflowCLISHA256, "release_bundled_files_digest": old.ReleaseBundledFilesDigestSHA256, "control_plane_plan_digest_sha256": old.ControlPlanePlanDigestSHA256})
+						_, priorDigest, _ := setupcontract.Canonicalize(priorRaw)
+						plan.Preconditions = append(plan.Preconditions, setupcontract.Precondition{ID: "installed", Kind: "platform_installation", Subject: layout.Root, Expected: priorDigest})
+					}
+					raw, _ := json.Marshal(plan)
+					_, _, digest, err := setupcontract.ParsePlan(raw)
+					if err != nil {
+						t.Fatal(err)
+					}
+					adapter := &fakeAdapter{states: map[string]setupcontract.EffectStatus{}, fail: "control-plane"}
+					engine := &Engine{Adapter: adapter, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}
+					result, applyErr := engine.Apply(ctx, raw, digest)
+					if result.Status != test.wantStatus || applyErr == nil {
+						t.Fatalf("result=%#v err=%v", result, applyErr)
+					}
+					if test.authorized {
+						database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+						if err != nil {
+							t.Fatal(err)
+						}
+						got, err := database.PlatformInstallation(ctx)
+						if err != nil || got.PlatformVersion != transition.targetVersion || got.ReleaseManifestDigestSHA256 != repeat("5", 64) || got.ControlPlanePlanDigestSHA256 != "" {
+							t.Fatalf("upgraded installation=%#v err=%v", got, err)
+						}
+						if err := database.Close(); err != nil {
+							t.Fatal(err)
+						}
+						withoutEvidence := plan
+						withoutEvidence.PlanID += "-without-evidence"
+						withoutEvidenceRaw, _ := json.Marshal(withoutEvidence)
+						_, _, withoutEvidenceDigest, parseErr := setupcontract.ParsePlan(withoutEvidenceRaw)
+						if parseErr != nil {
+							t.Fatal(parseErr)
+						}
+						withoutEvidenceResult, withoutEvidenceErr := (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, withoutEvidenceRaw, withoutEvidenceDigest)
+						if withoutEvidenceErr == nil || withoutEvidenceResult.Status != setupcontract.ExecutionDrifted {
+							t.Fatalf("exact-new installation without same-plan evidence result=%#v err=%v", withoutEvidenceResult, withoutEvidenceErr)
+						}
+						// A failed later effect may leave the installation effect durably
+						// recorded. The same approved plan must accept its exact new pins
+						// on retry even though its transition precondition names the old pins.
+						adapter.fail = ""
+						result, applyErr = engine.Apply(ctx, raw, digest)
+						if applyErr != nil || result.Status != setupcontract.ExecutionSucceeded {
+							t.Fatalf("Control Plane retry from exact-new installation result=%#v err=%v", result, applyErr)
+						}
+
+						database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+						if err != nil {
+							t.Fatal(err)
+						}
+						third := got
+						third.PlatformVersion = "3.0.0"
+						third.ReleaseManifestDigestSHA256 = repeat("9", 64)
+						if err := database.RecordPlatformInstallation(ctx, third); err != nil {
+							database.Close()
+							t.Fatal(err)
+						}
+						if err := database.Close(); err != nil {
+							t.Fatal(err)
+						}
+						result, applyErr = (&Engine{Adapter: &fakeAdapter{states: map[string]setupcontract.EffectStatus{}}, ExpectedResultVerifier: passingExpectedResultVerifier, PlatformPreconditionVerifier: passingPlatformPreconditionVerifier}).Apply(ctx, raw, digest)
+						if applyErr == nil || result.Status != setupcontract.ExecutionDrifted {
+							t.Fatalf("third-state retry result=%#v err=%v", result, applyErr)
+						}
+					}
+				})
 			}
 		})
 	}

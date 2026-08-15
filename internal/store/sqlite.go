@@ -95,10 +95,10 @@ func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
 		return nil, errors.New("read-only Store requires a database file")
 	}
 	// Planning must be observational: acquiring the runtime/restore barrier
-	// creates lock files beside the database. SQLite immutable mode also avoids
-	// journal discovery or any attempt to modify sidecars while inspecting the
-	// already-closed current-schema snapshot.
-	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro&immutable=1"}).String()
+	// creates lock files beside the database. Plain read-only mode still joins
+	// an active WAL, so inspection observes the writer's latest committed state
+	// instead of treating the main database file as an immutable stale snapshot.
+	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro"}).String()
 	db, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return nil, err
