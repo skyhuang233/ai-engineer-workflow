@@ -108,7 +108,8 @@ foreach ($skill in $managedSkills) {
     if ($owner.owner -ne "agent-workflow-platform") { throw "Existing skill '$skill' is not owned by Agent Workflow" }
     if ([string]$owner.version -ne [string]$manifest.platform_setup_contract.workflow_skill_bundle.version) { $bundleCurrent = $false; continue }
     $expectedForSkill = @($skillFiles | Where-Object { ([string]$_.path).StartsWith("$skill/") })
-    $actualFiles = @(Get-ChildItem -LiteralPath $skillRoot -Recurse -File | Where-Object { $_.FullName -ne $ownerPath })
+    $comparableOwnerPath = Get-ComparableWorkflowPath $ownerPath
+    $actualFiles = @(Get-ChildItem -LiteralPath $skillRoot -Recurse -File | Where-Object { (Get-ComparableWorkflowPath $_.FullName) -cne $comparableOwnerPath })
     if ($actualFiles.Count -ne $expectedForSkill.Count) { $bundleCurrent = $false; continue }
     foreach ($file in $expectedForSkill) {
         $relativeWithinSkill = ([string]$file.path).Substring($skill.Length + 1).Replace('/', [IO.Path]::DirectorySeparatorChar)
