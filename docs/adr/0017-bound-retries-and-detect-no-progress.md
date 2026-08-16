@@ -1,3 +1,0 @@
-# Bound retries and detect no progress
-
-Recovery is classified rather than blindly repeated: transient infrastructure failures create fenced replacement Worker Runs with exponential backoff, implementation and quality failures remain with the accountable Ticket Agent while its run budget remains, and product decisions wait for human input without holding compute. Repeated identical failures without a meaningful revision, exhausted time or token budgets, and active plans with unfinished work but no executable frontier transition to Needs Attention with an explanatory report. No failure class may retry without a configured bound, preventing livelock, runaway cost, and amplified mistakes.

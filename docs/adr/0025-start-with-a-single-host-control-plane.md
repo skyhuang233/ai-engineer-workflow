@@ -1,3 +1,0 @@
-# Start with a single-host Control Plane
-
-The supported deployment topology runs one persistent Control Plane process, local Docker Worker Runs, local Ticket Workspaces and Codex session storage, and one local durable database on a single host governed by `max_parallel_runs`. Restart recovery reconciles database state with Docker, GitHub, and filesystem facts; tested backups protect the database and workspaces, while host downtime safely pauses delivery. Kubernetes, distributed locks, message brokers, remote workers, and cross-host workspace synchronization are excluded because they contradict the chosen single-authority topology, and this decision is revisited only if requirements change.

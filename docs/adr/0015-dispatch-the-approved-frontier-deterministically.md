@@ -1,3 +1,0 @@
-# Dispatch the approved frontier deterministically
-
-Once `to-tickets` has published the approved dependency DAG, the Control Plane computes the executable frontier mechanically and does not ask another agent to reinterpret which tickets appear parallel. An active plan ticket is eligible only when it is executable, every blocker is Delivered, it has no accountable Ticket Agent, and execution capacity remains; eligible tickets are claimed atomically up to the global `max_parallel_runs` limit, with deterministic ordering and fairness across plans. This removes redundant model judgment and ensures runtime scheduling cannot silently contradict the plan the user approved.
