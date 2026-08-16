@@ -577,8 +577,9 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	isOnboarding := plan.Kind == setupcontract.RepositoryOnboarding
 	adapter := setupengine.HostAdapter{Layout: layout, RepositoryPath: plan.Target.RepositoryPath, PlanDigest: digest, OnboardingMergeHeads: map[string]string{}, CreatedRepositories: map[string]bool{}, InitialBaselineHeads: map[string]string{}, PublishedHistoryHeads: map[string]string{}, ApprovedGitHubPolicies: map[string]string{}}
-	if plan.Kind == setupcontract.RepositoryOnboarding {
+	if isOnboarding {
 		// Repository-owned Git transport configuration must be rejected before
 		// the persistent PAT is read into this process.
 		if err := onboarding.ValidateAuthenticatedGitRepository(context.Background(), plan.Target.RepositoryPath); err != nil {
@@ -602,10 +603,10 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 			token, tokenErr := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
 			database.Close()
 			if tokenErr != nil {
-				if plan.Kind == setupcontract.RepositoryOnboarding {
+				if isOnboarding {
 					return tokenErr
 				}
-			} else if plan.Kind == setupcontract.RepositoryOnboarding {
+			} else if isOnboarding {
 				adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
 				adapter.CleanupGitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
 				adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
@@ -615,13 +616,13 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 			}
 		} else {
 			database.Close()
-			if plan.Kind == setupcontract.RepositoryOnboarding {
+			if isOnboarding {
 				return readErr
 			}
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
-	} else if plan.Kind == setupcontract.RepositoryOnboarding {
+	} else if isOnboarding {
 		return errors.New("Repository Onboarding requires an existing Workflow Home database")
 	}
 	engine := setupengine.Engine{Adapter: &adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
