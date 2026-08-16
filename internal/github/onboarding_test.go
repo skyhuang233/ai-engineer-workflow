@@ -50,6 +50,32 @@ func TestActionsPolicyDiscoveryAndEnablementPreserveAllowedActions(t *testing.T)
 	}
 }
 
+func TestPolicyDiscoveryAcceptsUnavailableOptionalOwnerGuardedPolicy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = w.Write([]byte(`{"full_name":"owner/repo","default_branch":"main","private":true,"has_issues":true,"permissions":{"admin":true},"allow_squash_merge":true}`))
+		case "/repos/owner/repo/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case "/repos/owner/repo/branches/main/protection", "/repos/owner/repo/rulesets":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"GitHub plan does not support this private repository policy"}`))
+		default:
+			t.Fatalf("unexpected policy request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	policy, err := NewClient(server.URL, "token", server.Client()).DiscoverPolicy(context.Background(), "owner/repo", "main")
+	if err != nil {
+		t.Fatalf("Owner-Guarded repository policy discovery rejected unavailable optional policy: %v", err)
+	}
+	if !policy.Private || !policy.ActionsEnabled || policy.RequiredHumanReviews || policy.MergeQueue || len(policy.RequiredChecks) != 0 {
+		t.Fatalf("policy=%#v", policy)
+	}
+}
+
 func TestOnboardingMutationClientRejectsAnotherRepositoryAndLoginBeforeNetwork(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))

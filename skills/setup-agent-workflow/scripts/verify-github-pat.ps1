@@ -75,13 +75,19 @@ if ($PublicationState -eq "published") {
             $repositorySelected = $repositorySelectedResponse.Content | ConvertFrom-Json
             if (-not [bool]$repositorySelected.github_owned_allowed) { throw "Repository Actions policy does not allow the GitHub-owned checkout action" }
         } elseif ([string]$repositoryActions.allowed_actions -ne "all") { throw "Repository Actions policy is unavailable" }
-        $repositoryRulesetResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
-        foreach ($ruleset in @($repositoryRulesetResponse.Content | ConvertFrom-Json)) {
-            if ([string]$ruleset.enforcement -ne "active") { continue }
-            foreach ($rule in @($ruleset.rules)) {
-                if ([string]$rule.type -eq "merge_queue") { throw "Repository policy requires an unsupported merge queue" }
-                if ([string]$rule.type -eq "pull_request" -and [int]$rule.parameters.required_approving_review_count -gt 0) { throw "Repository policy requires human review before onboarding" }
+        try {
+            $repositoryRulesetResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/rulesets?includes_parents=true") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
+            foreach ($ruleset in @($repositoryRulesetResponse.Content | ConvertFrom-Json)) {
+                if ([string]$ruleset.enforcement -ne "active") { continue }
+                foreach ($rule in @($ruleset.rules)) {
+                    if ([string]$rule.type -eq "merge_queue") { throw "Repository policy requires an unsupported merge queue" }
+                    if ([string]$rule.type -eq "pull_request" -and [int]$rule.parameters.required_approving_review_count -gt 0) { throw "Repository policy requires human review before onboarding" }
+                }
             }
+        } catch {
+            $rulesetStatus = 0
+            if ($null -ne $_.Exception.Response) { $rulesetStatus = [int]$_.Exception.Response.StatusCode }
+            if ($rulesetStatus -ne 403) { throw }
         }
         try {
             $protectionResponse = Invoke-WebRequest -Uri ($GitHubPublicAPI + "/repos/" + [Uri]::EscapeDataString($boundOwner) + "/" + [Uri]::EscapeDataString($repositoryNameValue) + "/branches/" + [Uri]::EscapeDataString([string]$repository.default_branch) + "/protection") -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } -UseBasicParsing
@@ -90,7 +96,7 @@ if ($PublicationState -eq "published") {
         } catch {
             $protectionStatus = 0
             if ($null -ne $_.Exception.Response) { $protectionStatus = [int]$_.Exception.Response.StatusCode }
-            if ($protectionStatus -ne 404) { throw }
+            if ($protectionStatus -ne 404 -and $protectionStatus -ne 403) { throw }
         }
     } catch {
         throw "Published repository policy cannot be proved before Platform mutation: $($_.Exception.Message)"

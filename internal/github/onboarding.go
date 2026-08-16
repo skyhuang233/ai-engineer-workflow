@@ -137,7 +137,7 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 	result.ActionsEnabled = actions.Enabled
 	result.ActionsAllowed = actions.AllowedActions
 	var protection BranchProtection
-	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/branches/"+url.PathEscape(branch)+"/protection", nil, &protection); err != nil && !IsNotFound(err) {
+	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/branches/"+url.PathEscape(branch)+"/protection", nil, &protection); err != nil && !IsNotFound(err) && !IsForbidden(err) {
 		return result, err
 	}
 	if protection.RequiredPullRequestReviews != nil && protection.RequiredPullRequestReviews.RequiredApprovingReviewCount > 0 {
@@ -159,7 +159,7 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 		}
 	}
 	var rulesets []RepositoryRuleset
-	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/rulesets?includes_parents=true", nil, &rulesets); err != nil {
+	if err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/rulesets?includes_parents=true", nil, &rulesets); err != nil && !IsForbidden(err) {
 		return result, err
 	}
 	for _, ruleset := range rulesets {
@@ -191,6 +191,10 @@ func (c *Client) DiscoverPolicy(ctx context.Context, repository, branch string) 
 func IsNotFound(err error) bool {
 	var api *apiError
 	return errors.As(err, &api) && api.StatusCode == http.StatusNotFound
+}
+func IsForbidden(err error) bool {
+	var api *apiError
+	return errors.As(err, &api) && api.StatusCode == http.StatusForbidden
 }
 func IsConflict(err error) bool {
 	var api *apiError
