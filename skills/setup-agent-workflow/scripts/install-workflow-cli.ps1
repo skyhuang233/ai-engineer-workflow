@@ -27,13 +27,13 @@ function Invoke-WorkflowSetupApply([string]$Executable, [string]$Plan, [string]$
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
     [void]$process.Start()
-    $inputWriter = New-Object IO.StreamWriter($process.StandardInput.BaseStream, (New-Object Text.UTF8Encoding($false)))
+    $inputStream = $process.StandardInput.BaseStream
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($PAT + "`n")
     try {
-        $inputWriter.Write($PAT)
-        $inputWriter.Write("`n")
-        $inputWriter.Flush()
+        $inputStream.Write($bytes, 0, $bytes.Length)
+        $inputStream.Flush()
     } finally {
-        $inputWriter.Close()
+        $inputStream.Close()
     }
     $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
