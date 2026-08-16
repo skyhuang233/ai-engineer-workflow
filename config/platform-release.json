@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "docker_desktop": {
     "version": "4.86.0",
     "installer_url": "https://desktop.docker.com/win/main/amd64/236216/Docker%20Desktop%20Installer.exe",

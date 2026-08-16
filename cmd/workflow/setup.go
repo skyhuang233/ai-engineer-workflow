@@ -590,32 +590,39 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 			}
 		}
 	}
-	database, openErr := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
-	if openErr != nil {
-		return openErr
-	}
-	verification, readErr := database.GitHubPATVerification(context.Background())
-	if readErr == nil {
-		config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
-		token, tokenErr := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
-		database.Close()
-		if tokenErr != nil {
-			if plan.Kind == setupcontract.RepositoryOnboarding {
-				return tokenErr
+	databasePath := filepath.Join(layout.State, "workflow.db")
+	if _, statErr := os.Stat(databasePath); statErr == nil {
+		database, openErr := store.Open(context.Background(), databasePath)
+		if openErr != nil {
+			return openErr
+		}
+		verification, readErr := database.GitHubPATVerification(context.Background())
+		if readErr == nil {
+			config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: verification.Owner, PlaintextRelativePath: `state\credentials\github.pat`}}}
+			token, tokenErr := verifiedClassicPAT(context.Background(), database, config, layout.CredentialFile)
+			database.Close()
+			if tokenErr != nil {
+				if plan.Kind == setupcontract.RepositoryOnboarding {
+					return tokenErr
+				}
+			} else if plan.Kind == setupcontract.RepositoryOnboarding {
+				adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
+				adapter.CleanupGitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+				adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
+			} else {
+				adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
+				adapter.CleanupGitHub = adapter.GitHub
 			}
-		} else if plan.Kind == setupcontract.RepositoryOnboarding {
-			adapter.GitHub = github.NewClient("", token, nil).WithOnboardingIdentity(verification.Owner, verification.Login, plan.Target.GitHubRepository)
-			adapter.CleanupGitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
-			adapter.GitCredential = onboarding.GitCredential{Username: "x-access-token", Token: token}
 		} else {
-			adapter.GitHub = github.NewClient("", token, nil).WithRepositoryOwner(verification.Owner)
-			adapter.CleanupGitHub = adapter.GitHub
+			database.Close()
+			if plan.Kind == setupcontract.RepositoryOnboarding {
+				return readErr
+			}
 		}
-	} else {
-		database.Close()
-		if plan.Kind == setupcontract.RepositoryOnboarding {
-			return readErr
-		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	} else if plan.Kind == setupcontract.RepositoryOnboarding {
+		return errors.New("Repository Onboarding requires an existing Workflow Home database")
 	}
 	engine := setupengine.Engine{Adapter: &adapter, SecretInput: &setupengine.SecretInput{Reader: input}, PlatformPreconditionVerifier: func(ctx context.Context, plan setupcontract.Plan) error {
 		database, openErr := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))

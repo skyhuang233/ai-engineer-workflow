@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,10 +25,51 @@ import (
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
+	setupengine "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestSetupApplyOnFreshWorkflowHomeValidatesApprovalBeforeOpeningDatabase(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "AgentWorkflow")
+	plan := setupcontract.Plan{
+		SchemaVersion: 1,
+		PlanID:        "fresh-platform-bootstrap",
+		Kind:          setupcontract.PlatformBootstrap,
+		Target:        setupcontract.Target{WorkflowHome: home},
+		Preconditions: []setupcontract.Precondition{{
+			ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "unreached-host-identity",
+		}},
+		Effects: []setupcontract.Effect{{
+			ID: "install-cli", Kind: "platform_cli", Subject: filepath.Join(home, "bin", workflowhome.ExecutableName), Action: "install",
+			Parameters: map[string]string{
+				"version": "1.0.0", "sha256": strings.Repeat("c", 64),
+				"release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_digest": strings.Repeat("b", 64),
+				"workflow_cli_sha256": strings.Repeat("c", 64), "release_bundled_files_digest": strings.Repeat("d", 64),
+			},
+		}},
+		ExpectedResults: []setupcontract.ExpectedResult{{
+			ID: "ready", Kind: "platform_readiness", Subject: home, Expected: "ready",
+		}},
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runSetupApply([]string{"--plan", planPath, "--approved-digest", strings.Repeat("0", 64)}, strings.NewReader(""), io.Discard)
+	if !errors.Is(err, setupengine.ErrDigestMismatch) {
+		t.Fatalf("fresh setup apply error = %v, want digest mismatch before database open", err)
+	}
+	if _, statErr := os.Stat(home); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("fresh setup apply created Workflow Home before approval: %v", statErr)
+	}
+}
 
 func TestOnboardingStateRequiresEveryManagedContractSurface(t *testing.T) {
 	files, _, digest, err := repositorycontract.Render("single-context", []byte("# User instructions\n"), "owner/repo", "main")
