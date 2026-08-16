@@ -1,9 +1,6 @@
 package platformrelease
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -32,10 +29,10 @@ type Candidate struct {
 	Prerelease bool
 }
 
-type TrustPolicy struct {
+type ReleaseIdentity struct {
 	Repository   string
 	WorkflowPath string
-	KeyID        string
+	SourceCommit string
 }
 
 func (m Manifest) Validate() error {
@@ -82,9 +79,6 @@ func (m Manifest) Validate() error {
 	}
 	if !sameArtifacts(m.Artifacts, m.Provenance.Subjects) {
 		return errors.New("Platform Release provenance subjects do not cover exact release artifacts")
-	}
-	if m.Signature.Algorithm != "ecdsa-p256-sha256" || strings.TrimSpace(m.Signature.KeyID) == "" || m.Signature.SignatureAsset != "platform-release.json.sig" {
-		return errors.New("Platform Release signature metadata is invalid")
 	}
 	return nil
 }
@@ -152,7 +146,11 @@ func validateArtifacts(artifacts []Artifact, requireCore bool) error {
 		seen[artifact.Name] = struct{}{}
 	}
 	if requireCore {
-		for _, required := range []string{"workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json"} {
+		requiredArtifacts := []string{"workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json"}
+		if len(seen) != len(requiredArtifacts) {
+			return errors.New("Platform Release artifact set must exactly match required artifacts")
+		}
+		for _, required := range requiredArtifacts {
 			if _, ok := seen[required]; !ok {
 				return fmt.Errorf("Platform Release lacks required artifact %q", required)
 			}
@@ -204,43 +202,22 @@ func SelectLatestStable(candidates []Candidate, bootstrapSchema int) (Manifest, 
 	return compatible[0], nil
 }
 
-func Sign(raw []byte, privateKey *ecdsa.PrivateKey) ([]byte, error) {
-	if privateKey == nil || !isP256(privateKey.Curve) {
-		return nil, errors.New("Platform Release signing key must use ECDSA P-256")
+// VerifyManifest binds release metadata fetched from GitHub to the canonical
+// repository, immutable source commit, and publishing workflow expected by the
+// caller. Manifest validation separately binds every artifact digest and the
+// provenance subjects to that same release identity.
+func VerifyManifest(raw []byte, identity ReleaseIdentity) (Manifest, error) {
+	if !repositoryPattern.MatchString(identity.Repository) || !shaPattern.MatchString(identity.SourceCommit) || identity.WorkflowPath != ".github/workflows/publish-platform.yml" {
+		return Manifest{}, errors.New("Platform Release identity is invalid")
 	}
-	canonical, _, err := canonicalManifest(raw)
-	if err != nil {
-		return nil, err
-	}
-	digest := sha256.Sum256(canonical)
-	return ecdsa.SignASN1(rand.Reader, privateKey, digest[:])
-}
-
-func VerifySignedManifest(raw, signature []byte, publicKey *ecdsa.PublicKey, policy TrustPolicy) (Manifest, error) {
-	manifest, canonical, _, err := Parse(raw)
+	manifest, _, _, err := Parse(raw)
 	if err != nil {
 		return Manifest{}, err
 	}
-	if publicKey == nil || !isP256(publicKey.Curve) || !repositoryPattern.MatchString(policy.Repository) || policy.WorkflowPath == "" || policy.KeyID == "" {
-		return Manifest{}, errors.New("Platform Release trust policy is invalid")
-	}
-	if manifest.Release.Repository != policy.Repository || manifest.Provenance.Repository != policy.Repository || manifest.Provenance.WorkflowPath != policy.WorkflowPath || manifest.Signature.KeyID != policy.KeyID {
-		return Manifest{}, errors.New("Platform Release does not match trust policy")
-	}
-	digest := sha256.Sum256(canonical)
-	if !ecdsa.VerifyASN1(publicKey, digest[:], signature) {
-		return Manifest{}, errors.New("Platform Release signature is invalid")
+	if manifest.Release.Repository != identity.Repository || manifest.Release.SourceCommit != identity.SourceCommit || manifest.Provenance.Repository != identity.Repository || manifest.Provenance.SourceCommit != identity.SourceCommit || manifest.Provenance.WorkflowPath != identity.WorkflowPath {
+		return Manifest{}, errors.New("Platform Release does not match GitHub release identity")
 	}
 	return manifest, nil
-}
-
-func isP256(curve elliptic.Curve) bool {
-	return curve != nil && curve.Params().Name == elliptic.P256().Params().Name && curve.Params().BitSize == 256
-}
-
-func canonicalManifest(raw []byte) ([]byte, string, error) {
-	_, canonical, digest, err := Parse(raw)
-	return canonical, digest, err
 }
 
 func sameArtifacts(left, right []Artifact) bool {

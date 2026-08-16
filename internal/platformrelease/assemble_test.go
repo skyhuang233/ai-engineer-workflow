@@ -3,12 +3,10 @@ package platformrelease
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -30,20 +28,16 @@ func TestAssembleProducesReproducibleContentAddressedRelease(t *testing.T) {
 	if err := os.WriteFile(workflowEXE, []byte("windows-binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	template := validManifest(fixtureArtifacts())
 	template.Artifacts = nil
 	template.BundledFiles = nil
 	template.Provenance.Subjects = nil
 
-	first, err := Assemble(AssembleOptions{OutputDirectory: filepath.Join(t.TempDir(), "first"), WorkflowExecutable: workflowEXE, PayloadDirectory: inputs, Manifest: template, SigningKey: key})
+	first, err := Assemble(AssembleOptions{OutputDirectory: filepath.Join(t.TempDir(), "first"), WorkflowExecutable: workflowEXE, PayloadDirectory: inputs, Manifest: template})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Assemble(AssembleOptions{OutputDirectory: filepath.Join(t.TempDir(), "second"), WorkflowExecutable: workflowEXE, PayloadDirectory: inputs, Manifest: template, SigningKey: key})
+	second, err := Assemble(AssembleOptions{OutputDirectory: filepath.Join(t.TempDir(), "second"), WorkflowExecutable: workflowEXE, PayloadDirectory: inputs, Manifest: template})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,15 +73,17 @@ func TestAssembleProducesReproducibleContentAddressedRelease(t *testing.T) {
 	if !reflect.DeepEqual(names, wantNames) {
 		t.Fatalf("archive entries = %v, want %v", names, wantNames)
 	}
-	manifestRaw, err := os.ReadFile(filepath.Join(first.Directory, "platform-release.json"))
+	entries, err := os.ReadDir(first.Directory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signature, err := os.ReadFile(filepath.Join(first.Directory, "platform-release.json.sig"))
-	if err != nil {
-		t.Fatal(err)
+	var releaseAssets []string
+	for _, entry := range entries {
+		releaseAssets = append(releaseAssets, entry.Name())
 	}
-	if _, err := VerifySignedManifest(manifestRaw, signature, &key.PublicKey, TrustPolicy{Repository: template.Release.Repository, WorkflowPath: template.Provenance.WorkflowPath, KeyID: template.Signature.KeyID}); err != nil {
-		t.Fatal(err)
+	sort.Strings(releaseAssets)
+	wantAssets := []string{"SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip"}
+	if !reflect.DeepEqual(releaseAssets, wantAssets) {
+		t.Fatalf("release assets = %v, want fixed unsigned set %v", releaseAssets, wantAssets)
 	}
 }

@@ -15,7 +15,6 @@ on:
 permissions:
   contents: write
   pull-requests: read
-  id-token: write
 
 concurrency:
   group: publish-platform
@@ -60,36 +59,27 @@ jobs:
           New-Item -ItemType Directory -Force build/payload/skills | Out-Null
           Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
           Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
-      - name: Assemble signed content-addressed release
+      - name: Assemble content-addressed release
         shell: pwsh
         env:
-          PLATFORM_RELEASE_SIGNING_KEY_B64: ${{ secrets.PLATFORM_RELEASE_SIGNING_KEY_B64 }}
           DOCKER_DESKTOP_VERSION: ${{ vars.DOCKER_DESKTOP_VERSION }}
           DOCKER_DESKTOP_INSTALLER_URL: ${{ vars.DOCKER_DESKTOP_INSTALLER_URL }}
           DOCKER_DESKTOP_WINDOWS_AMD64_SHA256: ${{ vars.DOCKER_DESKTOP_WINDOWS_AMD64_SHA256 }}
           WORKER_IMAGE: ${{ vars.WORKFLOW_WORKER_IMAGE }}
           PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:PLATFORM_RELEASE_SIGNING_KEY_B64)) { throw "protected Platform Release signing key is required" }
-          [IO.File]::WriteAllBytes("build/signing-key.pem", [Convert]::FromBase64String($env:PLATFORM_RELEASE_SIGNING_KEY_B64))
-          try {
-            build/platform-release.exe `
-              -workflow-exe build/workflow.exe -payload build/payload -output build/release `
-              -version $env:PLATFORM_VERSION -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
-              -docker-version $env:DOCKER_DESKTOP_VERSION -docker-installer-url $env:DOCKER_DESKTOP_INSTALLER_URL `
-              -docker-installer-sha256 $env:DOCKER_DESKTOP_WINDOWS_AMD64_SHA256 -worker-image $env:WORKER_IMAGE `
-              -signing-key build/signing-key.pem
-          } finally {
-            Remove-Item -LiteralPath build/signing-key.pem -Force -ErrorAction SilentlyContinue
-          }
+          build/platform-release.exe `
+            -workflow-exe build/workflow.exe -payload build/payload -output build/release `
+            -version $env:PLATFORM_VERSION -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
+            -docker-version $env:DOCKER_DESKTOP_VERSION -docker-installer-url $env:DOCKER_DESKTOP_INSTALLER_URL `
+            -docker-installer-sha256 $env:DOCKER_DESKTOP_WINDOWS_AMD64_SHA256 -worker-image $env:WORKER_IMAGE
       - name: Verify checksum and provenance coverage
         shell: bash
         run: |
           cd build/release
           sha256sum --check SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 5
+          test "$(wc -l < SHA256SUMS)" -eq 4
           jq --exit-status --arg repository "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --argjson run_id "$GITHUB_RUN_ID" '.release.repository == $repository and .release.source_commit == $sha and .release.github_actions_run_id == $run_id and .provenance.workflow_path == ".github/workflows/publish-platform.yml" and ([.artifacts[].name] | sort) == (["platform-provenance.json","platform-sbom.spdx.json","workflow-windows-amd64.zip"] | sort)' platform-release.json >/dev/null
-          test -s platform-release.json.sig
           test -s platform-sbom.spdx.json
           test -s platform-provenance.json
       - name: Stage immutable Platform Release
@@ -110,4 +100,4 @@ jobs:
           gh release create "$tag" build/release/* --draft --target "$GITHUB_SHA" --title "Platform ${PLATFORM_VERSION}" --notes "Immutable Agent Workflow platform release for an owner-accepted main commit."
           gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["SHA256SUMS","platform-provenance.json","platform-release.json","platform-release.json.sig","platform-sbom.spdx.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
+          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["SHA256SUMS","platform-provenance.json","platform-release.json","platform-sbom.spdx.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null

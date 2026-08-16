@@ -1,4 +1,4 @@
-// Package platformrelease defines the complete, signed contract that permits a
+// Package platformrelease defines the complete release contract that permits a
 // bootstrap skill to plan an installation without trusting an installed CLI.
 package platformrelease
 
@@ -21,7 +21,6 @@ type Manifest struct {
 	Artifacts         []Artifact            `json:"artifacts"`
 	BundledFiles      []BundledFile         `json:"bundled_files"`
 	Provenance        Provenance            `json:"provenance"`
-	Signature         SignatureMetadata     `json:"signature"`
 }
 
 type ReleaseMetadata struct {
@@ -56,12 +55,6 @@ type Provenance struct {
 	GitHubActionsRunID int64      `json:"github_actions_run_id"`
 	BuilderID          string     `json:"builder_id"`
 	Subjects           []Artifact `json:"subjects"`
-}
-
-type SignatureMetadata struct {
-	Algorithm      string `json:"algorithm"`
-	KeyID          string `json:"key_id"`
-	SignatureAsset string `json:"signature_asset"`
 }
 
 func (m Manifest) Canonical() ([]byte, string, error) {

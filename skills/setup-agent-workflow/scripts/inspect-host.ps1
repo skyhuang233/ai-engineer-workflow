@@ -266,14 +266,12 @@ function Read-VerifiedBootstrapPin([string]$Path, [string]$Description) {
         $pinRaw = Get-Content -LiteralPath $Path -Raw
         $pin = $pinRaw | ConvertFrom-Json
         $pinPropertyNames = @($pin.PSObject.Properties.Name | Sort-Object)
-        $expectedPinPropertyNames = @("schema_version", "release_version", "release_manifest_digest_sha256", "platform_setup_contract_digest_sha256", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest_sha256", "control_plane_plan_digest_sha256", "manifest_base64", "signature_base64" | Sort-Object)
+        $expectedPinPropertyNames = @("schema_version", "release_version", "release_manifest_digest_sha256", "platform_setup_contract_digest_sha256", "workflow_cli_sha256", "release_bundled_files_json", "release_bundled_files_digest_sha256", "control_plane_plan_digest_sha256", "manifest_base64" | Sort-Object)
         if (($pinPropertyNames -join "`n") -cne ($expectedPinPropertyNames -join "`n")) { throw "$Description contains missing or unknown fields" }
         if ([int]$pin.schema_version -ne 1 -or ([string]$pin.release_manifest_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.platform_setup_contract_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.workflow_cli_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.release_bundled_files_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or ([string]$pin.control_plane_plan_digest_sha256) -notmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$pin.release_version)) { throw "$Description has invalid metadata" }
         $pinnedManifestPath = Join-Path $pinScratch "platform-release.json"
-        $pinnedSignaturePath = Join-Path $pinScratch "platform-release.json.sig"
         [IO.File]::WriteAllBytes($pinnedManifestPath, [Convert]::FromBase64String([string]$pin.manifest_base64))
-        [IO.File]::WriteAllBytes($pinnedSignaturePath, [Convert]::FromBase64String([string]$pin.signature_base64))
-        & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $pinnedManifestPath -SignaturePath $pinnedSignaturePath | Out-Null
+        & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $pinnedManifestPath | Out-Null
         $pinnedManifest = Get-Content -LiteralPath $pinnedManifestPath -Raw | ConvertFrom-Json
         $actualPinnedDigest = Get-SHA256File $pinnedManifestPath
         $contractInput = Join-Path $pinScratch "platform-contract.input.json"

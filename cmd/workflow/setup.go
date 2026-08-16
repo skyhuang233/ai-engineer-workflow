@@ -1112,27 +1112,27 @@ func cleanupComplete(tracker *platformCleanupTracker) func(string) error {
 func durableReleaseBundle(installation store.PlatformInstallation) ([]platformrelease.BundledFile, error) {
 	canonical, digest, err := setupcontract.Canonicalize([]byte(installation.ReleaseBundledFilesJSON))
 	if err != nil || string(canonical) != installation.ReleaseBundledFilesJSON || digest != installation.ReleaseBundledFilesDigestSHA256 {
-		return nil, errors.Join(errors.New("durable signed Platform Release bundled-file inventory differs"), err)
+		return nil, errors.Join(errors.New("durable verified Platform Release bundled-file inventory differs"), err)
 	}
 	var files []platformrelease.BundledFile
 	if json.Unmarshal(canonical, &files) != nil || len(files) == 0 {
-		return nil, errors.New("durable signed Platform Release bundled-file inventory is invalid")
+		return nil, errors.New("durable verified Platform Release bundled-file inventory is invalid")
 	}
 	seen, cli := map[string]bool{}, 0
 	for _, file := range files {
 		if seen[file.Path] || file.Path == "" || filepath.IsAbs(file.Path) || len(file.SHA256) != 64 {
-			return nil, errors.New("durable signed Platform Release bundled-file inventory is invalid")
+			return nil, errors.New("durable verified Platform Release bundled-file inventory is invalid")
 		}
 		seen[file.Path] = true
 		if file.Path == "bin/workflow.exe" {
 			cli++
 			if file.SHA256 != installation.WorkflowCLISHA256 {
-				return nil, errors.New("durable signed Platform Release Workflow CLI checksum differs")
+				return nil, errors.New("durable verified Platform Release Workflow CLI checksum differs")
 			}
 		}
 	}
 	if cli != 1 {
-		return nil, errors.New("durable signed Platform Release bundled-file inventory lacks one Workflow CLI")
+		return nil, errors.New("durable verified Platform Release bundled-file inventory lacks one Workflow CLI")
 	}
 	return files, nil
 }

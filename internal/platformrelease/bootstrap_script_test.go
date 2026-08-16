@@ -1,14 +1,9 @@
 package platformrelease
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,17 +14,13 @@ import (
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
 
-func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
+func TestBootstrapVerifiesCanonicalManifestBeforePlatformDownload(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {
 		pwsh, err = exec.LookPath("powershell.exe")
 	}
 	if err != nil {
 		t.Skip("PowerShell is unavailable")
-	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
 	}
 	manifest := validManifest(fixtureArtifacts())
 	manifest.PlatformSetup.SkillBundle.ManagedSkills = []string{"implement"}
@@ -44,18 +35,8 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signature, err := Sign(raw, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	directory := t.TempDir()
 	manifestPath := filepath.Join(directory, "platform-release.json")
-	signaturePath := filepath.Join(directory, "platform-release.json.sig")
-	publicKeyPath := filepath.Join(directory, "platform-release-public-key.pem")
 	policyPath := filepath.Join(directory, "release-policy.json")
 	write := func(path string, data []byte) {
 		t.Helper()
@@ -64,20 +45,16 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 		}
 	}
 	write(manifestPath, raw)
-	write(signaturePath, signature)
-	write(publicKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
 	policy, _ := json.Marshal(map[string]any{
 		"schema_version": 1, "repository": manifest.Release.Repository,
-		"workflow_path": manifest.Provenance.WorkflowPath, "key_id": manifest.Signature.KeyID,
-		"signature_algorithm": manifest.Signature.Algorithm, "minimum_platform_version": "0.0.0",
-		"public_key_file": filepath.Base(publicKeyPath),
+		"workflow_path": manifest.Provenance.WorkflowPath, "minimum_platform_version": "0.0.0",
 	})
 	write(policyPath, policy)
 
-	scriptRoot := copyBootstrapSkillForTest(t, directory, policy, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+	scriptRoot := copyBootstrapSkillForTest(t, directory, policy)
 	script := filepath.Join(scriptRoot, "verify-platform-release.ps1")
 	run := func(scriptPath string, extra ...string) (string, error) {
-		arguments := []string{"-NoProfile", "-File", scriptPath, "-ManifestPath", manifestPath, "-SignaturePath", signaturePath}
+		arguments := []string{"-NoProfile", "-File", scriptPath, "-ManifestPath", manifestPath}
 		if filepath.Base(scriptPath) == "new-platform-bootstrap-plan.ps1" {
 			arguments = append(arguments, "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
 		}
@@ -89,6 +66,17 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	if err != nil || !strings.Contains(output, `"verified":true`) {
 		t.Fatalf("verified release output = %q, %v", output, err)
 	}
+	var legacySignedManifest map[string]any
+	if err := json.Unmarshal(raw, &legacySignedManifest); err != nil {
+		t.Fatal(err)
+	}
+	legacySignedManifest["signature"] = map[string]any{"algorithm": "ecdsa-p256-sha256", "key_id": "obsolete", "signature_asset": "platform-release.json.sig"}
+	legacyRaw, _ := json.Marshal(legacySignedManifest)
+	write(manifestPath, legacyRaw)
+	if legacyOutput, legacyErr := run(script); legacyErr == nil || !strings.Contains(legacyOutput, "missing or unknown fields") {
+		t.Fatalf("verifier accepted obsolete signing metadata: output=%q err=%v", legacyOutput, legacyErr)
+	}
+	write(manifestPath, raw)
 	hostFactsPath := filepath.Join(directory, "host-facts.json")
 	planPath := filepath.Join(directory, "platform-plan.json")
 	workflowHome := filepath.Join(directory, "workflow-home")
@@ -324,7 +312,7 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	platformState["release_bundled_files_digest"] = strings.Repeat("5", 64)
 	driftFacts, _ = json.Marshal(noOpState)
 	write(hostFactsPath, driftFacts)
-	assertInstallationReauthorization("signed bundle inventory pin drift", "replace")
+	assertInstallationReauthorization("bundle inventory pin drift", "replace")
 	platformState["release_bundled_files_digest"] = bundledDigest
 	platformState["control_plane_plan_digest_sha256"] = strings.Repeat("3", 64)
 	driftFacts, _ = json.Marshal(noOpState)
@@ -407,20 +395,20 @@ func TestBootstrapVerifiesPinnedManifestBeforePlatformDownload(t *testing.T) {
 	incompatible := manifest
 	incompatible.BootstrapContract.MinimumSchema, incompatible.BootstrapContract.MaximumSchema = 2, 2
 	incompatibleRaw, _, _ := incompatible.Canonical()
-	incompatibleSignature, _ := Sign(incompatibleRaw, key)
 	write(manifestPath, incompatibleRaw)
-	write(signaturePath, incompatibleSignature)
 	output, err = run(planScript, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner")
 	if err == nil || !strings.Contains(output, "incompatible with this bootstrap planner") {
 		t.Fatalf("incompatible bootstrap contract reached planning: %q, %v", output, err)
 	}
 	write(manifestPath, raw)
-	write(signaturePath, signature)
 
-	write(signaturePath, append([]byte(nil), signature[:len(signature)-1]...))
+	tamperedManifest := manifest
+	tamperedManifest.Release.Repository = "attacker/platform"
+	tamperedManifestRaw, _, _ := tamperedManifest.Canonical()
+	write(manifestPath, tamperedManifestRaw)
 	output, err = run(installScript, "-PlanPath", filepath.Join(directory, "not-read-before-trust.json"), "-ApprovedDigest", strings.Repeat("0", 64))
-	if err == nil || !strings.Contains(output, "Platform Release signature") {
-		t.Fatalf("tampered signature was not rejected before plan/download: %q, %v", output, err)
+	if err == nil || !strings.Contains(output, "repository does not match") {
+		t.Fatalf("tampered manifest was not rejected before plan/download: %q, %v", output, err)
 	}
 }
 
@@ -433,7 +421,7 @@ func TestBootstrapProductionScriptsExposeNoTrustPathOverridesOnPowerShell51(t *t
 	scriptRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts"))
 	for _, name := range []string{"verify-platform-release.ps1", "new-platform-bootstrap-plan.ps1", "install-workflow-cli.ps1"} {
 		t.Run(name, func(t *testing.T) {
-			command := exec.Command(powershell, "-NoProfile", "-Command", `$parameters = (Get-Command $env:WORKFLOW_TEST_SCRIPT).Parameters; if ($parameters.ContainsKey('PolicyPath') -or $parameters.ContainsKey('PublicKeyPath')) { throw 'production trust override is exposed' }`)
+			command := exec.Command(powershell, "-NoProfile", "-Command", `$parameters = (Get-Command $env:WORKFLOW_TEST_SCRIPT).Parameters; if ($parameters.ContainsKey('PolicyPath') -or $parameters.ContainsKey('PublicKeyPath') -or $parameters.ContainsKey('SignaturePath')) { throw 'production trust override or signing input is exposed' }`)
 			command.Env = append(os.Environ(), "WORKFLOW_TEST_SCRIPT="+filepath.Join(scriptRoot, name))
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("production script exposes a trust-path override: %v (%s)", err, output)
@@ -442,7 +430,7 @@ func TestBootstrapProductionScriptsExposeNoTrustPathOverridesOnPowerShell51(t *t
 	}
 }
 
-func copyBootstrapSkillForTest(t *testing.T, directory string, policy, publicKey []byte) string {
+func copyBootstrapSkillForTest(t *testing.T, directory string, policy []byte) string {
 	t.Helper()
 	_, currentFile, _, _ := runtime.Caller(0)
 	sourceRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow"))
@@ -470,9 +458,6 @@ func copyBootstrapSkillForTest(t *testing.T, directory string, policy, publicKey
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(targetRoot, "trust", "release-policy.json"), policy, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(targetRoot, "trust", "platform-release-public-key.pem"), publicKey, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return filepath.Join(targetRoot, "scripts")
