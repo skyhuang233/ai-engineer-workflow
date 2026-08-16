@@ -15,14 +15,12 @@ function Assert-ReleaseResolver([bool]$Condition, [string]$Message) {
 
 function Get-StableVersion([string]$Value, [string]$Description) {
     Assert-ReleaseResolver ($Value -match '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "$Description must be a bare semantic version core (X.Y.Z) without leading zeros"
-    $components = @([string]$Matches[1], [string]$Matches[2], [string]$Matches[3])
-    $parsed = [Collections.Generic.List[int]]::new()
-    foreach ($component in $components) {
-        $value64 = [uint64]0
-        Assert-ReleaseResolver ([uint64]::TryParse($component, [ref]$value64) -and $value64 -le [int]::MaxValue) "$Description components must fit the signed 32-bit range"
-        $parsed.Add([int]$value64)
+    $parts = @([string]$Matches[1], [string]$Matches[2], [string]$Matches[3])
+    foreach ($part in $parts) {
+        $number = [uint64]0
+        Assert-ReleaseResolver ([uint64]::TryParse($part, [ref]$number) -and $number -le [int]::MaxValue) "$Description components must fit the signed 32-bit range"
     }
-    return [Version]::new($parsed[0], $parsed[1], $parsed[2])
+    return [Version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2])
 }
 
 function Get-SHA256File([string]$Path) {
@@ -30,185 +28,95 @@ function Get-SHA256File([string]$Path) {
     try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
 
-foreach ($requiredPath in @($HostFactsPath, $PolicyPath)) {
-    Assert-ReleaseResolver (Test-Path -LiteralPath $requiredPath -PathType Leaf) "Required release resolver input is missing: $requiredPath"
+foreach ($required in @($HostFactsPath, $PolicyPath)) {
+    Assert-ReleaseResolver (Test-Path -LiteralPath $required -PathType Leaf) "Required release resolver input is missing: $required"
 }
+
+# The caller supplies this one-use credential on standard input. It is never
+# read from gh, host state, or a persisted Control Plane credential.
+$pat = [Console]::In.ReadLine()
+Assert-ReleaseResolver (-not [string]::IsNullOrWhiteSpace($pat)) "Platform Release resolution requires a GitHub PAT on standard input"
 $policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
-Assert-ReleaseResolver ($policy.schema_version -eq 1) "Unsupported Platform Release trust policy"
-$policyPropertyNames = @($policy.PSObject.Properties.Name | Sort-Object)
-$expectedPolicyPropertyNames = @("minimum_platform_version", "repository", "schema_version", "workflow_path" | Sort-Object)
-Assert-ReleaseResolver (($policyPropertyNames -join "`n") -ceq ($expectedPolicyPropertyNames -join "`n")) "Platform Release trust policy contains missing or unknown fields"
+Assert-ReleaseResolver ($policy.schema_version -eq 1 -and [string]$policy.repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') "Platform Release trust policy is invalid"
 $repository = [string]$policy.repository
-Assert-ReleaseResolver ($repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') "Platform Release trust policy repository is invalid"
-$headers = @{ Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
-$fixedAssets = @("SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip" | Sort-Object)
+$headers = @{ Authorization = "Bearer $pat"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
+$fixedAssets = @("SHA256SUMS", "platform-release.json", "workflow-windows-amd64.zip" | Sort-Object)
 
 function Test-CanonicalPlatformRelease($Candidate) {
-    if ($null -eq $Candidate -or [bool]$Candidate.draft -or [bool]$Candidate.prerelease -or $Candidate.immutable -isnot [bool] -or -not [bool]$Candidate.immutable) { return $false }
-    $candidateTag = [string]$Candidate.tag_name
-    if ($candidateTag -notmatch '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') { return $false }
+    if ($null -eq $Candidate -or [bool]$Candidate.draft -or [bool]$Candidate.prerelease -or -not [bool]$Candidate.immutable) { return $false }
+    if ([string]$Candidate.tag_name -notmatch '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') { return $false }
     try { $null = Get-StableVersion ([string]$Matches[1]) "Platform Release version" } catch { return $false }
-    $candidateAssets = @($Candidate.assets)
-    $candidateNames = @($candidateAssets | ForEach-Object { [string]$_.name } | Sort-Object)
-    if (($candidateNames -join "`n") -cne ($fixedAssets -join "`n")) { return $false }
-    foreach ($candidateAsset in $candidateAssets) {
-        $candidateName = [string]$candidateAsset.name
-        if ([string]$candidateAsset.browser_download_url -cne "https://github.com/$repository/releases/download/$candidateTag/$candidateName") { return $false }
-    }
-    return $true
+    return ((@($Candidate.assets | ForEach-Object { [string]$_.name } | Sort-Object) -join "`n") -ceq ($fixedAssets -join "`n"))
+}
+
+function Get-ReleaseAsset($Release, [string]$Name) {
+    $asset = @($Release.assets | Where-Object { [string]$_.name -ceq $Name })
+    Assert-ReleaseResolver ($asset.Count -eq 1 -and [long]$asset[0].id -gt 0) "Platform Release lacks exact asset '$Name'"
+    return $asset[0]
+}
+
+function Download-ReleaseAsset($Asset, [string]$Destination) {
+    $assetHeaders = @{ Authorization = "Bearer $pat"; Accept = "application/octet-stream"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
+    Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/assets/$([long]$Asset.id)" -Headers $assetHeaders -OutFile $Destination -UseBasicParsing
 }
 
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
 Assert-ReleaseResolver ($facts.schema_version -eq 1) "Unsupported host-facts schema"
 $installed = ($null -ne $facts.platform -and [bool]$facts.platform.installation_recorded)
-$durableVersionText = ""
-$durableVersion = $null
-$durableDigest = ""
+$selected = $Version.Trim()
 $selection = "latest-stable"
-$selectedVersionText = $Version.Trim()
-$pinlessExistingInstall = (-not $installed -and $null -ne $facts.workflow -and [bool]$facts.workflow.installed)
-
-if (-not $installed) {
-    Assert-ReleaseResolver (-not $AllowUpgrade) "AllowUpgrade applies only when upgrading an existing Platform Installation"
-    if ($pinlessExistingInstall -and [string]::IsNullOrWhiteSpace($selectedVersionText)) {
-        throw "An existing Workflow CLI has no verified Platform Release primary or backup pin. Recover it with -Version <exact-installed-version>; latest selection is allowed only for a true fresh install"
-    }
-    if ($pinlessExistingInstall) {
-        Get-StableVersion $selectedVersionText "Exact recovery Platform Release version" | Out-Null
-        $selection = "exact-version-recovery"
-        $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
-    } elseif ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
-        $releaseAPI = ""
-    } else {
-        Get-StableVersion $selectedVersionText "Requested Platform Release version" | Out-Null
-        $selection = "explicit-version"
-        $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
-    }
-} else {
-    $durableVersionText = [string]$facts.platform.version
-    $durableVersion = Get-StableVersion $durableVersionText "Durable Platform Installation version"
+$durableVersion = $null; $durableDigest = ""
+if ($installed) {
+    $durableVersion = Get-StableVersion ([string]$facts.platform.version) "Durable Platform Installation version"
     $durableDigest = [string]$facts.platform.release_manifest_digest
     Assert-ReleaseResolver ($durableDigest -match '^[0-9a-f]{64}$') "Durable Platform Installation manifest digest is invalid"
-    if ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
-        Assert-ReleaseResolver (-not $AllowUpgrade) "An upgrade requires an explicit Platform Release version"
-        $selectedVersionText = $durableVersionText
-        $selection = "durable-repair"
-    } else {
-        $requestedVersion = Get-StableVersion $selectedVersionText "Requested Platform Release version"
-        $comparison = $requestedVersion.CompareTo($durableVersion)
+    if ([string]::IsNullOrWhiteSpace($selected)) { Assert-ReleaseResolver (-not $AllowUpgrade) "An upgrade requires an explicit Platform Release version"; $selected = $durableVersion.ToString(3); $selection = "durable-repair" }
+    else {
+        $comparison = (Get-StableVersion $selected "Requested Platform Release version").CompareTo($durableVersion)
         Assert-ReleaseResolver ($comparison -ge 0) "Requested Platform Release version is older than the durable Platform Installation"
-        if ($AllowUpgrade) {
-            Assert-ReleaseResolver ($comparison -gt 0) "AllowUpgrade authorizes only a version greater than the durable Platform Installation"
-            $selection = "explicit-upgrade"
-        } else {
-            Assert-ReleaseResolver ($comparison -eq 0) "A greater Platform Release version requires explicit AllowUpgrade authorization"
-            $selection = "durable-repair"
-        }
+        if ($AllowUpgrade) { Assert-ReleaseResolver ($comparison -gt 0) "AllowUpgrade authorizes only a version greater than the durable Platform Installation"; $selection = "explicit-upgrade" } else { Assert-ReleaseResolver ($comparison -eq 0) "A greater Platform Release version requires explicit AllowUpgrade authorization"; $selection = "durable-repair" }
     }
-    $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
+} elseif (-not [string]::IsNullOrWhiteSpace($selected)) {
+    Get-StableVersion $selected "Requested Platform Release version" | Out-Null
+    $selection = "explicit-version"
+} elseif ($null -ne $facts.workflow -and [bool]$facts.workflow.installed) {
+    throw "An existing Workflow CLI without a recorded Platform Installation requires -Version <exact-installed-version>"
 }
 
-if ([string]::IsNullOrWhiteSpace($releaseAPI)) {
-    $release = $null
-    $highestVersion = $null
-    $highestCount = 0
-    $paginationComplete = $false
-    foreach ($page in 1..100) {
-        $pageAPI = "https://api.github.com/repos/$repository/releases?per_page=100&page=$page"
-        $pageResponse = Invoke-WebRequest -Uri $pageAPI -Headers $headers -UseBasicParsing
-        $decodedPage = [string]$pageResponse.Content | ConvertFrom-Json
-        $pageReleases = @($decodedPage | Where-Object { $null -ne $_ })
-        if ($pageReleases.Count -eq 0) {
-            $paginationComplete = $true
-            break
-        }
-        foreach ($candidate in $pageReleases) {
-            if (-not (Test-CanonicalPlatformRelease $candidate)) { continue }
-            [string]$candidateVersionText = ([string]$candidate.tag_name).Substring("platform-v".Length)
-            $candidateVersion = Get-StableVersion $candidateVersionText "Platform Release version"
-            if ($null -eq $highestVersion -or $candidateVersion.CompareTo($highestVersion) -gt 0) {
-                $release = $candidate
-                $highestVersion = $candidateVersion
-                $highestCount = 1
-            } elseif ($candidateVersion.CompareTo($highestVersion) -eq 0) {
-                $highestCount++
+try {
+    if ([string]::IsNullOrWhiteSpace($selected)) {
+        $release = $null; $highest = $null
+        foreach ($page in 1..100) {
+            $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases?per_page=100&page=$page" -Headers $headers -UseBasicParsing
+            $candidates = @([string]$response.Content | ConvertFrom-Json)
+            if ($candidates.Count -eq 0) { break }
+            foreach ($candidate in $candidates) {
+                if (-not (Test-CanonicalPlatformRelease $candidate)) { continue }
+                $candidateTag = [string]$candidate.tag_name
+                $candidateVersion = Get-StableVersion $candidateTag.Substring(10) "Platform Release version"
+                if ($null -eq $highest -or $candidateVersion.CompareTo($highest) -gt 0) { $release = $candidate; $highest = $candidateVersion }
             }
         }
+        Assert-ReleaseResolver ($null -ne $release) "No canonical immutable stable Platform Release was found"
+    } else {
+        $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/tags/platform-v$selected" -Headers $headers -UseBasicParsing
+        $release = [string]$response.Content | ConvertFrom-Json
     }
-    Assert-ReleaseResolver $paginationComplete "Platform Release pagination exceeded the fail-closed page limit"
-    Assert-ReleaseResolver ($null -ne $release) "No canonical immutable stable Platform Release was found"
-    Assert-ReleaseResolver ($highestCount -eq 1) "Highest canonical Platform Release version is ambiguous"
-} else {
-    $releaseResponse = Invoke-WebRequest -Uri $releaseAPI -Headers $headers -UseBasicParsing
-    $release = [string]$releaseResponse.Content | ConvertFrom-Json
-}
-Assert-ReleaseResolver (-not [bool]$release.draft -and -not [bool]$release.prerelease) "Selected GitHub Release is not stable"
-Assert-ReleaseResolver ($release.immutable -is [bool] -and [bool]$release.immutable) "Selected GitHub Release is not immutable"
-$tag = [string]$release.tag_name
-Assert-ReleaseResolver ($tag -match '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') "Selected GitHub Release tag is not a canonical stable Platform Release"
-$metadataVersionText = [string]$Matches[1]
-if (-not [string]::IsNullOrWhiteSpace($selectedVersionText)) {
-    Assert-ReleaseResolver ($metadataVersionText -eq $selectedVersionText) "GitHub Release tag does not match the selected Platform Release version"
-}
-$releaseAssets = @($release.assets)
-$assetNames = @($releaseAssets | ForEach-Object { [string]$_.name } | Sort-Object)
-Assert-ReleaseResolver (($assetNames -join "`n") -ceq ($fixedAssets -join "`n")) "GitHub Release asset set is not exact"
-foreach ($asset in $releaseAssets) {
-    $assetName = [string]$asset.name
-    $expectedAssetURL = "https://github.com/$repository/releases/download/$tag/$assetName"
-    Assert-ReleaseResolver ([string]$asset.browser_download_url -ceq $expectedAssetURL) "GitHub Release asset '$assetName' does not use its canonical HTTPS download URL"
-}
-
-$taskTemp = Join-Path ([IO.Path]::GetTempPath()) ("workflow-platform-release-" + [Guid]::NewGuid().ToString("N"))
-$manifestPath = Join-Path $taskTemp "platform-release.json"
-try {
+    Assert-ReleaseResolver (Test-CanonicalPlatformRelease $release) "Selected GitHub Release is not a canonical immutable stable Platform Release"
+    $tag = [string]$release.tag_name
+    $versionText = $tag.Substring(10)
+    if (-not [string]::IsNullOrWhiteSpace($selected)) { Assert-ReleaseResolver ($versionText -ceq $selected) "GitHub Release tag does not match the selected Platform Release version" }
+    $taskTemp = Join-Path ([IO.Path]::GetTempPath()) ("workflow-platform-release-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $taskTemp | Out-Null
-    $downloadRoot = "https://github.com/$repository/releases/download/$tag"
-    Invoke-WebRequest -Uri "$downloadRoot/platform-release.json" -Headers $headers -OutFile $manifestPath -UseBasicParsing
+    $manifestPath = Join-Path $taskTemp "platform-release.json"
+    Download-ReleaseAsset (Get-ReleaseAsset $release "platform-release.json") $manifestPath
     & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $manifestPath | Out-Null
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $candidateVersionText = [string]$manifest.release.version
-    $candidateVersion = Get-StableVersion $candidateVersionText "Verified Platform Release version"
-    Assert-ReleaseResolver ([string]$manifest.release.tag -eq $tag -and $candidateVersionText -eq $metadataVersionText) "Verified Platform Release identity does not match the selected GitHub Release"
-    Assert-ReleaseResolver ([string]$release.target_commitish -ceq [string]$manifest.release.source_commit) "GitHub Release target commit does not match the verified Platform Release manifest"
-    $sourceCommit = [string]$manifest.release.source_commit
-    $runID = [long]$manifest.release.github_actions_run_id
-    $runResponse = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/actions/runs/$runID" -Headers $headers -UseBasicParsing
-    $run = [string]$runResponse.Content | ConvertFrom-Json
-    Assert-ReleaseResolver ([long]$run.id -eq $runID -and [string]$run.repository.full_name -ceq $repository -and [string]$run.path -ceq [string]$policy.workflow_path -and [string]$run.head_sha -ceq $sourceCommit -and [string]$run.head_branch -ceq "main" -and [string]$run.event -ceq "push" -and [string]$run.status -ceq "completed" -and [string]$run.conclusion -ceq "success") "Platform Release publisher run does not match the canonical successful main workflow"
-
-    $pullsResponse = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/commits/$sourceCommit/pulls" -Headers $headers -UseBasicParsing
-    $matchingPulls = @([string]$pullsResponse.Content | ConvertFrom-Json | Where-Object { $null -ne $_.merged_at -and [string]$_.merge_commit_sha -ceq $sourceCommit -and [string]$_.base.ref -ceq "main" })
-    Assert-ReleaseResolver ($matchingPulls.Count -eq 1 -and [long]$matchingPulls[0].number -gt 0) "Platform Release source commit must have exactly one merged main pull request"
-    $pullNumber = [long]$matchingPulls[0].number
-    $pullResponse = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/pulls/$pullNumber" -Headers $headers -UseBasicParsing
-    $pull = [string]$pullResponse.Content | ConvertFrom-Json
-    $repositoryOwner = $repository.Split('/')[0]
-    $mergedByLogin = [string]$pull.merged_by.login
-    Assert-ReleaseResolver ($null -ne $pull.merged_at -and [string]$pull.merge_commit_sha -ceq $sourceCommit -and [string]$pull.base.ref -ceq "main" -and [string]::Equals($mergedByLogin, $repositoryOwner, [StringComparison]::OrdinalIgnoreCase) -and [string]$pull.merged_by.type -ceq "User" -and -not $mergedByLogin.EndsWith("[bot]", [StringComparison]::OrdinalIgnoreCase)) "Platform Release source commit was not merged to main by the repository owner"
+    Assert-ReleaseResolver ([string]$manifest.release.repository -ceq $repository -and [string]$manifest.release.tag -ceq $tag -and [string]$manifest.release.version -ceq $versionText) "Platform Release manifest does not match selected release"
     $manifestDigest = Get-SHA256File $manifestPath
-
-    if ($installed) {
-        $candidateComparison = $candidateVersion.CompareTo($durableVersion)
-        Assert-ReleaseResolver ($candidateComparison -ge 0) "Verified Platform Release is older than the durable Platform Installation"
-        if ($AllowUpgrade) {
-            Assert-ReleaseResolver ($candidateComparison -gt 0) "AllowUpgrade authorizes only a version greater than the durable Platform Installation"
-        } else {
-            Assert-ReleaseResolver ($candidateComparison -eq 0) "A release change requires explicit AllowUpgrade authorization"
-            Assert-ReleaseResolver ($manifestDigest -eq $durableDigest) "Durable Platform Installation repair requires its exact manifest digest"
-        }
-    }
-
-    [ordered]@{
-        verified = $true
-        selection = $selection
-        release_version = $candidateVersionText
-        release_tag = $tag
-        manifest_digest_sha256 = $manifestDigest
-        manifest_path = [IO.Path]::GetFullPath($manifestPath)
-        temp_directory = [IO.Path]::GetFullPath($taskTemp)
-    } | ConvertTo-Json -Compress
+    if ($installed -and -not $AllowUpgrade) { Assert-ReleaseResolver ($manifestDigest -ceq $durableDigest) "Durable Platform Installation repair requires its exact manifest digest" }
+    [ordered]@{ verified = $true; selection = $selection; release_version = $versionText; release_tag = $tag; manifest_digest_sha256 = $manifestDigest; manifest_path = [IO.Path]::GetFullPath($manifestPath); temp_directory = [IO.Path]::GetFullPath($taskTemp) } | ConvertTo-Json -Compress
 } catch {
-    if (Test-Path -LiteralPath $taskTemp) { Remove-Item -LiteralPath $taskTemp -Recurse -Force }
+    if ($taskTemp -and (Test-Path -LiteralPath $taskTemp)) { Remove-Item -LiteralPath $taskTemp -Recurse -Force }
     throw
-}
+} finally { $pat = $null }

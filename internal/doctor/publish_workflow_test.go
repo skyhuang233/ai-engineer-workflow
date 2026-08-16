@@ -186,14 +186,13 @@ func TestPlatformPublisherBindsGitHubHostedImmutableReleaseContractWithoutManage
 		"GOOS: windows",
 		"GOARCH: amd64",
 		`GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`,
-		"platform-sbom.spdx.json",
-		"platform-provenance.json",
+		"config/platform-release.json",
 		"workflow-windows-amd64.zip",
+		"platform-release.json",
 		"sha256sum --check SHA256SUMS",
 		"--draft",
 		`gh release edit "$tag" --draft=false`,
 		"(.immutable == true)",
-		`gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}"`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Platform publisher omits release contract %q", required)
@@ -206,6 +205,16 @@ func TestPlatformPublisherBindsGitHubHostedImmutableReleaseContractWithoutManage
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("Platform publisher still depends on a managed signing key or detached signature %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"platform-sbom.spdx.json", "platform-provenance.json", `commits/${GITHUB_SHA}/pulls`, "WORKFLOW_PLATFORM_VERSION", "DOCKER_DESKTOP_VERSION"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("Platform publisher retained removed release input or owner-PR check %q", forbidden)
+		}
+	}
+	for _, required := range []string{"fetch-depth: 0", "github.event.before", `git diff --quiet "$before" "$GITHUB_SHA"`, `git show "$before:config/platform-release.json"`} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("Platform publisher does not compare Platform version across the complete push range: missing %q", required)
 		}
 	}
 }

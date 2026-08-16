@@ -71,15 +71,6 @@ func (m Manifest) Validate() error {
 		}
 		bundledPaths[file.Path] = struct{}{}
 	}
-	if m.Provenance.Repository != m.Release.Repository || m.Provenance.SourceCommit != m.Release.SourceCommit || m.Provenance.GitHubActionsRunID != m.Release.GitHubActionsRunID || m.Provenance.WorkflowPath != ".github/workflows/publish-platform.yml" || m.Provenance.BuilderID != "github-actions" {
-		return errors.New("Platform Release provenance does not match release identity")
-	}
-	if err := validateArtifacts(m.Provenance.Subjects, true); err != nil {
-		return fmt.Errorf("invalid provenance subjects: %w", err)
-	}
-	if !sameArtifacts(m.Artifacts, m.Provenance.Subjects) {
-		return errors.New("Platform Release provenance subjects do not cover exact release artifacts")
-	}
 	return nil
 }
 
@@ -152,7 +143,7 @@ func validateArtifacts(artifacts []Artifact, requireCore bool) error {
 		seen[artifact.Name] = struct{}{}
 	}
 	if requireCore {
-		requiredArtifacts := []string{"workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json"}
+		requiredArtifacts := []string{"workflow-windows-amd64.zip"}
 		if len(seen) != len(requiredArtifacts) {
 			return errors.New("Platform Release artifact set must exactly match required artifacts")
 		}
@@ -209,9 +200,8 @@ func SelectLatestStable(candidates []Candidate, bootstrapSchema int) (Manifest, 
 }
 
 // VerifyManifest binds release metadata fetched from GitHub to the canonical
-// repository, immutable source commit, and publishing workflow expected by the
-// caller. Manifest validation separately binds every artifact digest and the
-// provenance subjects to that same release identity.
+// repository and immutable source commit expected by the caller. Package
+// acceptance is performed by the separately published SHA256SUMS file.
 func VerifyManifest(raw []byte, identity ReleaseIdentity) (Manifest, error) {
 	if !repositoryPattern.MatchString(identity.Repository) || !shaPattern.MatchString(identity.SourceCommit) || identity.WorkflowPath != ".github/workflows/publish-platform.yml" {
 		return Manifest{}, errors.New("Platform Release identity is invalid")
@@ -220,7 +210,7 @@ func VerifyManifest(raw []byte, identity ReleaseIdentity) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	if manifest.Release.Repository != identity.Repository || manifest.Release.SourceCommit != identity.SourceCommit || manifest.Provenance.Repository != identity.Repository || manifest.Provenance.SourceCommit != identity.SourceCommit || manifest.Provenance.WorkflowPath != identity.WorkflowPath {
+	if manifest.Release.Repository != identity.Repository || manifest.Release.SourceCommit != identity.SourceCommit {
 		return Manifest{}, errors.New("Platform Release does not match GitHub release identity")
 	}
 	return manifest, nil

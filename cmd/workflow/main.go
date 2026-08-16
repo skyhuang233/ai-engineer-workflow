@@ -55,8 +55,11 @@ func resolveDoctorCodexAuth(ctx context.Context, requested string, resolve func(
 		return "", err
 	}
 	requested = strings.TrimSpace(requested)
-	if requested != "" && !strings.EqualFold(filepath.Clean(requested), filepath.Clean(resolved)) {
-		return "", errors.New("--codex-auth-file must match the ChatGPT source verified by codex doctor and codex login status")
+	if requested != "" {
+		same, compareErr := workflowhome.SameFilesystemPath(requested, resolved)
+		if compareErr != nil || !same {
+			return "", errors.New("--codex-auth-file must match the ChatGPT source verified by codex doctor and codex login status")
+		}
 	}
 	return resolved, nil
 }

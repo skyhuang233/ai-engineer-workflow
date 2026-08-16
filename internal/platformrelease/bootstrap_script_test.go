@@ -66,17 +66,6 @@ func TestBootstrapVerifiesCanonicalManifestBeforePlatformDownload(t *testing.T) 
 	if err != nil || !strings.Contains(output, `"verified":true`) {
 		t.Fatalf("verified release output = %q, %v", output, err)
 	}
-	var legacySignedManifest map[string]any
-	if err := json.Unmarshal(raw, &legacySignedManifest); err != nil {
-		t.Fatal(err)
-	}
-	legacySignedManifest["signature"] = map[string]any{"algorithm": "ecdsa-p256-sha256", "key_id": "obsolete", "signature_asset": "platform-release.json.sig"}
-	legacyRaw, _ := json.Marshal(legacySignedManifest)
-	write(manifestPath, legacyRaw)
-	if legacyOutput, legacyErr := run(script); legacyErr == nil || !strings.Contains(legacyOutput, "missing or unknown fields") {
-		t.Fatalf("verifier accepted obsolete signing metadata: output=%q err=%v", legacyOutput, legacyErr)
-	}
-	write(manifestPath, raw)
 	hostFactsPath := filepath.Join(directory, "host-facts.json")
 	planPath := filepath.Join(directory, "platform-plan.json")
 	workflowHome := filepath.Join(directory, "workflow-home")

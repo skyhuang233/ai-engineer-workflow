@@ -28,8 +28,9 @@ func TestFreshBootstrapInstallerForwardsPATOnStdinWithoutLeakingItOnWindowsPower
 	fakeSource := filepath.Join(directory, "fake-workflow.go")
 	fakeExecutable := filepath.Join(directory, "workflow.exe")
 	fakeProgram := `package main
-import ("encoding/json"; "io"; "os"; "strings")
+import ("encoding/json"; "io"; "os"; "path/filepath"; "strings")
 func main() {
+ if strings.ToLower(filepath.Base(os.Args[0])) != "workflow.exe" { return }
  args := strings.Join(os.Args[1:], " ")
  calls, _ := os.OpenFile(os.Getenv("WORKFLOW_TEST_CALLS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); if calls != nil { _, _ = calls.WriteString(args+"\n"); _ = calls.Close() }
  if args == "version" { os.Stdout.WriteString("workflow "+os.Getenv("WORKFLOW_TEST_RELEASE_VERSION")+"\n"); return }
@@ -46,6 +47,22 @@ func main() {
 	build := exec.Command("go", "build", "-o", fakeExecutable, fakeSource)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build fake workflow.exe: %v (%s)", err, output)
+	}
+	// Host inspection is exercised separately. This installer test must not
+	// depend on a live Docker daemon or the desktop Codex process; make their
+	// probes deterministic and fast while preserving the Workflow CLI fixture.
+	for _, name := range []string{"codex.exe", "docker.exe"} {
+		data, err := os.ReadFile(fakeExecutable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspectionEnvironment := func(entries ...string) []string {
+		base := replaceTestEnvironment(os.Environ(), map[string]string{"PATH": directory + string(os.PathListSeparator) + os.Getenv("PATH")})
+		return append(base, entries...)
 	}
 	executableBytes, err := os.ReadFile(fakeExecutable)
 	if err != nil {
@@ -72,6 +89,11 @@ func main() {
 	}
 	archiveBytes, err := os.ReadFile(archivePath)
 	if err != nil {
+		t.Fatal(err)
+	}
+	checksumPath := filepath.Join(directory, "SHA256SUMS")
+	archiveSum := sha256.Sum256(archiveBytes)
+	if err := os.WriteFile(checksumPath, []byte(hex.EncodeToString(archiveSum[:])+"  workflow-windows-amd64.zip\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	artifacts := fixtureArtifacts()
@@ -101,20 +123,6 @@ func main() {
 	workflowHome := filepath.Join(directory, "workflow-home")
 	hostFactsPath := filepath.Join(directory, "host-facts.json")
 	planPath := filepath.Join(directory, "platform-plan.json")
-	inspectCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "inspect-host.ps1"), "-Repository", directory, "-WorkflowHome", workflowHome)
-	inspectOutput, err := inspectCommand.CombinedOutput()
-	var inspected struct {
-		SchemaVersion int  `json:"schema_version"`
-		SupportedHost bool `json:"supported_host"`
-		HostIdentity  struct {
-			UserID              string `json:"user_id"`
-			Username            string `json:"username"`
-			WorkflowHomeOwnerID string `json:"workflow_home_owner_id"`
-		} `json:"host_identity"`
-	}
-	if err != nil || json.Unmarshal(inspectOutput, &inspected) != nil || inspected.SchemaVersion != 1 || !inspected.SupportedHost || !strings.HasPrefix(inspected.HostIdentity.UserID, "S-") || inspected.HostIdentity.Username == "" || inspected.HostIdentity.WorkflowHomeOwnerID != inspected.HostIdentity.UserID {
-		t.Fatalf("fresh host inspection on powershell.exe: %v (%s)", err, inspectOutput)
-	}
 	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
 	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
@@ -159,6 +167,7 @@ func main() {
 	pinBackupPath := filepath.Join(workflowHome, "backups", "bootstrap-platform-release-pin.json")
 	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	failedDownload := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", failedDownloadWrapper)
+	failedDownload.Stdin = bytes.NewBufferString(token + "\n")
 	failedDownload.Env = append(os.Environ(), "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
 	if failedOutput, failedErr := failedDownload.CombinedOutput(); failedErr == nil || !strings.Contains(string(failedOutput), "simulated archive download failure") {
 		t.Fatalf("simulated failed install was not observed: err=%v output=%s", failedErr, failedOutput)
@@ -169,18 +178,20 @@ func main() {
 	if _, err := os.Stat(pinBackupPath); !os.IsNotExist(err) {
 		t.Fatalf("failed download advanced the bootstrap release pin backup: %v", err)
 	}
-	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	wrapper := `function Invoke-WebRequest { param([string]$Uri,$Headers,[string]$OutFile,[switch]$UseBasicParsing) if ([string]::IsNullOrWhiteSpace($OutFile)) { return [pscustomobject]@{ Content = '{"assets":[{"id":1,"name":"SHA256SUMS"},{"id":2,"name":"workflow-windows-amd64.zip"}]}' } }; if ($Uri.EndsWith('/assets/1')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_CHECKSUM -Destination $OutFile } elseif ($Uri.EndsWith('/assets/2')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile } else { throw "unexpected request $Uri" } }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	tamperedArchivePath := filepath.Join(directory, "tampered-workflow-windows-amd64.zip")
 	tamperedArchive := append(append([]byte(nil), archiveBytes...), 0)
 	write(tamperedArchivePath, tamperedArchive)
 	tamperedArchiveCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
-	tamperedArchiveCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+tamperedArchivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
-	if output, runErr := tamperedArchiveCommand.CombinedOutput(); runErr == nil || !strings.Contains(string(output), "checksum or size mismatch") {
+	tamperedArchiveCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+tamperedArchivePath, "WORKFLOW_TEST_CHECKSUM="+checksumPath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
+	tamperedArchiveCommand.Stdin = bytes.NewBufferString(token + "\n")
+	if output, runErr := tamperedArchiveCommand.CombinedOutput(); runErr == nil || !strings.Contains(string(output), "checksum differs from SHA256SUMS") {
 		t.Fatalf("installer accepted a tampered archive: err=%v output=%s", runErr, output)
 	}
 	versionMismatchCalls := filepath.Join(directory, "version-mismatch-calls.txt")
 	versionMismatch := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
-	versionMismatch.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION=0.9.0", "WORKFLOW_TEST_CALLS="+versionMismatchCalls)
+	versionMismatch.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_CHECKSUM="+checksumPath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION=0.9.0", "WORKFLOW_TEST_CALLS="+versionMismatchCalls)
+	versionMismatch.Stdin = bytes.NewBufferString(token + "\n")
 	versionMismatchOutput, versionMismatchErr := versionMismatch.CombinedOutput()
 	if versionMismatchErr == nil || !strings.Contains(string(versionMismatchOutput), "published version differs from the Platform Release Manifest") {
 		t.Fatalf("installer accepted a Workflow CLI whose published version differs from the manifest: err=%v output=%s", versionMismatchErr, versionMismatchOutput)
@@ -190,7 +201,7 @@ func main() {
 	}
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
 	installCommand.Stdin = bytes.NewBufferString(token + "\n")
-	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
+	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_CHECKSUM="+checksumPath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
 	installOutput, err := installCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh install on powershell.exe: %v (%s)", err, installOutput)
@@ -234,6 +245,7 @@ func main() {
 	write(cliRepairPlanPath, cliRepairEnvelope)
 	priorControlPlaneDigest := strings.Repeat("7", 64)
 	cliRepairCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
+	cliRepairCommand.Stdin = bytes.NewBufferString(token + "\n")
 	cliRepairCommand.Env = replaceTestEnvironment(installCommand.Env, map[string]string{"WORKFLOW_TEST_PLAN": cliRepairPlanPath, "WORKFLOW_TEST_DIGEST": cliRepairDigest, "WORKFLOW_TEST_CP_DIGEST": priorControlPlaneDigest})
 	if output, err := cliRepairCommand.CombinedOutput(); err != nil {
 		t.Fatalf("CLI-only repair on powershell.exe: %v (%s)", err, output)
@@ -252,7 +264,7 @@ func main() {
 	}
 	inspectWrapper := `function Get-Acl { param([string]$LiteralPath) [pscustomobject]@{ Owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
 	inspectPinned := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	inspectPinned.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome)
+	inspectPinned.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome)
 	pinnedOutput, err := inspectPinned.CombinedOutput()
 	var pinnedFacts struct {
 		Workflow struct {
@@ -291,7 +303,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	write(installedExecutable, mismatchedBytes)
 	sideEffectPath := filepath.Join(directory, "untrusted-workflow-executed.txt")
 	mismatchedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	mismatchedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
+	mismatchedInspect.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
 	mismatchedOutput, mismatchedErr := mismatchedInspect.CombinedOutput()
 	var mismatchedFacts struct {
 		Workflow struct {
@@ -317,7 +329,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	ownerSideEffectArgs := filepath.Join(directory, "owner-mismatch-args.txt")
 	ownerMismatchWrapper := `function Get-Acl { param([string]$LiteralPath) if ([IO.Path]::GetExtension($LiteralPath) -ieq '.exe') { [pscustomobject]@{ Owner = 'BUILTIN\Administrators' } } else { [pscustomobject]@{ Owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name } } }; & $env:WORKFLOW_TEST_INSPECT -Repository $env:WORKFLOW_TEST_REPOSITORY -WorkflowHome $env:WORKFLOW_TEST_HOME`
 	ownerMismatchInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ownerMismatchWrapper)
-	ownerMismatchInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs)
+	ownerMismatchInspect.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs)
 	ownerMismatchOutput, ownerMismatchErr := ownerMismatchInspect.CombinedOutput()
 	var ownerMismatchFacts struct {
 		Workflow struct {
@@ -338,7 +350,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	}
 	missingPinInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
 	backupRecoveryCalls := filepath.Join(directory, "backup-recovery-calls.txt")
-	missingPinInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs, "WORKFLOW_TEST_CALLS="+backupRecoveryCalls)
+	missingPinInspect.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_STDIN="+ownerSideEffectStdin, "WORKFLOW_TEST_ARGS="+ownerSideEffectArgs, "WORKFLOW_TEST_CALLS="+backupRecoveryCalls)
 	missingPinOutput, missingPinErr := missingPinInspect.CombinedOutput()
 	var missingPinFacts struct {
 		Workflow struct {
@@ -409,7 +421,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 		t.Fatal(err)
 	}
 	tamperedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	tamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
+	tamperedInspect.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
 	tamperedOutput, tamperedErr := tamperedInspect.CombinedOutput()
 	var tamperedFacts struct {
 		Workflow struct {
@@ -427,7 +439,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 		t.Fatal(err)
 	}
 	bothTamperedInspect := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspectWrapper)
-	bothTamperedInspect.Env = append(os.Environ(), "WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
+	bothTamperedInspect.Env = inspectionEnvironment("WORKFLOW_TEST_INSPECT="+filepath.Join(scriptRoot, "inspect-host.ps1"), "WORKFLOW_TEST_REPOSITORY="+directory, "WORKFLOW_TEST_HOME="+workflowHome, "WORKFLOW_TEST_SIDE_EFFECT="+sideEffectPath)
 	bothTamperedOutput, bothTamperedErr := bothTamperedInspect.CombinedOutput()
 	var bothTamperedFacts struct {
 		Workflow struct {

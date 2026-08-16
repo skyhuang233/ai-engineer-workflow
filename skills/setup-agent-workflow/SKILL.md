@@ -29,7 +29,7 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
    ```
 
-   Resolve both paths and require `$hostFacts.workflow_home` to equal `$confirmedWorkflowHome`; otherwise fail closed. Every later reinspection must pass `-WorkflowHome $confirmedWorkflowHome` again; never recover the default from process environment after this choice.
+   Compare both Workflow Home paths by filesystem identity when the target exists (or by the same normalized Windows path form when it does not); otherwise fail closed. Every later reinspection must pass `-WorkflowHome $confirmedWorkflowHome` again; never recover the default from process environment after this choice.
 
    Before release resolution, handle an already-authorized absent Control Plane process as an existing-authorization Control Plane restart. Use an explicit exact predicate; do not infer restart authority from a state label alone:
 
@@ -73,7 +73,7 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    Require the already-approved classic PAT scopes `repo,workflow` for a personal owner. Organization ownership remains supported in the design but must stop with `requires an approved organization scope contract` until that additional credential contract is explicitly approved; do not infer or request extra scopes. Capture the verifier's redacted JSON result and pass its `owner_type` and `fingerprint_sha256` unchanged to the bootstrap planner. When the persisted credential is already live-verified, reuse those two fields from `$hostFacts.github_credential`; never calculate a fingerprint from an unverified value.
 2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. When no verified credential exists, ask for the classic PAT and pipe it to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`. A personal owner must verify personal identity, exact `repo,workflow` scopes, repository access or absence, and Actions checkout feasibility. Observe active review/merge-queue policy when GitHub makes those optional capabilities readable; a 403 from repository rulesets or branch protection is capability-unavailable, not a credential failure, so proceed in Owner-Guarded Mode. Positively observed review, merge-queue, or required-check policy remains applicable to the Onboarding Pull Request and must still be handled safely. An organization owner stops pending the approved organization scope contract. If any required fact cannot be proved, stop before producing a Platform Bootstrap Plan. Never fall back to another owner after rejection.
 
-   Resolve the trusted Platform Release automatically. Do not accept release paths or URLs from the user or an unverified manifest. A fresh host may either use the default latest stable release or the user's explicitly confirmed exact version. `AllowUpgrade` is only for an installed lower version moving to a higher exact version:
+   Resolve the trusted Platform Release automatically from the fixed repository. For every resolution, ask for the user's PAT explicitly; do not read `gh`, a host credential store, or the persisted Control Plane credential. Pass that one-use PAT to the resolver and later installer on BOM-free standard input, never as an argument, file, or ordinary output. A fresh host may either use the default latest stable release or the user's explicitly confirmed exact version. `AllowUpgrade` is only for an installed lower version moving to a higher exact version:
 
    ```powershell
    $releaseArguments = @{ HostFactsPath = $hostFactsPath }
@@ -81,7 +81,10 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    $releaseArguments.Version = <confirmed-version>
    # Add AllowUpgrade only when an installed lower version is explicitly moving to that higher version:
    $releaseArguments.AllowUpgrade = $true
-   $resolvedRelease = & scripts/resolve-platform-release.ps1 @releaseArguments | ConvertFrom-Json
+   # Start scripts/resolve-platform-release.ps1 with a ProcessStartInfo StandardInput writer created
+   # with [Text.UTF8Encoding]::new($false), then write the explicit PAT once.
+   # Do not use a Windows PowerShell 5.1 text pipeline because it prefixes UTF-8 BOM bytes.
+   $resolvedRelease = <resolver-standard-output> | ConvertFrom-Json
    ```
 
    Branch on the inspected pin state without inventing release authority:
@@ -90,7 +93,7 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    - When either verified durable pin is available, the verified backup pin automatically supplies exact repair authority if the primary is missing; omit `Version` for that exact pin repair. The resolver selects the pinned release and the later approved apply recreates the missing primary or backup.
    - When both verified pins are missing while the Workflow CLI exists, ask the user to confirm the exact installed version. Add `$releaseArguments.Version = <confirmed-exact-installed-version>` and do not add `AllowUpgrade`; never use latest-stable selection for a pinless existing installation.
 
-   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they verify and preview the exact repair but do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver accepts only the packaged canonical GitHub repository, an immutable stable release, its exact source commit and fixed manifest asset, then verifies every declared artifact checksum, release identity, provenance, and Platform Setup Contract before returning paths. Any repository, version, commit, pin, manifest, provenance, or checksum disagreement blocks.
+   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver accepts the fixed repository's immutable stable release and downloads its functional `platform-release.json` through the authenticated Release Asset API. The installer uses the same explicit PAT to download `SHA256SUMS` and `workflow-windows-amd64.zip` through that API, and accepts the ZIP only when its SHA-256 matches that file. It does not consult SBOM, provenance, a signature, a `gh` login, or a persisted release credential.
 
    Produce the Platform Plan only from the resolver output:
 
@@ -103,10 +106,10 @@ Treat the current directory as the target. Keep discovery read-only and use the 
 3. After approval, run the exact installer command:
 
    ```powershell
-   & scripts/install-workflow-cli.ps1 -ManifestPath $resolvedRelease.manifest_path -PlanPath $platformPlanPath -ApprovedDigest <approved-digest>
+   <start installer with the same BOM-free standard-input PAT writer>
    ```
 
-   It re-verifies the manifest and approved plan before downloading the exact checksummed platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. Supply a PAT to `workflow setup apply` over standard input; keep it out of arguments and ordinary output. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
+   It checks the approved plan before downloading the exact checksummed platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. The installer passes the same PAT to `workflow setup apply` with a BOM-free standard-input writer; keep it out of arguments and ordinary output. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
 4. Use the installed CLI for the remaining deterministic loop:
 
    ```powershell

@@ -280,7 +280,7 @@ func TestBootstrapSkillChoosesWorkflowHomeBeforeFirstInspection(t *testing.T) {
 	for _, required := range []string{
 		"Confirm the absolute local Workflow Home once before the first host inspection",
 		`inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome`,
-		"require `$hostFacts.workflow_home` to equal `$confirmedWorkflowHome`",
+		"Compare both Workflow Home paths by filesystem identity",
 	} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks first-inspection Workflow Home contract %q", required)

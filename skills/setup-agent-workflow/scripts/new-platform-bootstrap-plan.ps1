@@ -17,6 +17,14 @@ function Get-SHA256Hex([byte[]]$Bytes) {
 function Get-SHA256File([string]$Path) {
     return Get-SHA256Hex ([IO.File]::ReadAllBytes($Path))
 }
+function Get-ComparableWorkflowPath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    # Existing Windows paths may be reported through an 8.3 alias by one
+    # process and their long form by another. Resolve an existing target to
+    # its filesystem identity; planned paths retain their normalized form.
+    if (Test-Path -LiteralPath $full) { return (Get-Item -LiteralPath $full).FullName }
+    return $full
+}
 & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath | Out-Null
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
@@ -179,7 +187,7 @@ if ([string]::IsNullOrWhiteSpace($hostUserID) -or [string]::IsNullOrWhiteSpace($
 if (-not [string]::Equals($hostUserID, $workflowHomeOwnerID, [StringComparison]::OrdinalIgnoreCase)) {
     throw "The existing Workflow Home must be owned by the current Windows user"
 }
-$approvedHostIdentity = [ordered]@{ user_id = $hostUserID; username = $hostUsername; workflow_home = [IO.Path]::GetFullPath([string]$facts.workflow_home); workflow_home_owner_id = $workflowHomeOwnerID }
+$approvedHostIdentity = [ordered]@{ user_id = $hostUserID; username = $hostUsername; workflow_home = (Get-ComparableWorkflowPath ([string]$facts.workflow_home)); workflow_home_owner_id = $workflowHomeOwnerID }
 $platformPreconditions += [ordered]@{ id = "windows-user-and-home-owner"; kind = "host_identity"; subject = "current-user"; expected = ($approvedHostIdentity | ConvertTo-Json -Compress) }
 $codexAuthVerified = ($facts.codex_auth.verified -and [IO.Path]::IsPathRooted([string]$facts.codex_auth.source) -and [string]$facts.codex_auth.fingerprint_sha256 -match '^[0-9a-f]{64}$')
 if (-not $codexAuthVerified) { throw "A supported verified Codex ChatGPT authentication snapshot is required" }

@@ -45,25 +45,17 @@ Assert-PlatformRelease (($policyPropertyNames -join "`n") -ceq ($expectedPolicyP
 
 $manifestBytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath))
 $manifest = [Text.Encoding]::UTF8.GetString($manifestBytes) | ConvertFrom-Json
-Assert-ExactProperties $manifest @("artifacts", "bootstrap_contract", "bundled_files", "platform_setup_contract", "provenance", "release", "schema_version") "Platform Release Manifest"
-Assert-ExactProperties $manifest.release @("channel", "github_actions_run_id", "repository", "source_commit", "tag", "version") "Platform Release identity"
-Assert-ExactProperties $manifest.provenance @("builder_id", "github_actions_run_id", "repository", "source_commit", "subjects", "workflow_path") "Platform Release provenance"
+foreach ($required in @("schema_version", "release", "bootstrap_contract", "platform_setup_contract", "artifacts", "bundled_files")) { Get-RequiredProperty $manifest $required | Out-Null }
+foreach ($required in @("repository", "tag", "version", "channel")) { Get-RequiredProperty $manifest.release $required | Out-Null }
 Assert-PlatformRelease ($manifest.schema_version -eq 1) "Unsupported Platform Release Manifest schema"
 Assert-PlatformRelease ([int]$manifest.bootstrap_contract.minimum_schema -le 1 -and [int]$manifest.bootstrap_contract.maximum_schema -ge 1) "Platform Release is incompatible with this bootstrap planner"
 Assert-PlatformRelease ($manifest.release.repository -eq $policy.repository) "Platform Release repository does not match pinned trust policy"
-Assert-PlatformRelease ($manifest.provenance.repository -eq $policy.repository) "Platform Release provenance repository does not match pinned trust policy"
-Assert-PlatformRelease ($manifest.provenance.workflow_path -eq $policy.workflow_path) "Platform Release workflow does not match pinned trust policy"
 
 $releaseVersion = Get-SemanticVersion ([string]$manifest.release.version)
 $minimumVersion = Get-SemanticVersion ([string]$policy.minimum_platform_version)
 Assert-PlatformRelease ($releaseVersion -ge $minimumVersion) "Platform Release is older than the pinned minimum version"
 Assert-PlatformRelease ($manifest.release.channel -eq "stable") "Bootstrap accepts stable Platform Releases only"
 Assert-PlatformRelease ($manifest.release.tag -eq ("platform-v" + $releaseVersion.ToString(3))) "Platform Release tag does not match its version"
-Assert-PlatformRelease (([string]$manifest.release.source_commit) -match '^[0-9a-f]{40}$') "Platform Release source commit is invalid"
-Assert-PlatformRelease ([long]$manifest.release.github_actions_run_id -gt 0) "Platform Release GitHub Actions run identity is invalid"
-Assert-PlatformRelease ($manifest.provenance.source_commit -eq $manifest.release.source_commit) "Platform Release provenance source commit does not match"
-Assert-PlatformRelease ([long]$manifest.provenance.github_actions_run_id -eq [long]$manifest.release.github_actions_run_id) "Platform Release provenance run identity does not match"
-Assert-PlatformRelease ($manifest.provenance.builder_id -eq "github-actions") "Platform Release provenance builder is invalid"
 
 $platformContract = Get-RequiredProperty $manifest "platform_setup_contract"
 Assert-PlatformRelease ([string]$platformContract.workflow_home_default -ceq '%LOCALAPPDATA%\AgentWorkflow') "Workflow Home default is invalid"
@@ -108,8 +100,8 @@ foreach ($artifact in @($manifest.artifacts)) {
     Assert-PlatformRelease (-not $artifactIdentities.ContainsKey($name)) "Platform Release artifact is duplicated"
     $artifactIdentities[$name] = "$sha`:$size"
 }
-Assert-PlatformRelease ($artifactIdentities.Count -eq 3) "Platform Release artifact set must exactly match required artifacts"
-foreach ($required in @("workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json")) {
+Assert-PlatformRelease ($artifactIdentities.Count -eq 1) "Platform Release artifact set must exactly match the package"
+foreach ($required in @("workflow-windows-amd64.zip")) {
     Assert-PlatformRelease ($artifactIdentities.ContainsKey($required)) "Platform Release lacks required artifact '$required'"
 }
 $bundledFileIdentities = @{}
@@ -123,20 +115,6 @@ foreach ($bundledFile in @($manifest.bundled_files)) {
     $bundledFileIdentities[$bundledPath] = $bundledSHA
 }
 Assert-PlatformRelease ($bundledFileIdentities.Count -gt 0) "Platform Release must bind bundled files"
-$subjectIdentities = @{}
-foreach ($subject in @($manifest.provenance.subjects)) {
-    Assert-ExactProperties $subject @("name", "sha256", "size") "Platform Release provenance subject"
-    $name = [string](Get-RequiredProperty $subject "name")
-    $sha = [string](Get-RequiredProperty $subject "sha256")
-    $size = [long](Get-RequiredProperty $subject "size")
-    Assert-PlatformRelease (-not $subjectIdentities.ContainsKey($name)) "Platform Release provenance subject is duplicated"
-    $subjectIdentities[$name] = "$sha`:$size"
-}
-Assert-PlatformRelease ($subjectIdentities.Count -eq $artifactIdentities.Count) "Platform Release provenance subjects do not exactly cover artifacts"
-foreach ($name in $artifactIdentities.Keys) {
-    Assert-PlatformRelease ($subjectIdentities[$name] -eq $artifactIdentities[$name]) "Platform Release provenance subject '$name' does not match"
-}
-
 $hasher = [Security.Cryptography.SHA256]::Create()
 try { $digest = ([BitConverter]::ToString($hasher.ComputeHash($manifestBytes))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 [ordered]@{
@@ -144,7 +122,4 @@ try { $digest = ([BitConverter]::ToString($hasher.ComputeHash($manifestBytes))).
     manifest_digest_sha256 = $digest
     release_version = [string]$manifest.release.version
     repository = [string]$manifest.release.repository
-    source_commit = [string]$manifest.release.source_commit
-    workflow_path = [string]$manifest.provenance.workflow_path
-    github_actions_run_id = [long]$manifest.release.github_actions_run_id
 } | ConvertTo-Json -Compress

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "version": "0.1.0",
+  "docker_desktop": {
+    "version": "4.86.0",
+    "installer_url": "https://desktop.docker.com/win/main/amd64/236216/Docker%20Desktop%20Installer.exe",
+    "windows_amd64_sha256": "820438e75c16e44b393079154bea7d27958a15845c23a635b1a1f6f586b2ed44"
+  },
+  "worker_image": "ghcr.io/skyhuang233/workflow-worker@sha256:be28323864eb46ddd800d24d0eb26394b99a8b372449a2ce48ea54762ce0880c"
+}
