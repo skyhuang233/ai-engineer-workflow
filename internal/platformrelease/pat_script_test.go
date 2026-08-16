@@ -185,10 +185,14 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 	}
 	for _, required := range []string{
 		"ask once for the classic PAT",
+		"even when `$hostFacts.github_credential` is already live-verified",
 		"current Setup invocation's memory",
+		"skip only the Control Plane credential verifier",
 		"Control Plane credential verifier",
 		"Release Resolver",
 		"exact-package installer",
+		"BOM-free copy of the same in-memory PAT",
+		"clear `$setupPAT` before stopping",
 	} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks single-PAT setup contract %q", required)
@@ -196,6 +200,12 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 	}
 	if strings.Contains(content, "For every resolution, ask for the user's PAT explicitly") {
 		t.Fatal("bootstrap skill must not require users to re-enter the PAT for release resolution")
+	}
+	firstCapture := strings.Index(content, "ask once for the classic PAT")
+	resolver := strings.Index(content, "Reuse the PAT already captured for this Setup invocation")
+	installer := strings.Index(content, "do not ask for the PAT again")
+	if firstCapture < 0 || resolver < firstCapture || installer < resolver {
+		t.Fatalf("bootstrap skill must capture once before reuse by resolver and installer: capture=%d resolver=%d installer=%d", firstCapture, resolver, installer)
 	}
 	for _, obsolete := range []string{"obtain the exact release", "SignaturePath", "signature_path", ".sig", "pinned public key", "missing pinned key"} {
 		if strings.Contains(content, obsolete) {
