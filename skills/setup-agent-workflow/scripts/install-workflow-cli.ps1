@@ -26,8 +26,14 @@ function Invoke-WorkflowSetupApply([string]$Executable, [string]$Plan, [string]$
     $start.RedirectStandardError = $true
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
-    [void]$process.Start()
-    $inputStream = $process.StandardInput.BaseStream
+    $originalConsoleInputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+        [void]$process.Start()
+        $inputStream = $process.StandardInput.BaseStream
+    } finally {
+        [Console]::InputEncoding = $originalConsoleInputEncoding
+    }
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($PAT + "`n")
     try {
         $inputStream.Write($bytes, 0, $bytes.Length)
