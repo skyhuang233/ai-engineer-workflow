@@ -47,6 +47,8 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrga
 			_, _ = w.Write([]byte(`{"full_name":"alice/no-merge","private":true,"default_branch":"main","allow_squash_merge":false,"allow_merge_commit":false,"allow_rebase_merge":false,"permissions":{"admin":true}}`))
 		case "/repos/alice/protected":
 			_, _ = w.Write([]byte(`{"full_name":"alice/protected","private":true,"default_branch":"main","allow_squash_merge":true,"permissions":{"admin":true}}`))
+		case "/repos/alice/owner-guarded":
+			_, _ = w.Write([]byte(`{"full_name":"alice/owner-guarded","private":true,"default_branch":"main","allow_squash_merge":true,"permissions":{"admin":true}}`))
 		case "/repos/alice/published/actions/permissions":
 			_, _ = w.Write([]byte(`{"enabled":false,"allowed_actions":"selected"}`))
 		case "/repos/alice/published/actions/permissions/selected-actions":
@@ -62,6 +64,11 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrga
 			_, _ = w.Write([]byte(`[]`))
 		case "/repos/alice/protected/branches/main/protection":
 			_, _ = w.Write([]byte(`{"required_pull_request_reviews":{"required_approving_review_count":1}}`))
+		case "/repos/alice/owner-guarded/actions/permissions":
+			_, _ = w.Write([]byte(`{"enabled":true,"allowed_actions":"all"}`))
+		case "/repos/alice/owner-guarded/rulesets", "/repos/alice/owner-guarded/branches/main/protection":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"GitHub plan does not support this private repository policy"}`))
 		case "/orgs/acme":
 			_, _ = w.Write([]byte(`{"login":"acme"}`))
 		case "/orgs/acme/actions/permissions":
@@ -119,6 +126,9 @@ func TestVerifyGitHubPATRunsOnWindowsPowerShell51AndFailsClosedForUnapprovedOrga
 	}
 	if output, runErr = run("alice", "published", "published"); runErr != nil {
 		t.Fatalf("published repository with administration permission was rejected: %q, %v", output, runErr)
+	}
+	if output, runErr = run("alice", "owner-guarded", "published"); runErr != nil {
+		t.Fatalf("private Owner-Guarded repository with unavailable optional policy was rejected: %q, %v", output, runErr)
 	}
 	output, runErr = run("alice", "read-only", "published")
 	if runErr == nil || !strings.Contains(string(output), "repository administration") {

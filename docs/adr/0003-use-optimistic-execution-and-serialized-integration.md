@@ -1,3 +1,0 @@
-# Use optimistic execution and serialized integration
-
-The Control Plane dispatches tickets from their explicit dependency DAG and treats planned file lists only as risk hints, without semantic change-scope leases or runtime scope renegotiation. Worker Runs may therefore execute speculatively in parallel, while pull requests enter a serialized integration queue and must be updated onto the latest `main` and pass the full quality gate again before merge. This accepts some wasted execution when concurrent work conflicts in exchange for a much simpler agent protocol and moves the hard safety invariant to the point where it can be checked against actual diffs and the current codebase.

@@ -1,3 +1,0 @@
-# Require approval for active Plan Amendments
-
-Ticket Agents may adapt implementation within an Executable Ticket but cannot unilaterally change an active Delivery Plan's acceptance criteria, membership, dependency edges, or cross-ticket contracts. Discoveries that invalidate the approved DAG become a Plan Amendment with an impact analysis; only the affected ticket and downstream subgraph pause while unrelated frontier work continues, and a human must approve the amendment before GitHub relationships change and scheduling resumes. This prevents a worker from silently changing global intent merely to unblock its local execution.

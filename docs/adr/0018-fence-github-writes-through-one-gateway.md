@@ -1,3 +1,0 @@
-# Fence GitHub writes through one gateway
-
-Ticket Agent containers are trusted for local execution, but neither agents nor their embedded `no-mistakes` Delivery Controllers receive raw GitHub write credentials. They submit mutations to a narrow GitHub Write Gateway that checks the current Run Lease, derives the permitted ticket branch and pull request, compares the expected remote head, and never exposes merge or direct-`main` operations. This deliberately addresses stale-agent writes and credential ownership with one boundary while avoiding network allowlists, a separate privileged delivery service, and treating the trusted container as an untrusted-code isolation boundary. ADR-0004 owns the trusted container's Codex sandbox and Docker privilege contract.

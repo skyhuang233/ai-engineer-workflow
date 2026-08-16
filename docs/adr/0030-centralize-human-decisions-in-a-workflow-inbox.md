@@ -1,3 +1,0 @@
-# Centralize human decisions in a Workflow Inbox
-
-Every `ask-user` finding, agent clarification, Plan Amendment approval, cancellation confirmation, and Needs Attention decision is presented in one repository-level GitHub Workflow Inbox with a stable question id and links to its plan, ticket, pull request, commit, finding, and evidence. Humans answer there with an id-addressed command, the Control Plane accepts one answer idempotently and routes it to the owning Ticket Session or gate, and origin surfaces contain links rather than duplicate question bodies. Pull requests remain the place where humans initiate code review, but users never need to search multiple objects for automation waiting on their input.

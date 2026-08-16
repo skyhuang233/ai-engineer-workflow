@@ -1,3 +1,0 @@
-# Route all human pull-request feedback to the Ticket Agent
-
-In Owner-Guarded Mode, every review, inline comment, and pull-request conversation comment from the configured owner is delivered to the accountable Ticket Agent, which decides whether to modify code, answer a question, or simply acknowledge it. Submitted review comments are batched, feedback received during active work is queued within the same Ticket Session, and GitHub event identities are deduplicated. Comments from all other accounts, bots, and the Ticket Agent itself are excluded to prevent feedback loops and keep external repository input observation-only.

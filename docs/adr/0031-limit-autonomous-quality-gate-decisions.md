@@ -1,3 +1,0 @@
-# Limit autonomous quality-gate decisions
-
-Ticket Agents may authorize specific `auto-fix` findings, approve informational `no-op` findings, and inspect the resulting fix review within configured no-progress bounds. Every `ask-user` finding and every request to skip a quality step must be routed through the Workflow Inbox for explicit human authorization, and global `--yes` operation is prohibited because it would silently decide product intent. While a gate is active, the agent must drive its response protocol rather than editing around it; a new manual repair round begins only after the prior pipeline run reaches a terminal failure.

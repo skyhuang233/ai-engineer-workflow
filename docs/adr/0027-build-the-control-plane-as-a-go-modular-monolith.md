@@ -1,3 +1,0 @@
-# Build the Control Plane as a Go modular monolith
-
-The Control Plane is one Go process organized into deep modules for plan state, deterministic scheduling, Codex agents, delivery cycles, GitHub integration, Docker runtime, and SQLite persistence. Go matches the `no-mistakes` ecosystem and the workload's process supervision, JSONL streams, timers, Docker integration, HTTP, and transactional concurrency while producing a simple deployment artifact. The fork remains an explicit tool or library boundary, and internal module interfaces preserve testability without introducing scheduler, gateway, and state microservices.
