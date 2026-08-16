@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
+	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
 func TestBootstrapVerifiesCanonicalManifestBeforePlatformDownload(t *testing.T) {
@@ -112,7 +113,10 @@ func TestBootstrapVerifiesCanonicalManifestBeforePlatformDownload(t *testing.T) 
 			WorkflowHome        string `json:"workflow_home"`
 			WorkflowHomeOwnerID string `json:"workflow_home_owner_id"`
 		}
-		hostIdentityBound = hostIdentityBound || precondition.Kind == "host_identity" && precondition.Subject == "current-user" && json.Unmarshal([]byte(precondition.Expected), &identity) == nil && identity.UserID == "S-1-5-21-planner" && identity.Username == `DOMAIN\planner` && identity.WorkflowHome == workflowHome && identity.WorkflowHomeOwnerID == "S-1-5-21-planner"
+		if precondition.Kind == "host_identity" && precondition.Subject == "current-user" && json.Unmarshal([]byte(precondition.Expected), &identity) == nil {
+			sameWorkflowHome, pathErr := workflowhome.SameFilesystemPath(identity.WorkflowHome, workflowHome)
+			hostIdentityBound = hostIdentityBound || identity.UserID == "S-1-5-21-planner" && identity.Username == `DOMAIN\planner` && pathErr == nil && sameWorkflowHome && identity.WorkflowHomeOwnerID == "S-1-5-21-planner"
+		}
 	}
 	if err != nil || !hasSkillBundle || !hasExactCLI || !hostIdentityBound || parseErr != nil || string(canonical) != planned.CanonicalJSON || digest != planned.DigestSHA256 || parsed.Preconditions[0].Kind != "platform_release" || parsed.Preconditions[0].Expected != hex.EncodeToString(manifestDigest[:]) {
 		t.Fatalf("verified Platform Bootstrap Plan omitted exact Workflow Skill Bundle: %q, %v", output, err)

@@ -212,7 +212,7 @@ func TestPlatformPublisherBindsGitHubHostedImmutableReleaseContractWithoutManage
 			t.Fatalf("Platform publisher retained removed release input or owner-PR check %q", forbidden)
 		}
 	}
-	for _, required := range []string{"fetch-depth: 0", "github.event.before", `git diff --quiet "$before" "$GITHUB_SHA"`, `git show "$before:config/platform-release.json"`} {
+	for _, required := range []string{"fetch-depth: 0", "workflow_dispatch:", "github.event.before", `github.event_name }}" = "workflow_dispatch"`, `git diff --quiet "$before" "$GITHUB_SHA"`, `git show "$before:config/platform-release.json"`} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Platform publisher does not compare Platform version across the complete push range: missing %q", required)
 		}

@@ -1,6 +1,7 @@
 name: publish-platform
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -44,10 +45,14 @@ jobs:
           "docker_url=$([string]$config.docker_desktop.installer_url)" >> $env:GITHUB_OUTPUT
           "docker_sha256=$([string]$config.docker_desktop.windows_amd64_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$([string]$config.worker_image)" >> $env:GITHUB_OUTPUT
-      - name: Publish only when the version changed
+      - name: Publish on a changed version or explicit dispatch
         id: version-change
         shell: bash
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           before="${{ github.event.before }}"
           if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before:config/platform-release.json" 2>/dev/null; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
