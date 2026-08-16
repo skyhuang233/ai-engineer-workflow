@@ -6,9 +6,32 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 function Get-SHA256File([string]$Path) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+}
+function Get-ReleaseAsset($Release, [string]$Name) {
+    $matches = @($Release.assets | Where-Object { [string]$_.name -ceq $Name })
+    if ($matches.Count -ne 1 -or [long]$matches[0].id -le 0) { throw "Platform Release lacks exact asset '$Name'" }
+    return $matches[0]
+}
+function Invoke-WorkflowSetupApply([string]$Executable, [string]$Plan, [string]$Digest, [string]$PAT) {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $Executable
+    $start.Arguments = 'setup apply --plan "' + $Plan.Replace('"', '\"') + '" --approved-digest ' + $Digest
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    [void]$process.Start()
+    $writer = New-Object IO.StreamWriter($process.StandardInput.BaseStream, (New-Object Text.UTF8Encoding($false)))
+    try { $writer.WriteLine($PAT); $writer.Flush() } finally { $writer.Dispose() }
+    $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) { throw "workflow setup apply failed with exit code $($process.ExitCode): $stderr$stdout" }
 }
 & (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath | Out-Null
 
@@ -22,8 +45,6 @@ if ([string]::IsNullOrWhiteSpace($canonicalPlan)) { throw "Setup Plan envelope l
 $approvedPlan = $canonicalPlan | ConvertFrom-Json
 $manifestDigest = Get-SHA256File $ManifestPath
 
-$asset = $manifest.artifacts | Where-Object { $_.name -eq "workflow-windows-amd64.zip" } | Select-Object -First 1
-if ($null -eq $asset) { throw "Release has no Windows amd64 Workflow CLI asset" }
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("AgentWorkflow\downloads\" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
 try {
@@ -86,12 +107,26 @@ try {
             }
         }
     }
-    $archive = Join-Path $temporaryRoot $asset.name
-    $assetURL = "https://github.com/$($manifest.release.repository)/releases/download/$($manifest.release.tag)/$($asset.name)"
-    Invoke-WebRequest -Uri $assetURL -OutFile $archive -UseBasicParsing
+    # The same explicitly supplied, one-use PAT authenticates both private
+    # release asset reads and the Control Plane apply when that plan needs it.
+    $releasePAT = [Console]::In.ReadLine()
+    if ([string]::IsNullOrWhiteSpace($releasePAT)) { throw "Platform Release download requires a GitHub PAT on standard input" }
+    $repository = [string]$manifest.release.repository
+    $releaseHeaders = @{ Authorization = "Bearer $releasePAT"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
+    $releaseResponse = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/tags/$([string]$manifest.release.tag)" -Headers $releaseHeaders -UseBasicParsing
+    $release = [string]$releaseResponse.Content | ConvertFrom-Json
+    $assetHeaders = @{ Authorization = "Bearer $releasePAT"; Accept = "application/octet-stream"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
+    $checksumPath = Join-Path $temporaryRoot "SHA256SUMS"
+    $checksumAsset = Get-ReleaseAsset $release "SHA256SUMS"
+    Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/assets/$([long]$checksumAsset.id)" -Headers $assetHeaders -OutFile $checksumPath -UseBasicParsing
+    $checksumMatch = Select-String -LiteralPath $checksumPath -Pattern '^([0-9a-f]{64})  workflow-windows-amd64\.zip$'
+    if (@($checksumMatch).Count -ne 1) { throw "SHA256SUMS lacks an exact workflow-windows-amd64.zip checksum" }
+    $expectedArchiveSHA256 = [string]$checksumMatch[0].Matches[0].Groups[1].Value
+    $archive = Join-Path $temporaryRoot "workflow-windows-amd64.zip"
+    $archiveAsset = Get-ReleaseAsset $release "workflow-windows-amd64.zip"
+    Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/assets/$([long]$archiveAsset.id)" -Headers $assetHeaders -OutFile $archive -UseBasicParsing
     $actual = Get-SHA256File $archive
-    $actualSize = (Get-Item -LiteralPath $archive).Length
-    if ($actual -ne $asset.sha256 -or $actualSize -ne [long]$asset.size) { throw "Workflow CLI asset checksum or size mismatch" }
+    if ($actual -ne $expectedArchiveSHA256) { throw "Workflow CLI archive checksum differs from SHA256SUMS" }
     $expanded = Join-Path $temporaryRoot "expanded"
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
     $expectedExecutablePath = Join-Path $expanded "bin\workflow.exe"
@@ -104,13 +139,11 @@ try {
     $patEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "github_pat" })
     if ($patEffects.Count -gt 1) { throw "Approved Setup Plan contains multiple GitHub PAT effects" }
     if ($patEffects.Count -eq 1) {
-        $pat = [Console]::In.ReadLine()
-        if ([string]::IsNullOrWhiteSpace($pat)) { throw "Approved GitHub PAT effect requires standard input" }
-        try { $pat | & $executable.FullName setup apply --plan $canonicalPlanPath --approved-digest $ApprovedDigest } finally { $pat = $null }
+        Invoke-WorkflowSetupApply $executable.FullName $canonicalPlanPath $ApprovedDigest $releasePAT
     } else {
         & $executable.FullName setup apply --plan $canonicalPlanPath --approved-digest $ApprovedDigest
     }
-    if ($LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }
+    if ($patEffects.Count -eq 0 -and $LASTEXITCODE -ne 0) { throw "workflow setup apply failed with exit code $LASTEXITCODE" }
     $workflowHome = [IO.Path]::GetFullPath([string]$approvedPlan.target.workflow_home)
     if (-not [IO.Path]::IsPathRooted($workflowHome) -or $workflowHome.StartsWith("\\")) { throw "Approved Setup Plan Workflow Home is not an absolute local path" }
     $inspectionOutput = (& $executable.FullName setup inspect-platform --workflow-home $workflowHome | Out-String).Trim()
@@ -161,5 +194,6 @@ try {
         }
     }
 } finally {
+    $releasePAT = $null
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

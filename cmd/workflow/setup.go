@@ -787,7 +787,11 @@ func currentPlatformStateDigest(ctx context.Context, database *store.Store, incl
 	}
 	var snapshot platformStateSnapshot
 	sum := sha256.Sum256(content)
-	snapshot.CodexAuth.Source = filepath.Clean(source)
+	canonicalSource, canonicalErr := workflowhome.CanonicalFilesystemPath(source)
+	if canonicalErr != nil {
+		return "", canonicalErr
+	}
+	snapshot.CodexAuth.Source = canonicalSource
 	snapshot.CodexAuth.FingerprintSHA256 = hex.EncodeToString(sum[:])
 	if includePAT {
 		verification, err := database.GitHubPATVerification(ctx)

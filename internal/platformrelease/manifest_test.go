@@ -12,8 +12,6 @@ import (
 func TestManifestRoundTripAndArtifactVerification(t *testing.T) {
 	artifacts := map[string][]byte{
 		"workflow-windows-amd64.zip": []byte("package"),
-		"platform-sbom.spdx.json":    []byte(`{"spdxVersion":"SPDX-2.3","name":"workflow-platform"}`),
-		"platform-provenance.json":   []byte(`{"subject":"workflow-windows-amd64.zip"}`),
 	}
 	manifest := validManifest(artifacts)
 	raw, digest, err := manifest.Canonical()
@@ -143,7 +141,6 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 			m.Release.Version = "1.0.0+build.1"
 			m.Release.Tag = "platform-v1.0.0+build.1"
 		},
-		"provenance mismatch": func(m *Manifest) { m.Provenance.SourceCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -158,7 +155,7 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 
 func validManifest(artifactData map[string][]byte) Manifest {
 	artifacts := make([]Artifact, 0, len(artifactData))
-	for _, name := range []string{"platform-provenance.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip"} {
+	for _, name := range []string{"workflow-windows-amd64.zip"} {
 		data := artifactData[name]
 		sum := sha256.Sum256(data)
 		artifacts = append(artifacts, Artifact{Name: name, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))})
@@ -184,7 +181,5 @@ func validManifest(artifactData map[string][]byte) Manifest {
 func fixtureArtifacts() map[string][]byte {
 	return map[string][]byte{
 		"workflow-windows-amd64.zip": []byte("package"),
-		"platform-sbom.spdx.json":    []byte(`{"spdxVersion":"SPDX-2.3","name":"workflow-platform"}`),
-		"platform-provenance.json":   []byte(`{"subject":"workflow-windows-amd64.zip"}`),
 	}
 }

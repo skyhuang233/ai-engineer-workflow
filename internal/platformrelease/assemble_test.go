@@ -41,7 +41,7 @@ func TestAssembleProducesReproducibleContentAddressedRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"workflow-windows-amd64.zip", "platform-sbom.spdx.json", "platform-provenance.json", "platform-release.json"} {
+	for _, name := range []string{"workflow-windows-amd64.zip", "platform-release.json"} {
 		left, err := os.ReadFile(filepath.Join(first.Directory, name))
 		if err != nil {
 			t.Fatal(err)
@@ -82,8 +82,8 @@ func TestAssembleProducesReproducibleContentAddressedRelease(t *testing.T) {
 		releaseAssets = append(releaseAssets, entry.Name())
 	}
 	sort.Strings(releaseAssets)
-	wantAssets := []string{"SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip"}
+	wantAssets := []string{"SHA256SUMS", "platform-release.json", "workflow-windows-amd64.zip"}
 	if !reflect.DeepEqual(releaseAssets, wantAssets) {
-		t.Fatalf("release assets = %v, want fixed unsigned set %v", releaseAssets, wantAssets)
+		t.Fatalf("release assets = %v, want minimal release set %v", releaseAssets, wantAssets)
 	}
 }

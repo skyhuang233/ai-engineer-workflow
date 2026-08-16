@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -13,8 +12,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/skyhuang233/workflow/internal/setupcontract"
 )
 
 type AssembleOptions struct {
@@ -50,24 +47,17 @@ func Assemble(options AssembleOptions) (Assembly, error) {
 		sum := sha256.Sum256(file.Data)
 		bundled = append(bundled, BundledFile{Path: file.Path, SHA256: hex.EncodeToString(sum[:])})
 	}
-	sbom, err := buildSBOM(options.Manifest.Release.Version, bundled)
-	if err != nil {
-		return Assembly{}, err
-	}
-	provenance, err := buildProvenance(options.Manifest, archive, sbom)
-	if err != nil {
-		return Assembly{}, err
-	}
 	artifactData := map[string][]byte{
 		"workflow-windows-amd64.zip": archive,
-		"platform-sbom.spdx.json":    sbom,
-		"platform-provenance.json":   provenance,
 	}
 	artifacts := artifactsFor(artifactData)
 	manifest := options.Manifest
 	manifest.Artifacts = artifacts
 	manifest.BundledFiles = bundled
-	manifest.Provenance.Subjects = append([]Artifact(nil), artifacts...)
+	// SHA256SUMS is the sole package-integrity input used by bootstrap. The
+	// manifest remains the functional installation-plan input, not a second
+	// package attestation channel.
+	manifest.Provenance.Subjects = nil
 	if err := manifest.Validate(); err != nil {
 		return Assembly{}, fmt.Errorf("validate assembled Platform Release Manifest: %w", err)
 	}
@@ -77,8 +67,6 @@ func Assemble(options AssembleOptions) (Assembly, error) {
 	}
 	allFiles := map[string][]byte{
 		"workflow-windows-amd64.zip": archive,
-		"platform-sbom.spdx.json":    sbom,
-		"platform-provenance.json":   provenance,
 		"platform-release.json":      manifestRaw,
 	}
 	allFiles["SHA256SUMS"] = checksumFile(allFiles)
@@ -151,48 +139,6 @@ func buildDeterministicZip(files []packageFile) ([]byte, error) {
 		return nil, fmt.Errorf("close Platform Release archive: %w", err)
 	}
 	return buffer.Bytes(), nil
-}
-
-func buildSBOM(version string, files []BundledFile) ([]byte, error) {
-	document := struct {
-		SPDXVersion string        `json:"spdxVersion"`
-		DataLicense string        `json:"dataLicense"`
-		SPDXID      string        `json:"SPDXID"`
-		Name        string        `json:"name"`
-		Version     string        `json:"version"`
-		Files       []BundledFile `json:"files"`
-	}{"SPDX-2.3", "CC0-1.0", "SPDXRef-DOCUMENT", "workflow-platform", version, files}
-	return canonicalJSON(document)
-}
-
-func buildProvenance(manifest Manifest, archive, sbom []byte) ([]byte, error) {
-	type subject struct {
-		Name   string `json:"name"`
-		SHA256 string `json:"sha256"`
-	}
-	statement := struct {
-		PredicateType string    `json:"predicate_type"`
-		Repository    string    `json:"repository"`
-		SourceCommit  string    `json:"source_commit"`
-		WorkflowPath  string    `json:"workflow_path"`
-		RunID         int64     `json:"github_actions_run_id"`
-		Subjects      []subject `json:"subjects"`
-	}{
-		PredicateType: "https://slsa.dev/provenance/v1",
-		Repository:    manifest.Provenance.Repository, SourceCommit: manifest.Provenance.SourceCommit,
-		WorkflowPath: manifest.Provenance.WorkflowPath, RunID: manifest.Provenance.GitHubActionsRunID,
-		Subjects: []subject{{Name: "platform-sbom.spdx.json", SHA256: digestBytes(sbom)}, {Name: "workflow-windows-amd64.zip", SHA256: digestBytes(archive)}},
-	}
-	return canonicalJSON(statement)
-}
-
-func canonicalJSON(value any) ([]byte, error) {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	canonical, _, err := setupcontract.Canonicalize(raw)
-	return canonical, err
 }
 
 func artifactsFor(data map[string][]byte) []Artifact {

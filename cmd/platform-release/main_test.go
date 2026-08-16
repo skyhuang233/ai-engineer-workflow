@@ -15,11 +15,11 @@ func TestPlatformPublisherBuildInjectsTheExactManifestAndTagVersion(t *testing.T
 	}
 	workflow := string(body)
 	for _, required := range []string{
-		`PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}`,
-		`$env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'`,
+		`config/platform-release.json`,
+		`steps.release.outputs.version`,
 		`2147483647`,
 		`-X main.Version=$env:PLATFORM_VERSION`,
-		`-version $env:PLATFORM_VERSION`,
+		`-version '${{ steps.release.outputs.version }}'`,
 		`tag="platform-v${PLATFORM_VERSION}"`,
 	} {
 		if !strings.Contains(workflow, required) {

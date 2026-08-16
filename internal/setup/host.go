@@ -1132,7 +1132,11 @@ func (a HostAdapter) checkHostIdentityBeforeLayout(value setupcontract.Precondit
 	if err := json.Unmarshal([]byte(value.Expected), &expected); err != nil || expected.UserID == "" || expected.Username == "" || expected.WorkflowHome == "" || expected.WorkflowHomeOwnerID == "" {
 		return hostIdentityPrecondition{}, errors.New("approved host identity precondition is invalid")
 	}
-	if a.Layout.Root == "" || !strings.EqualFold(filepath.Clean(expected.WorkflowHome), filepath.Clean(a.Layout.Root)) {
+	if a.Layout.Root == "" {
+		return hostIdentityPrecondition{}, errors.New("approved host identity is not bound to the target Workflow Home")
+	}
+	sameWorkflowHome, err := workflowhome.SameFilesystemPath(expected.WorkflowHome, a.Layout.Root)
+	if err != nil || !sameWorkflowHome {
 		return hostIdentityPrecondition{}, errors.New("approved host identity is not bound to the target Workflow Home")
 	}
 	current, err := user.Current()

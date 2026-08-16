@@ -9,12 +9,11 @@ on:
       - "internal/setupcontract/**"
       - "deploy/platform/**"
       - "cmd/workflow/**"
-      - "config/toolchain.json"
+      - "config/platform-release.json"
       - ".github/workflows/publish-platform.yml"
 
 permissions:
   contents: write
-  pull-requests: read
 
 concurrency:
   group: publish-platform
@@ -27,88 +26,95 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-      - name: Verify owner-merged main commit
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read the versioned Platform Release input
+        id: release
+        shell: pwsh
         run: |
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
-          pull_number="$(jq --raw-output --arg sha "$GITHUB_SHA" '[.[] | select(.merged_at != null and .merge_commit_sha == $sha and .base.ref == "main")] | if length == 1 then .[0].number else empty end' <<<"$pulls")"
-          test -n "$pull_number"
-          pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}")"
-          jq --exit-status --arg owner "$owner" --arg sha "$GITHUB_SHA" '(.merged_at != null) and (.merge_commit_sha == $sha) and (.base.ref == "main") and ((.merged_by.login | ascii_downcase) == $owner) and ((.merged_by.type | ascii_downcase) == "user") and ((.merged_by.login | endswith("[bot]")) | not)' <<<"$pull" >/dev/null
+          $config = Get-Content -LiteralPath config/platform-release.json -Raw | ConvertFrom-Json
+          if ($config.schema_version -ne 1) { throw "Unsupported platform-release.json schema" }
+          $version = [string]$config.version
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "platform-release.json version must be a bare semantic version core (X.Y.Z) without leading zeros" }
+          foreach ($component in $version.Split('.')) {
+            $value64 = [uint64]0
+            if (-not [uint64]::TryParse($component, [ref]$value64) -or $value64 -gt 2147483647) { throw "platform-release.json version components must fit the signed 32-bit range" }
+          }
+          if ([string]::IsNullOrWhiteSpace([string]$config.docker_desktop.version) -or [string]::IsNullOrWhiteSpace([string]$config.docker_desktop.installer_url) -or [string]::IsNullOrWhiteSpace([string]$config.docker_desktop.windows_amd64_sha256) -or [string]::IsNullOrWhiteSpace([string]$config.worker_image)) { throw "platform-release.json lacks a required release input" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "docker_version=$([string]$config.docker_desktop.version)" >> $env:GITHUB_OUTPUT
+          "docker_url=$([string]$config.docker_desktop.installer_url)" >> $env:GITHUB_OUTPUT
+          "docker_sha256=$([string]$config.docker_desktop.windows_amd64_sha256)" >> $env:GITHUB_OUTPUT
+          "worker_image=$([string]$config.worker_image)" >> $env:GITHUB_OUTPUT
+      - name: Publish only when the version changed
+        id: version-change
+        shell: bash
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before:config/platform-release.json" 2>/dev/null; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --quiet "$before" "$GITHUB_SHA" -- config/platform-release.json; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          previous="$(git show "$before:config/platform-release.json" | jq -r '.version')"
+          current="${{ steps.release.outputs.version }}"
+          if [ "$previous" = "$current" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Test release contracts
+        if: steps.version-change.outputs.publish == 'true'
         shell: pwsh
         run: go test ./internal/setupcontract ./internal/platformrelease ./internal/doctor
       - name: Build Windows amd64 platform
+        if: steps.version-change.outputs.publish == 'true'
         shell: pwsh
         env:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0
-          PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
+          PLATFORM_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:PLATFORM_VERSION)) { throw "WORKFLOW_PLATFORM_VERSION is required" }
-          if ($env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" }
-          foreach ($component in $env:PLATFORM_VERSION.Split('.')) {
-            $value64 = [uint64]0
-            if (-not [uint64]::TryParse($component, [ref]$value64) -or $value64 -gt 2147483647) { throw "WORKFLOW_PLATFORM_VERSION components must fit the signed 32-bit range" }
-          }
           New-Item -ItemType Directory -Force build | Out-Null
           go build -trimpath -ldflags "-buildid= -X main.Version=$env:PLATFORM_VERSION" -o build/workflow.exe ./cmd/workflow
-          if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from WORKFLOW_PLATFORM_VERSION" }
+          if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from platform-release.json" }
           go build -trimpath -ldflags "-buildid=" -o build/platform-release.exe ./cmd/platform-release
           New-Item -ItemType Directory -Force build/payload/repository-contract | Out-Null
           New-Item -ItemType Directory -Force build/payload/skills | Out-Null
           Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
           Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
-      - name: Assemble content-addressed release
+      - name: Assemble Platform Release
+        if: steps.version-change.outputs.publish == 'true'
         shell: pwsh
-        env:
-          DOCKER_DESKTOP_VERSION: ${{ vars.DOCKER_DESKTOP_VERSION }}
-          DOCKER_DESKTOP_INSTALLER_URL: ${{ vars.DOCKER_DESKTOP_INSTALLER_URL }}
-          DOCKER_DESKTOP_WINDOWS_AMD64_SHA256: ${{ vars.DOCKER_DESKTOP_WINDOWS_AMD64_SHA256 }}
-          WORKER_IMAGE: ${{ vars.WORKFLOW_WORKER_IMAGE }}
-          PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
         run: |
           build/platform-release.exe `
             -workflow-exe build/workflow.exe -payload build/payload -output build/release `
-            -version $env:PLATFORM_VERSION -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
-            -docker-version $env:DOCKER_DESKTOP_VERSION -docker-installer-url $env:DOCKER_DESKTOP_INSTALLER_URL `
-            -docker-installer-sha256 $env:DOCKER_DESKTOP_WINDOWS_AMD64_SHA256 -worker-image $env:WORKER_IMAGE
-      - name: Verify checksum and provenance coverage
+            -version '${{ steps.release.outputs.version }}' -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
+            -docker-version '${{ steps.release.outputs.docker_version }}' -docker-installer-url '${{ steps.release.outputs.docker_url }}' `
+            -docker-installer-sha256 '${{ steps.release.outputs.docker_sha256 }}' -worker-image '${{ steps.release.outputs.worker_image }}'
+      - name: Verify the minimal release package
+        if: steps.version-change.outputs.publish == 'true'
         shell: bash
         run: |
           cd build/release
           sha256sum --check SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 4
-          jq --exit-status --arg repository "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --argjson run_id "$GITHUB_RUN_ID" '.release.repository == $repository and .release.source_commit == $sha and .release.github_actions_run_id == $run_id and .provenance.workflow_path == ".github/workflows/publish-platform.yml" and ([.artifacts[].name] | sort) == (["platform-provenance.json","platform-sbom.spdx.json","workflow-windows-amd64.zip"] | sort)' platform-release.json >/dev/null
-          test -s platform-sbom.spdx.json
-          test -s platform-provenance.json
+          test "$(wc -l < SHA256SUMS)" -eq 2
+          test "$(find . -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" = "SHA256SUMS platform-release.json workflow-windows-amd64.zip "
       - name: Stage immutable Platform Release
+        if: steps.version-change.outputs.publish == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}
+          PLATFORM_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          [[ "$PLATFORM_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
-            echo "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" >&2
-            exit 1
-          }
-          IFS=. read -r major minor patch <<<"$PLATFORM_VERSION"
-          for component in "$major" "$minor" "$patch"; do
-            if (( ${#component} > 10 )) || { (( ${#component} == 10 )) && [[ "$component" > "2147483647" ]]; }; then
-              echo "WORKFLOW_PLATFORM_VERSION components must fit the signed 32-bit range" >&2
-              exit 1
-            fi
-          done
           tag="platform-v${PLATFORM_VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Refusing to replace existing Platform Release $tag" >&2
             exit 1
           fi
-          gh release create "$tag" build/release/* --draft --target "$GITHUB_SHA" --title "Platform ${PLATFORM_VERSION}" --notes "Immutable Agent Workflow platform release for an owner-accepted main commit."
+          gh release create "$tag" build/release/* --draft --target "$GITHUB_SHA" --title "Platform ${PLATFORM_VERSION}" --notes "Immutable Agent Workflow platform release."
           gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["SHA256SUMS","platform-provenance.json","platform-release.json","platform-sbom.spdx.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
+          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["SHA256SUMS","platform-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
