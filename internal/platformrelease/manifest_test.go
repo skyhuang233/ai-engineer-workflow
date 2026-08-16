@@ -130,6 +130,10 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 			m.Release.Version = "01.0.0"
 			m.Release.Tag = "platform-v01.0.0"
 		},
+		"out-of-range platform version": func(m *Manifest) {
+			m.Release.Version = "2147483648.0.0"
+			m.Release.Tag = "platform-v2147483648.0.0"
+		},
 		"prerelease platform version": func(m *Manifest) {
 			m.Release.Version = "1.0.0-rc.1"
 			m.Release.Channel = "prerelease"

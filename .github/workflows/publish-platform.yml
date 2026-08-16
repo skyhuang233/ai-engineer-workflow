@@ -51,6 +51,10 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:PLATFORM_VERSION)) { throw "WORKFLOW_PLATFORM_VERSION is required" }
           if ($env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" }
+          foreach ($component in $env:PLATFORM_VERSION.Split('.')) {
+            $value64 = [uint64]0
+            if (-not [uint64]::TryParse($component, [ref]$value64) -or $value64 -gt 2147483647) { throw "WORKFLOW_PLATFORM_VERSION components must fit the signed 32-bit range" }
+          }
           New-Item -ItemType Directory -Force build | Out-Null
           go build -trimpath -ldflags "-buildid= -X main.Version=$env:PLATFORM_VERSION" -o build/workflow.exe ./cmd/workflow
           if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from WORKFLOW_PLATFORM_VERSION" }
@@ -92,6 +96,13 @@ jobs:
             echo "WORKFLOW_PLATFORM_VERSION must be a bare semantic version core (X.Y.Z) without leading zeros" >&2
             exit 1
           }
+          IFS=. read -r major minor patch <<<"$PLATFORM_VERSION"
+          for component in "$major" "$minor" "$patch"; do
+            if (( ${#component} > 10 )) || { (( ${#component} == 10 )) && [[ "$component" > "2147483647" ]]; }; then
+              echo "WORKFLOW_PLATFORM_VERSION components must fit the signed 32-bit range" >&2
+              exit 1
+            fi
+          done
           tag="platform-v${PLATFORM_VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Refusing to replace existing Platform Release $tag" >&2

@@ -24,7 +24,14 @@ function Assert-ExactProperties($Object, [string[]]$Expected, [string]$Descripti
 
 function Get-SemanticVersion([string]$Value) {
     Assert-PlatformRelease ($Value -match '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Platform Release version must be a bare semantic version core (X.Y.Z) without leading zeros"
-    return [Version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    $components = @([string]$Matches[1], [string]$Matches[2], [string]$Matches[3])
+    $parsed = [Collections.Generic.List[int]]::new()
+    foreach ($component in $components) {
+        $value64 = [uint64]0
+        Assert-PlatformRelease ([uint64]::TryParse($component, [ref]$value64) -and $value64 -le [int]::MaxValue) "Platform Release version components must fit the signed 32-bit range"
+        $parsed.Add([int]$value64)
+    }
+    return [Version]::new($parsed[0], $parsed[1], $parsed[2])
 }
 
 foreach ($path in @($ManifestPath, $PolicyPath)) {

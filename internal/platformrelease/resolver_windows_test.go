@@ -45,7 +45,8 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 		t.Fatal(err)
 	}
 	want := []string{
-		"https://api.github.com/repos/owner/platform/releases/latest",
+		"https://api.github.com/repos/owner/platform/releases?per_page=100&page=1",
+		"https://api.github.com/repos/owner/platform/releases?per_page=100&page=2",
 		"https://github.com/owner/platform/releases/download/platform-v1.2.3/platform-release.json",
 		"https://api.github.com/repos/owner/platform/actions/runs/42",
 		"https://api.github.com/repos/owner/platform/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/pulls",
@@ -58,6 +59,49 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 	}
 	if strings.Contains(string(requests), "evil.example") {
 		t.Fatalf("resolver trusted release asset URL: %q", requests)
+	}
+}
+
+func TestResolvePlatformReleasePaginatesMixedReleasesAndSelectsHighestCanonicalPlatformVersion(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	metadata := resolverMetadata(t, fixture)
+	older := cloneResolverJSON(t, metadata)
+	older["tag_name"] = "platform-v1.2.2"
+	for _, asset := range older["assets"].([]any) {
+		entry := asset.(map[string]any)
+		entry["browser_download_url"] = strings.ReplaceAll(entry["browser_download_url"].(string), "platform-v1.2.3", "platform-v1.2.2")
+	}
+	worker := cloneResolverJSON(t, metadata)
+	worker["tag_name"] = "worker-v99.0.0"
+	mutable := cloneResolverJSON(t, metadata)
+	mutable["tag_name"] = "platform-v9.0.0"
+	mutable["immutable"] = false
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{worker, older, mutable})
+	writeResolverJSON(t, fixture.releasePagePaths[1], []any{metadata})
+	writeResolverJSON(t, fixture.releasePagePaths[2], []any{})
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr != nil || !strings.Contains(output, `"release_version":"1.2.3"`) {
+		t.Fatalf("paginated mixed releases did not select highest canonical Platform version: err=%v output=%s", runErr, output)
+	}
+	requests, err := os.ReadFile(fixture.requestLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page := 1; page <= 3; page++ {
+		want := "https://api.github.com/repos/owner/platform/releases?per_page=100&page=" + string(rune('0'+page))
+		if !strings.Contains(string(requests), want) {
+			t.Fatalf("resolver did not paginate through page %d: %q", page, requests)
+		}
+	}
+	if strings.Contains(string(requests), "/releases/latest") {
+		t.Fatalf("resolver used repository-wide latest release: %q", requests)
 	}
 }
 
@@ -104,11 +148,17 @@ func TestResolvePlatformReleaseRequiresCanonicalBareSemanticVersionCore(t *testi
 		accept  bool
 	}{
 		{version: "1.2.3", accept: true},
+		{version: "2147483647.2147483647.2147483647", accept: true},
 		{version: "v1.2.3"},
 		{version: "01.2.3"},
+		{version: "2147483648.0.0"},
 	} {
 		t.Run(test.version, func(t *testing.T) {
-			fixture := newResolverFixture(t, "1.2.3")
+			candidateVersion := "1.2.3"
+			if test.accept {
+				candidateVersion = test.version
+			}
+			fixture := newResolverFixture(t, candidateVersion)
 			factsPath := filepath.Join(fixture.directory, "host-facts.json")
 			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 
@@ -119,7 +169,7 @@ func TestResolvePlatformReleaseRequiresCanonicalBareSemanticVersionCore(t *testi
 				}
 				return
 			}
-			if runErr == nil || !strings.Contains(output, "bare semantic version core") {
+			if runErr == nil || (!strings.Contains(output, "bare semantic version core") && !strings.Contains(output, "32-bit range")) {
 				t.Fatalf("non-canonical version accepted: err=%v output=%s", runErr, output)
 			}
 			if requests, err := os.ReadFile(fixture.requestLog); err == nil && len(requests) != 0 {
@@ -258,10 +308,10 @@ func TestResolvePlatformReleaseRejectsMutableGitHubReleaseMetadata(t *testing.T)
 	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 	metadata := resolverMetadata(t, fixture)
 	metadata["immutable"] = false
-	writeResolverJSON(t, fixture.metadataPath, metadata)
+	writeResolverReleaseMetadata(t, fixture, metadata)
 
 	output, runErr := fixture.run(t, powershell, factsPath, "", false)
-	if runErr == nil || !strings.Contains(output, "GitHub Release is not immutable") || strings.Contains(output, `"manifest_path"`) {
+	if runErr == nil || !strings.Contains(output, "No canonical immutable stable Platform Release was found") || strings.Contains(output, `"manifest_path"`) {
 		t.Fatalf("mutable release did not fail closed before emitting paths: err=%v output=%s", runErr, output)
 	}
 }
@@ -288,10 +338,10 @@ func TestResolvePlatformReleaseRejectsNoncanonicalReleaseAssets(t *testing.T) {
 			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 			metadata := resolverMetadata(t, fixture)
 			test.mutate(metadata)
-			writeResolverJSON(t, fixture.metadataPath, metadata)
+			writeResolverReleaseMetadata(t, fixture, metadata)
 
 			output, runErr := fixture.run(t, powershell, factsPath, "", false)
-			if runErr == nil || !strings.Contains(output, "GitHub Release asset") || strings.Contains(output, `"manifest_path"`) {
+			if runErr == nil || !strings.Contains(output, "No canonical immutable stable Platform Release was found") || strings.Contains(output, `"manifest_path"`) {
 				t.Fatalf("noncanonical release assets emitted trusted paths: err=%v output=%s", runErr, output)
 			}
 		})
@@ -387,7 +437,7 @@ func TestResolvePlatformReleaseBindsGitHubReleaseTargetToManifestCommit(t *testi
 			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 			metadata := resolverMetadata(t, fixture)
 			test.mutate(metadata)
-			writeResolverJSON(t, fixture.metadataPath, metadata)
+			writeResolverReleaseMetadata(t, fixture, metadata)
 
 			output, runErr := fixture.run(t, powershell, factsPath, "", false)
 			if runErr == nil || !strings.Contains(output, "target commit does not match the verified Platform Release manifest") || strings.Contains(output, `"manifest_path"`) {
@@ -398,15 +448,16 @@ func TestResolvePlatformReleaseBindsGitHubReleaseTargetToManifestCommit(t *testi
 }
 
 type resolverFixture struct {
-	directory       string
-	scriptPath      string
-	policyPath      string
-	manifestPath    string
-	metadataPath    string
-	runPath         string
-	commitPullsPath string
-	pullPath        string
-	requestLog      string
+	directory        string
+	scriptPath       string
+	policyPath       string
+	manifestPath     string
+	metadataPath     string
+	runPath          string
+	commitPullsPath  string
+	pullPath         string
+	requestLog       string
+	releasePagePaths []string
 }
 
 func newResolverFixture(t *testing.T, version string) resolverFixture {
@@ -432,6 +483,9 @@ func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*M
 		directory: directory, manifestPath: filepath.Join(directory, "source-platform-release.json"),
 		policyPath: filepath.Join(directory, "setup-agent-workflow", "trust", "release-policy.json"), metadataPath: filepath.Join(directory, "release.json"),
 		runPath: filepath.Join(directory, "run.json"), commitPullsPath: filepath.Join(directory, "commit-pulls.json"), pullPath: filepath.Join(directory, "pull.json"), requestLog: filepath.Join(directory, "requests.log"),
+	}
+	for page := 1; page <= 3; page++ {
+		fixture.releasePagePaths = append(fixture.releasePagePaths, filepath.Join(directory, "releases-page-"+string(rune('0'+page))+".json"))
 	}
 	_, current, _, _ := runtime.Caller(0)
 	sourceScripts := filepath.Clean(filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts"))
@@ -459,6 +513,9 @@ func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*M
 	}
 	metadata, _ := json.Marshal(map[string]any{"tag_name": manifest.Release.Tag, "draft": false, "prerelease": false, "immutable": true, "target_commitish": manifest.Release.SourceCommit, "assets": assets})
 	writeResolverFile(t, fixture.metadataPath, metadata)
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{json.RawMessage(metadata)})
+	writeResolverJSON(t, fixture.releasePagePaths[1], []any{})
+	writeResolverJSON(t, fixture.releasePagePaths[2], []any{})
 	run, _ := json.Marshal(map[string]any{"id": manifest.Release.GitHubActionsRunID, "repository": map[string]any{"full_name": "owner/platform"}, "path": manifest.Provenance.WorkflowPath, "head_sha": manifest.Release.SourceCommit, "head_branch": "main", "event": "push", "status": "completed", "conclusion": "success"})
 	writeResolverFile(t, fixture.runPath, run)
 	pull := map[string]any{"number": 7, "merged_at": "2026-08-16T00:00:00Z", "merge_commit_sha": manifest.Release.SourceCommit, "base": map[string]any{"ref": "main"}, "merged_by": map[string]any{"login": "owner", "type": "User"}}
@@ -489,6 +546,25 @@ func writeResolverJSON(t *testing.T, path string, value any) {
 	writeResolverFile(t, path, raw)
 }
 
+func writeResolverReleaseMetadata(t *testing.T, fixture resolverFixture, metadata map[string]any) {
+	t.Helper()
+	writeResolverJSON(t, fixture.metadataPath, metadata)
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{metadata})
+}
+
+func cloneResolverJSON(t *testing.T, value map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(raw, &clone); err != nil {
+		t.Fatal(err)
+	}
+	return clone
+}
+
 func (fixture resolverFixture) run(t *testing.T, powershell, factsPath, version string, allowUpgrade bool) (string, error) {
 	t.Helper()
 	wrapper := filepath.Join(fixture.directory, "invoke-resolver.ps1")
@@ -497,13 +573,20 @@ function Invoke-WebRequest {
     param([string]$Uri, $Headers, [string]$OutFile, [switch]$UseBasicParsing)
     Add-Content -LiteralPath $env:WORKFLOW_TEST_REQUEST_LOG -Value $Uri
     if ([string]::IsNullOrWhiteSpace($OutFile)) {
-        if ($Uri -match '/actions/runs/') { $source = $env:WORKFLOW_TEST_RUN }
+		if ($Uri.StartsWith('https://api.github.com/repos/owner/platform/releases?per_page=100&page=', [StringComparison]::Ordinal)) {
+			$page = [int]$Uri.Substring($Uri.LastIndexOf('=') + 1)
+			$pages = @($env:WORKFLOW_TEST_RELEASE_PAGE_1, $env:WORKFLOW_TEST_RELEASE_PAGE_2, $env:WORKFLOW_TEST_RELEASE_PAGE_3)
+			if ($page -le $pages.Count) { $source = $pages[$page - 1] }
+			else { return [pscustomobject]@{ Content = '[]' } }
+		}
+		elseif ($Uri -match '/actions/runs/') { $source = $env:WORKFLOW_TEST_RUN }
         elseif ($Uri -match '/commits/.+/pulls$') { $source = $env:WORKFLOW_TEST_COMMIT_PULLS }
         elseif ($Uri -match '/pulls/[0-9]+$') { $source = $env:WORKFLOW_TEST_PULL }
-        else { $source = $env:WORKFLOW_TEST_METADATA }
+		elseif ($Uri -match '/releases/tags/') { $source = $env:WORKFLOW_TEST_METADATA }
+		else { throw "unexpected API request $Uri" }
         return [pscustomobject]@{ Content = [IO.File]::ReadAllText($source) }
     }
-    if ($Uri.EndsWith('/platform-release.json')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
+	if ($Uri.EndsWith('/platform-release.json')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
     else { throw "unexpected download $Uri" }
 }
 $parameters = @{
@@ -521,6 +604,9 @@ if ($env:WORKFLOW_TEST_ALLOW_UPGRADE -eq '1') { $parameters.AllowUpgrade = $true
 	command.Env = append(os.Environ(),
 		"WORKFLOW_TEST_REQUEST_LOG="+fixture.requestLog,
 		"WORKFLOW_TEST_METADATA="+fixture.metadataPath,
+		"WORKFLOW_TEST_RELEASE_PAGE_1="+fixture.releasePagePaths[0],
+		"WORKFLOW_TEST_RELEASE_PAGE_2="+fixture.releasePagePaths[1],
+		"WORKFLOW_TEST_RELEASE_PAGE_3="+fixture.releasePagePaths[2],
 		"WORKFLOW_TEST_MANIFEST="+fixture.manifestPath,
 		"WORKFLOW_TEST_RUN="+fixture.runPath,
 		"WORKFLOW_TEST_COMMIT_PULLS="+fixture.commitPullsPath,

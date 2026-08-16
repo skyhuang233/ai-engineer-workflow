@@ -820,7 +820,7 @@ func preflightGitHubPATBindings(layout workflowhome.Layout, plan setupcontract.P
 				continue
 			}
 			if len(contractRaw) != 0 || candidate.Parameters["platform_setup_contract_digest"] != contractDigest {
-				return errors.New("GitHub PAT effect is not bound to one exact signed Platform Setup Contract")
+				return errors.New("GitHub PAT effect is not bound to one exact digest-bound Platform Setup Contract")
 			}
 			contractRaw = []byte(candidate.Parameters["platform_setup_contract_json"])
 		}
@@ -834,14 +834,14 @@ func preflightGitHubPATBindings(layout workflowhome.Layout, plan setupcontract.P
 		_, actualContractDigest, err := setupcontract.Canonicalize(contractRaw)
 		var contract platformrelease.PlatformSetupContract
 		if err != nil || actualContractDigest != contractDigest || json.Unmarshal(contractRaw, &contract) != nil || contract.Validate() != nil {
-			return errors.New("GitHub PAT effect is not bound to the exact signed Platform Setup Contract")
+			return errors.New("GitHub PAT effect is not bound to the exact digest-bound Platform Setup Contract")
 		}
 		expectedCredentialPath := filepath.Join(layout.Root, filepath.FromSlash(strings.ReplaceAll(contract.Credential.PlaintextRelativePath, `\`, "/")))
 		if effect.Subject != layout.CredentialFile || !strings.EqualFold(filepath.Clean(expectedCredentialPath), filepath.Clean(layout.CredentialFile)) {
 			return errors.New("GitHub PAT effect is not bound to the exact Workflow Home credential path")
 		}
 		if effect.Parameters["required_scopes"] != strings.Join(contract.Credential.RequiredScopes, ",") {
-			return errors.New("GitHub PAT effect is not bound to the exact signed credential scopes")
+			return errors.New("GitHub PAT effect is not bound to the exact verified credential scopes")
 		}
 	}
 	return nil
@@ -917,7 +917,7 @@ func recordPlatformInstallation(ctx context.Context, database *store.Store, layo
 	canonicalBundledFiles, bundledFilesDigest, bundledFilesErr := setupcontract.Canonicalize(bundledFilesRaw)
 	var bundledFiles []platformrelease.BundledFile
 	if len(bundledFilesRaw) == 0 || bundledFilesErr != nil || string(canonicalBundledFiles) != string(bundledFilesRaw) || bundledFilesDigest != effect.Parameters["release_bundled_files_digest"] || json.Unmarshal(bundledFilesRaw, &bundledFiles) != nil || len(bundledFiles) == 0 {
-		return errors.New("platform installation effect lacks the signed release bundled-file inventory")
+		return errors.New("platform installation effect lacks the digest-bound release bundled-file inventory")
 	}
 	contractPath := filepath.Join(layout.Config, "platform-setup-contract.json")
 	if err := writeAtomic(contractPath, contractRaw); err != nil {

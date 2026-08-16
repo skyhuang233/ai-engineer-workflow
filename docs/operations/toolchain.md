@@ -26,6 +26,19 @@ key, detached signature, or repository signing secret.
 [ADR-0064](../adr/0064-trust-canonical-github-platform-releases-without-managed-keys.md)
 owns this trust boundary.
 
+The publisher requires exactly these five GitHub Actions repository variables;
+their production values are operator-supplied and are not inferred by setup:
+
+- `WORKFLOW_PLATFORM_VERSION`
+- `DOCKER_DESKTOP_VERSION`
+- `DOCKER_DESKTOP_INSTALLER_URL`
+- `DOCKER_DESKTOP_WINDOWS_AMD64_SHA256`
+- `WORKFLOW_WORKER_IMAGE`
+
+Platform publication requires zero repository Actions secrets. The workflow's
+ephemeral, job-scoped `GITHUB_TOKEN` is supplied by GitHub and is not a
+configured repository secret.
+
 The verified release contract is the sole source for the exact Docker Desktop
 installer/version/checksum, Worker image digest, Repository Contract, managed
 labels, and user-level Workflow Skill Bundle. An existing same-name Codex skill

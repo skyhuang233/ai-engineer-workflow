@@ -15,7 +15,14 @@ function Assert-ReleaseResolver([bool]$Condition, [string]$Message) {
 
 function Get-StableVersion([string]$Value, [string]$Description) {
     Assert-ReleaseResolver ($Value -match '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "$Description must be a bare semantic version core (X.Y.Z) without leading zeros"
-    return [Version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    $components = @([string]$Matches[1], [string]$Matches[2], [string]$Matches[3])
+    $parsed = [Collections.Generic.List[int]]::new()
+    foreach ($component in $components) {
+        $value64 = [uint64]0
+        Assert-ReleaseResolver ([uint64]::TryParse($component, [ref]$value64) -and $value64 -le [int]::MaxValue) "$Description components must fit the signed 32-bit range"
+        $parsed.Add([int]$value64)
+    }
+    return [Version]::new($parsed[0], $parsed[1], $parsed[2])
 }
 
 function Get-SHA256File([string]$Path) {
@@ -33,6 +40,23 @@ $expectedPolicyPropertyNames = @("minimum_platform_version", "repository", "sche
 Assert-ReleaseResolver (($policyPropertyNames -join "`n") -ceq ($expectedPolicyPropertyNames -join "`n")) "Platform Release trust policy contains missing or unknown fields"
 $repository = [string]$policy.repository
 Assert-ReleaseResolver ($repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') "Platform Release trust policy repository is invalid"
+$headers = @{ Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
+$fixedAssets = @("SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip" | Sort-Object)
+
+function Test-CanonicalPlatformRelease($Candidate) {
+    if ($null -eq $Candidate -or [bool]$Candidate.draft -or [bool]$Candidate.prerelease -or $Candidate.immutable -isnot [bool] -or -not [bool]$Candidate.immutable) { return $false }
+    $candidateTag = [string]$Candidate.tag_name
+    if ($candidateTag -notmatch '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') { return $false }
+    try { $null = Get-StableVersion ([string]$Matches[1]) "Platform Release version" } catch { return $false }
+    $candidateAssets = @($Candidate.assets)
+    $candidateNames = @($candidateAssets | ForEach-Object { [string]$_.name } | Sort-Object)
+    if (($candidateNames -join "`n") -cne ($fixedAssets -join "`n")) { return $false }
+    foreach ($candidateAsset in $candidateAssets) {
+        $candidateName = [string]$candidateAsset.name
+        if ([string]$candidateAsset.browser_download_url -cne "https://github.com/$repository/releases/download/$candidateTag/$candidateName") { return $false }
+    }
+    return $true
+}
 
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
 Assert-ReleaseResolver ($facts.schema_version -eq 1) "Unsupported host-facts schema"
@@ -54,7 +78,7 @@ if (-not $installed) {
         $selection = "exact-version-recovery"
         $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
     } elseif ([string]::IsNullOrWhiteSpace($selectedVersionText)) {
-        $releaseAPI = "https://api.github.com/repos/$repository/releases/latest"
+        $releaseAPI = ""
     } else {
         Get-StableVersion $selectedVersionText "Requested Platform Release version" | Out-Null
         $selection = "explicit-version"
@@ -84,9 +108,40 @@ if (-not $installed) {
     $releaseAPI = "https://api.github.com/repos/$repository/releases/tags/platform-v$selectedVersionText"
 }
 
-$headers = @{ Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
-$releaseResponse = Invoke-WebRequest -Uri $releaseAPI -Headers $headers -UseBasicParsing
-$release = [string]$releaseResponse.Content | ConvertFrom-Json
+if ([string]::IsNullOrWhiteSpace($releaseAPI)) {
+    $release = $null
+    $highestVersion = $null
+    $highestCount = 0
+    $paginationComplete = $false
+    foreach ($page in 1..100) {
+        $pageAPI = "https://api.github.com/repos/$repository/releases?per_page=100&page=$page"
+        $pageResponse = Invoke-WebRequest -Uri $pageAPI -Headers $headers -UseBasicParsing
+        $decodedPage = [string]$pageResponse.Content | ConvertFrom-Json
+        $pageReleases = @($decodedPage | Where-Object { $null -ne $_ })
+        if ($pageReleases.Count -eq 0) {
+            $paginationComplete = $true
+            break
+        }
+        foreach ($candidate in $pageReleases) {
+            if (-not (Test-CanonicalPlatformRelease $candidate)) { continue }
+            [string]$candidateVersionText = ([string]$candidate.tag_name).Substring("platform-v".Length)
+            $candidateVersion = Get-StableVersion $candidateVersionText "Platform Release version"
+            if ($null -eq $highestVersion -or $candidateVersion.CompareTo($highestVersion) -gt 0) {
+                $release = $candidate
+                $highestVersion = $candidateVersion
+                $highestCount = 1
+            } elseif ($candidateVersion.CompareTo($highestVersion) -eq 0) {
+                $highestCount++
+            }
+        }
+    }
+    Assert-ReleaseResolver $paginationComplete "Platform Release pagination exceeded the fail-closed page limit"
+    Assert-ReleaseResolver ($null -ne $release) "No canonical immutable stable Platform Release was found"
+    Assert-ReleaseResolver ($highestCount -eq 1) "Highest canonical Platform Release version is ambiguous"
+} else {
+    $releaseResponse = Invoke-WebRequest -Uri $releaseAPI -Headers $headers -UseBasicParsing
+    $release = [string]$releaseResponse.Content | ConvertFrom-Json
+}
 Assert-ReleaseResolver (-not [bool]$release.draft -and -not [bool]$release.prerelease) "Selected GitHub Release is not stable"
 Assert-ReleaseResolver ($release.immutable -is [bool] -and [bool]$release.immutable) "Selected GitHub Release is not immutable"
 $tag = [string]$release.tag_name
@@ -95,7 +150,6 @@ $metadataVersionText = [string]$Matches[1]
 if (-not [string]::IsNullOrWhiteSpace($selectedVersionText)) {
     Assert-ReleaseResolver ($metadataVersionText -eq $selectedVersionText) "GitHub Release tag does not match the selected Platform Release version"
 }
-$fixedAssets = @("SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip" | Sort-Object)
 $releaseAssets = @($release.assets)
 $assetNames = @($releaseAssets | ForEach-Object { [string]$_.name } | Sort-Object)
 Assert-ReleaseResolver (($assetNames -join "`n") -ceq ($fixedAssets -join "`n")) "GitHub Release asset set is not exact"

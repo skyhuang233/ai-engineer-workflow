@@ -17,6 +17,7 @@ func TestPlatformPublisherBuildInjectsTheExactManifestAndTagVersion(t *testing.T
 	for _, required := range []string{
 		`PLATFORM_VERSION: ${{ vars.WORKFLOW_PLATFORM_VERSION }}`,
 		`$env:PLATFORM_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'`,
+		`2147483647`,
 		`-X main.Version=$env:PLATFORM_VERSION`,
 		`-version $env:PLATFORM_VERSION`,
 		`tag="platform-v${PLATFORM_VERSION}"`,
@@ -28,7 +29,7 @@ func TestPlatformPublisherBuildInjectsTheExactManifestAndTagVersion(t *testing.T
 }
 
 func TestPlatformPublisherRejectsNonCanonicalPlatformVersionInput(t *testing.T) {
-	for _, version := range []string{"v1.2.3", "01.2.3", "1.2.3-rc.1", "1.2.3+build.1"} {
+	for _, version := range []string{"v1.2.3", "01.2.3", "1.2.3-rc.1", "1.2.3+build.1", "2147483648.0.0"} {
 		t.Run(version, func(t *testing.T) {
 			err := run([]string{
 				"-workflow-exe", "missing-workflow.exe",
@@ -42,7 +43,7 @@ func TestPlatformPublisherRejectsNonCanonicalPlatformVersionInput(t *testing.T) 
 				"-docker-installer-sha256", strings.Repeat("b", 64),
 				"-worker-image", "ghcr.io/owner/worker@sha256:" + strings.Repeat("c", 64),
 			})
-			if err == nil || !strings.Contains(err.Error(), "bare semantic version core") {
+			if err == nil || (!strings.Contains(err.Error(), "bare semantic version core") && !strings.Contains(err.Error(), "signed 32-bit range")) {
 				t.Fatalf("publisher accepted version %q: %v", version, err)
 			}
 		})

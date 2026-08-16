@@ -86,8 +86,14 @@ func (m Manifest) Validate() error {
 // ValidatePlatformVersion accepts only the canonical bare SemVer core used by
 // every Platform Release identity boundary.
 func ValidatePlatformVersion(value string) error {
-	if !versionPattern.MatchString(value) {
+	parts := versionPattern.FindStringSubmatch(value)
+	if parts == nil {
 		return errors.New("Platform Release version must be a bare semantic version core (X.Y.Z) without leading zeros")
+	}
+	for _, part := range parts[1:] {
+		if _, err := strconv.ParseUint(part, 10, 31); err != nil {
+			return errors.New("Platform Release version components must fit the signed 32-bit range")
+		}
 	}
 	return nil
 }
