@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
+	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
 func TestFreshBootstrapInstallerForwardsPATOnStdinWithoutLeakingItOnWindowsPowerShell51(t *testing.T) {
@@ -522,7 +523,8 @@ func main() {
 		t.Fatalf("fresh inspect output=%q run=%v decode=%v", output, err, decodeErr)
 	}
 	sum := sha256.Sum256(auth)
-	if !facts.CodexAuth.Verified || facts.CodexAuth.Source != authPath || facts.CodexAuth.FingerprintSHA256 != hex.EncodeToString(sum[:]) {
+	sameSource, compareErr := workflowhome.SameFilesystemPath(facts.CodexAuth.Source, authPath)
+	if !facts.CodexAuth.Verified || compareErr != nil || !sameSource || facts.CodexAuth.FingerprintSHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("fresh Codex auth facts=%#v", facts.CodexAuth)
 	}
 }

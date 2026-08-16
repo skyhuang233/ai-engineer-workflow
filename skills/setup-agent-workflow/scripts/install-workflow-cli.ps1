@@ -27,8 +27,13 @@ function Invoke-WorkflowSetupApply([string]$Executable, [string]$Plan, [string]$
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
     [void]$process.Start()
-    $writer = New-Object IO.StreamWriter($process.StandardInput.BaseStream, (New-Object Text.UTF8Encoding($false)))
-    try { $writer.WriteLine($PAT); $writer.Flush() } finally { $writer.Dispose() }
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($PAT + "`n")
+    try {
+        $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $process.StandardInput.BaseStream.Flush()
+    } finally {
+        $process.StandardInput.Close()
+    }
     $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) { throw "workflow setup apply failed with exit code $($process.ExitCode): $stderr$stdout" }
