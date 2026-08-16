@@ -114,7 +114,8 @@ try {
     }
     # The same explicitly supplied, one-use PAT authenticates both private
     # release asset reads and the Control Plane apply when that plan needs it.
-    $releasePAT = [Console]::In.ReadLine()
+    $releasePAT = [string]([Console]::In.ReadLine())
+    if ($releasePAT.Length -gt 0 -and $releasePAT[0] -eq [char]0xFEFF) { $releasePAT = $releasePAT.Substring(1) }
     if ([string]::IsNullOrWhiteSpace($releasePAT)) { throw "Platform Release download requires a GitHub PAT on standard input" }
     $repository = [string]$manifest.release.repository
     $releaseHeaders = @{ Authorization = "Bearer $releasePAT"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
