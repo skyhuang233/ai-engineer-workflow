@@ -34,7 +34,8 @@ foreach ($required in @($HostFactsPath, $PolicyPath)) {
 
 # The caller supplies this one-use credential on standard input. It is never
 # read from gh, host state, or a persisted Control Plane credential.
-$pat = [Console]::In.ReadLine()
+$pat = [string]([Console]::In.ReadLine())
+if ($pat.Length -gt 0 -and $pat[0] -eq [char]0xFEFF) { $pat = $pat.Substring(1) }
 Assert-ReleaseResolver (-not [string]::IsNullOrWhiteSpace($pat)) "Platform Release resolution requires a GitHub PAT on standard input"
 $policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 Assert-ReleaseResolver ($policy.schema_version -eq 1 -and [string]$policy.repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') "Platform Release trust policy is invalid"

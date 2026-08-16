@@ -514,6 +514,7 @@ func (fixture resolverFixture) run(t *testing.T, powershell, factsPath, version 
 	writeResolverFile(t, wrapper, []byte(`
 function Invoke-WebRequest {
     param([string]$Uri, $Headers, [string]$OutFile, [switch]$UseBasicParsing)
+    if ([string]$Headers.Authorization -cne ("Bearer " + $env:WORKFLOW_TEST_EXPECTED_PAT)) { throw "unexpected Authorization header" }
     Add-Content -LiteralPath $env:WORKFLOW_TEST_REQUEST_LOG -Value $Uri
     if ([string]::IsNullOrWhiteSpace($OutFile)) {
 		if ($Uri.StartsWith('https://api.github.com/repos/owner/platform/releases?per_page=100&page=', [StringComparison]::Ordinal)) {
@@ -555,6 +556,7 @@ if ($env:WORKFLOW_TEST_ALLOW_UPGRADE -eq '1') { $parameters.AllowUpgrade = $true
 		"WORKFLOW_TEST_FACTS="+factsPath,
 		"WORKFLOW_TEST_VERSION="+version,
 		"WORKFLOW_TEST_ALLOW_UPGRADE="+allow,
+		"WORKFLOW_TEST_EXPECTED_PAT=ghp_test_release_resolution",
 		"WORKFLOW_TEST_RESOLVER="+fixture.scriptPath,
 	)
 	output, err := command.CombinedOutput()
