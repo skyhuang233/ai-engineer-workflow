@@ -40,13 +40,17 @@ $policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 Assert-ReleaseResolver ($policy.schema_version -eq 1 -and [string]$policy.repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') "Platform Release trust policy is invalid"
 $repository = [string]$policy.repository
 $headers = @{ Authorization = "Bearer $pat"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
-$fixedAssets = @("SHA256SUMS", "platform-release.json", "workflow-windows-amd64.zip" | Sort-Object)
+$requiredAssets = @("SHA256SUMS", "platform-release.json", "workflow-windows-amd64.zip")
 
 function Test-CanonicalPlatformRelease($Candidate) {
     if ($null -eq $Candidate -or [bool]$Candidate.draft -or [bool]$Candidate.prerelease -or -not [bool]$Candidate.immutable) { return $false }
     if ([string]$Candidate.tag_name -notmatch '^platform-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') { return $false }
     try { $null = Get-StableVersion ([string]$Matches[1]) "Platform Release version" } catch { return $false }
-    return ((@($Candidate.assets | ForEach-Object { [string]$_.name } | Sort-Object) -join "`n") -ceq ($fixedAssets -join "`n"))
+    foreach ($required in $requiredAssets) {
+        $matches = @($Candidate.assets | Where-Object { [string]$_.name -ceq $required })
+        if ($matches.Count -ne 1 -or [long]$matches[0].id -le 0) { return $false }
+    }
+    return $true
 }
 
 function Get-ReleaseAsset($Release, [string]$Name) {
@@ -58,6 +62,22 @@ function Get-ReleaseAsset($Release, [string]$Name) {
 function Download-ReleaseAsset($Asset, [string]$Destination) {
     $assetHeaders = @{ Authorization = "Bearer $pat"; Accept = "application/octet-stream"; "X-GitHub-Api-Version" = "2022-11-28"; "User-Agent" = "agent-workflow-bootstrap" }
     Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases/assets/$([long]$Asset.id)" -Headers $assetHeaders -OutFile $Destination -UseBasicParsing
+}
+
+function Get-AdditionalAssetWarnings($Release) {
+    $warnings = @()
+    foreach ($asset in @($Release.assets)) {
+        $name = [string]$asset.name
+        if ($requiredAssets -ccontains $name) { continue }
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $warnings += "Platform Release includes an additional asset without a usable name; ignored"
+        } elseif ([long]$asset.id -le 0) {
+            $warnings += "Platform Release includes additional asset '$name' missing a usable asset ID; ignored"
+        } else {
+            $warnings += "Platform Release includes additional asset '$name'; ignored"
+        }
+    }
+    return @($warnings)
 }
 
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
@@ -115,7 +135,7 @@ try {
     Assert-ReleaseResolver ([string]$manifest.release.repository -ceq $repository -and [string]$manifest.release.tag -ceq $tag -and [string]$manifest.release.version -ceq $versionText) "Platform Release manifest does not match selected release"
     $manifestDigest = Get-SHA256File $manifestPath
     if ($installed -and -not $AllowUpgrade) { Assert-ReleaseResolver ($manifestDigest -ceq $durableDigest) "Durable Platform Installation repair requires its exact manifest digest" }
-    [ordered]@{ verified = $true; selection = $selection; release_version = $versionText; release_tag = $tag; manifest_digest_sha256 = $manifestDigest; manifest_path = [IO.Path]::GetFullPath($manifestPath); temp_directory = [IO.Path]::GetFullPath($taskTemp) } | ConvertTo-Json -Compress
+    [ordered]@{ verified = $true; selection = $selection; release_version = $versionText; release_tag = $tag; manifest_digest_sha256 = $manifestDigest; manifest_path = [IO.Path]::GetFullPath($manifestPath); temp_directory = [IO.Path]::GetFullPath($taskTemp); asset_warnings = @(Get-AdditionalAssetWarnings $release) } | ConvertTo-Json -Compress
 } catch {
     if ($taskTemp -and (Test-Path -LiteralPath $taskTemp)) { Remove-Item -LiteralPath $taskTemp -Recurse -Force }
     throw

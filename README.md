@@ -18,7 +18,7 @@ $setup-agent-workflow
 
 The skill first checks whether the current directory is a Git repository. It then presents at most two complete approvals: a Platform Bootstrap Plan for host changes and an Onboarding Plan for repository changes. A classic GitHub PAT with `repo` and `workflow` scopes is stored in plaintext under the current user's Workflow Home; the PAT is available to trusted host components but never to Worker containers.
 
-Platform installation resolves an immutable stable release from this canonical GitHub repository and verifies its source commit, GitHub Actions provenance, fixed asset set, and exact SHA-256 checksums. Publication uses GitHub's job-scoped token, so setup requires no separate platform credential.
+Platform installation resolves an immutable stable release from this canonical GitHub repository and verifies its source commit, GitHub Actions provenance, the required `SHA256SUMS`, `platform-release.json`, and `workflow-windows-amd64.zip` assets, and exact SHA-256 checksums. Extra Release assets (such as SBOMs, signatures, or packages for other platforms) are ignored with a warning. Publication uses GitHub's job-scoped token, so setup requires no separate platform credential.
 
 The first release supports a current-user Windows host, Docker Desktop, the invoking user's existing Codex ChatGPT login, and a GitHub `origin`. Setup resolves that login automatically from the redacted machine-readable `codex doctor --json` report and confirms it with `codex login status`; ordinary users do not configure a credential path. With no `origin`, setup can create a private GitHub repository. A non-GitHub `origin`, a different GitHub owner, or an organization that rejects classic PATs blocks setup.
 
