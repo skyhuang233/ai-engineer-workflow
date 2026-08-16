@@ -309,7 +309,46 @@ func TestResolvePlatformReleaseRejectsMutableGitHubReleaseMetadata(t *testing.T)
 	}
 }
 
-func TestResolvePlatformReleaseRejectsNoncanonicalReleaseAssets(t *testing.T) {
+func TestResolvePlatformReleaseAcceptsAdditionalReleaseAssetsWithWarnings(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+	metadata := resolverMetadata(t, fixture)
+	metadata["assets"] = append(metadata["assets"].([]any),
+		map[string]any{"id": 4, "name": "workflow-linux-amd64.tar.gz"},
+		map[string]any{"id": 5, "name": "platform-sbom.spdx.json"},
+		map[string]any{"id": 6, "name": "sha256sums"},
+		map[string]any{"name": "metadata-missing-id.json"},
+	)
+	writeResolverReleaseMetadata(t, fixture, metadata)
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr != nil {
+		t.Fatalf("additional release assets rejected: %v\n%s", runErr, output)
+	}
+	var result struct {
+		Verified      bool     `json:"verified"`
+		AssetWarnings []string `json:"asset_warnings"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode resolver output: %v\n%s", err, output)
+	}
+	if !result.Verified {
+		t.Fatalf("additional release assets did not produce a verified result: %#v", result)
+	}
+	joinedWarnings := strings.Join(result.AssetWarnings, "\n")
+	for _, expected := range []string{"workflow-linux-amd64.tar.gz", "platform-sbom.spdx.json", "sha256sums", "metadata-missing-id.json", "missing a usable asset ID"} {
+		if !strings.Contains(joinedWarnings, expected) {
+			t.Fatalf("additional asset warning lacks %q: %#v", expected, result.AssetWarnings)
+		}
+	}
+}
+
+func TestResolvePlatformReleaseRejectsMissingOrAmbiguousRequiredAssets(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {
 		t.Skip("Windows PowerShell 5.1 is unavailable")
@@ -318,8 +357,11 @@ func TestResolvePlatformReleaseRejectsNoncanonicalReleaseAssets(t *testing.T) {
 		name   string
 		mutate func(map[string]any)
 	}{
-		{name: "unexpected asset", mutate: func(metadata map[string]any) {
-			metadata["assets"] = append(metadata["assets"].([]any), map[string]any{"name": "unexpected.bin", "browser_download_url": "https://github.com/owner/platform/releases/download/platform-v1.2.3/unexpected.bin"})
+		{name: "missing required asset", mutate: func(metadata map[string]any) {
+			metadata["assets"] = metadata["assets"].([]any)[:2]
+		}},
+		{name: "duplicate required asset", mutate: func(metadata map[string]any) {
+			metadata["assets"] = append(metadata["assets"].([]any), map[string]any{"id": 4, "name": "SHA256SUMS"})
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -332,7 +374,7 @@ func TestResolvePlatformReleaseRejectsNoncanonicalReleaseAssets(t *testing.T) {
 
 			output, runErr := fixture.run(t, powershell, factsPath, "", false)
 			if runErr == nil || !strings.Contains(output, "No canonical immutable stable Platform Release was found") || strings.Contains(output, `"manifest_path"`) {
-				t.Fatalf("noncanonical release assets emitted trusted paths: err=%v output=%s", runErr, output)
+				t.Fatalf("release with invalid required assets emitted trusted paths: err=%v output=%s", runErr, output)
 			}
 		})
 	}
