@@ -183,6 +183,20 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 			t.Fatalf("bootstrap skill lacks owner/release decision contract %q", required)
 		}
 	}
+	for _, required := range []string{
+		"ask once for the classic PAT",
+		"current Setup invocation's memory",
+		"Control Plane credential verifier",
+		"Release Resolver",
+		"exact-package installer",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("bootstrap skill lacks single-PAT setup contract %q", required)
+		}
+	}
+	if strings.Contains(content, "For every resolution, ask for the user's PAT explicitly") {
+		t.Fatal("bootstrap skill must not require users to re-enter the PAT for release resolution")
+	}
 	for _, obsolete := range []string{"obtain the exact release", "SignaturePath", "signature_path", ".sig", "pinned public key", "missing pinned key"} {
 		if strings.Contains(content, obsolete) {
 			t.Fatalf("bootstrap skill retains obsolete signing instruction %q", obsolete)
