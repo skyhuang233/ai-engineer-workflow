@@ -28,4 +28,10 @@ func TestSameFilesystemPathAcceptsWindowsShortAndLongNames(t *testing.T) {
 	if err != nil || !same {
 		t.Fatalf("short %q and long %q were not one filesystem identity: %v", short, long, err)
 	}
+	plannedShort := filepath.Join(short, "planned", "workflow-home")
+	plannedLong := filepath.Join(long, "planned", "workflow-home")
+	same, err = SameFilesystemPath(plannedShort, plannedLong)
+	if err != nil || !same {
+		t.Fatalf("planned paths below short %q and long %q were not one filesystem identity: %v", plannedShort, plannedLong, err)
+	}
 }
