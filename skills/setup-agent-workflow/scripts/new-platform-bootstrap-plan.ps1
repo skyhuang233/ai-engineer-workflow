@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
-    [Parameter(Mandatory = $true)][string]$SignaturePath,
     [Parameter(Mandatory = $true)][string]$HostFactsPath,
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)][string]$GitHubOwner,
@@ -18,7 +17,7 @@ function Get-SHA256Hex([byte[]]$Bytes) {
 function Get-SHA256File([string]$Path) {
     return Get-SHA256Hex ([IO.File]::ReadAllBytes($Path))
 }
-& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath -SignaturePath $SignaturePath | Out-Null
+& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath | Out-Null
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
@@ -146,7 +145,7 @@ if ([string]::IsNullOrWhiteSpace($effectiveOwnerType) -and -not [string]::IsNull
 if ([string]::IsNullOrWhiteSpace($effectiveOwnerType)) { throw "GitHubOwnerType must come from the read-only PAT owner verification before Platform planning" }
 $requiredCredentialScopes = @(& (Join-Path $PSScriptRoot "resolve-github-required-scopes.ps1") -OwnerType $effectiveOwnerType)
 $expectedCredentialPath = [IO.Path]::GetFullPath((Join-Path ([string]$facts.workflow_home) ([string]$manifest.platform_setup_contract.credential.plaintext_relative_path)))
-if (-not [string]::Equals([IO.Path]::GetFullPath([string]$facts.github_credential.path), $expectedCredentialPath, [StringComparison]::OrdinalIgnoreCase)) { throw "Host facts GitHub credential path differs from the signed Platform Setup Contract" }
+if (-not [string]::Equals([IO.Path]::GetFullPath([string]$facts.github_credential.path), $expectedCredentialPath, [StringComparison]::OrdinalIgnoreCase)) { throw "Host facts GitHub credential path differs from the Platform Setup Contract" }
 $credentialScopesMatch = @($requiredCredentialScopes | Where-Object { $observedScopes -notcontains $_ }).Count -eq 0
 $credentialCurrent = ($facts.github_credential.exists -and $facts.github_credential.verified -and $credentialOwnerMatches -and $credentialScopesMatch)
 if (-not $credentialCurrent) {

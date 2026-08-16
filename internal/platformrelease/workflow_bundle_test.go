@@ -2,9 +2,6 @@ package platformrelease
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -141,14 +138,10 @@ func TestAssembledReleaseManifestIncludesEveryWorkflowSkillSourceFile(t *testing
 	if err := os.WriteFile(cli, []byte("workflow-cli"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	manifest := validManifest(fixtureArtifacts())
 	manifest.Artifacts, manifest.BundledFiles, manifest.Provenance.Subjects = nil, nil, nil
 	manifest.PlatformSetup.SkillBundle.ManagedSkills = []string{"agent-workflow"}
-	assembly, err := Assemble(AssembleOptions{OutputDirectory: t.TempDir(), WorkflowExecutable: cli, PayloadDirectory: payload, Manifest: manifest, SigningKey: key})
+	assembly, err := Assemble(AssembleOptions{OutputDirectory: t.TempDir(), WorkflowExecutable: cli, PayloadDirectory: payload, Manifest: manifest})
 	if err != nil {
 		t.Fatal(err)
 	}

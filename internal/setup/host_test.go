@@ -1526,7 +1526,7 @@ func TestEngineRejectsPATOutsideExactWorkflowHomeCredentialPathBeforeSecret(t *t
 	}
 }
 
-func TestEngineRejectsPATScopesNotBoundToInstalledSignedContractBeforeSecret(t *testing.T) {
+func TestEngineRejectsPATScopesNotBoundToInstalledDigestBoundContractBeforeSecret(t *testing.T) {
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
 		t.Fatal(err)
@@ -1540,8 +1540,8 @@ func TestEngineRejectsPATScopesNotBoundToInstalledSignedContractBeforeSecret(t *
 	}
 	secret := &SecretInput{Reader: bytes.NewBufferString("ghp_must_not_be_read")}
 	_, applyErr := (&Engine{Adapter: HostAdapter{Layout: layout}, SecretInput: secret}).Apply(context.Background(), raw, digest)
-	if applyErr == nil || !strings.Contains(applyErr.Error(), "exact signed Platform Setup Contract") || secret.consumed {
-		t.Fatalf("wrong signed contract error=%v consumed=%v", applyErr, secret.consumed)
+	if applyErr == nil || !strings.Contains(applyErr.Error(), "exact digest-bound Platform Setup Contract") || secret.consumed {
+		t.Fatalf("wrong digest-bound contract error=%v consumed=%v", applyErr, secret.consumed)
 	}
 }
 

@@ -9,35 +9,35 @@ prerequisite, not the approval itself.
 
 ## Platform Release and setup inputs
 
-The entry skill selects only an immutable stable GitHub Release whose
-`platform-release.json` and detached P-256 signature match the pinned repository,
-publisher workflow, key id, provenance subjects, and bootstrap schema. The
-release ZIP, SPDX SBOM, and provenance statement must exactly match the signed
-manifest before extraction. A missing trust key, mutable release, prerelease,
-checksum mismatch, extra subject, or incompatible bootstrap schema fails before
-host mutation.
+The entry skill selects only an immutable stable GitHub Release from the
+canonical repository in its packaged source policy. It uses GitHub HTTPS and API
+metadata to bind the fixed tag and asset set to one exact `main` source commit,
+the successful publisher workflow run, and the release `target_commitish`.
+`platform-release.json` binds the publisher provenance subjects and exact
+SHA-256/size of the release ZIP, SPDX SBOM, and provenance statement; the
+installer verifies every downloaded byte before extraction. A noncanonical
+repository or URL, mutable release, prerelease, source or workflow mismatch,
+checksum mismatch, extra asset or subject, or incompatible bootstrap schema
+fails before host mutation.
 
-### Maintainer trust-key ceremony
+Platform publication uses only the job-scoped `GITHUB_TOKEN`. Agent Workflow
+does not create, store, or request a Platform Release public or private signing
+key, detached signature, or repository signing secret.
+[ADR-0064](../adr/0064-trust-canonical-github-platform-releases-without-managed-keys.md)
+owns this trust boundary.
 
-Create the production signing key only on an offline maintainer-controlled path
-outside this Git repository. The command refuses to place private material under
-the repository, refuses to overwrite an existing private key, and emits only the
-public artifact path and SHA-256—not the private key:
+The publisher requires exactly these five GitHub Actions repository variables;
+their production values are operator-supplied and are not inferred by setup:
 
-```powershell
-go run ./cmd/platform-release trust-key `
-  --repository-root (git rev-parse --show-toplevel) `
-  --private-key D:\offline-workflow-keys\platform-release-private-key.pem `
-  --public-key .\skills\setup-agent-workflow\trust\platform-release-public-key.pem `
-  --generate
-```
+- `WORKFLOW_PLATFORM_VERSION`
+- `DOCKER_DESKTOP_VERSION`
+- `DOCKER_DESKTOP_INSTALLER_URL`
+- `DOCKER_DESKTOP_WINDOWS_AMD64_SHA256`
+- `WORKFLOW_WORKER_IMAGE`
 
-To reproduce the public artifact later, omit `--generate` and supply the same
-offline private-key path. Derivation is deterministic and succeeds when the
-existing repository public artifact is byte-identical; a different existing
-artifact fails closed. Review and commit only the public PEM. Never commit,
-upload, paste, or log the private PEM. Until the reviewed public artifact exists,
-the entry skill intentionally rejects every Platform Release.
+Platform publication requires zero repository Actions secrets. The workflow's
+ephemeral, job-scoped `GITHUB_TOKEN` is supplied by GitHub and is not a
+configured repository secret.
 
 The verified release contract is the sole source for the exact Docker Desktop
 installer/version/checksum, Worker image digest, Repository Contract, managed
@@ -122,8 +122,8 @@ but remains fail-closed until missing host paths are explicitly completed.
   only its fingerprint, authenticated login, owner, scopes, path, status, and
   verification time. Workers receive neither the value nor its path.
 
-The installed `platform-setup-contract.json` is copied only from the verified,
-signed Platform Release. It pins Docker Desktop's version, HTTPS installer and
+The installed `platform-setup-contract.json` is copied only from the verified
+Platform Release. It pins Docker Desktop's version, HTTPS installer and
 SHA-256, the immutable Worker image digest, Workflow Skill Bundle ownership and
 digests, the repository contract, and the managed label vocabulary. Setup
 installs only the current-user CLI shim and current-user Codex skills, and

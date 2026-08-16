@@ -42,6 +42,5 @@
     "github_actions_run_id": 1,
     "builder_id": "github-actions",
     "subjects": []
-  },
-  "signature": {"algorithm": "ecdsa-p256-sha256", "key_id": "platform-release-2026", "signature_asset": "platform-release.json.sig"}
+  }
 }

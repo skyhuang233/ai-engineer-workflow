@@ -10,7 +10,8 @@ The release is not qualified unless the README's `npx skills@latest add ...`
 command, followed by explicit `$setup-agent-workflow` invocation in a clean
 Windows profile, reaches both gates:
 
-- **Platform Ready:** signed Platform Release and exact CLI/bundle installation,
+- **Platform Ready:** immutable canonical GitHub Platform Release and exact
+  manifest/checksum-bound CLI and bundle installation,
   Docker Linux `amd64` container/mount/network probe, owner-bound PAT scope and
   capability verification, live `workflow serve` health, and real Codex Worker
   create-and-resume all pass.

@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
-    [Parameter(Mandatory = $true)][string]$SignaturePath,
     [Parameter(Mandatory = $true)][string]$PlanPath,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$ApprovedDigest
 )
@@ -11,7 +10,7 @@ function Get-SHA256File([string]$Path) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
-& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath -SignaturePath $SignaturePath | Out-Null
+& (Join-Path $PSScriptRoot "verify-platform-release.ps1") -ManifestPath $ManifestPath | Out-Null
 
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $planEnvelope = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
@@ -91,16 +90,17 @@ try {
     $assetURL = "https://github.com/$($manifest.release.repository)/releases/download/$($manifest.release.tag)/$($asset.name)"
     Invoke-WebRequest -Uri $assetURL -OutFile $archive -UseBasicParsing
     $actual = Get-SHA256File $archive
-    if ($actual -ne $asset.sha256) { throw "Workflow CLI asset checksum mismatch" }
+    $actualSize = (Get-Item -LiteralPath $archive).Length
+    if ($actual -ne $asset.sha256 -or $actualSize -ne [long]$asset.size) { throw "Workflow CLI asset checksum or size mismatch" }
     $expanded = Join-Path $temporaryRoot "expanded"
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
     $expectedExecutablePath = Join-Path $expanded "bin\workflow.exe"
     $workflowExecutableEntries = @(Get-ChildItem -LiteralPath $expanded -File -Recurse | Where-Object { [string]::Equals($_.Name, "workflow.exe", [StringComparison]::OrdinalIgnoreCase) })
     if ($workflowExecutableEntries.Count -ne 1 -or -not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or -not [string]::Equals([IO.Path]::GetFullPath($workflowExecutableEntries[0].FullName), [IO.Path]::GetFullPath($expectedExecutablePath), [StringComparison]::OrdinalIgnoreCase)) { throw "Workflow CLI archive must contain only exact bin/workflow.exe" }
     $executable = Get-Item -LiteralPath $expectedExecutablePath
-    if ((Get-SHA256File $executable.FullName) -cne [string]$workflowExecutablePins[0].sha256) { throw "Workflow CLI executable checksum differs from the signed workflow_cli_sha256" }
+    if ((Get-SHA256File $executable.FullName) -cne [string]$workflowExecutablePins[0].sha256) { throw "Workflow CLI executable checksum differs from the manifest workflow_cli_sha256" }
     $publishedVersion = (& $executable.FullName version | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $publishedVersion -cne ("workflow " + [string]$manifest.release.version)) { throw "Workflow CLI published version differs from the signed Platform Release Manifest" }
+    if ($LASTEXITCODE -ne 0 -or $publishedVersion -cne ("workflow " + [string]$manifest.release.version)) { throw "Workflow CLI published version differs from the Platform Release Manifest" }
     $patEffects = @($approvedPlan.effects | Where-Object { [string]$_.kind -eq "github_pat" })
     if ($patEffects.Count -gt 1) { throw "Approved Setup Plan contains multiple GitHub PAT effects" }
     if ($patEffects.Count -eq 1) {
@@ -143,7 +143,6 @@ try {
         release_bundled_files_digest_sha256 = $releaseBundledFilesDigest
         control_plane_plan_digest_sha256 = $controlPlaneAuthorizationDigest
         manifest_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($ManifestPath)))
-        signature_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($SignaturePath)))
     }
     $pinJSON = $pin | ConvertTo-Json -Compress
     foreach ($durablePinPath in @($pinBackupPath, $pinPath)) {

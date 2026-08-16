@@ -3,14 +3,9 @@ package platformrelease
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,21 +86,7 @@ func main() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signature, err := Sign(raw, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	manifestPath := filepath.Join(directory, "platform-release.json")
-	signaturePath := filepath.Join(directory, "platform-release.json.sig")
-	publicKeyPath := filepath.Join(directory, "platform-release-public-key.pem")
 	policyPath := filepath.Join(directory, "release-policy.json")
 	write := func(path string, data []byte) {
 		t.Helper()
@@ -114,11 +95,9 @@ func main() {
 		}
 	}
 	write(manifestPath, raw)
-	write(signaturePath, signature)
-	write(publicKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
-	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": manifest.Release.Repository, "workflow_path": manifest.Provenance.WorkflowPath, "key_id": manifest.Signature.KeyID, "signature_algorithm": manifest.Signature.Algorithm, "minimum_platform_version": "0.0.0", "public_key_file": filepath.Base(publicKeyPath)})
+	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": manifest.Release.Repository, "workflow_path": manifest.Provenance.WorkflowPath, "minimum_platform_version": "0.0.0"})
 	write(policyPath, policy)
-	scriptRoot := copyBootstrapSkillForTest(t, directory, policy, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+	scriptRoot := copyBootstrapSkillForTest(t, directory, policy)
 	workflowHome := filepath.Join(directory, "workflow-home")
 	hostFactsPath := filepath.Join(directory, "host-facts.json")
 	planPath := filepath.Join(directory, "platform-plan.json")
@@ -138,7 +117,7 @@ func main() {
 	}
 	hostFacts, _ := json.Marshal(map[string]any{"schema_version": 1, "supported_host": true, "workflow_home": workflowHome, "host_identity": map[string]any{"user_id": "S-1-5-21-planner", "username": `DOMAIN\planner`, "workflow_home_owner_id": "S-1-5-21-planner"}, "workflow": map[string]any{"installed": false}, "docker": map[string]any{"installed": true, "desktop_version": manifest.PlatformSetup.Docker.Version, "engine_os": "linux", "engine_arch": "amd64"}, "github_credential": map[string]any{"exists": false, "path": filepath.Join(workflowHome, "state", "credentials", "github.pat")}, "codex_auth": map[string]any{"verified": true, "source": filepath.Join(directory, "codex-auth.json"), "fingerprint_sha256": strings.Repeat("9", 64)}, "codex_skills_root": filepath.Join(directory, "skills")})
 	write(hostFactsPath, hostFacts)
-	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
+	planCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-HostFactsPath", hostFactsPath, "-OutputPath", planPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
 	planOutput, err := planCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh plan on powershell.exe: %v (%s)", err, planOutput)
@@ -178,9 +157,9 @@ func main() {
 	token := "ghp_fresh_bootstrap_must_not_leak"
 	pinPath := filepath.Join(workflowHome, "config", "bootstrap-platform-release-pin.json")
 	pinBackupPath := filepath.Join(workflowHome, "backups", "bootstrap-platform-release-pin.json")
-	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	failedDownloadWrapper := `function Invoke-WebRequest { throw 'simulated archive download failure' }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
 	failedDownload := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", failedDownloadWrapper)
-	failedDownload.Env = append(os.Environ(), "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
+	failedDownload.Env = append(os.Environ(), "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
 	if failedOutput, failedErr := failedDownload.CombinedOutput(); failedErr == nil || !strings.Contains(string(failedOutput), "simulated archive download failure") {
 		t.Fatalf("simulated failed install was not observed: err=%v output=%s", failedErr, failedOutput)
 	}
@@ -190,20 +169,28 @@ func main() {
 	if _, err := os.Stat(pinBackupPath); !os.IsNotExist(err) {
 		t.Fatalf("failed download advanced the bootstrap release pin backup: %v", err)
 	}
-	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -SignaturePath $env:WORKFLOW_TEST_SIGNATURE -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	wrapper := `function Invoke-WebRequest { param([string]$Uri,[string]$OutFile,[switch]$UseBasicParsing) Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }; & $env:WORKFLOW_TEST_INSTALLER -ManifestPath $env:WORKFLOW_TEST_MANIFEST -PlanPath $env:WORKFLOW_TEST_PLAN -ApprovedDigest $env:WORKFLOW_TEST_DIGEST`
+	tamperedArchivePath := filepath.Join(directory, "tampered-workflow-windows-amd64.zip")
+	tamperedArchive := append(append([]byte(nil), archiveBytes...), 0)
+	write(tamperedArchivePath, tamperedArchive)
+	tamperedArchiveCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
+	tamperedArchiveCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+tamperedArchivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest)
+	if output, runErr := tamperedArchiveCommand.CombinedOutput(); runErr == nil || !strings.Contains(string(output), "checksum or size mismatch") {
+		t.Fatalf("installer accepted a tampered archive: err=%v output=%s", runErr, output)
+	}
 	versionMismatchCalls := filepath.Join(directory, "version-mismatch-calls.txt")
 	versionMismatch := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
-	versionMismatch.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION=0.9.0", "WORKFLOW_TEST_CALLS="+versionMismatchCalls)
+	versionMismatch.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION=0.9.0", "WORKFLOW_TEST_CALLS="+versionMismatchCalls)
 	versionMismatchOutput, versionMismatchErr := versionMismatch.CombinedOutput()
-	if versionMismatchErr == nil || !strings.Contains(string(versionMismatchOutput), "published version differs from the signed Platform Release Manifest") {
-		t.Fatalf("installer accepted a Workflow CLI whose published version differs from the signed manifest: err=%v output=%s", versionMismatchErr, versionMismatchOutput)
+	if versionMismatchErr == nil || !strings.Contains(string(versionMismatchOutput), "published version differs from the Platform Release Manifest") {
+		t.Fatalf("installer accepted a Workflow CLI whose published version differs from the manifest: err=%v output=%s", versionMismatchErr, versionMismatchOutput)
 	}
 	if calls, err := os.ReadFile(versionMismatchCalls); err != nil || strings.Contains(string(calls), "setup apply") {
 		t.Fatalf("version-mismatched Workflow CLI reached setup apply: calls=%q err=%v", calls, err)
 	}
 	installCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", wrapper)
 	installCommand.Stdin = bytes.NewBufferString(token + "\n")
-	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_SIGNATURE="+signaturePath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_PUBLIC_KEY="+publicKeyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
+	installCommand.Env = append(os.Environ(), "WORKFLOW_TEST_ARCHIVE="+archivePath, "WORKFLOW_TEST_INSTALLER="+filepath.Join(scriptRoot, "install-workflow-cli.ps1"), "WORKFLOW_TEST_MANIFEST="+manifestPath, "WORKFLOW_TEST_PLAN="+planPath, "WORKFLOW_TEST_DIGEST="+envelope.Digest, "WORKFLOW_TEST_POLICY="+policyPath, "WORKFLOW_TEST_STDIN="+stdinCapture, "WORKFLOW_TEST_ARGS="+argsCapture, "WORKFLOW_TEST_CALLS="+callsCapture, "WORKFLOW_TEST_CP_DIGEST="+envelope.Digest, "WORKFLOW_TEST_RELEASE_VERSION="+manifest.Release.Version, "WORKFLOW_TEST_MANIFEST_DIGEST="+hex.EncodeToString(manifestSum[:]), "WORKFLOW_TEST_CONTRACT_DIGEST="+contractDigest, "WORKFLOW_TEST_CLI_DIGEST="+hex.EncodeToString(cliSum[:]), "WORKFLOW_TEST_BUNDLE_JSON="+string(bundledCanonical), "WORKFLOW_TEST_BUNDLE_DIGEST="+bundledDigest)
 	installOutput, err := installCommand.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fresh install on powershell.exe: %v (%s)", err, installOutput)
@@ -382,7 +369,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 	recoveryFactsPath := filepath.Join(directory, "backup-recovery-facts.json")
 	recoveryPlanPath := filepath.Join(directory, "backup-recovery-plan.json")
 	write(recoveryFactsPath, recoveryFactsRaw)
-	recoveryPlanCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-SignaturePath", signaturePath, "-HostFactsPath", recoveryFactsPath, "-OutputPath", recoveryPlanPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
+	recoveryPlanCommand := exec.Command(powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(scriptRoot, "new-platform-bootstrap-plan.ps1"), "-ManifestPath", manifestPath, "-HostFactsPath", recoveryFactsPath, "-OutputPath", recoveryPlanPath, "-GitHubOwner", "owner", "-GitHubOwnerType", "personal", "-GitHubPATFingerprintSHA256", strings.Repeat("8", 64))
 	recoveryPlanOutput, recoveryPlanErr := recoveryPlanCommand.CombinedOutput()
 	var recoveryEnvelope struct {
 		CanonicalJSON string `json:"canonical_json"`
@@ -414,7 +401,7 @@ func main() { _ = os.WriteFile(os.Getenv("WORKFLOW_TEST_SIDE_EFFECT"), []byte("e
 		t.Fatal("bootstrap release pin is not JSON")
 	}
 	if pinDocument["release_bundled_files_json"] == "" || pinDocument["release_bundled_files_digest_sha256"] == "" || pinDocument["control_plane_plan_digest_sha256"] != priorControlPlaneDigest {
-		t.Fatalf("bootstrap release pin omitted signed bundle inventory or Control Plane authorization fence: %#v", pinDocument)
+		t.Fatalf("bootstrap release pin omitted bundle inventory or Control Plane authorization fence: %#v", pinDocument)
 	}
 	pinDocument["unexpected_future_authority"] = "not-approved"
 	tamperedPin, _ := json.Marshal(pinDocument)
@@ -536,7 +523,7 @@ func TestBootstrapInstallerUsesOnlyExactPinnedArchiveExecutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(body)
-	for _, required := range []string{`Join-Path $expanded "bin\workflow.exe"`, "Workflow CLI archive must contain only exact bin/workflow.exe", "Workflow CLI executable checksum differs from the signed workflow_cli_sha256", `& $executable.FullName version`, "Workflow CLI published version differs from the signed Platform Release Manifest"} {
+	for _, required := range []string{`Join-Path $expanded "bin\workflow.exe"`, "Workflow CLI archive must contain only exact bin/workflow.exe", "Workflow CLI executable checksum differs from the manifest workflow_cli_sha256", `& $executable.FullName version`, "Workflow CLI published version differs from the Platform Release Manifest"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap installer lacks exact archive executable contract %q", required)
 		}

@@ -168,12 +168,17 @@ func TestBootstrapSkillDeterminesOwnerAndReleaseBeforePlatformPlanning(t *testin
 		t.Fatal(err)
 	}
 	content := string(raw)
-	for _, required := range []string{"present its owner as the candidate together with its repository name", "With no `origin`, explicitly ask", "repository name and private/public visibility", "before any Platform mutation", "confirmed owner, repository name, visibility, publication state, and domain layout", "-Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>", "workflow setup plan --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>", "workflow setup verify --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path", "plan target.workflow_home exactly equals `$confirmedWorkflowHome`", "scripts/resolve-platform-release.ps1", "HostFactsPath = $hostFactsPath", "$resolvedRelease.manifest_path", "$resolvedRelease.signature_path", "fresh host may either use the default latest stable release", "On a fresh host, add Version alone", "AllowUpgrade only when an installed lower version", "AllowUpgrade = $true", "verified backup pin automatically supplies exact repair authority", "omit `Version` for that exact pin repair", "both verified pins are missing while the Workflow CLI exists", "confirm the exact installed version", "$releaseArguments.Version = <confirmed-exact-installed-version>", "never use latest-stable selection for a pinless existing installation", "contract-validated, forward-only dry run"} {
+	for _, required := range []string{"present its owner as the candidate together with its repository name", "With no `origin`, explicitly ask", "repository name and private/public visibility", "before any Platform mutation", "confirmed owner, repository name, visibility, publication state, and domain layout", "-Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>", "workflow setup plan --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>", "workflow setup verify --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path", "plan target.workflow_home exactly equals `$confirmedWorkflowHome`", "scripts/resolve-platform-release.ps1", "HostFactsPath = $hostFactsPath", "$resolvedRelease.manifest_path", "fresh host may either use the default latest stable release", "On a fresh host, add Version alone", "AllowUpgrade only when an installed lower version", "AllowUpgrade = $true", "verified backup pin automatically supplies exact repair authority", "omit `Version` for that exact pin repair", "both verified pins are missing while the Workflow CLI exists", "confirm the exact installed version", "$releaseArguments.Version = <confirmed-exact-installed-version>", "never use latest-stable selection for a pinless existing installation", "contract-validated, forward-only dry run"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("bootstrap skill lacks owner/release decision contract %q", required)
 		}
 	}
-	if strings.Contains(content, "obtain the exact release") || strings.Contains(content, "with `-ManifestPath`, `-SignaturePath`") {
+	for _, obsolete := range []string{"obtain the exact release", "SignaturePath", "signature_path", ".sig", "pinned public key", "missing pinned key"} {
+		if strings.Contains(content, obsolete) {
+			t.Fatalf("bootstrap skill retains obsolete signing instruction %q", obsolete)
+		}
+	}
+	if strings.Contains(content, "with `-ManifestPath`, `-SignaturePath`") {
 		t.Fatal("bootstrap skill still asks the agent to obtain or manually supply release trust inputs")
 	}
 }

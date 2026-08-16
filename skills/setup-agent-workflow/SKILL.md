@@ -90,17 +90,23 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    - When either verified durable pin is available, the verified backup pin automatically supplies exact repair authority if the primary is missing; omit `Version` for that exact pin repair. The resolver selects the pinned release and the later approved apply recreates the missing primary or backup.
    - When both verified pins are missing while the Workflow CLI exists, ask the user to confirm the exact installed version. Add `$releaseArguments.Version = <confirmed-exact-installed-version>` and do not add `AllowUpgrade`; never use latest-stable selection for a pinless existing installation.
 
-   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they verify and preview the exact repair but do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver verifies the packaged trust policy, pinned public key, immutable fixed GitHub Release assets, source commit, signature, release identity, and Platform Setup Contract before returning paths. A missing pinned key or any version/pin disagreement blocks.
+   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they verify and preview the exact repair but do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver accepts only the packaged canonical GitHub repository, an immutable stable release, its exact source commit and fixed manifest asset, then verifies every declared artifact checksum, release identity, provenance, and Platform Setup Contract before returning paths. Any repository, version, commit, pin, manifest, provenance, or checksum disagreement blocks.
 
    Produce the Platform Plan only from the resolver output:
 
    ```powershell
    $platformPlanPath = Join-Path $setupTaskRoot "platform-plan.json"
-   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -SignaturePath $resolvedRelease.signature_path -HostFactsPath $hostFactsPath -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization> -GitHubPATFingerprintSHA256 <verified-fingerprint>
+   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -HostFactsPath $hostFactsPath -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization> -GitHubPATFingerprintSHA256 <verified-fingerprint>
    ```
 
    Pass `-AllowUpgrade` to the planner only for the same explicitly confirmed upgrade. If it returns `plan_required`, show its complete readable projection and ask for one approval of the displayed SHA-256 digest.
-3. After approval, run the installer with `$resolvedRelease.manifest_path`, `$resolvedRelease.signature_path`, the approved digest, and `$platformPlanPath`. It re-verifies trust before downloading the platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. Supply a PAT to `workflow setup apply` over standard input; keep it out of arguments and ordinary output. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
+3. After approval, run the exact installer command:
+
+   ```powershell
+   & scripts/install-workflow-cli.ps1 -ManifestPath $resolvedRelease.manifest_path -PlanPath $platformPlanPath -ApprovedDigest <approved-digest>
+   ```
+
+   It re-verifies the manifest and approved plan before downloading the exact checksummed platform archive. Allow UAC, Docker first launch, Codex login restoration, and PAT entry only when the corresponding approved plan declares them. Supply a PAT to `workflow setup apply` over standard input; keep it out of arguments and ordinary output. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
 4. Use the installed CLI for the remaining deterministic loop:
 
    ```powershell

@@ -1,11 +1,9 @@
 package platformrelease
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
@@ -38,37 +36,40 @@ func TestManifestRoundTripAndArtifactVerification(t *testing.T) {
 	}
 }
 
-func TestSignedManifestBindsTrustPolicyAndProvenance(t *testing.T) {
+func TestManifestBindsCanonicalGitHubReleaseIdentityAndProvenance(t *testing.T) {
 	manifest := validManifest(fixtureArtifacts())
 	raw, _, err := manifest.Canonical()
 	if err != nil {
 		t.Fatal(err)
 	}
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signature, err := Sign(raw, privateKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	policy := TrustPolicy{
+	identity := ReleaseIdentity{
 		Repository:   "skyhuang233/ai-engineer-workflow",
 		WorkflowPath: ".github/workflows/publish-platform.yml",
-		KeyID:        "platform-release-2026",
+		SourceCommit: strings.Repeat("a", 40),
 	}
-	if _, err := VerifySignedManifest(raw, signature, &privateKey.PublicKey, policy); err != nil {
+	if _, err := VerifyManifest(raw, identity); err != nil {
 		t.Fatal(err)
 	}
-	policy.Repository = "attacker/fork"
-	if _, err := VerifySignedManifest(raw, signature, &privateKey.PublicKey, policy); err == nil {
+	identity.Repository = "attacker/fork"
+	if _, err := VerifyManifest(raw, identity); err == nil {
 		t.Fatal("accepted manifest from a different release repository")
 	}
-	raw[len(raw)-1] ^= 1
-	if _, err := VerifySignedManifest(raw, signature, &privateKey.PublicKey, TrustPolicy{
-		Repository: "skyhuang233/ai-engineer-workflow", WorkflowPath: ".github/workflows/publish-platform.yml", KeyID: "platform-release-2026",
-	}); err == nil {
-		t.Fatal("accepted tampered signed manifest")
+	identity.Repository = manifest.Release.Repository
+	identity.SourceCommit = strings.Repeat("b", 40)
+	if _, err := VerifyManifest(raw, identity); err == nil {
+		t.Fatal("accepted manifest from a different immutable release commit")
+	}
+}
+
+func TestManifestRejectsRemovedSignatureMetadata(t *testing.T) {
+	manifest := validManifest(fixtureArtifacts())
+	raw, _, err := manifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw[:len(raw)-1], []byte(`,"signature":{"algorithm":"ecdsa-p256-sha256","key_id":"old","signature_asset":"platform-release.json.sig"}}`)...)
+	if _, _, _, err := Parse(raw); err == nil {
+		t.Fatal("accepted obsolete detached-signature metadata")
 	}
 }
 
@@ -100,14 +101,19 @@ func TestSelectLatestStableRequiresCompatibleVerifiedRelease(t *testing.T) {
 		t.Fatal("accepted mutable release")
 	}
 	if _, err := SelectLatestStable([]Candidate{{Manifest: base, Immutable: true}}, setupcontract.SchemaVersion); err == nil {
-		t.Fatal("accepted release whose signature and provenance were not verified")
+		t.Fatal("accepted release whose GitHub identity and provenance were not verified")
 	}
 }
 
 func TestManifestValidationFailsClosed(t *testing.T) {
 	tests := map[string]func(*Manifest){
-		"missing checksum":      func(m *Manifest) { m.Artifacts[0].SHA256 = "" },
-		"duplicate artifact":    func(m *Manifest) { m.Artifacts = append(m.Artifacts, m.Artifacts[0]) },
+		"missing checksum":   func(m *Manifest) { m.Artifacts[0].SHA256 = "" },
+		"duplicate artifact": func(m *Manifest) { m.Artifacts = append(m.Artifacts, m.Artifacts[0]) },
+		"extra artifact": func(m *Manifest) {
+			extra := Artifact{Name: "unexpected.bin", SHA256: strings.Repeat("1", 64), Size: 1}
+			m.Artifacts = append(m.Artifacts, extra)
+			m.Provenance.Subjects = append(m.Provenance.Subjects, extra)
+		},
 		"missing scope":         func(m *Manifest) { m.PlatformSetup.Credential.RequiredScopes = []string{"repo"} },
 		"mutable worker pin":    func(m *Manifest) { m.PlatformSetup.Worker.Image = "ghcr.io/owner/worker:latest" },
 		"missing Docker URL":    func(m *Manifest) { m.PlatformSetup.Docker.InstallerURL = "" },
@@ -123,6 +129,10 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 		"zero-padded platform version": func(m *Manifest) {
 			m.Release.Version = "01.0.0"
 			m.Release.Tag = "platform-v01.0.0"
+		},
+		"out-of-range platform version": func(m *Manifest) {
+			m.Release.Version = "2147483648.0.0"
+			m.Release.Tag = "platform-v2147483648.0.0"
 		},
 		"prerelease platform version": func(m *Manifest) {
 			m.Release.Version = "1.0.0-rc.1"
@@ -168,7 +178,6 @@ func validManifest(artifactData map[string][]byte) Manifest {
 		Artifacts:    artifacts,
 		BundledFiles: []BundledFile{{Path: "bin/workflow.exe", SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, {Path: "skills/implement/SKILL.md", SHA256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}, {Path: "repository-contract/AGENTS.block.md", SHA256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}},
 		Provenance:   Provenance{Repository: "skyhuang233/ai-engineer-workflow", SourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WorkflowPath: ".github/workflows/publish-platform.yml", GitHubActionsRunID: 42, BuilderID: "github-actions", Subjects: artifacts},
-		Signature:    SignatureMetadata{Algorithm: "ecdsa-p256-sha256", KeyID: "platform-release-2026", SignatureAsset: "platform-release.json.sig"},
 	}
 }
 

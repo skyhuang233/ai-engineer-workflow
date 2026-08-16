@@ -1,14 +1,9 @@
 package platformrelease
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,13 +29,12 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 		Verified       bool   `json:"verified"`
 		ReleaseVersion string `json:"release_version"`
 		ManifestPath   string `json:"manifest_path"`
-		SignaturePath  string `json:"signature_path"`
 		TempDirectory  string `json:"temp_directory"`
 	}
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
 		t.Fatalf("decode resolver output: %v\n%s", err, output)
 	}
-	if !result.Verified || result.ReleaseVersion != "1.2.3" || filepath.Base(result.ManifestPath) != "platform-release.json" || filepath.Base(result.SignaturePath) != "platform-release.json.sig" || filepath.Dir(result.ManifestPath) != result.TempDirectory || filepath.Dir(result.SignaturePath) != result.TempDirectory {
+	if !result.Verified || result.ReleaseVersion != "1.2.3" || filepath.Base(result.ManifestPath) != "platform-release.json" || filepath.Dir(result.ManifestPath) != result.TempDirectory {
 		t.Fatalf("unexpected resolver result: %#v", result)
 	}
 	if _, err := os.Stat(result.ManifestPath); err != nil {
@@ -51,9 +45,12 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 		t.Fatal(err)
 	}
 	want := []string{
-		"https://api.github.com/repos/owner/platform/releases/latest",
+		"https://api.github.com/repos/owner/platform/releases?per_page=100&page=1",
+		"https://api.github.com/repos/owner/platform/releases?per_page=100&page=2",
 		"https://github.com/owner/platform/releases/download/platform-v1.2.3/platform-release.json",
-		"https://github.com/owner/platform/releases/download/platform-v1.2.3/platform-release.json.sig",
+		"https://api.github.com/repos/owner/platform/actions/runs/42",
+		"https://api.github.com/repos/owner/platform/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/pulls",
+		"https://api.github.com/repos/owner/platform/pulls/7",
 	}
 	for _, request := range want {
 		if !strings.Contains(string(requests), request) {
@@ -62,6 +59,49 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 	}
 	if strings.Contains(string(requests), "evil.example") {
 		t.Fatalf("resolver trusted release asset URL: %q", requests)
+	}
+}
+
+func TestResolvePlatformReleasePaginatesMixedReleasesAndSelectsHighestCanonicalPlatformVersion(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	metadata := resolverMetadata(t, fixture)
+	older := cloneResolverJSON(t, metadata)
+	older["tag_name"] = "platform-v1.2.2"
+	for _, asset := range older["assets"].([]any) {
+		entry := asset.(map[string]any)
+		entry["browser_download_url"] = strings.ReplaceAll(entry["browser_download_url"].(string), "platform-v1.2.3", "platform-v1.2.2")
+	}
+	worker := cloneResolverJSON(t, metadata)
+	worker["tag_name"] = "worker-v99.0.0"
+	mutable := cloneResolverJSON(t, metadata)
+	mutable["tag_name"] = "platform-v9.0.0"
+	mutable["immutable"] = false
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{worker, older, mutable})
+	writeResolverJSON(t, fixture.releasePagePaths[1], []any{metadata})
+	writeResolverJSON(t, fixture.releasePagePaths[2], []any{})
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr != nil || !strings.Contains(output, `"release_version":"1.2.3"`) {
+		t.Fatalf("paginated mixed releases did not select highest canonical Platform version: err=%v output=%s", runErr, output)
+	}
+	requests, err := os.ReadFile(fixture.requestLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page := 1; page <= 3; page++ {
+		want := "https://api.github.com/repos/owner/platform/releases?per_page=100&page=" + string(rune('0'+page))
+		if !strings.Contains(string(requests), want) {
+			t.Fatalf("resolver did not paginate through page %d: %q", page, requests)
+		}
+	}
+	if strings.Contains(string(requests), "/releases/latest") {
+		t.Fatalf("resolver used repository-wide latest release: %q", requests)
 	}
 }
 
@@ -108,11 +148,17 @@ func TestResolvePlatformReleaseRequiresCanonicalBareSemanticVersionCore(t *testi
 		accept  bool
 	}{
 		{version: "1.2.3", accept: true},
+		{version: "2147483647.2147483647.2147483647", accept: true},
 		{version: "v1.2.3"},
 		{version: "01.2.3"},
+		{version: "2147483648.0.0"},
 	} {
 		t.Run(test.version, func(t *testing.T) {
-			fixture := newResolverFixture(t, "1.2.3")
+			candidateVersion := "1.2.3"
+			if test.accept {
+				candidateVersion = test.version
+			}
+			fixture := newResolverFixture(t, candidateVersion)
 			factsPath := filepath.Join(fixture.directory, "host-facts.json")
 			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 
@@ -123,7 +169,7 @@ func TestResolvePlatformReleaseRequiresCanonicalBareSemanticVersionCore(t *testi
 				}
 				return
 			}
-			if runErr == nil || !strings.Contains(output, "bare semantic version core") {
+			if runErr == nil || (!strings.Contains(output, "bare semantic version core") && !strings.Contains(output, "32-bit range")) {
 				t.Fatalf("non-canonical version accepted: err=%v output=%s", runErr, output)
 			}
 			if requests, err := os.ReadFile(fixture.requestLog); err == nil && len(requests) != 0 {
@@ -186,7 +232,7 @@ func TestResolvePlatformReleaseEnforcesDurableVersionTransitions(t *testing.T) {
 		{name: "greater without authorization", candidate: "1.3.0", requested: "1.3.0", wantError: "requires explicit AllowUpgrade"},
 		{name: "allow upgrade on same version", candidate: "1.2.0", requested: "1.2.0", allowUpgrade: true, wantError: "only a version greater"},
 		{name: "downgrade", candidate: "1.1.9", requested: "1.1.9", allowUpgrade: true, wantError: "older than the durable"},
-		{name: "same version wrong durable manifest", candidate: "1.2.0", durableDigest: strings.Repeat("0", 64), wantError: "exact signed manifest digest"},
+		{name: "same version wrong durable manifest", candidate: "1.2.0", durableDigest: strings.Repeat("0", 64), wantError: "exact manifest digest"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -222,27 +268,24 @@ func TestResolvePlatformReleaseEnforcesDurableVersionTransitions(t *testing.T) {
 	}
 }
 
-func TestResolvePlatformReleaseFailsClosedBeforeOutputForMissingKeyOrInvalidContract(t *testing.T) {
+func TestResolvePlatformReleaseNeedsNoPlatformSigningKeyAndRejectsInvalidContract(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {
 		t.Skip("Windows PowerShell 5.1 is unavailable")
 	}
-	t.Run("missing pinned key", func(t *testing.T) {
+	t.Run("freshly installed skill has no signing key", func(t *testing.T) {
 		fixture := newResolverFixture(t, "1.2.3")
 		factsPath := filepath.Join(fixture.directory, "host-facts.json")
 		writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
-		if err := os.Remove(fixture.publicKeyPath); err != nil {
-			t.Fatal(err)
-		}
 		output, runErr := fixture.run(t, powershell, factsPath, "", false)
-		if runErr == nil || !strings.Contains(output, "Pinned Platform Release public key is missing") || strings.Contains(output, `"manifest_path"`) {
-			t.Fatalf("missing key did not fail closed: err=%v output=%s", runErr, output)
+		if runErr != nil || !strings.Contains(output, `"manifest_path"`) {
+			t.Fatalf("unsigned canonical release did not resolve: err=%v output=%s", runErr, output)
 		}
-		if requests, err := os.ReadFile(fixture.requestLog); err == nil && len(requests) != 0 {
-			t.Fatalf("resolver used the network before validating its key: %q", requests)
+		if matches, _ := filepath.Glob(filepath.Join(fixture.directory, "setup-agent-workflow", "trust", "*.pem")); len(matches) != 0 {
+			t.Fatalf("fixture unexpectedly required a signing key: %v", matches)
 		}
 	})
-	t.Run("signed invalid platform contract", func(t *testing.T) {
+	t.Run("invalid platform contract", func(t *testing.T) {
 		fixture := newResolverFixtureWithMutation(t, "1.2.3", func(manifest *Manifest) {
 			manifest.PlatformSetup.WorkflowHomeDefault = `%TEMP%\UntrustedWorkflow`
 		})
@@ -250,7 +293,7 @@ func TestResolvePlatformReleaseFailsClosedBeforeOutputForMissingKeyOrInvalidCont
 		writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 		output, runErr := fixture.run(t, powershell, factsPath, "", false)
 		if runErr == nil || !strings.Contains(output, "Workflow Home default") || strings.Contains(output, `"manifest_path"`) {
-			t.Fatalf("invalid signed contract emitted trusted paths: err=%v output=%s", runErr, output)
+			t.Fatalf("invalid contract emitted trusted paths: err=%v output=%s", runErr, output)
 		}
 	})
 }
@@ -265,15 +308,117 @@ func TestResolvePlatformReleaseRejectsMutableGitHubReleaseMetadata(t *testing.T)
 	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 	metadata := resolverMetadata(t, fixture)
 	metadata["immutable"] = false
-	writeResolverJSON(t, fixture.metadataPath, metadata)
+	writeResolverReleaseMetadata(t, fixture, metadata)
 
 	output, runErr := fixture.run(t, powershell, factsPath, "", false)
-	if runErr == nil || !strings.Contains(output, "GitHub Release is not immutable") || strings.Contains(output, `"manifest_path"`) {
+	if runErr == nil || !strings.Contains(output, "No canonical immutable stable Platform Release was found") || strings.Contains(output, `"manifest_path"`) {
 		t.Fatalf("mutable release did not fail closed before emitting paths: err=%v output=%s", runErr, output)
 	}
 }
 
-func TestResolvePlatformReleaseBindsGitHubReleaseTargetToSignedManifestCommit(t *testing.T) {
+func TestResolvePlatformReleaseRejectsNoncanonicalReleaseAssets(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "unexpected asset", mutate: func(metadata map[string]any) {
+			metadata["assets"] = append(metadata["assets"].([]any), map[string]any{"name": "unexpected.bin", "browser_download_url": "https://github.com/owner/platform/releases/download/platform-v1.2.3/unexpected.bin"})
+		}},
+		{name: "noncanonical URL", mutate: func(metadata map[string]any) {
+			metadata["assets"].([]any)[0].(map[string]any)["browser_download_url"] = "https://evil.example/SHA256SUMS"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResolverFixture(t, "1.2.3")
+			factsPath := filepath.Join(fixture.directory, "host-facts.json")
+			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+			metadata := resolverMetadata(t, fixture)
+			test.mutate(metadata)
+			writeResolverReleaseMetadata(t, fixture, metadata)
+
+			output, runErr := fixture.run(t, powershell, factsPath, "", false)
+			if runErr == nil || !strings.Contains(output, "No canonical immutable stable Platform Release was found") || strings.Contains(output, `"manifest_path"`) {
+				t.Fatalf("noncanonical release assets emitted trusted paths: err=%v output=%s", runErr, output)
+			}
+		})
+	}
+}
+
+func TestResolvePlatformReleaseRejectsUntrustedPublisherProvenance(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	for _, test := range []struct {
+		name      string
+		mutateRun func(map[string]any)
+		mutatePR  func(map[string]any)
+		want      string
+	}{
+		{name: "failed workflow run", mutateRun: func(run map[string]any) { run["conclusion"] = "failure" }, want: "publisher run"},
+		{name: "different workflow commit", mutateRun: func(run map[string]any) { run["head_sha"] = strings.Repeat("b", 40) }, want: "publisher run"},
+		{name: "non-owner merge", mutatePR: func(pull map[string]any) { pull["merged_by"].(map[string]any)["login"] = "collaborator" }, want: "not merged to main by the repository owner"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResolverFixture(t, "1.2.3")
+			factsPath := filepath.Join(fixture.directory, "host-facts.json")
+			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+			if test.mutateRun != nil {
+				raw, readErr := os.ReadFile(fixture.runPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				var run map[string]any
+				if err := json.Unmarshal(raw, &run); err != nil {
+					t.Fatal(err)
+				}
+				test.mutateRun(run)
+				writeResolverJSON(t, fixture.runPath, run)
+			}
+			if test.mutatePR != nil {
+				raw, readErr := os.ReadFile(fixture.pullPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				var pull map[string]any
+				if err := json.Unmarshal(raw, &pull); err != nil {
+					t.Fatal(err)
+				}
+				test.mutatePR(pull)
+				writeResolverJSON(t, fixture.pullPath, pull)
+			}
+
+			output, runErr := fixture.run(t, powershell, factsPath, "", false)
+			if runErr == nil || !strings.Contains(output, test.want) || strings.Contains(output, `"manifest_path"`) {
+				t.Fatalf("untrusted publisher provenance emitted trusted paths: err=%v output=%s", runErr, output)
+			}
+		})
+	}
+}
+
+func TestResolvePlatformReleaseRejectsManifestFromNoncanonicalRepository(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixtureWithMutation(t, "1.2.3", func(manifest *Manifest) {
+		manifest.Release.Repository = "attacker/platform"
+		manifest.Provenance.Repository = "attacker/platform"
+	})
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr == nil || !strings.Contains(output, "repository does not match pinned trust policy") || strings.Contains(output, `"manifest_path"`) {
+		t.Fatalf("noncanonical manifest repository emitted trusted paths: err=%v output=%s", runErr, output)
+	}
+}
+
+func TestResolvePlatformReleaseBindsGitHubReleaseTargetToManifestCommit(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {
 		t.Skip("Windows PowerShell 5.1 is unavailable")
@@ -292,7 +437,7 @@ func TestResolvePlatformReleaseBindsGitHubReleaseTargetToSignedManifestCommit(t 
 			writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
 			metadata := resolverMetadata(t, fixture)
 			test.mutate(metadata)
-			writeResolverJSON(t, fixture.metadataPath, metadata)
+			writeResolverReleaseMetadata(t, fixture, metadata)
 
 			output, runErr := fixture.run(t, powershell, factsPath, "", false)
 			if runErr == nil || !strings.Contains(output, "target commit does not match the verified Platform Release manifest") || strings.Contains(output, `"manifest_path"`) {
@@ -303,14 +448,16 @@ func TestResolvePlatformReleaseBindsGitHubReleaseTargetToSignedManifestCommit(t 
 }
 
 type resolverFixture struct {
-	directory     string
-	scriptPath    string
-	policyPath    string
-	publicKeyPath string
-	manifestPath  string
-	signaturePath string
-	metadataPath  string
-	requestLog    string
+	directory        string
+	scriptPath       string
+	policyPath       string
+	manifestPath     string
+	metadataPath     string
+	runPath          string
+	commitPullsPath  string
+	pullPath         string
+	requestLog       string
+	releasePagePaths []string
 }
 
 func newResolverFixture(t *testing.T, version string) resolverFixture {
@@ -319,10 +466,6 @@ func newResolverFixture(t *testing.T, version string) resolverFixture {
 
 func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*Manifest)) resolverFixture {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	manifest := validManifest(fixtureArtifacts())
 	manifest.Release.Repository = "owner/platform"
 	manifest.Provenance.Repository = "owner/platform"
@@ -335,21 +478,14 @@ func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*M
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(raw)
-	signature, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	directory := t.TempDir()
 	fixture := resolverFixture{
-		directory:    directory,
-		manifestPath: filepath.Join(directory, "source-platform-release.json"), signaturePath: filepath.Join(directory, "source-platform-release.json.sig"),
-		policyPath: filepath.Join(directory, "setup-agent-workflow", "trust", "release-policy.json"), publicKeyPath: filepath.Join(directory, "setup-agent-workflow", "trust", "platform-release-public-key.pem"),
-		metadataPath: filepath.Join(directory, "release.json"), requestLog: filepath.Join(directory, "requests.log"),
+		directory: directory, manifestPath: filepath.Join(directory, "source-platform-release.json"),
+		policyPath: filepath.Join(directory, "setup-agent-workflow", "trust", "release-policy.json"), metadataPath: filepath.Join(directory, "release.json"),
+		runPath: filepath.Join(directory, "run.json"), commitPullsPath: filepath.Join(directory, "commit-pulls.json"), pullPath: filepath.Join(directory, "pull.json"), requestLog: filepath.Join(directory, "requests.log"),
+	}
+	for page := 1; page <= 3; page++ {
+		fixture.releasePagePaths = append(fixture.releasePagePaths, filepath.Join(directory, "releases-page-"+string(rune('0'+page))+".json"))
 	}
 	_, current, _, _ := runtime.Caller(0)
 	sourceScripts := filepath.Clean(filepath.Join(filepath.Dir(current), "..", "..", "skills", "setup-agent-workflow", "scripts"))
@@ -368,12 +504,23 @@ func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*M
 		writeResolverFile(t, filepath.Join(filepath.Dir(fixture.scriptPath), scriptName), source)
 	}
 	writeResolverFile(t, fixture.manifestPath, raw)
-	writeResolverFile(t, fixture.signaturePath, signature)
-	writeResolverFile(t, fixture.publicKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
-	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": "owner/platform", "workflow_path": manifest.Provenance.WorkflowPath, "key_id": manifest.Signature.KeyID, "signature_algorithm": manifest.Signature.Algorithm, "minimum_platform_version": "0.0.0", "public_key_file": filepath.Base(fixture.publicKeyPath)})
+	policy, _ := json.Marshal(map[string]any{"schema_version": 1, "repository": "owner/platform", "workflow_path": manifest.Provenance.WorkflowPath, "minimum_platform_version": "0.0.0"})
 	writeResolverFile(t, fixture.policyPath, policy)
-	metadata, _ := json.Marshal(map[string]any{"tag_name": manifest.Release.Tag, "draft": false, "prerelease": false, "immutable": true, "target_commitish": manifest.Release.SourceCommit, "assets": []map[string]string{{"name": "platform-release.json", "browser_download_url": "https://evil.example/manifest"}, {"name": "platform-release.json.sig", "browser_download_url": "https://evil.example/signature"}}})
+	assetNames := []string{"SHA256SUMS", "platform-provenance.json", "platform-release.json", "platform-sbom.spdx.json", "workflow-windows-amd64.zip"}
+	assets := make([]map[string]string, 0, len(assetNames))
+	for _, name := range assetNames {
+		assets = append(assets, map[string]string{"name": name, "browser_download_url": "https://github.com/owner/platform/releases/download/" + manifest.Release.Tag + "/" + name})
+	}
+	metadata, _ := json.Marshal(map[string]any{"tag_name": manifest.Release.Tag, "draft": false, "prerelease": false, "immutable": true, "target_commitish": manifest.Release.SourceCommit, "assets": assets})
 	writeResolverFile(t, fixture.metadataPath, metadata)
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{json.RawMessage(metadata)})
+	writeResolverJSON(t, fixture.releasePagePaths[1], []any{})
+	writeResolverJSON(t, fixture.releasePagePaths[2], []any{})
+	run, _ := json.Marshal(map[string]any{"id": manifest.Release.GitHubActionsRunID, "repository": map[string]any{"full_name": "owner/platform"}, "path": manifest.Provenance.WorkflowPath, "head_sha": manifest.Release.SourceCommit, "head_branch": "main", "event": "push", "status": "completed", "conclusion": "success"})
+	writeResolverFile(t, fixture.runPath, run)
+	pull := map[string]any{"number": 7, "merged_at": "2026-08-16T00:00:00Z", "merge_commit_sha": manifest.Release.SourceCommit, "base": map[string]any{"ref": "main"}, "merged_by": map[string]any{"login": "owner", "type": "User"}}
+	writeResolverJSON(t, fixture.commitPullsPath, []any{pull})
+	writeResolverJSON(t, fixture.pullPath, pull)
 	return fixture
 }
 
@@ -399,6 +546,25 @@ func writeResolverJSON(t *testing.T, path string, value any) {
 	writeResolverFile(t, path, raw)
 }
 
+func writeResolverReleaseMetadata(t *testing.T, fixture resolverFixture, metadata map[string]any) {
+	t.Helper()
+	writeResolverJSON(t, fixture.metadataPath, metadata)
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{metadata})
+}
+
+func cloneResolverJSON(t *testing.T, value map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(raw, &clone); err != nil {
+		t.Fatal(err)
+	}
+	return clone
+}
+
 func (fixture resolverFixture) run(t *testing.T, powershell, factsPath, version string, allowUpgrade bool) (string, error) {
 	t.Helper()
 	wrapper := filepath.Join(fixture.directory, "invoke-resolver.ps1")
@@ -407,10 +573,20 @@ function Invoke-WebRequest {
     param([string]$Uri, $Headers, [string]$OutFile, [switch]$UseBasicParsing)
     Add-Content -LiteralPath $env:WORKFLOW_TEST_REQUEST_LOG -Value $Uri
     if ([string]::IsNullOrWhiteSpace($OutFile)) {
-        return [pscustomobject]@{ Content = [IO.File]::ReadAllText($env:WORKFLOW_TEST_METADATA) }
+		if ($Uri.StartsWith('https://api.github.com/repos/owner/platform/releases?per_page=100&page=', [StringComparison]::Ordinal)) {
+			$page = [int]$Uri.Substring($Uri.LastIndexOf('=') + 1)
+			$pages = @($env:WORKFLOW_TEST_RELEASE_PAGE_1, $env:WORKFLOW_TEST_RELEASE_PAGE_2, $env:WORKFLOW_TEST_RELEASE_PAGE_3)
+			if ($page -le $pages.Count) { $source = $pages[$page - 1] }
+			else { return [pscustomobject]@{ Content = '[]' } }
+		}
+		elseif ($Uri -match '/actions/runs/') { $source = $env:WORKFLOW_TEST_RUN }
+        elseif ($Uri -match '/commits/.+/pulls$') { $source = $env:WORKFLOW_TEST_COMMIT_PULLS }
+        elseif ($Uri -match '/pulls/[0-9]+$') { $source = $env:WORKFLOW_TEST_PULL }
+		elseif ($Uri -match '/releases/tags/') { $source = $env:WORKFLOW_TEST_METADATA }
+		else { throw "unexpected API request $Uri" }
+        return [pscustomobject]@{ Content = [IO.File]::ReadAllText($source) }
     }
-    if ($Uri.EndsWith('/platform-release.json.sig')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_SIGNATURE -Destination $OutFile }
-    elseif ($Uri.EndsWith('/platform-release.json')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
+	if ($Uri.EndsWith('/platform-release.json')) { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
     else { throw "unexpected download $Uri" }
 }
 $parameters = @{
@@ -428,8 +604,13 @@ if ($env:WORKFLOW_TEST_ALLOW_UPGRADE -eq '1') { $parameters.AllowUpgrade = $true
 	command.Env = append(os.Environ(),
 		"WORKFLOW_TEST_REQUEST_LOG="+fixture.requestLog,
 		"WORKFLOW_TEST_METADATA="+fixture.metadataPath,
+		"WORKFLOW_TEST_RELEASE_PAGE_1="+fixture.releasePagePaths[0],
+		"WORKFLOW_TEST_RELEASE_PAGE_2="+fixture.releasePagePaths[1],
+		"WORKFLOW_TEST_RELEASE_PAGE_3="+fixture.releasePagePaths[2],
 		"WORKFLOW_TEST_MANIFEST="+fixture.manifestPath,
-		"WORKFLOW_TEST_SIGNATURE="+fixture.signaturePath,
+		"WORKFLOW_TEST_RUN="+fixture.runPath,
+		"WORKFLOW_TEST_COMMIT_PULLS="+fixture.commitPullsPath,
+		"WORKFLOW_TEST_PULL="+fixture.pullPath,
 		"WORKFLOW_TEST_FACTS="+factsPath,
 		"WORKFLOW_TEST_VERSION="+version,
 		"WORKFLOW_TEST_ALLOW_UPGRADE="+allow,

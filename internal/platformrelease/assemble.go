@@ -3,11 +3,9 @@ package platformrelease
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -24,7 +22,6 @@ type AssembleOptions struct {
 	WorkflowExecutable string
 	PayloadDirectory   string
 	Manifest           Manifest
-	SigningKey         *ecdsa.PrivateKey
 }
 
 type Assembly struct {
@@ -38,12 +35,8 @@ type packageFile struct {
 }
 
 // Assemble builds a byte-reproducible Windows amd64 package and its canonical
-// release metadata. The detached ECDSA signature is intentionally not expected
-// to be byte-reproducible, but always verifies the same canonical manifest.
+// release metadata.
 func Assemble(options AssembleOptions) (Assembly, error) {
-	if options.SigningKey == nil {
-		return Assembly{}, errors.New("Platform Release signing key is required")
-	}
 	files, err := collectPackageFiles(options.WorkflowExecutable, options.PayloadDirectory)
 	if err != nil {
 		return Assembly{}, err
@@ -82,16 +75,11 @@ func Assemble(options AssembleOptions) (Assembly, error) {
 	if err != nil {
 		return Assembly{}, err
 	}
-	signature, err := Sign(manifestRaw, options.SigningKey)
-	if err != nil {
-		return Assembly{}, err
-	}
 	allFiles := map[string][]byte{
 		"workflow-windows-amd64.zip": archive,
 		"platform-sbom.spdx.json":    sbom,
 		"platform-provenance.json":   provenance,
 		"platform-release.json":      manifestRaw,
-		"platform-release.json.sig":  signature,
 	}
 	allFiles["SHA256SUMS"] = checksumFile(allFiles)
 	if err := os.MkdirAll(options.OutputDirectory, 0o755); err != nil {

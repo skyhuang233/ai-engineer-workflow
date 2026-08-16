@@ -176,7 +176,7 @@ func TestWorkerWorkflowsBindSBOMAndFailClosedOnFixableHighVulnerabilities(t *tes
 	}
 }
 
-func TestPlatformPublisherBindsSignedImmutableReleaseContract(t *testing.T) {
+func TestPlatformPublisherBindsGitHubHostedImmutableReleaseContractWithoutManagedKeys(t *testing.T) {
 	workflow := readWorkflow(t, ".github", "workflows", "publish-platform.yml")
 	for _, required := range []string{
 		`- "internal/setupcontract/**"`,
@@ -185,8 +185,7 @@ func TestPlatformPublisherBindsSignedImmutableReleaseContract(t *testing.T) {
 		"go test ./internal/setupcontract ./internal/platformrelease ./internal/doctor",
 		"GOOS: windows",
 		"GOARCH: amd64",
-		"PLATFORM_RELEASE_SIGNING_KEY_B64",
-		"platform-release.json.sig",
+		`GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`,
 		"platform-sbom.spdx.json",
 		"platform-provenance.json",
 		"workflow-windows-amd64.zip",
@@ -198,6 +197,15 @@ func TestPlatformPublisherBindsSignedImmutableReleaseContract(t *testing.T) {
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Platform publisher omits release contract %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"PLATFORM_RELEASE_SIGNING_KEY",
+		"platform-release.json.sig",
+		"-signing-key",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("Platform publisher still depends on a managed signing key or detached signature %q", forbidden)
 		}
 	}
 }
