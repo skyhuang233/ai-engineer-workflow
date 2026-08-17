@@ -93,7 +93,7 @@ try {
                 $manifestSkills = @($manifest.platform_setup_contract.workflow_skill_bundle.managed_skills | ForEach-Object { [string]$_ })
                 if ($plannedSkills.Count -ne $manifestSkills.Count) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" }
                 for ($index = 0; $index -lt $manifestSkills.Count; $index++) { if ($plannedSkills[$index] -ne $manifestSkills[$index]) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" } }
-                $plannedFiles = @([string]$effect.parameters.files_json | ConvertFrom-Json)
+                $plannedFiles = @([string]$effect.parameters.files_json | ConvertFrom-Json | ForEach-Object { $_ })
                 $manifestFiles = @($manifest.bundled_files | Where-Object { ([string]$_.path).StartsWith("skills/") })
                 if ($plannedFiles.Count -ne $manifestFiles.Count) { throw "Approved Setup Plan Workflow Skill Bundle payload differs from the verified manifest" }
                 for ($index = 0; $index -lt $manifestFiles.Count; $index++) {
