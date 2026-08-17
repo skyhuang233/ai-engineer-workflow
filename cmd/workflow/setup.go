@@ -97,6 +97,7 @@ func setupVerificationBlocked(err error, repairHint string, secrets ...string) s
 
 var (
 	verifyPlatformReadyForSetup         = verifyPlatformReadyReadOnly
+	verifyPlatformReadyForApply         = verifyPlatformReadyTracked
 	verifyPlatformPreconditionsForSetup = verifySatisfiedPlatformComponents
 	verifyRecordedAdmissionForSetup     = verifyRecordedAdmissionReadOnly
 	resolveCodexAuthForSetup            = codexauth.ResolveChatGPT
@@ -642,7 +643,7 @@ func runSetupApply(args []string, input io.Reader, output io.Writer) error {
 		}
 		defer database.Close()
 		tracker := &platformCleanupTracker{database: database, plan: currentPlan, digest: digest, effectID: expected.ID}
-		return verifyPlatformReadyTracked(ctx, database, layout, tracker)
+		return verifyPlatformReadyForApply(ctx, database, layout, tracker)
 	}}
 	result, applyErr := engine.Apply(context.Background(), raw, *approved)
 	writeErr := writeSetupResponse(output, setupResponse{Status: string(result.Status), Result: result})
