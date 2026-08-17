@@ -98,6 +98,9 @@ type PreconditionChecker interface {
 type PreLayoutPreconditionChecker interface {
 	CheckPreLayoutPrecondition(context.Context, setupcontract.Precondition) error
 }
+type PostLayoutPreconditionChecker interface {
+	CheckPostLayoutPrecondition(context.Context, setupcontract.Precondition) error
+}
 type EffectResultRestorer interface {
 	RestoreEffectResults([]setupcontract.EffectResult) error
 }
@@ -175,6 +178,19 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 	}
 	if err := layout.Ensure(); err != nil {
 		return setupcontract.ExecutionResult{}, err
+	}
+	// A fresh Windows Workflow Home can inherit the elevated process token's
+	// default owner instead of the approved current user. Give the host adapter
+	// a chance to bind the newly created root before any durable state is opened.
+	for _, precondition := range plan.Preconditions {
+		if precondition.Kind != "host_identity" {
+			continue
+		}
+		if checker, ok := e.Adapter.(PostLayoutPreconditionChecker); ok {
+			if err := checker.CheckPostLayoutPrecondition(ctx, precondition); err != nil {
+				return setupcontract.ExecutionResult{}, err
+			}
+		}
 	}
 	lock, err := startup.AcquireWorkflowHomeLock(layout.Root)
 	if err != nil {

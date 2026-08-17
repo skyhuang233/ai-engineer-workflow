@@ -52,6 +52,7 @@ type HostAdapter struct {
 	RemoveCleanupContainer       func(context.Context, string) error
 	DeleteCleanupBranchWithLease func(context.Context, string, string, string, onboarding.GitCredential) error
 	RecordCleanupObligation      func(context.Context, setupcontract.Effect, store.SetupCleanupObligation) error
+	freshWorkflowHome            bool
 }
 
 const onboardingMergeHeadEvidence = "onboarding_merge_head="
@@ -1088,7 +1089,7 @@ func (a HostAdapter) CheckPrecondition(ctx context.Context, value setupcontract.
 // user without reading or creating Workflow Home. CheckPrecondition repeats
 // this identity check after layout creation and additionally verifies its real
 // filesystem owner.
-func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupcontract.Precondition) error {
+func (a *HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupcontract.Precondition) error {
 	if err := setupcontract.ValidatePreconditionForExecution(value); err != nil {
 		return err
 	}
@@ -1102,7 +1103,12 @@ func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupco
 	info, err := os.Stat(a.Layout.Root)
 	if errors.Is(err, os.ErrNotExist) {
 		// A fresh Workflow Home has no owner to inspect yet. Layout creation will
-		// make it current-user-owned and the ordinary precondition pass verifies it.
+		// explicitly bind it to the approved current user before durable state is
+		// opened, and the ordinary precondition pass verifies that binding again.
+		if !strings.EqualFold(expected.WorkflowHomeOwnerID, expected.UserID) {
+			return errors.New("approved fresh Workflow Home owner identity is not the current Windows user")
+		}
+		a.freshWorkflowHome = true
 		return nil
 	}
 	if err != nil {
@@ -1111,6 +1117,7 @@ func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupco
 	if !info.IsDir() {
 		return errors.New("existing Workflow Home is not a directory")
 	}
+	a.freshWorkflowHome = false
 	ownerID, err := workflowHomeOwnerIdentity(a.Layout.Root)
 	if err != nil {
 		return fmt.Errorf("read existing Workflow Home owner identity before layout use: %w", err)
@@ -1120,6 +1127,39 @@ func (a HostAdapter) CheckPreLayoutPrecondition(_ context.Context, value setupco
 	}
 	if !strings.EqualFold(ownerID, expected.WorkflowHomeOwnerID) {
 		return errors.New("existing Workflow Home owner identity drifted from the approved plan")
+	}
+	return nil
+}
+
+// CheckPostLayoutPrecondition assigns the approved current-user owner only to
+// a Workflow Home that this apply observed as absent before layout creation.
+// Existing homes are observation-only and were already fenced above.
+func (a *HostAdapter) CheckPostLayoutPrecondition(_ context.Context, value setupcontract.Precondition) error {
+	if !a.freshWorkflowHome {
+		return nil
+	}
+	expected, err := a.checkHostIdentityBeforeLayout(value)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(expected.WorkflowHomeOwnerID, expected.UserID) {
+		return errors.New("approved fresh Workflow Home owner identity is not the current Windows user")
+	}
+	ownerID, err := workflowHomeOwnerIdentity(a.Layout.Root)
+	if err != nil {
+		return fmt.Errorf("read fresh Workflow Home owner identity: %w", err)
+	}
+	if !strings.EqualFold(ownerID, expected.UserID) {
+		if err := setWorkflowHomeOwnerIdentity(a.Layout.Root, expected.UserID); err != nil {
+			return fmt.Errorf("bind fresh Workflow Home to the approved current Windows user: %w", err)
+		}
+		ownerID, err = workflowHomeOwnerIdentity(a.Layout.Root)
+		if err != nil {
+			return fmt.Errorf("verify fresh Workflow Home owner identity: %w", err)
+		}
+	}
+	if !strings.EqualFold(ownerID, expected.UserID) {
+		return errors.New("fresh Workflow Home owner identity differs from the approved current Windows user")
 	}
 	return nil
 }
