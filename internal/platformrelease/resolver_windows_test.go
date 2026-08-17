@@ -1,9 +1,11 @@
 package platformrelease
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,9 +199,20 @@ func TestResolvePlatformReleaseRequiresExactVersionWhenExistingInstallLostBothPi
 	if err != nil {
 		t.Skip("Windows PowerShell 5.1 is unavailable")
 	}
-	fixture := newResolverFixture(t, "1.2.3")
+	legacyBundle := `[{"path":"bin/workflow.exe","sha256":"legacy"}]`
+	fixture := newResolverFixtureWithCandidateInspection(t, "1.2.3", map[string]any{
+		"installation_recorded":            true,
+		"version":                          "1.2.3",
+		"release_manifest_digest":          strings.Repeat("1", 64),
+		"platform_setup_contract_digest":   strings.Repeat("2", 64),
+		"workflow_cli_sha256":              strings.Repeat("3", 64),
+		"release_bundled_files_json":       legacyBundle,
+		"release_bundled_files_digest":     resolverDigest([]byte(legacyBundle)),
+		"control_plane_plan_digest_sha256": "",
+	})
 	factsPath := filepath.Join(fixture.directory, "host-facts.json")
-	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"workflow":{"installed":true,"trust_state":"repair_required","diagnostic":"Bootstrap Platform Release primary and backup pins are missing"},"platform":{"installation_recorded":false}}`))
+	facts, _ := json.Marshal(map[string]any{"schema_version": 1, "workflow_home": filepath.Join(fixture.directory, "workflow-home"), "workflow": map[string]any{"installed": true, "trust_state": "repair_required", "diagnostic": "Bootstrap Platform Release primary and backup pins are missing"}, "platform": map[string]any{"installation_recorded": false}})
+	writeResolverFile(t, factsPath, facts)
 
 	output, runErr := fixture.run(t, powershell, factsPath, "", false)
 	if runErr == nil || !strings.Contains(output, "-Version <exact-installed-version>") || strings.Contains(output, `"manifest_path"`) {
@@ -214,13 +227,65 @@ func TestResolvePlatformReleaseRequiresExactVersionWhenExistingInstallLostBothPi
 		Selection      string `json:"selection"`
 		ReleaseVersion string `json:"release_version"`
 	}
-	if decodeErr := json.Unmarshal([]byte(output), &result); runErr != nil || decodeErr != nil || result.Selection != "explicit-version" || result.ReleaseVersion != "1.2.3" {
+	if decodeErr := json.Unmarshal([]byte(output), &result); runErr != nil || decodeErr != nil || result.Selection != "durable-repair" || result.ReleaseVersion != "1.2.3" {
 		t.Fatalf("explicit exact-version recovery failed: err=%v decode=%v output=%s", runErr, decodeErr, output)
 	}
 	requests, err := os.ReadFile(fixture.requestLog)
 	wantMetadataURL := "https://api.github.com/repos/owner/platform/releases/tags/platform-v1.2.3"
 	if err != nil || !strings.Contains(string(requests), wantMetadataURL) || strings.Contains(string(requests), "/releases/latest") {
 		t.Fatalf("exact-version recovery did not stay on the immutable requested tag: err=%v requests=%q", err, requests)
+	}
+}
+
+func TestResolvePlatformReleaseRecoversPinlessLegacyInstallationForExplicitUpgrade(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	legacy := map[string]any{
+		"installation_recorded":            true,
+		"version":                          "1.2.2",
+		"release_manifest_digest":          strings.Repeat("1", 64),
+		"platform_setup_contract_digest":   strings.Repeat("2", 64),
+		"workflow_cli_sha256":              strings.Repeat("3", 64),
+		"release_bundled_files_json":       `[{"path":"bin/workflow.exe","sha256":"legacy"}]`,
+		"release_bundled_files_digest":     resolverDigest([]byte(`[{"path":"bin/workflow.exe","sha256":"legacy"}]`)),
+		"control_plane_plan_digest_sha256": "",
+	}
+	fixture := newResolverFixtureWithCandidateInspection(t, "1.2.3", legacy)
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	workflowHome := filepath.Join(fixture.directory, "workflow-home")
+	facts, _ := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"workflow_home":  workflowHome,
+		"workflow":       map[string]any{"installed": true, "trust_state": "repair_required"},
+		"platform":       map[string]any{"installation_recorded": false},
+	})
+	writeResolverFile(t, factsPath, facts)
+
+	output, runErr := fixture.run(t, powershell, factsPath, "1.2.3", true)
+	var result struct {
+		Selection     string `json:"selection"`
+		HostFactsPath string `json:"host_facts_path"`
+	}
+	if decodeErr := json.Unmarshal([]byte(output), &result); runErr != nil || decodeErr != nil || result.Selection != "explicit-upgrade" || result.HostFactsPath == "" || result.HostFactsPath == factsPath {
+		t.Fatalf("pinless legacy upgrade was not recovered through the verified candidate CLI: run=%v decode=%v result=%#v output=%s", runErr, decodeErr, result, output)
+	}
+	augmentedRaw, err := os.ReadFile(result.HostFactsPath)
+	var augmented struct {
+		Platform map[string]any `json:"platform"`
+	}
+	if err != nil || json.Unmarshal(augmentedRaw, &augmented) != nil || augmented.Platform["installation_recorded"] != true || augmented.Platform["version"] != "1.2.2" || augmented.Platform["control_plane_plan_digest_sha256"] != "" {
+		t.Fatalf("resolver did not retain the exact legacy installation for planning: err=%v facts=%s", err, augmentedRaw)
+	}
+	requests, err := os.ReadFile(fixture.requestLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, assetID := range []string{"/assets/1", "/assets/2", "/assets/3"} {
+		if !strings.Contains(string(requests), assetID) {
+			t.Fatalf("pinless recovery did not verify every required candidate asset %s: %q", assetID, requests)
+		}
 	}
 }
 
@@ -426,10 +491,75 @@ type resolverFixture struct {
 	metadataPath     string
 	requestLog       string
 	releasePagePaths []string
+	checksumPath     string
+	archivePath      string
+	inspectionPath   string
 }
 
 func newResolverFixture(t *testing.T, version string) resolverFixture {
 	return newResolverFixtureWithMutation(t, version, nil)
+}
+
+func newResolverFixtureWithCandidateInspection(t *testing.T, version string, platform map[string]any) resolverFixture {
+	t.Helper()
+	buildDirectory := t.TempDir()
+	sourcePath := filepath.Join(buildDirectory, "fake-workflow.go")
+	executablePath := filepath.Join(buildDirectory, "workflow.exe")
+	program := fmt.Sprintf(`package main
+import ("fmt"; "os"; "path/filepath"; "strings")
+func main() {
+ args := strings.Join(os.Args[1:], " ")
+ if args == "version" { fmt.Print("workflow %s\n"); return }
+ if strings.HasPrefix(args, "setup inspect-platform-installation --workflow-home ") { raw, err := os.ReadFile(os.Getenv("WORKFLOW_TEST_INSPECTION")); if err != nil { panic(err) }; os.Stdout.Write(raw); return }
+ fmt.Fprintf(os.Stderr, "unexpected %%s invocation: %%s", filepath.Base(os.Args[0]), args); os.Exit(2)
+}
+`, version)
+	writeResolverFile(t, sourcePath, []byte(program))
+	if output, err := exec.Command("go", "build", "-o", executablePath, sourcePath).CombinedOutput(); err != nil {
+		t.Fatalf("build resolver candidate CLI: %v (%s)", err, output)
+	}
+	executable, err := os.ReadFile(executablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executableSum := sha256.Sum256(executable)
+	fixture := newResolverFixtureWithMutation(t, version, func(manifest *Manifest) {
+		for index := range manifest.BundledFiles {
+			if manifest.BundledFiles[index].Path == "bin/workflow.exe" {
+				manifest.BundledFiles[index].SHA256 = hex.EncodeToString(executableSum[:])
+			}
+		}
+	})
+	fixture.archivePath = filepath.Join(fixture.directory, "workflow-windows-amd64.zip")
+	archiveFile, err := os.Create(fixture.archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveWriter := zip.NewWriter(archiveFile)
+	entry, err := archiveWriter.Create("bin/workflow.exe")
+	if err == nil {
+		_, err = entry.Write(executable)
+	}
+	if closeErr := archiveWriter.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := archiveFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := os.ReadFile(fixture.archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveSum := sha256.Sum256(archive)
+	fixture.checksumPath = filepath.Join(fixture.directory, "SHA256SUMS")
+	writeResolverFile(t, fixture.checksumPath, []byte(hex.EncodeToString(archiveSum[:])+"  workflow-windows-amd64.zip\n"))
+	fixture.inspectionPath = filepath.Join(fixture.directory, "platform-inspection.json")
+	inspection, _ := json.Marshal(map[string]any{"status": "ready", "result": map[string]any{"platform": platform}})
+	writeResolverFile(t, fixture.inspectionPath, inspection)
+	return fixture
 }
 
 func newResolverFixtureWithMutation(t *testing.T, version string, mutate func(*Manifest)) resolverFixture {
@@ -550,7 +680,9 @@ function Invoke-WebRequest {
 		else { throw "unexpected API request $Uri" }
         return [pscustomobject]@{ Content = [IO.File]::ReadAllText($source) }
     }
-	if ($Uri -match '/releases/assets/[0-9]+$') { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
+	if ($Uri -match '/releases/assets/1$') { Copy-Item -LiteralPath $env:WORKFLOW_TEST_CHECKSUM -Destination $OutFile }
+	elseif ($Uri -match '/releases/assets/2$') { Copy-Item -LiteralPath $env:WORKFLOW_TEST_MANIFEST -Destination $OutFile }
+	elseif ($Uri -match '/releases/assets/3$') { Copy-Item -LiteralPath $env:WORKFLOW_TEST_ARCHIVE -Destination $OutFile }
 	else { throw "unexpected download $Uri" }
 }
 $parameters = @{
@@ -573,6 +705,9 @@ if ($env:WORKFLOW_TEST_ALLOW_UPGRADE -eq '1') { $parameters.AllowUpgrade = $true
 		"WORKFLOW_TEST_RELEASE_PAGE_2="+fixture.releasePagePaths[1],
 		"WORKFLOW_TEST_RELEASE_PAGE_3="+fixture.releasePagePaths[2],
 		"WORKFLOW_TEST_MANIFEST="+fixture.manifestPath,
+		"WORKFLOW_TEST_CHECKSUM="+fixture.checksumPath,
+		"WORKFLOW_TEST_ARCHIVE="+fixture.archivePath,
+		"WORKFLOW_TEST_INSPECTION="+fixture.inspectionPath,
 		"WORKFLOW_TEST_FACTS="+factsPath,
 		"WORKFLOW_TEST_VERSION="+version,
 		"WORKFLOW_TEST_ALLOW_UPGRADE="+allow,

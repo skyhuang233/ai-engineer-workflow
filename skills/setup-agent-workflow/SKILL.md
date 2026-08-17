@@ -91,15 +91,15 @@ Treat the current directory as the target. Keep discovery read-only and use the 
 
    - For a true fresh installation, omit `Version` only when the user selected latest stable.
    - When either verified durable pin is available, the verified backup pin automatically supplies exact repair authority if the primary is missing; omit `Version` for that exact pin repair. The resolver selects the pinned release and the later approved apply recreates the missing primary or backup.
-   - When both verified pins are missing while the Workflow CLI exists, ask the user to confirm the exact installed version. Add `$releaseArguments.Version = <confirmed-exact-installed-version>` and do not add `AllowUpgrade`; never use latest-stable selection for a pinless existing installation.
+   - When both verified pins are missing while the Workflow CLI exists, never use latest-stable selection. For an exact repair, ask the user to confirm the exact installed version, add `$releaseArguments.Version = <confirmed-exact-installed-version>`, and omit `AllowUpgrade`. For an explicitly requested upgrade, add the exact target version and `AllowUpgrade`; the resolver must recover the prior Platform Installation through the verified target CLI and prove that the target version is greater before it emits planning inputs.
 
-   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they do not rewrite either pin. Only the later exact-digest apply may repair durable state. The resolver accepts the fixed repository's immutable stable release and downloads its functional `platform-release.json` through the authenticated Release Asset API. The installer uses the same explicit PAT to download `SHA256SUMS` and `workflow-windows-amd64.zip` through that API, and accepts the ZIP only when its SHA-256 matches that file. It does not consult SBOM, provenance, a signature, a `gh` login, or a persisted release credential.
+   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they do not rewrite either pin or the Platform Installation. The resolver accepts the fixed repository's immutable stable release and downloads its functional `platform-release.json` through the authenticated Release Asset API. For a pinless existing CLI only, it also verifies `SHA256SUMS` and `workflow-windows-amd64.zip`, then runs the verified target CLI's strictly read-only `setup inspect-platform-installation` command to recover the exact prior installation into `$resolvedRelease.host_facts_path`. This is the only authority for a pinless installation transition; never copy or infer old pins. The installer uses the same explicit PAT to download and independently verify the exact archive again. Neither path consults SBOM, provenance, a signature, a `gh` login, or a persisted release credential.
 
    Produce the Platform Plan only from the resolver output:
 
    ```powershell
    $platformPlanPath = Join-Path $setupTaskRoot "platform-plan.json"
-   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -HostFactsPath $hostFactsPath -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization> -GitHubPATFingerprintSHA256 <verified-fingerprint>
+   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -HostFactsPath $resolvedRelease.host_facts_path -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization> -GitHubPATFingerprintSHA256 <verified-fingerprint>
    ```
 
    Pass `-AllowUpgrade` to the planner only for the same explicitly confirmed upgrade. If it returns `plan_required`, show its complete readable projection and ask for one approval of the displayed SHA-256 digest.
@@ -109,7 +109,7 @@ Treat the current directory as the target. Keep discovery read-only and use the 
    <start installer with the same BOM-free standard-input PAT writer>
    ```
 
-   It checks the approved plan before downloading the exact checksummed platform archive. Allow UAC, Docker first launch, and Codex login restoration only when the corresponding approved plan declares them; do not ask for the PAT again. The installer passes the same in-memory PAT to `workflow setup apply` with a BOM-free standard-input writer; keep it out of arguments and ordinary output, then discard it when the Setup invocation finishes or fails. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
+   It checks the approved plan before downloading the exact checksummed platform archive. `workflow setup apply` verifies any prior Platform Installation transition before the first effect, so a drifted upgrade cannot replace the CLI and leave the old installation record behind. Allow UAC, Docker first launch, and Codex login restoration only when the corresponding approved plan declares them; do not ask for the PAT again. The installer passes the same in-memory PAT to `workflow setup apply` with a BOM-free standard-input writer; keep it out of arguments and ordinary output, then discard it when the Setup invocation finishes or fails. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
 4. Use the installed CLI for the remaining deterministic loop:
 
    ```powershell

@@ -569,6 +569,73 @@ func TestSetupInspectPlatformReportsOldSchemaRepairBlockerWithoutMigrating(t *te
 	}
 }
 
+func TestSetupInspectPlatformInstallationReadsLegacyRecordWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "home"))
+	if err != nil || layout.Ensure() != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(layout.State, "workflow.db")
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBundleJSON := `[{"path":"bin/workflow.exe","sha256":"legacy"}]`
+	_, legacyBundleDigest, err := setupcontract.Canonicalize([]byte(legacyBundleJSON))
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	legacy := store.PlatformInstallation{
+		PlatformVersion:                   "0.1.2",
+		ReleaseManifestDigestSHA256:       strings.Repeat("1", 64),
+		PlatformSetupContractDigestSHA256: strings.Repeat("2", 64),
+		WorkflowCLISHA256:                 strings.Repeat("3", 64),
+		ReleaseBundledFilesJSON:           legacyBundleJSON,
+		ReleaseBundledFilesDigestSHA256:   legacyBundleDigest,
+		ControlPlanePlanDigestSHA256:      "",
+		WorkflowHome:                      layout.Root,
+		InstalledAt:                       time.Now().UTC(),
+		VerifiedAt:                        time.Now().UTC(),
+	}
+	if err := database.RecordPlatformInstallation(ctx, legacy); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beforeDatabase, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeDigest := sha256.Sum256(beforeDatabase)
+	var output bytes.Buffer
+	if err := runSetupInspectPlatformInstallation([]string{"--workflow-home", layout.Root}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Status string `json:"status"`
+		Result struct {
+			Platform struct {
+				InstallationRecorded   bool   `json:"installation_recorded"`
+				Version                string `json:"version"`
+				ControlPlanePlanDigest string `json:"control_plane_plan_digest_sha256"`
+			} `json:"platform"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &response); err != nil || response.Status != "ready" || !response.Result.Platform.InstallationRecorded || response.Result.Platform.Version != "0.1.2" || response.Result.Platform.ControlPlanePlanDigest != "" {
+		t.Fatalf("legacy installation inspection response=%s err=%v", output.String(), err)
+	}
+	afterDatabase, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDigest := sha256.Sum256(afterDatabase); afterDigest != beforeDigest {
+		t.Fatalf("setup inspect-platform-installation changed the durable workflow database")
+	}
+}
+
 type setupPlanTreeEntry struct {
 	Mode    os.FileMode
 	Size    int64

@@ -854,6 +854,7 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationTransition(t *testing.T
 						{ID: "release", Kind: "platform_release", Subject: "platform-v2.0.0", Expected: repeat("5", 64)},
 						{ID: "contract", Kind: "platform_setup_contract", Subject: "platform-v2.0.0", Expected: contractDigest},
 					}, Effects: []setupcontract.Effect{
+						{ID: "cli", Kind: "platform_cli", Subject: filepath.Join(layout.Bin, "workflow.exe"), Action: "install", Parameters: map[string]string{"version": transition.targetVersion, "sha256": cliDigest, "release_manifest_digest": repeat("5", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
 						{ID: "record", Kind: "platform_installation", Subject: layout.Root, Action: "record", Parameters: map[string]string{"version": transition.targetVersion, "release_manifest_digest": repeat("5", 64), "platform_setup_contract_json": string(contractCanonical), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_json": string(bundleCanonical), "release_bundled_files_digest": bundleDigest}},
 						{ID: "control-plane", Kind: "control_plane", Subject: layout.Root, Action: "start", Parameters: map[string]string{"version": transition.targetVersion, "release_manifest_digest": repeat("5", 64), "platform_setup_contract_digest": contractDigest, "workflow_cli_sha256": cliDigest, "release_bundled_files_digest": bundleDigest}},
 					}, ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: layout.Root, Expected: "ready"}}}
@@ -872,6 +873,9 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationTransition(t *testing.T
 					result, applyErr := engine.Apply(ctx, raw, digest)
 					if result.Status != test.wantStatus || applyErr == nil {
 						t.Fatalf("result=%#v err=%v", result, applyErr)
+					}
+					if !test.authorized && len(adapter.applied) != 0 {
+						t.Fatalf("unapproved installation transition mutated earlier effects: %v", adapter.applied)
 					}
 					if test.authorized {
 						database, err = store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
