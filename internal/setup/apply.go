@@ -278,7 +278,7 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		} else if precondition.Kind == "platform_setup_contract" {
 			checkErr = checkPlatformSetupContractPrecondition(plan, precondition)
 		} else if precondition.Kind == "platform_installation" {
-			checkErr = checkPlatformInstallationPrecondition(ctx, database, plan, precondition)
+			checkErr = checkPlatformInstallationPrecondition(ctx, database, plan, digest, precondition)
 		} else if checker, ok := e.Adapter.(PreconditionChecker); ok {
 			checkErr = checker.CheckPrecondition(ctx, precondition)
 		} else {
@@ -726,7 +726,7 @@ func checkPlatformSetupContractPrecondition(plan setupcontract.Plan, preconditio
 	return errors.New("Platform Setup Contract precondition is not bound to an approved platform effect")
 }
 
-func checkPlatformInstallationPrecondition(ctx context.Context, database *store.Store, plan setupcontract.Plan, precondition setupcontract.Precondition) error {
+func checkPlatformInstallationPrecondition(ctx context.Context, database *store.Store, plan setupcontract.Plan, planDigest string, precondition setupcontract.Precondition) error {
 	if plan.Kind != setupcontract.PlatformBootstrap || precondition.Subject != plan.Target.WorkflowHome {
 		return errors.New("Platform Installation transition precondition is not bound to its Workflow Home")
 	}
@@ -756,9 +756,9 @@ func checkPlatformInstallationPrecondition(ctx context.Context, database *store.
 		return nil
 	}
 	// A previous attempt may have durably recorded the approved installation
-	// before a later Control Plane effect failed. Accept only the exact state
-	// that this same approved record effect writes (authorization is still
-	// blank at that boundary); any third state remains drift.
+	// before a later effect failed, or authorized that installation immediately
+	// before a failed Control Plane launch. Accept only those two exact states
+	// from the same approved plan; any third state remains drift.
 	approvedNew := store.PlatformInstallation{
 		PlatformVersion:                   approvedEffect.Parameters["version"],
 		ReleaseManifestDigestSHA256:       approvedEffect.Parameters["release_manifest_digest"],
@@ -767,10 +767,13 @@ func checkPlatformInstallationPrecondition(ctx context.Context, database *store.
 		ReleaseBundledFilesDigestSHA256:   approvedEffect.Parameters["release_bundled_files_digest"],
 	}
 	_, approvedNewDigest, newErr := setupcontract.Canonicalize(platformInstallationStateJSON(approvedNew))
-	if newErr == nil && actualDigest == approvedNewDigest && platformInstallationEffectPreviouslySatisfied(ctx, database, plan.PlanID, approvedEffect.ID) {
+	authorizedNew := approvedNew
+	authorizedNew.ControlPlanePlanDigestSHA256 = planDigest
+	_, authorizedNewDigest, authorizationErr := setupcontract.Canonicalize(platformInstallationStateJSON(authorizedNew))
+	if newErr == nil && authorizationErr == nil && (actualDigest == approvedNewDigest || actualDigest == authorizedNewDigest) && platformInstallationEffectPreviouslySatisfied(ctx, database, plan.PlanID, approvedEffect.ID) {
 		return nil
 	}
-	return errors.Join(errors.New("Platform Installation transition source pins drifted"), newErr)
+	return errors.Join(errors.New("Platform Installation transition source pins drifted"), newErr, authorizationErr)
 }
 
 func platformInstallationEffectPreviouslySatisfied(ctx context.Context, database *store.Store, planID, effectID string) bool {

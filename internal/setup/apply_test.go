@@ -879,7 +879,7 @@ func TestEngineAppliesOnlyDigestBoundPlatformInstallationTransition(t *testing.T
 							t.Fatal(err)
 						}
 						got, err := database.PlatformInstallation(ctx)
-						if err != nil || got.PlatformVersion != transition.targetVersion || got.ReleaseManifestDigestSHA256 != repeat("5", 64) || got.ControlPlanePlanDigestSHA256 != "" {
+						if err != nil || got.PlatformVersion != transition.targetVersion || got.ReleaseManifestDigestSHA256 != repeat("5", 64) || got.ControlPlanePlanDigestSHA256 != digest {
 							t.Fatalf("upgraded installation=%#v err=%v", got, err)
 						}
 						if err := database.Close(); err != nil {
