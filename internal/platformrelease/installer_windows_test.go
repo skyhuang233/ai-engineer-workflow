@@ -103,7 +103,12 @@ func main() {
 	manifest.PlatformSetup.SkillBundle.ManagedSkills = []string{"implement"}
 	cliSum := sha256.Sum256(executableBytes)
 	skillSum := sha256.Sum256([]byte("# implement\n"))
-	manifest.BundledFiles = []BundledFile{{Path: "bin/workflow.exe", SHA256: hex.EncodeToString(cliSum[:])}, {Path: "skills/implement/SKILL.md", SHA256: hex.EncodeToString(skillSum[:])}}
+	referenceSum := sha256.Sum256([]byte("# guide\n"))
+	manifest.BundledFiles = []BundledFile{
+		{Path: "bin/workflow.exe", SHA256: hex.EncodeToString(cliSum[:])},
+		{Path: "skills/implement/SKILL.md", SHA256: hex.EncodeToString(skillSum[:])},
+		{Path: "skills/implement/references/guide.md", SHA256: hex.EncodeToString(referenceSum[:])},
+	}
 	manifest.Provenance.Subjects = manifest.Artifacts
 	raw, _, err := manifest.Canonical()
 	if err != nil {
