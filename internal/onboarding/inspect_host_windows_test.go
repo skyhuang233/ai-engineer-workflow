@@ -228,7 +228,10 @@ func main() { fmt.Fprintln(os.Stderr, "fatal: kein Git-Repository (lokalisierte 
 	}
 	_, currentFile, _, _ := runtime.Caller(0)
 	script := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", "..", "skills", "setup-agent-workflow", "scripts", "inspect-host.ps1"))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Leave the product's 15-second external-command fence in charge of hang
+	// detection; the test harness must also allow for a cold PowerShell/module
+	// start on a clean Windows runner.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Repository", directory, "-GitProbeOnly")
 	for _, entry := range os.Environ() {

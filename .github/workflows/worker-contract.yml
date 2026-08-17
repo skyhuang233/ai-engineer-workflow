@@ -26,7 +26,10 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Test Control Plane
-        run: go test ./...
+        # Windows PowerShell integration probes carry intentional 10-15 second
+        # child-process deadlines. Serialize packages so unrelated compile- and
+        # agent-heavy packages cannot starve those probes on the shared runner.
+        run: go test -p 1 ./...
       - name: Vet Control Plane
         run: go vet ./...
 

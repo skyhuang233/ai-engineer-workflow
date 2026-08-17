@@ -129,7 +129,12 @@ func engineBehaviors() map[setupeffect.EngineSemantics]engineBehavior {
 		},
 		setupeffect.ControlPlaneEffect: {
 			readback: standardReadback,
-			apply:    standardApply,
+			apply: func(run *effectExecution, effect setupcontract.Effect) error {
+				if err := authorizeControlPlane(run.ctx, run.database, effect, run.digest); err != nil {
+					return err
+				}
+				return standardApply(run, effect)
+			},
 			afterSatisfied: func(run *effectExecution, effect setupcontract.Effect, _ bool) error {
 				return authorizeControlPlane(run.ctx, run.database, effect, run.digest)
 			},

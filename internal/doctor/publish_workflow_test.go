@@ -144,7 +144,7 @@ func TestIntegrationWorkflowSupportsPostVisibilityDispatch(t *testing.T) {
 
 func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
-	for _, required := range []string{`- "**/*.go"`, `- "go.mod"`, `- "go.sum"`, "go test ./...", "go vet ./..."} {
+	for _, required := range []string{`- "**/*.go"`, `- "go.mod"`, `- "go.sum"`, "go test -p 1 ./...", "go vet ./..."} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("worker-contract does not preserve Control Plane test coverage: missing %q", required)
 		}
@@ -156,7 +156,7 @@ func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 	}
 	controlPlaneJob := text[controlPlaneStart:workerContractStart]
 	workerContractJob := text[workerContractStart:]
-	for _, required := range []string{"runs-on: windows-latest", "TEMP: 'C:\\t'", "TMP: 'C:\\t'", "go test ./...", "go vet ./..."} {
+	for _, required := range []string{"runs-on: windows-latest", "TEMP: 'C:\\t'", "TMP: 'C:\\t'", "go test -p 1 ./...", "go vet ./..."} {
 		if !strings.Contains(controlPlaneJob, required) {
 			t.Fatalf("Windows Control Plane job is missing %q", required)
 		}
