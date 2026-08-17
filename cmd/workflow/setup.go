@@ -107,7 +107,7 @@ var (
 
 func setupCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("setup requires plan, apply, inspect-platform, or verify")
+		return errors.New("setup requires plan, apply, inspect-platform, inspect-platform-installation, or verify")
 	}
 	switch args[0] {
 	case "plan":
@@ -118,9 +118,39 @@ func setupCommand(args []string) error {
 		return runSetupVerify(args[1:], os.Stdout)
 	case "inspect-platform":
 		return runSetupInspectPlatform(args[1:], os.Stdout)
+	case "inspect-platform-installation":
+		return runSetupInspectPlatformInstallation(args[1:], os.Stdout)
 	default:
 		return fmt.Errorf("unknown setup command %q", args[0])
 	}
+}
+
+func runSetupInspectPlatformInstallation(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("setup inspect-platform-installation", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	homeOverride := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	layout, err := workflowhome.Resolve(*homeOverride)
+	if err != nil {
+		return err
+	}
+	database, err := store.OpenReadOnly(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	if err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
+	}
+	defer database.Close()
+	installation, err := database.PlatformInstallation(context.Background())
+	if err != nil {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: err.Error()})
+	}
+	sameHome, err := workflowhome.SameFilesystemPath(installation.WorkflowHome, layout.Root)
+	if err != nil || !sameHome {
+		return writeSetupResponse(output, setupResponse{Status: "blocked", Blocker: "Platform Installation Workflow Home differs from the inspected target"})
+	}
+	result := platformInspectionFromInstallation(installation)
+	return writeSetupResponse(output, setupResponse{Status: "ready", Result: result})
 }
 
 type platformInspection struct {
@@ -152,6 +182,19 @@ type platformInspection struct {
 		FingerprintSHA256 string `json:"fingerprint_sha256,omitempty"`
 		Diagnostic        string `json:"diagnostic,omitempty"`
 	} `json:"codex_auth"`
+}
+
+func platformInspectionFromInstallation(installation store.PlatformInstallation) platformInspection {
+	var facts platformInspection
+	facts.Platform.InstallationRecorded = true
+	facts.Platform.Version = installation.PlatformVersion
+	facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
+	facts.Platform.PlatformSetupContractDigest = installation.PlatformSetupContractDigestSHA256
+	facts.Platform.WorkflowCLISHA256 = installation.WorkflowCLISHA256
+	facts.Platform.ReleaseBundledFilesJSON = installation.ReleaseBundledFilesJSON
+	facts.Platform.ReleaseBundledFilesDigest = installation.ReleaseBundledFilesDigestSHA256
+	facts.Platform.ControlPlanePlanDigest = installation.ControlPlanePlanDigestSHA256
+	return facts
 }
 
 func runSetupInspectPlatform(args []string, output io.Writer) error {
@@ -201,14 +244,7 @@ func inspectPlatform(ctx context.Context, database *store.Store, layout workflow
 	var pins platformPins
 	if installationErr == nil {
 		pins = platformPins{Version: installation.PlatformVersion, ReleaseManifestDigest: installation.ReleaseManifestDigestSHA256, PlatformSetupContractDigest: installation.PlatformSetupContractDigestSHA256, WorkflowCLISHA256: installation.WorkflowCLISHA256, ReleaseBundledFilesDigest: installation.ReleaseBundledFilesDigestSHA256}
-		facts.Platform.InstallationRecorded = true
-		facts.Platform.Version = installation.PlatformVersion
-		facts.Platform.ReleaseManifestDigest = installation.ReleaseManifestDigestSHA256
-		facts.Platform.PlatformSetupContractDigest = installation.PlatformSetupContractDigestSHA256
-		facts.Platform.WorkflowCLISHA256 = installation.WorkflowCLISHA256
-		facts.Platform.ReleaseBundledFilesJSON = installation.ReleaseBundledFilesJSON
-		facts.Platform.ReleaseBundledFilesDigest = installation.ReleaseBundledFilesDigestSHA256
-		facts.Platform.ControlPlanePlanDigest = installation.ControlPlanePlanDigestSHA256
+		facts = platformInspectionFromInstallation(installation)
 	}
 	contractRaw, contractErr := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
 	_, contractDigest, canonicalErr := setupcontract.Canonicalize(contractRaw)

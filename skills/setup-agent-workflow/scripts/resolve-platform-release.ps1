@@ -23,9 +23,12 @@ function Get-StableVersion([string]$Value, [string]$Description) {
     return [Version]::new([int]$parts[0], [int]$parts[1], [int]$parts[2])
 }
 
-function Get-SHA256File([string]$Path) {
+function Get-SHA256Hex([byte[]]$Bytes) {
     $hasher = [Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+    try { return ([BitConverter]::ToString($hasher.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+}
+function Get-SHA256File([string]$Path) {
+    return Get-SHA256Hex ([IO.File]::ReadAllBytes($Path))
 }
 
 foreach ($required in @($HostFactsPath, $PolicyPath)) {
@@ -84,6 +87,7 @@ function Get-AdditionalAssetWarnings($Release) {
 $facts = Get-Content -LiteralPath $HostFactsPath -Raw | ConvertFrom-Json
 Assert-ReleaseResolver ($facts.schema_version -eq 1) "Unsupported host-facts schema"
 $installed = ($null -ne $facts.platform -and [bool]$facts.platform.installation_recorded)
+$pinlessExisting = (-not $installed -and $null -ne $facts.workflow -and [bool]$facts.workflow.installed)
 $selected = $Version.Trim()
 $selection = "latest-stable"
 $durableVersion = $null; $durableDigest = ""
@@ -98,8 +102,8 @@ if ($installed) {
         if ($AllowUpgrade) { Assert-ReleaseResolver ($comparison -gt 0) "AllowUpgrade authorizes only a version greater than the durable Platform Installation"; $selection = "explicit-upgrade" } else { Assert-ReleaseResolver ($comparison -eq 0) "A greater Platform Release version requires explicit AllowUpgrade authorization"; $selection = "durable-repair" }
     }
 } elseif (-not [string]::IsNullOrWhiteSpace($selected)) {
-    Get-StableVersion $selected "Requested Platform Release version" | Out-Null
-    $selection = "explicit-version"
+	Get-StableVersion $selected "Requested Platform Release version" | Out-Null
+	$selection = "explicit-version"
 } elseif ($null -ne $facts.workflow -and [bool]$facts.workflow.installed) {
     throw "An existing Workflow CLI without a recorded Platform Installation requires -Version <exact-installed-version>"
 }
@@ -136,7 +140,56 @@ try {
     Assert-ReleaseResolver ([string]$manifest.release.repository -ceq $repository -and [string]$manifest.release.tag -ceq $tag -and [string]$manifest.release.version -ceq $versionText) "Platform Release manifest does not match selected release"
     $manifestDigest = Get-SHA256File $manifestPath
     if ($installed -and -not $AllowUpgrade) { Assert-ReleaseResolver ($manifestDigest -ceq $durableDigest) "Durable Platform Installation repair requires its exact manifest digest" }
-    [ordered]@{ verified = $true; selection = $selection; release_version = $versionText; release_tag = $tag; manifest_digest_sha256 = $manifestDigest; manifest_path = [IO.Path]::GetFullPath($manifestPath); temp_directory = [IO.Path]::GetFullPath($taskTemp); asset_warnings = @(Get-AdditionalAssetWarnings $release) } | ConvertTo-Json -Compress
+    $resolvedHostFactsPath = [IO.Path]::GetFullPath($HostFactsPath)
+    if ($pinlessExisting) {
+        Assert-ReleaseResolver (-not [string]::IsNullOrWhiteSpace($selected)) "A pinless existing Workflow CLI requires an explicit Platform Release version"
+        $checksumPath = Join-Path $taskTemp "SHA256SUMS"
+        Download-ReleaseAsset (Get-ReleaseAsset $release "SHA256SUMS") $checksumPath
+        $checksumMatch = Select-String -LiteralPath $checksumPath -Pattern '^([0-9a-f]{64})  workflow-windows-amd64\.zip$'
+        Assert-ReleaseResolver (@($checksumMatch).Count -eq 1) "SHA256SUMS lacks an exact workflow-windows-amd64.zip checksum"
+        $archivePath = Join-Path $taskTemp "workflow-windows-amd64.zip"
+        Download-ReleaseAsset (Get-ReleaseAsset $release "workflow-windows-amd64.zip") $archivePath
+        Assert-ReleaseResolver ((Get-SHA256File $archivePath) -ceq [string]$checksumMatch[0].Matches[0].Groups[1].Value) "Workflow CLI archive checksum differs from SHA256SUMS"
+        $expandedPath = Join-Path $taskTemp "expanded"
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $expandedPath
+        $candidatePath = Join-Path $expandedPath "bin\workflow.exe"
+        $candidateEntries = @(Get-ChildItem -LiteralPath $expandedPath -File -Recurse | Where-Object { [string]::Equals($_.Name, "workflow.exe", [StringComparison]::OrdinalIgnoreCase) })
+        Assert-ReleaseResolver ($candidateEntries.Count -eq 1 -and (Test-Path -LiteralPath $candidatePath -PathType Leaf) -and [string]::Equals([IO.Path]::GetFullPath($candidateEntries[0].FullName), [IO.Path]::GetFullPath($candidatePath), [StringComparison]::OrdinalIgnoreCase)) "Workflow CLI archive must contain only exact bin/workflow.exe"
+        $workflowPins = @($manifest.bundled_files | Where-Object { [string]$_.path -eq "bin/workflow.exe" })
+        Assert-ReleaseResolver ($workflowPins.Count -eq 1 -and (Get-SHA256File $candidatePath) -ceq [string]$workflowPins[0].sha256) "Workflow CLI executable checksum differs from the Platform Release Manifest"
+        $candidateVersion = (& $candidatePath version | Out-String).Trim()
+        Assert-ReleaseResolver ($LASTEXITCODE -eq 0 -and $candidateVersion -ceq ("workflow " + $versionText)) "Workflow CLI published version differs from the Platform Release Manifest"
+        $workflowHome = [IO.Path]::GetFullPath([string]$facts.workflow_home)
+        Assert-ReleaseResolver ([IO.Path]::IsPathRooted($workflowHome) -and -not $workflowHome.StartsWith("\\")) "Pinless Platform Installation recovery requires an absolute local Workflow Home"
+        $inspectionOutput = (& $candidatePath setup inspect-platform-installation --workflow-home $workflowHome | Out-String).Trim()
+        Assert-ReleaseResolver ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($inspectionOutput)) "Verified candidate Workflow CLI could not inspect the prior Platform Installation"
+        try { $inspection = $inspectionOutput | ConvertFrom-Json } catch { throw "Verified candidate Workflow CLI returned invalid Platform Installation inspection JSON" }
+        $prior = $inspection.result.platform
+        Assert-ReleaseResolver ([string]$inspection.status -eq "ready" -and $null -ne $prior -and [bool]$prior.installation_recorded) "Verified candidate Workflow CLI did not recover a prior Platform Installation"
+        $priorVersion = Get-StableVersion ([string]$prior.version) "Recovered Platform Installation version"
+        foreach ($name in @("release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest")) {
+            Assert-ReleaseResolver ([string]$prior.$name -match '^[0-9a-f]{64}$') "Recovered Platform Installation has an invalid durable release pin '$name'"
+        }
+        $priorBundleJSON = [string]$prior.release_bundled_files_json
+        Assert-ReleaseResolver (-not [string]::IsNullOrWhiteSpace($priorBundleJSON) -and (Get-SHA256Hex ([Text.UTF8Encoding]::new($false).GetBytes($priorBundleJSON))) -ceq [string]$prior.release_bundled_files_digest) "Recovered Platform Installation bundle inventory digest differs"
+        $priorControlPlaneDigest = [string]$prior.control_plane_plan_digest_sha256
+        Assert-ReleaseResolver ([string]::IsNullOrWhiteSpace($priorControlPlaneDigest) -or $priorControlPlaneDigest -match '^[0-9a-f]{64}$') "Recovered Platform Installation has an invalid Control Plane authorization digest"
+        $targetVersion = Get-StableVersion $versionText "Selected Platform Release version"
+        $comparison = $targetVersion.CompareTo($priorVersion)
+        if ($AllowUpgrade) {
+            Assert-ReleaseResolver ($comparison -gt 0) "AllowUpgrade authorizes only a version greater than the recovered Platform Installation"
+            $selection = "explicit-upgrade"
+        } else {
+            Assert-ReleaseResolver ($comparison -eq 0) "A greater Platform Release version requires explicit AllowUpgrade authorization"
+            $selection = "durable-repair"
+        }
+        $facts.platform = $prior
+        $resolvedHostFactsPath = Join-Path $taskTemp "host-facts.resolved.json"
+        [IO.File]::WriteAllText($resolvedHostFactsPath, ($facts | ConvertTo-Json -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+    } elseif ($AllowUpgrade -and -not $installed) {
+        throw "AllowUpgrade requires a durable or recovered prior Platform Installation"
+    }
+    [ordered]@{ verified = $true; selection = $selection; release_version = $versionText; release_tag = $tag; manifest_digest_sha256 = $manifestDigest; manifest_path = [IO.Path]::GetFullPath($manifestPath); host_facts_path = [IO.Path]::GetFullPath($resolvedHostFactsPath); temp_directory = [IO.Path]::GetFullPath($taskTemp); asset_warnings = @(Get-AdditionalAssetWarnings $release) } | ConvertTo-Json -Compress
 } catch {
     if ($taskTemp -and (Test-Path -LiteralPath $taskTemp)) { Remove-Item -LiteralPath $taskTemp -Recurse -Force }
     throw

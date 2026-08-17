@@ -212,7 +212,17 @@ if ($facts.platform.installation_recorded -and -not $platformRecordCurrent) {
         release_bundled_files_digest = [string]$facts.platform.release_bundled_files_digest
         control_plane_plan_digest_sha256 = [string]$facts.platform.control_plane_plan_digest_sha256
     }
-    foreach ($value in $priorInstallation.Values) { if ([string]::IsNullOrWhiteSpace([string]$value)) { throw "Platform Installation repair requires every durable prior pin" } }
+    foreach ($name in @("version", "release_manifest_digest", "platform_setup_contract_digest", "workflow_cli_sha256", "release_bundled_files_digest")) {
+        if ([string]::IsNullOrWhiteSpace([string]$priorInstallation[$name])) { throw "Platform Installation repair requires every durable release pin" }
+    }
+    # Platform 0.1.2 could persist the release pins before it authorized or
+    # launched the Control Plane. Its empty authorization digest is therefore
+    # an exact legacy state that an explicitly approved upgrade must be able to
+    # name, rather than authority to invent a digest for the old installation.
+    $priorControlPlaneDigest = [string]$priorInstallation.control_plane_plan_digest_sha256
+    if (-not [string]::IsNullOrWhiteSpace($priorControlPlaneDigest) -and $priorControlPlaneDigest -notmatch '^[0-9a-f]{64}$') {
+        throw "Platform Installation repair has an invalid prior Control Plane authorization digest"
+    }
     $priorInput = Join-Path $scratchRoot "prior-installation.input.json"; $priorCanonical = Join-Path $scratchRoot "prior-installation.canonical.json"
     [IO.File]::WriteAllText($priorInput, ($priorInstallation | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
     $priorDigest = (& $canonicalizer -InputPath $priorInput -OutputPath $priorCanonical | Select-Object -Last 1).Trim()

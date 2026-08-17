@@ -294,9 +294,10 @@ func (e *Engine) Apply(ctx context.Context, raw []byte, approvedDigest string) (
 		}
 	}
 	if plan.Kind == setupcontract.PlatformBootstrap {
-		if e.PlatformPreconditionVerifier == nil {
+		err = preflightPlatformInstallationMutation(ctx, database, plan)
+		if err == nil && e.PlatformPreconditionVerifier == nil {
 			err = errors.New("Platform component precondition verifier is required")
-		} else {
+		} else if err == nil {
 			err = e.PlatformPreconditionVerifier(ctx, plan)
 		}
 		if err != nil {
@@ -802,6 +803,42 @@ func hasPlatformInstallationTransition(plan setupcontract.Plan) bool {
 		}
 	}
 	return false
+}
+
+func preflightPlatformInstallationMutation(ctx context.Context, database *store.Store, plan setupcontract.Plan) error {
+	if hasPlatformInstallationTransition(plan) {
+		// The ordinary precondition pass has already verified the exact source
+		// installation digest before this function is called.
+		return nil
+	}
+	var approved *setupcontract.Effect
+	for index := range plan.Effects {
+		if plan.Effects[index].Kind != "platform_installation" {
+			continue
+		}
+		approved = &plan.Effects[index]
+		break
+	}
+	if approved == nil {
+		return nil
+	}
+	installed, err := database.PlatformInstallation(ctx)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	parameters := approved.Parameters
+	if installed.PlatformVersion == parameters["version"] &&
+		installed.ReleaseManifestDigestSHA256 == parameters["release_manifest_digest"] &&
+		installed.PlatformSetupContractDigestSHA256 == parameters["platform_setup_contract_digest"] &&
+		installed.WorkflowCLISHA256 == parameters["workflow_cli_sha256"] &&
+		installed.ReleaseBundledFilesJSON == parameters["release_bundled_files_json"] &&
+		installed.ReleaseBundledFilesDigestSHA256 == parameters["release_bundled_files_digest"] {
+		return nil
+	}
+	return errors.New("Platform Installation changed outside the approved transition")
 }
 
 func platformInstallationStateJSON(value store.PlatformInstallation) []byte {

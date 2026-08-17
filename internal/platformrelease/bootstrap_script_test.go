@@ -320,6 +320,12 @@ func TestBootstrapVerifiesCanonicalManifestBeforePlatformDownload(t *testing.T) 
 		t.Fatalf("implicit release switch was accepted: %q, %v", output, err)
 	}
 	assertInstallationReauthorization("explicit release upgrade", "replace", "-AllowUpgrade")
+	platformState["version"] = "0.1.2"
+	platformState["control_plane_plan_digest_sha256"] = ""
+	noOpState["control_plane"] = map[string]any{"state": "stopped", "runtime": nil}
+	legacyFacts, _ := json.Marshal(noOpState)
+	write(hostFactsPath, legacyFacts)
+	assertInstallationReauthorization("legacy upgrade without Control Plane authorization", "start", "-AllowUpgrade")
 
 	installScript := filepath.Join(filepath.Dir(script), "install-workflow-cli.ps1")
 	tampered := parsed
