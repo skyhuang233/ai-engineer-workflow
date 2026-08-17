@@ -109,7 +109,7 @@ try {
         $release = $null; $highest = $null
         foreach ($page in 1..100) {
             $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$repository/releases?per_page=100&page=$page" -Headers $headers -UseBasicParsing
-            $candidates = @([string]$response.Content | ConvertFrom-Json)
+            $candidates = @([string]$response.Content | ConvertFrom-Json | ForEach-Object { $_ })
             if ($candidates.Count -eq 0) { break }
             foreach ($candidate in $candidates) {
                 if (-not (Test-CanonicalPlatformRelease $candidate)) { continue }

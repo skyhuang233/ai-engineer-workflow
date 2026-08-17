@@ -59,6 +59,26 @@ func TestResolvePlatformReleaseDownloadsAndVerifiesLatestStableForFreshInstall(t
 	}
 }
 
+func TestResolvePlatformReleaseSelectsCanonicalPlatformReleaseFromMixedPage(t *testing.T) {
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell 5.1 is unavailable")
+	}
+	fixture := newResolverFixture(t, "1.2.3")
+	metadata := resolverMetadata(t, fixture)
+	worker := cloneResolverJSON(t, metadata)
+	worker["tag_name"] = "worker-v99.0.0"
+	writeResolverJSON(t, fixture.releasePagePaths[0], []any{worker, metadata})
+	writeResolverJSON(t, fixture.releasePagePaths[1], []any{})
+	factsPath := filepath.Join(fixture.directory, "host-facts.json")
+	writeResolverFile(t, factsPath, []byte(`{"schema_version":1,"platform":{"installation_recorded":false}}`))
+
+	output, runErr := fixture.run(t, powershell, factsPath, "", false)
+	if runErr != nil || !strings.Contains(output, `"release_version":"1.2.3"`) {
+		t.Fatalf("mixed release page did not select canonical Platform version: err=%v output=%s", runErr, output)
+	}
+}
+
 func TestResolvePlatformReleasePaginatesMixedReleasesAndSelectsHighestCanonicalPlatformVersion(t *testing.T) {
 	powershell, err := exec.LookPath("powershell.exe")
 	if err != nil {
