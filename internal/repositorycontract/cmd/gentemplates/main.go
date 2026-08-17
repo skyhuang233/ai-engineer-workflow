@@ -35,6 +35,7 @@ func main() {
 	}
 	if *check {
 		current, err := os.ReadFile(*output)
+		current = bytes.ReplaceAll(current, []byte("\r\n"), []byte("\n"))
 		if err != nil || !bytes.Equal(current, generated) {
 			fatal(errors.New("templates_generated.go differs from deploy canonical templates; run go generate ./internal/repositorycontract"))
 		}

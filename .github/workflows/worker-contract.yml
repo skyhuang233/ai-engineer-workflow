@@ -16,13 +16,19 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Test Control Plane
         run: go test ./...
       - name: Vet Control Plane
         run: go vet ./...
+
+  worker-contract:
+    # Linux is the Worker container runtime, not a supported Control Plane host.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Read accepted tool versions
         id: pins
         shell: bash
