@@ -9,10 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +24,20 @@ import (
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
+const workflowServeChildTestEnvironment = "WORKFLOW_TEST_REAL_SERVE_CHILD"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(workflowServeChildTestEnvironment) == "1" && len(os.Args) > 1 && os.Args[1] == "serve-child" {
+		Version = "1.0.0"
+		if err := serveChildCommand(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
 func TestWindowsFreshSetupApplyStartsRealControlPlaneWithDurableAuthorization(t *testing.T) {
 	ctx := context.Background()
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "WorkflowHome"))
@@ -35,13 +48,9 @@ func TestWindowsFreshSetupApplyStartsRealControlPlaneWithDurableAuthorization(t 
 		t.Fatalf("fresh Workflow Home exists before installation: %v", err)
 	}
 
-	_, current, _, _ := runtime.Caller(0)
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(current), "..", ".."))
-	source := filepath.Join(t.TempDir(), workflowhome.ExecutableName)
-	build := exec.Command("go", "build", "-trimpath", "-ldflags", "-buildid= -X main.Version=1.0.0", "-o", source, "./cmd/workflow")
-	build.Dir = repositoryRoot
-	if output, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("build real workflow.exe: %v\n%s", buildErr, output)
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
 	}
 	cli, err := os.ReadFile(source)
 	if err != nil {
@@ -119,6 +128,7 @@ func TestWindowsFreshSetupApplyStartsRealControlPlaneWithDurableAuthorization(t 
 	}
 
 	originalPreconditions, originalReady := verifyPlatformPreconditionsForSetup, verifyPlatformReadyForApply
+	t.Setenv(workflowServeChildTestEnvironment, "1")
 	t.Cleanup(func() {
 		verifyPlatformPreconditionsForSetup, verifyPlatformReadyForApply = originalPreconditions, originalReady
 	})
