@@ -156,7 +156,7 @@ func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 	}
 	controlPlaneJob := text[controlPlaneStart:workerContractStart]
 	workerContractJob := text[workerContractStart:]
-	for _, required := range []string{"runs-on: windows-latest", "go test ./...", "go vet ./..."} {
+	for _, required := range []string{"runs-on: windows-latest", "TEMP: 'C:\\t'", "TMP: 'C:\\t'", "go test ./...", "go vet ./..."} {
 		if !strings.Contains(controlPlaneJob, required) {
 			t.Fatalf("Windows Control Plane job is missing %q", required)
 		}
@@ -168,6 +168,14 @@ func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 		if strings.Contains(workerContractJob, forbidden) {
 			t.Fatalf("Linux Worker contract job runs unsupported Control Plane command %q", forbidden)
 		}
+	}
+	for _, required := range []string{"Detect Worker image input changes", "cmd/delivery-source-digest", "internal/deliverysource", "deploy/worker", "config/toolchain.json"} {
+		if !strings.Contains(workerContractJob, required) {
+			t.Fatalf("Worker container contract does not detect candidate image input %q", required)
+		}
+	}
+	if got := strings.Count(workerContractJob, "if: steps.worker-changes.outputs.required == 'true'"); got != 5 {
+		t.Fatalf("Worker container validation condition count = %d, want 5", got)
 	}
 }
 

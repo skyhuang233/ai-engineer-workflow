@@ -17,8 +17,14 @@ permissions:
 jobs:
   build-and-test:
     runs-on: windows-latest
+    env:
+      TEMP: 'C:\t'
+      TMP: 'C:\t'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Prepare short Windows test paths
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Test Control Plane
         run: go test ./...
       - name: Vet Control Plane
@@ -29,7 +35,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Detect Worker image input changes
+        id: worker-changes
+        shell: bash
+        run: |
+          if git diff --quiet "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- \
+            cmd/delivery-source-digest internal/deliverysource deploy/worker config/toolchain.json go.mod go.sum \
+            .github/workflows/publish-worker.yml; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Read accepted tool versions
+        if: steps.worker-changes.outputs.required == 'true'
         id: pins
         shell: bash
         run: |
@@ -46,6 +66,7 @@ jobs:
           echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Build without publishing
+        if: steps.worker-changes.outputs.required == 'true'
         run: |
           docker build \
             --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
@@ -62,6 +83,7 @@ jobs:
             --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" \
             --file deploy/worker/Dockerfile .
       - name: Verify Worker contract
+        if: steps.worker-changes.outputs.required == 'true'
         shell: bash
         run: |
           codex_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" codex --version)"
@@ -104,6 +126,7 @@ jobs:
           test "${embedded_no_mistakes_modified[0]}" = false
           test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"
       - name: Generate candidate Worker SBOM
+        if: steps.worker-changes.outputs.required == 'true'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
           image: workflow-worker:${{ steps.pins.outputs.worker_version }}
@@ -111,6 +134,7 @@ jobs:
           output-file: worker-sbom.spdx.json
           upload-artifact: false
       - name: Scan candidate Worker dependencies
+        if: steps.worker-changes.outputs.required == 'true'
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
         with:
           sbom: worker-sbom.spdx.json

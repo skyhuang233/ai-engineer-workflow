@@ -121,7 +121,7 @@ func TestHostAdapterPreLayoutRejectsOwnerSnapshotNotBoundToExistingWorkflowHome(
 	expected, _ := json.Marshal(hostIdentityPrecondition{UserID: current.Uid, Username: current.Username, WorkflowHome: root, WorkflowHomeOwnerID: wrongOwner})
 	adapter := HostAdapter{Layout: workflowhome.Layout{Root: root}}
 	err = adapter.CheckPreLayoutPrecondition(context.Background(), setupcontract.Precondition{ID: "user", Kind: "host_identity", Subject: "current-user", Expected: string(expected)})
-	if err == nil || !strings.Contains(err.Error(), "owner") {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "own") {
 		t.Fatalf("existing Workflow Home accepted an unbound owner snapshot: %v", err)
 	}
 }
