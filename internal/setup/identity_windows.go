@@ -25,3 +25,11 @@ func workflowHomeOwnerIdentity(path string) (string, error) {
 	}
 	return owner.String(), nil
 }
+
+func setWorkflowHomeOwnerIdentity(path, identity string) error {
+	owner, err := windows.StringToSid(identity)
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
+}

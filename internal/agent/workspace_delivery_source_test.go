@@ -452,6 +452,10 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("requires a Windows host")
 	}
+	databasePath := strings.TrimSpace(os.Getenv("WORKFLOW_QUALIFICATION_DATABASE"))
+	if databasePath == "" {
+		t.Skip("requires the production qualification database activated by workflow doctor")
+	}
 	ctx := context.Background()
 	dockerInfo := exec.CommandContext(ctx, "docker", "info", "--format", "{{.OSType}}")
 	output, err := dockerInfo.CombinedOutput()
@@ -479,10 +483,6 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	want, err := gitOutput(ctx, deliverySource, "rev-parse", "refs/heads/main")
 	if err != nil {
 		t.Fatal(err)
-	}
-	databasePath := strings.TrimSpace(os.Getenv("WORKFLOW_QUALIFICATION_DATABASE"))
-	if databasePath == "" {
-		t.Fatal("WORKFLOW_QUALIFICATION_DATABASE must name the production database activated by workflow doctor")
 	}
 	if !filepath.IsAbs(databasePath) {
 		t.Fatalf("WORKFLOW_QUALIFICATION_DATABASE must be absolute: %q", databasePath)

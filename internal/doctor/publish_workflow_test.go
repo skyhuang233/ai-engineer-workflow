@@ -149,6 +149,34 @@ func TestWorkerContractRunsControlPlaneTestsForSourceChanges(t *testing.T) {
 			t.Fatalf("worker-contract does not preserve Control Plane test coverage: missing %q", required)
 		}
 	}
+	controlPlaneStart := strings.Index(text, "\n  build-and-test:")
+	workerContractStart := strings.Index(text, "\n  worker-contract:")
+	if controlPlaneStart < 0 || workerContractStart <= controlPlaneStart {
+		t.Fatal("worker-contract does not define separate Control Plane and Worker contract jobs")
+	}
+	controlPlaneJob := text[controlPlaneStart:workerContractStart]
+	workerContractJob := text[workerContractStart:]
+	for _, required := range []string{"runs-on: windows-latest", "TEMP: 'C:\\t'", "TMP: 'C:\\t'", "go test ./...", "go vet ./..."} {
+		if !strings.Contains(controlPlaneJob, required) {
+			t.Fatalf("Windows Control Plane job is missing %q", required)
+		}
+	}
+	if !strings.Contains(workerContractJob, "runs-on: ubuntu-latest") {
+		t.Fatal("Worker container contract job does not run on Linux")
+	}
+	for _, forbidden := range []string{"go test ./...", "go vet ./..."} {
+		if strings.Contains(workerContractJob, forbidden) {
+			t.Fatalf("Linux Worker contract job runs unsupported Control Plane command %q", forbidden)
+		}
+	}
+	for _, required := range []string{"Detect Worker image input changes", "cmd/delivery-source-digest", "internal/deliverysource", "deploy/worker", "config/toolchain.json"} {
+		if !strings.Contains(workerContractJob, required) {
+			t.Fatalf("Worker container contract does not detect candidate image input %q", required)
+		}
+	}
+	if got := strings.Count(workerContractJob, "if: steps.worker-changes.outputs.required == 'true'"); got != 5 {
+		t.Fatalf("Worker container validation condition count = %d, want 5", got)
+	}
 }
 
 func TestWorkerWorkflowsBindSBOMAndFailClosedOnFixableHighVulnerabilities(t *testing.T) {

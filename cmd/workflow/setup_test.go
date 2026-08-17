@@ -9,10 +9,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -24,10 +26,210 @@ import (
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
+	setupengine "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
+
+func TestSetupApplyOnFreshWorkflowHomeValidatesApprovalBeforeOpeningDatabase(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "AgentWorkflow")
+	plan := setupcontract.Plan{
+		SchemaVersion: 1,
+		PlanID:        "fresh-platform-bootstrap",
+		Kind:          setupcontract.PlatformBootstrap,
+		Target:        setupcontract.Target{WorkflowHome: home},
+		Preconditions: []setupcontract.Precondition{{
+			ID: "host", Kind: "host_identity", Subject: "current-user", Expected: "unreached-host-identity",
+		}},
+		Effects: []setupcontract.Effect{{
+			ID: "install-cli", Kind: "platform_cli", Subject: filepath.Join(home, "bin", workflowhome.ExecutableName), Action: "install",
+			Parameters: map[string]string{
+				"version": "1.0.0", "sha256": strings.Repeat("c", 64),
+				"release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_digest": strings.Repeat("b", 64),
+				"workflow_cli_sha256": strings.Repeat("c", 64), "release_bundled_files_digest": strings.Repeat("d", 64),
+			},
+		}},
+		ExpectedResults: []setupcontract.ExpectedResult{{
+			ID: "ready", Kind: "platform_readiness", Subject: home, Expected: "ready",
+		}},
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runSetupApply([]string{"--plan", planPath, "--approved-digest", strings.Repeat("0", 64)}, strings.NewReader(""), io.Discard)
+	if !errors.Is(err, setupengine.ErrDigestMismatch) {
+		t.Fatalf("fresh setup apply error = %v, want digest mismatch before database open", err)
+	}
+	if _, statErr := os.Stat(home); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("fresh setup apply created Workflow Home before approval: %v", statErr)
+	}
+	t.Logf("wrong digest rejected before Workflow Home creation: %v", err)
+}
+
+func TestSetupApplyOnFreshWorkflowHomeLetsEngineCreateAuthorizedDatabase(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(t.TempDir(), "AgentWorkflow")
+	hostIdentity, err := json.Marshal(map[string]string{
+		"user_id": current.Uid, "username": current.Username, "workflow_home": home, "workflow_home_owner_id": current.Uid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := freshBootstrapApplyPlan(home, string(hostIdentity))
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalVerifier := verifyPlatformPreconditionsForSetup
+	t.Cleanup(func() { verifyPlatformPreconditionsForSetup = originalVerifier })
+	verifiedAfterDatabaseOpen := false
+	stopAfterDatabaseOpen := errors.New("stop after authorized database open")
+	verifyPlatformPreconditionsForSetup = func(_ context.Context, _ *store.Store, layout workflowhome.Layout, _ setupengine.HostAdapter, _ setupcontract.Plan) error {
+		if _, statErr := os.Stat(filepath.Join(layout.State, "workflow.db")); statErr != nil {
+			t.Fatalf("authorized fresh apply did not create its database: %v", statErr)
+		}
+		verifiedAfterDatabaseOpen = true
+		return stopAfterDatabaseOpen
+	}
+
+	var output bytes.Buffer
+	err = runSetupApply([]string{"--plan", planPath, "--approved-digest", digest}, strings.NewReader(""), &output)
+	if !errors.Is(err, stopAfterDatabaseOpen) || !verifiedAfterDatabaseOpen {
+		t.Fatalf("authorized fresh apply did not reach post-database verification: err=%v output=%s", err, output.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "state", "workflow.db")); statErr != nil {
+		t.Fatalf("authorized fresh apply database is absent: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "state", "credentials", "github.pat")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("fresh apply persisted an unapproved PAT: %v", statErr)
+	}
+	t.Logf("approved fresh apply reached its Engine-created database without persisting a PAT; response=%s", strings.TrimSpace(output.String()))
+}
+
+func TestSetupApplyOnFreshWorkflowHomeRejectsHostIdentityBeforeCreatingLayout(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "AgentWorkflow")
+	hostIdentity, err := json.Marshal(map[string]string{
+		"user_id": "not-the-current-user", "username": "not-the-current-user", "workflow_home": home, "workflow_home_owner_id": "not-the-current-user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := freshBootstrapApplyPlan(home, string(hostIdentity))
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runSetupApply([]string{"--plan", planPath, "--approved-digest", digest}, strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "host identity") {
+		t.Fatalf("fresh setup apply error = %v, want host identity rejection", err)
+	}
+	if _, statErr := os.Stat(home); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("host identity rejection created Workflow Home: %v", statErr)
+	}
+	t.Logf("approved digest with drifted host identity rejected before Workflow Home creation: %v", err)
+}
+
+func TestSetupApplyRepositoryOnboardingRequiresExistingWorkflowHomeDatabase(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "AgentWorkflow")
+	repository := t.TempDir()
+	if output, err := exec.Command("git", "-C", repository, "init").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	configPath := filepath.Join(repository, ".git", "config")
+	configBefore, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest := strings.Repeat("a", 64)
+	plan := setupcontract.Plan{
+		SchemaVersion: 1,
+		PlanID:        "onboarding-without-workflow-home",
+		Kind:          setupcontract.RepositoryOnboarding,
+		Target:        setupcontract.Target{WorkflowHome: home, RepositoryPath: repository, GitHubRepository: "owner/repo"},
+		Preconditions: []setupcontract.Precondition{{ID: "head", Kind: "git_head", Subject: repository}},
+		Effects: []setupcontract.Effect{{
+			ID: "admit", Kind: "repository_admission", Subject: "owner/repo", Action: "verify_and_record",
+			Parameters: map[string]string{"default_branch": "main", "manifest_digest": manifestDigest, "contract_version": "1"},
+		}},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "repository_admission", Subject: "owner/repo", Expected: manifestDigest}},
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, digest, err := setupcontract.ParsePlan(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runSetupApply([]string{"--plan", planPath, "--approved-digest", digest}, strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "Repository Onboarding requires an existing Workflow Home database") {
+		t.Fatalf("onboarding without Workflow Home database error = %v", err)
+	}
+	applyErr := err
+	if _, statErr := os.Stat(home); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("rejected onboarding created Workflow Home: %v", statErr)
+	}
+	configAfter, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(configBefore, configAfter) {
+		t.Fatal("rejected onboarding changed the target repository configuration")
+	}
+	t.Logf("Repository Onboarding rejected the absent Workflow Home database without creating the home or changing target Git configuration: %v", applyErr)
+}
+
+func freshBootstrapApplyPlan(home, hostIdentity string) setupcontract.Plan {
+	return setupcontract.Plan{
+		SchemaVersion: 1,
+		PlanID:        "fresh-platform-bootstrap",
+		Kind:          setupcontract.PlatformBootstrap,
+		Target:        setupcontract.Target{WorkflowHome: home},
+		Preconditions: []setupcontract.Precondition{{ID: "host", Kind: "host_identity", Subject: "current-user", Expected: hostIdentity}},
+		Effects: []setupcontract.Effect{{
+			ID: "install-cli", Kind: "platform_cli", Subject: filepath.Join(home, "bin", workflowhome.ExecutableName), Action: "install",
+			Parameters: map[string]string{
+				"version": "1.0.0", "sha256": strings.Repeat("c", 64),
+				"release_manifest_digest": strings.Repeat("a", 64), "platform_setup_contract_digest": strings.Repeat("b", 64),
+				"workflow_cli_sha256": strings.Repeat("c", 64), "release_bundled_files_digest": strings.Repeat("d", 64),
+			},
+		}},
+		ExpectedResults: []setupcontract.ExpectedResult{{ID: "ready", Kind: "platform_readiness", Subject: home, Expected: "ready"}},
+	}
+}
 
 func TestOnboardingStateRequiresEveryManagedContractSurface(t *testing.T) {
 	files, _, digest, err := repositorycontract.Render("single-context", []byte("# User instructions\n"), "owner/repo", "main")

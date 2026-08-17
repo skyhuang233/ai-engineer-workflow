@@ -2405,7 +2405,7 @@ func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) 
 	}
 }
 
-func TestControllerRejectsAnswerForStaleQualityGate(t *testing.T) {
+func TestControllerKeepsQualityGateAnswerableUntilHumanDecision(t *testing.T) {
 	ctx := context.Background()
 	source := initRepository(t)
 	root := t.TempDir()
@@ -2424,8 +2424,8 @@ func TestControllerRejectsAnswerForStaleQualityGate(t *testing.T) {
 	if err := db.MarkTicketDelivered(ctx, version.ID, claim.TicketID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "proceed", time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("stale quality gate answer = %v, want ErrNotFound", err)
+	if err := db.AnswerWorkflowQuestion(ctx, "owner/repo", questions[0].ID, "proceed", time.Now().UTC()); err != nil {
+		t.Fatalf("quality gate answer after premature delivery observation: %v", err)
 	}
 }
 
