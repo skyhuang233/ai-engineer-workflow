@@ -76,6 +76,13 @@ type Engine struct {
 	// record becomes the first durable state in a previously missing Workflow
 	// Home. Production callers leave it nil.
 	AfterConsentRecorded func(string)
+	// AfterConsentWritten is a crash-injection seam between durable Consent and
+	// its immediately following Attempt. Production callers leave it nil.
+	AfterConsentWritten func(string)
+	// BeforeRecoveryLock is a test seam called after a fresh recovery is
+	// discovered but before its in-Home lock is acquired and revalidated.
+	// Production callers leave it nil.
+	BeforeRecoveryLock func(string)
 }
 
 // Lifecycle is the only boundary through which Launcher controls external
@@ -125,6 +132,9 @@ func (e Engine) Inspect(ctx context.Context, request Request) (Result, error) {
 			return result("ready", map[string]any{"disposition": "repair", "consent_id": consent.ID}), nil
 		}
 	}
+	if consent, attempt, ok := e.reusableFreshRecovery(request.WorkflowHome, request.TargetVersion, request.BundleDigest, required); ok {
+		return result("ready", map[string]any{"disposition": "repair", "consent_id": consent.ID, "attempt": attempt}), nil
+	}
 	return result("consent_required", map[string]any{"disposition": "apply", "required_capabilities": required}), nil
 }
 
@@ -135,8 +145,14 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	if err := validateApplyRequest(request); err != nil {
 		return blocked(err), nil
 	}
-	if err := validateHomeForApply(request.WorkflowHome); err != nil {
-		return blocked(err), nil
+	recoveryConsent, recoveryAttempt, recoveringFresh, recoveryErr := e.freshRecoveryForApply(ctx, request)
+	if recoveryErr != nil {
+		return blocked(recoveryErr), nil
+	}
+	if !recoveringFresh {
+		if err := validateHomeForApply(request.WorkflowHome); err != nil {
+			return blocked(err), nil
+		}
 	}
 	if preflight, invalid := e.preflightConsent(ctx, request); invalid {
 		return preflight, nil
@@ -170,11 +186,27 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 			return preflight, nil
 		}
 	} else {
+		if recoveringFresh && e.BeforeRecoveryLock != nil {
+			e.BeforeRecoveryLock(request.WorkflowHome)
+		}
 		unlock, lockErr := acquireLock(request.WorkflowHome)
 		if lockErr != nil {
 			return blocked(lockErr), nil
 		}
 		defer unlock()
+		// A recovery record is untrusted until it is discovered again while the
+		// in-Home lock is held.  Do not let the pre-lock snapshot authorize
+		// cleanup or staging after another process has changed the layout.
+		if recoveringFresh {
+			lockedConsent, lockedAttempt, lockedRecovery, lockedErr := e.freshRecoveryForApply(ctx, request)
+			if lockedErr != nil || !lockedRecovery {
+				if lockedErr == nil {
+					lockedErr = errors.New("fresh recovery layout changed while awaiting lock")
+				}
+				return blocked(lockedErr), nil
+			}
+			recoveryConsent, recoveryAttempt = lockedConsent, lockedAttempt
+		}
 		if preflight, invalid := e.preflightConsent(ctx, request); invalid {
 			return preflight, nil
 		}
@@ -243,7 +275,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		if err != nil {
 			return result("consent_required", map[string]any{"reason": "github_owner_required"}), nil
 		}
-		if consent.TargetVersion != request.TargetVersion || consent.BundleDigest != request.BundleDigest || !sameCapabilities(consent.Capabilities, required) {
+		if consent.TargetVersion != request.TargetVersion || consent.BundleDigest != request.BundleDigest || !e.sameRecoveryCapabilities(consent.Capabilities, required) {
 			return result("consent_required", map[string]any{"reason": "consent_target_changed", "required_capabilities": required}), nil
 		}
 	} else {
@@ -263,9 +295,39 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		if err := writeJSONAtomic(filepath.Join(request.WorkflowHome, "platform", "consents", consent.ID+".json"), consent); err != nil {
 			return Result{}, err
 		}
-		if freshHome && e.AfterConsentRecorded != nil {
+		if freshHome && e.AfterConsentWritten != nil {
+			e.AfterConsentWritten(request.WorkflowHome)
+		}
+	}
+	// A fresh Attempt is durable immediately after its Consent and before the
+	// PAT, dependency, PATH, dispatcher, or payload mutations which can fail.
+	// This makes a consent-only crash window a precise forward-repair subject.
+	freshCandidate := activeErr != nil && (freshHome || recoveringFresh)
+	var freshAttempt Attempt
+	if freshCandidate {
+		if recoveringFresh {
+			consent, freshAttempt = recoveryConsent, recoveryAttempt
+			if freshAttempt.ID == "" {
+				freshAttempt = Attempt{SchemaVersion: ProtocolVersion, ID: randomID("attempt-"), TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, Generation: generationName(request.BundleDigest), ConsentID: consent.ID, Phase: "consented", CreatedAt: now}
+				if err := writeJSONAtomic(filepath.Join(request.WorkflowHome, "platform", "attempts", freshAttempt.ID+".json"), freshAttempt); err != nil {
+					return Result{}, err
+				}
+			}
+		} else {
+			freshAttempt = Attempt{SchemaVersion: ProtocolVersion, ID: randomID("attempt-"), TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, Generation: generationName(request.BundleDigest), ConsentID: consent.ID, Phase: "consented", CreatedAt: now}
+			if err := writeJSONAtomic(filepath.Join(request.WorkflowHome, "platform", "attempts", freshAttempt.ID+".json"), freshAttempt); err != nil {
+				return Result{}, err
+			}
+		}
+		if e.AfterConsentRecorded != nil {
 			e.AfterConsentRecorded(request.WorkflowHome)
 		}
+	}
+	failPreactivation := func(cause error) (Result, error) {
+		if freshCandidate {
+			return e.failFreshAttempt(request.WorkflowHome, freshAttempt, cause)
+		}
+		return result("blocked", map[string]any{"error": cause.Error()}), nil
 	}
 	// Consent is the first durable Home record for a fresh installation. Only
 	// now create the regular in-Home lock used by the rest of the lifecycle.
@@ -291,7 +353,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		// upgrade failure must leave a restartable old generation with its prior
 		// fingerprint and credential bytes intact.
 		if err := e.verifyPATIdentity(ctx, request, consent); err != nil {
-			return result("blocked", map[string]any{"error": err.Error()}), nil
+			return failPreactivation(err)
 		}
 		credentialPath := filepath.Join(request.WorkflowHome, "state", "credentials", "github.pat")
 		if existing, err := os.ReadFile(credentialPath); err == nil {
@@ -300,23 +362,23 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 			return Result{}, err
 		}
 		if err := writeSecret(credentialPath, request.PAT); err != nil {
-			return Result{}, err
+			return failPreactivation(err)
 		}
 		credentialReplaced = true
 	}
 	if e.Lifecycle != nil {
 		if err := e.Lifecycle.Prepare(ctx, request, consent); err != nil {
-			return result("blocked", map[string]any{"error": err.Error()}), nil
+			return failPreactivation(err)
 		}
 	}
 	// Stable Dispatcher is the exact Launcher bytes from the selected Bundle,
 	// never a copied versioned CLI.
 	if err := copyFile(filepath.Join(e.BundleRoot, "setup", "workflow-setup.exe"), filepath.Join(request.WorkflowHome, "bin", "workflow.exe"), 0o700); err != nil {
-		return Result{}, err
+		return failPreactivation(err)
 	}
 	if e.ReconcilePath != nil {
 		if err := e.ReconcilePath(filepath.Join(request.WorkflowHome, "bin")); err != nil {
-			return Result{}, err
+			return failPreactivation(err)
 		}
 	}
 	if resumeActiveRepair {
@@ -330,8 +392,13 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	}
 
 	attempt := Attempt{SchemaVersion: ProtocolVersion, ID: randomID("attempt-"), TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, Generation: generationName(request.BundleDigest), ConsentID: consent.ID, Phase: "staged", CreatedAt: now}
+	if freshCandidate {
+		attempt = freshAttempt
+	}
 	resume := activeErr == nil && active.Readiness == activeRepairRequired && active.Version == request.TargetVersion && active.BundleDigest == request.BundleDigest
-	if resume {
+	if freshCandidate {
+		// Attempt already persisted with its consent before any pre-activation work.
+	} else if resume {
 		if existing, err := readAttempt(request.WorkflowHome, active.AttemptID); err == nil {
 			attempt = existing
 			attempt.ConsentID = consent.ID
@@ -346,6 +413,9 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	}
 	generation := filepath.Join(request.WorkflowHome, "platform", "generations", attempt.Generation)
 	if err := e.stageGeneration(generation); err != nil {
+		if freshCandidate {
+			return e.failFreshAttempt(request.WorkflowHome, attempt, err)
+		}
 		return e.failAttempt(request.WorkflowHome, attempt, err)
 	}
 	if oldDB != nil {
@@ -359,12 +429,18 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	}
 	candidate, err := store.Open(ctx, filepath.Join(generation, "workflow.db"))
 	if err != nil {
+		if freshCandidate {
+			return e.failFreshAttempt(request.WorkflowHome, attempt, err)
+		}
 		return e.failAttempt(request.WorkflowHome, attempt, err)
 	}
 	if request.PAT != "" {
 		target, targetErr := canonicalPATCapability(request.WorkflowHome, consent.Capabilities)
 		if targetErr != nil {
 			_ = candidate.Close()
+			if freshCandidate {
+				return e.failFreshAttempt(request.WorkflowHome, attempt, targetErr)
+			}
 			return e.failAttempt(request.WorkflowHome, attempt, targetErr)
 		}
 		var binding PATCapabilityTarget
@@ -381,20 +457,32 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 			if verifyErr == nil {
 				verifyErr = errors.New("GitHub PAT verification fingerprint or owner mismatch")
 			}
+			if freshCandidate {
+				return e.failFreshAttempt(request.WorkflowHome, attempt, verifyErr)
+			}
 			return e.failAttempt(request.WorkflowHome, attempt, verifyErr)
 		}
 		if recordErr := candidate.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: verification.FingerprintSHA256, Login: verification.Login, UserID: verification.UserID, Owner: verification.Owner, Scopes: verification.Scopes, CredentialPath: binding.Path, Status: "verified", VerifiedAt: verification.VerifiedAt}); recordErr != nil {
 			_ = candidate.Close()
+			if freshCandidate {
+				return e.failFreshAttempt(request.WorkflowHome, attempt, recordErr)
+			}
 			return e.failAttempt(request.WorkflowHome, attempt, recordErr)
 		}
 	}
 	_ = candidate.Close()
 	attempt.Phase = "verified"
 	if err := writeJSONAtomic(filepath.Join(request.WorkflowHome, "platform", "attempts", attempt.ID+".json"), attempt); err != nil {
+		if freshCandidate {
+			return e.failFreshAttempt(request.WorkflowHome, attempt, err)
+		}
 		return Result{}, err
 	}
 	active = Active{SchemaVersion: ProtocolVersion, Generation: attempt.Generation, Version: request.TargetVersion, BundleDigest: request.BundleDigest, AttemptID: attempt.ID, ConsentID: consent.ID, Readiness: activeRepairRequired, ActivatedAt: now}
 	if err := writeJSONAtomic(activePath(request.WorkflowHome), active); err != nil {
+		if freshCandidate {
+			return e.failFreshAttempt(request.WorkflowHome, attempt, err)
+		}
 		return Result{}, err
 	}
 	activationCommitted = true
@@ -563,6 +651,29 @@ func (e Engine) failAttempt(home string, attempt Attempt, cause error) (Result, 
 	attempt.Diagnostics = cause.Error()
 	_ = writeJSONAtomic(filepath.Join(home, "platform", "attempts", attempt.ID+".json"), attempt)
 	return result("blocked", map[string]any{"error": cause.Error(), "attempt_id": attempt.ID}), nil
+}
+
+// failFreshAttempt records a failed pre-activation transition without
+// inventing active.json. Its exact Consent/Attempt is the only authority a
+// caller may use to repair this fresh Home.
+func (e Engine) failFreshAttempt(home string, attempt Attempt, cause error) (Result, error) {
+	// Only immutable Bundle copies and the stable dispatcher are discarded.
+	// Consent and Attempt remain the exact recovery authority; credential bytes
+	// are restored by Apply's pre-activation defer before inspect can reuse it.
+	if err := os.RemoveAll(filepath.Join(home, "platform", "generations", generationName(attempt.BundleDigest))); err != nil {
+		return result("blocked", map[string]any{"error": fmt.Sprintf("fresh recovery cleanup generation: %v", err), "attempt": attempt, "consent_id": attempt.ConsentID}), nil
+	}
+	for _, path := range []string{filepath.Join(home, "platform", "generations"), filepath.Join(home, "bin", "workflow.exe"), filepath.Join(home, "bin")} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return result("blocked", map[string]any{"error": fmt.Sprintf("fresh recovery cleanup artifact: %v", err), "attempt": attempt, "consent_id": attempt.ConsentID}), nil
+		}
+	}
+	attempt.Phase = "failed"
+	attempt.Diagnostics = cause.Error()
+	if err := writeJSONAtomic(filepath.Join(home, "platform", "attempts", attempt.ID+".json"), attempt); err != nil {
+		return Result{}, err
+	}
+	return result("repair_required", map[string]any{"attempt": attempt, "consent_id": attempt.ConsentID, "error": cause.Error()}), nil
 }
 func (e Engine) requiredCapabilities(ctx context.Context, request Request, consent *Consent) ([]Capability, error) {
 	owner := strings.ToLower(strings.TrimSpace(request.GitHubOwner))
@@ -746,7 +857,7 @@ func (e Engine) preflightConsent(ctx context.Context, request Request) (Result, 
 		if err != nil {
 			return result("consent_required", map[string]any{"reason": "github_owner_required"}), true
 		}
-		if consent.TargetVersion != request.TargetVersion || consent.BundleDigest != request.BundleDigest || !sameCapabilities(consent.Capabilities, required) {
+		if consent.TargetVersion != request.TargetVersion || consent.BundleDigest != request.BundleDigest || !e.sameRecoveryCapabilities(consent.Capabilities, required) {
 			return result("consent_required", map[string]any{"reason": "consent_target_changed", "required_capabilities": required}), true
 		}
 		return Result{}, false
@@ -910,6 +1021,295 @@ func reusableConsent(home, version, digest string, required []Capability) (Conse
 	}
 	c, err := readConsent(home, active.ConsentID)
 	return c, err == nil && c.TargetVersion == version && c.BundleDigest == digest && sameCapabilities(c.Capabilities, required)
+}
+
+func (e Engine) reusableFreshRecovery(home, version, digest string, required []Capability) (Consent, Attempt, bool) {
+	entries, err := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+	if errors.Is(err, os.ErrNotExist) || len(entries) == 0 {
+		consents, consentErr := os.ReadDir(filepath.Join(home, "platform", "consents"))
+		if consentErr != nil || len(consents) != 1 || consents[0].IsDir() {
+			return Consent{}, Attempt{}, false
+		}
+		id := strings.TrimSuffix(consents[0].Name(), ".json")
+		if !safeConsentID(id) || !regularFile(filepath.Join(home, "platform", "consents", consents[0].Name())) {
+			return Consent{}, Attempt{}, false
+		}
+		consent, readErr := readConsent(home, id)
+		if readErr != nil || consent.SchemaVersion != ProtocolVersion || consent.ID != id || consent.TargetVersion != version || consent.BundleDigest != digest || filepath.Clean(consent.WorkflowHome) != filepath.Clean(home) || !e.sameRecoveryCapabilities(consent.Capabilities, required) || !consentOnlyLayout(home, consent) {
+			return Consent{}, Attempt{}, false
+		}
+		return consent, Attempt{}, true
+	}
+	if err != nil || len(entries) != 1 || entries[0].IsDir() || !strings.HasSuffix(entries[0].Name(), ".json") {
+		return Consent{}, Attempt{}, false
+	}
+	filenameID := strings.TrimSuffix(entries[0].Name(), ".json")
+	if !safeAttemptID(filenameID) {
+		return Consent{}, Attempt{}, false
+	}
+	attempt, err := readAttempt(home, filenameID)
+	if err != nil {
+		return Consent{}, Attempt{}, false
+	}
+	if !safeConsentID(attempt.ConsentID) || !regularFile(filepath.Join(home, "platform", "consents", attempt.ConsentID+".json")) {
+		return Consent{}, Attempt{}, false
+	}
+	consent, err := readConsent(home, attempt.ConsentID)
+	if err != nil || !e.validFreshRecovery(home, filenameID, attempt, consent, version, digest, required) {
+		return Consent{}, Attempt{}, false
+	}
+	if _, err := ReadActive(home); err == nil {
+		return Consent{}, Attempt{}, false
+	}
+	if !freshRecoveryLayout(home, consent, attempt) {
+		return Consent{}, Attempt{}, false
+	}
+	return consent, attempt, true
+}
+
+func (e Engine) freshRecoveryForApply(ctx context.Context, request Request) (Consent, Attempt, bool, error) {
+	home := request.WorkflowHome
+	if request.ConsentID == "" {
+		return Consent{}, Attempt{}, false, nil
+	}
+	if !safeConsentID(request.ConsentID) || !regularFile(filepath.Join(home, "platform", "consents", request.ConsentID+".json")) {
+		return Consent{}, Attempt{}, false, nil
+	}
+	entries, err := os.ReadDir(home)
+	if errors.Is(err, os.ErrNotExist) {
+		return Consent{}, Attempt{}, false, nil
+	}
+	if err != nil {
+		return Consent{}, Attempt{}, false, err
+	}
+	if len(entries) == 0 {
+		return Consent{}, Attempt{}, false, nil
+	}
+	consent, err := readConsent(home, request.ConsentID)
+	if err != nil {
+		return Consent{}, Attempt{}, false, nil
+	}
+	entries, err = os.ReadDir(filepath.Join(home, "platform", "attempts"))
+	if errors.Is(err, os.ErrNotExist) || len(entries) == 0 {
+		required, requiredErr := e.requiredCapabilities(ctx, request, &consent)
+		if requiredErr == nil && consent.SchemaVersion == ProtocolVersion && consent.ID == request.ConsentID && consent.TargetVersion == request.TargetVersion && consent.BundleDigest == request.BundleDigest && e.sameRecoveryCapabilities(consent.Capabilities, required) && consentOnlyLayout(home, consent) {
+			return consent, Attempt{}, true, nil
+		}
+		return Consent{}, Attempt{}, false, nil
+	}
+	if err != nil || len(entries) != 1 || entries[0].IsDir() {
+		return Consent{}, Attempt{}, false, nil
+	}
+	filenameID := strings.TrimSuffix(entries[0].Name(), ".json")
+	if !safeAttemptID(filenameID) || !regularFile(filepath.Join(home, "platform", "attempts", filenameID+".json")) {
+		return Consent{}, Attempt{}, false, nil
+	}
+	attempt, err := readAttempt(home, filenameID)
+	if err != nil {
+		return Consent{}, Attempt{}, false, nil
+	}
+	required, requiredErr := e.requiredCapabilities(ctx, request, &consent)
+	if requiredErr != nil || !e.validFreshRecovery(home, filenameID, attempt, consent, request.TargetVersion, request.BundleDigest, required) {
+		return Consent{}, Attempt{}, false, nil
+	}
+	return consent, attempt, true, nil
+}
+
+func consentOnlyLayout(home string, consent Consent) bool {
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return false
+	}
+	if len(entries) < 1 || len(entries) > 2 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Name() == "state" {
+			if !consentOnlyStateLayout(filepath.Join(home, "state")) {
+				return false
+			}
+			continue
+		}
+		if entry.Name() != "platform" || !entry.IsDir() {
+			return false
+		}
+	}
+	platform, err := os.ReadDir(filepath.Join(home, "platform"))
+	if err != nil || len(platform) < 1 || len(platform) > 2 {
+		return false
+	}
+	for _, entry := range platform {
+		if entry.Name() == "consents" && entry.IsDir() {
+			continue
+		}
+		if entry.Name() == "installation.lock" && regularFile(filepath.Join(home, "platform", entry.Name())) {
+			continue
+		}
+		return false
+	}
+	consents, err := os.ReadDir(filepath.Join(home, "platform", "consents"))
+	if err != nil || len(consents) != 1 || consents[0].Name() != consent.ID+".json" || !regularFile(filepath.Join(home, "platform", "consents", consents[0].Name())) {
+		return false
+	}
+	return true
+}
+
+// consentOnlyStateLayout accepts only state which may have existed before the
+// Consent was durably written. It must never follow a symlink or Windows
+// reparse point: later credential writes must remain inside Workflow Home.
+func consentOnlyStateLayout(statePath string) bool {
+	info, err := os.Lstat(statePath)
+	if err != nil || !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return false
+	}
+	entries, err := os.ReadDir(statePath)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "setup.lock":
+			if !regularFile(filepath.Join(statePath, entry.Name())) {
+				return false
+			}
+		case "credentials":
+			credentialsPath := filepath.Join(statePath, entry.Name())
+			credentials, credentialsErr := os.Lstat(credentialsPath)
+			if credentialsErr != nil || !credentials.IsDir() || credentials.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+				return false
+			}
+			contents, contentsErr := os.ReadDir(credentialsPath)
+			if contentsErr != nil || len(contents) != 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func safeConsentID(id string) bool { return safeRecordID(id, "consent-") }
+func safeAttemptID(id string) bool { return safeRecordID(id, "attempt-") }
+func safeRecordID(id, prefix string) bool {
+	if !strings.HasPrefix(id, prefix) || len(id) != len(prefix)+24 {
+		return false
+	}
+	for _, r := range id[len(prefix):] {
+		if !((r >= 'a' && r <= 'f') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+func regularFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func (e Engine) validFreshRecovery(home, filenameID string, attempt Attempt, consent Consent, version, digest string, required []Capability) bool {
+	if filenameID == "" || strings.ContainsAny(filenameID, `/\\`) || attempt.SchemaVersion != ProtocolVersion || attempt.ID != filenameID || attempt.TargetVersion != version || attempt.BundleDigest != digest || attempt.Generation != generationName(digest) || attempt.ConsentID == "" || attempt.CreatedAt.IsZero() {
+		return false
+	}
+	switch attempt.Phase {
+	case "consented", "staged", "verified", "failed":
+	default:
+		return false
+	}
+	if consent.SchemaVersion != ProtocolVersion || consent.ID != attempt.ConsentID || !safeConsentID(consent.ID) || consent.TargetVersion != version || consent.BundleDigest != digest || !filepath.IsAbs(consent.WorkflowHome) || filepath.Clean(consent.WorkflowHome) != filepath.Clean(home) || !e.sameRecoveryCapabilities(consent.Capabilities, required) {
+		return false
+	}
+	return freshRecoveryLayout(home, consent, attempt)
+}
+
+// sameRecoveryCapabilities permits only the monotonic Docker transition an
+// accepted install/upgrade itself causes: after the approved Desktop version
+// is installed, inspect observes exact reuse. Every other capability remains
+// byte-for-byte consent-bound.
+func (e Engine) sameRecoveryCapabilities(accepted, required []Capability) bool {
+	if sameCapabilities(accepted, required) {
+		return true
+	}
+	accepted = canonicalCapabilities(accepted)
+	required = canonicalCapabilities(required)
+	if len(accepted) != len(required) {
+		return false
+	}
+	for i := range accepted {
+		if accepted[i].Name != required[i].Name {
+			return false
+		}
+		if accepted[i].Name != "manage_docker_desktop" {
+			if accepted[i].Value != required[i].Value {
+				return false
+			}
+			continue
+		}
+		oldTarget, oldErr := dockerCapability([]Capability{accepted[i]})
+		newTarget, newErr := dockerCapability([]Capability{required[i]})
+		compatibility, compatibilityErr := e.bundleCompatibility()
+		if oldErr != nil || newErr != nil || compatibilityErr != nil || validateDockerCapability(oldTarget, compatibility) != nil || (oldTarget.Action != dockerActionInstall && oldTarget.Action != dockerActionUpgrade) || newTarget.Action != dockerActionReuse || oldTarget.RequiredVersion != newTarget.RequiredVersion || newTarget.ObservedVersion != newTarget.RequiredVersion {
+			return false
+		}
+	}
+	return true
+}
+
+func freshRecoveryLayout(home string, consent Consent, attempt Attempt) bool {
+	directories := map[string]bool{"platform": true, "platform/consents": true, "platform/attempts": true, "state": true, "state/credentials": true}
+	requiredDirectories := map[string]bool{"platform": true, "platform/consents": true, "platform/attempts": true}
+	files := map[string]bool{"platform/consents/" + consent.ID + ".json": true, "platform/attempts/" + attempt.ID + ".json": true, "platform/installation.lock": true, "state/credentials/github.pat": true, "state/setup.lock": true}
+	seen := map[string]bool{}
+	valid := true
+	_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			valid = false
+			return err
+		}
+		rel, relErr := filepath.Rel(home, path)
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if entry.Type()&os.ModeSymlink != 0 {
+			valid = false
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			valid = false
+			return nil
+		}
+		if directories[rel] {
+			if !info.IsDir() {
+				valid = false
+			} else {
+				seen[rel] = true
+			}
+			return nil
+		}
+		if files[rel] {
+			if !info.Mode().IsRegular() {
+				valid = false
+			} else {
+				seen[rel] = true
+			}
+			return nil
+		}
+		valid = false
+		return nil
+	})
+	for required := range requiredDirectories {
+		if !seen[required] {
+			valid = false
+		}
+	}
+	for required := range files {
+		if required != "state/credentials/github.pat" && required != "state/setup.lock" && required != "platform/installation.lock" && !seen[required] {
+			valid = false
+		}
+	}
+	return valid
 }
 
 func readAttempt(home, id string) (Attempt, error) {

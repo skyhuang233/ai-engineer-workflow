@@ -56,12 +56,18 @@ func (h WindowsDockerDesktopHost) Download(ctx context.Context, url, path string
 	return errorsJoin(copyErr, file.Sync(), file.Close())
 }
 func (WindowsDockerDesktopHost) InstallElevated(ctx context.Context, path string) error {
-	script := `$p=Start-Process -FilePath $args[0] -ArgumentList 'install','--quiet','--accept-license' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode`
-	return exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, path).Run()
+	// Arguments after -Command are not a reliable $args binding for a command
+	// string. Pass the exact path through a dedicated environment variable so
+	// spaces survive both the PowerShell and UAC boundaries.
+	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", dockerDesktopInstallerCommand())
+	command.Env = dockerDesktopEnvironment(os.Environ(), dockerDesktopInstallerEnvironment, path)
+	return command.Run()
 }
 func (WindowsDockerDesktopHost) Start(ctx context.Context) error {
 	path := filepath.Join(os.Getenv("ProgramFiles"), "Docker", "Docker", "Docker Desktop.exe")
-	return exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Process -FilePath $args[0] -WindowStyle Hidden", path).Run()
+	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", dockerDesktopStartCommand())
+	command.Env = dockerDesktopEnvironment(os.Environ(), dockerDesktopExecutableEnvironment, path)
+	return command.Run()
 }
 func (WindowsDockerDesktopHost) EngineReady(ctx context.Context) error {
 	output, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.OSType}}/{{.Architecture}}").CombinedOutput()

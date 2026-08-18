@@ -30,6 +30,11 @@ func EnsureDockerDesktop(ctx context.Context, contract DockerDesktopContract, ho
 		return err
 	}
 	if installed == contract.Version {
+		// A running Desktop needs no process launch.  In particular this avoids
+		// asking Windows to start a second GUI instance during ordinary reuse.
+		if err := host.EngineReady(ctx); err == nil {
+			return nil
+		}
 		if err := host.Start(ctx); err != nil {
 			return err
 		}

@@ -5,6 +5,7 @@ package launcher
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,7 +110,11 @@ func DecodeRequest(raw []byte) (Request, error) {
 }
 
 func validTarget(request Request) error {
-	if strings.TrimSpace(request.TargetVersion) == "" || len(strings.TrimPrefix(request.BundleDigest, "sha256:")) != 64 {
+	digest := strings.TrimPrefix(request.BundleDigest, "sha256:")
+	if strings.TrimSpace(request.TargetVersion) == "" || !strings.HasPrefix(request.BundleDigest, "sha256:") || len(digest) != 64 || digest != strings.ToLower(digest) {
+		return errors.New("target_version and sha256 bundle_digest are required")
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
 		return errors.New("target_version and sha256 bundle_digest are required")
 	}
 	for _, c := range request.AcceptedCapabilities {

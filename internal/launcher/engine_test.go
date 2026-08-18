@@ -194,6 +194,370 @@ func TestFreshApplyRecordsConsentBeforeInstallationLock(t *testing.T) {
 	}
 }
 
+func TestFreshPrepareFailureReturnsRepairAndResumesSameConsentAttempt(t *testing.T) {
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	home := filepath.Join(t.TempDir(), "fresh-home")
+	lifecycle := &fakeLifecycle{prepareErr: errors.New("Docker Desktop did not start")}
+	verify := func(_ context.Context, token, owner string) (githubcredential.Verification, error) {
+		return githubcredential.Verification{FingerprintSHA256: credential.Fingerprint(token), Login: owner, UserID: 1, Owner: owner, Scopes: []string{"repo", "workflow"}, VerifiedAt: time.Now().UTC()}, nil
+	}
+	engine := Engine{BundleRoot: bundle, Lifecycle: lifecycle, VerifyPAT: verify}
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("a", 64), GitHubOwner: "owner", PAT: "secret"}
+	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+	first, err := engine.Apply(context.Background(), request)
+	if err != nil || first.Status != "repair_required" {
+		t.Fatalf("failed fresh apply=%#v,%v", first, err)
+	}
+	attemptFiles, err := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+	if err != nil || len(attemptFiles) != 1 {
+		t.Fatalf("fresh failure did not persist one attempt: %v,%v", attemptFiles, err)
+	}
+	attemptID := strings.TrimSuffix(attemptFiles[0].Name(), ".json")
+	inspect, err := engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspect.Status != "ready" || inspect.Evidence["consent_id"] == nil {
+		t.Fatalf("fresh repair inspect=%#v,%v", inspect, err)
+	}
+	lifecycle.prepareErr = nil
+	retry := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: inspect.Evidence["consent_id"].(string), PAT: "secret"}
+	ready, err := engine.Apply(context.Background(), retry)
+	if err != nil || ready.Status != "ready" {
+		t.Fatalf("fresh repair=%#v,%v", ready, err)
+	}
+	active, err := ReadActive(home)
+	if err != nil || active.AttemptID != attemptID {
+		t.Fatalf("fresh repair replaced attempt: %#v,%v", active, err)
+	}
+}
+
+func TestFreshRecoveryRejectsUnknownOrForeignState(t *testing.T) {
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	home := filepath.Join(t.TempDir(), "fresh-home")
+	engine := Engine{BundleRoot: bundle, Lifecycle: &fakeLifecycle{prepareErr: errors.New("prepare failed")}, VerifyPAT: func(_ context.Context, token, owner string) (githubcredential.Verification, error) {
+		return githubcredential.Verification{FingerprintSHA256: credential.Fingerprint(token), Login: owner, UserID: 1, Owner: owner, Scopes: []string{"repo", "workflow"}, VerifiedAt: time.Now().UTC()}, nil
+	}}
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("b", 64), GitHubOwner: "owner", PAT: "secret"}
+	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+	if got, err := engine.Apply(context.Background(), request); err != nil || got.Status != "repair_required" {
+		t.Fatalf("failed fresh=%#v,%v", got, err)
+	}
+	inspection, err := engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspection.Status != "ready" {
+		t.Fatalf("exact recovery inspection=%#v,%v", inspection, err)
+	}
+	consentID := inspection.Evidence["consent_id"].(string)
+	if err := os.WriteFile(filepath.Join(home, "unexpected.txt"), []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspection.Status != "consent_required" {
+		t.Fatalf("unknown state became reusable: %#v,%v", inspection, err)
+	}
+	retry := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: consentID, PAT: "secret"}
+	if got, err := engine.Apply(context.Background(), retry); err != nil || got.Status != "blocked" {
+		t.Fatalf("unknown state apply=%#v,%v", got, err)
+	}
+	if err := os.Remove(filepath.Join(home, "unexpected.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(home, "platform", "consents", "foreign.json"), Consent{SchemaVersion: ProtocolVersion, ID: "foreign", TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(home, "platform", "attempts", "foreign.json"), Attempt{SchemaVersion: ProtocolVersion, ID: "foreign", TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, Generation: "foreign", ConsentID: "foreign"}); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspection.Status != "consent_required" {
+		t.Fatalf("foreign consent or attempt became reusable: %#v,%v", inspection, err)
+	}
+}
+
+func TestConsentOnlyRecoveryRejectsUnsafeStateLayout(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		arrange func(*testing.T, string, string)
+	}{
+		{
+			name: "regular state file",
+			arrange: func(t *testing.T, home, _ string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(home, "state"), []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "state symlink",
+			arrange: func(t *testing.T, home, outside string) {
+				t.Helper()
+				if err := os.Symlink(outside, filepath.Join(home, "state")); err != nil {
+					t.Skipf("directory symlinks are unavailable: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+			home := filepath.Join(t.TempDir(), "fresh-home")
+			request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("a", 64), GitHubOwner: "owner"}
+			crashing := Engine{BundleRoot: bundle, AfterConsentWritten: func(string) { panic("simulated consent-only crash") }}
+			request.AcceptedCapabilities = requiredCapabilities(t, crashing, request)
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("consent-only crash was not injected")
+					}
+				}()
+				_, _ = crashing.Apply(context.Background(), request)
+			}()
+			consentID := readOnlyConsentID(t, home)
+			outside := t.TempDir()
+			sentinel := filepath.Join(outside, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("outside remains untouched"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			test.arrange(t, home, outside)
+
+			inspectRequest := Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"}
+			if got, err := (Engine{BundleRoot: bundle}).Inspect(context.Background(), inspectRequest); err != nil || got.Status != "consent_required" {
+				t.Fatalf("unsafe state recovery inspect=%#v, %v", got, err)
+			}
+			if got, err := (Engine{BundleRoot: bundle}).Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: consentID}); err != nil || got.Status != "blocked" {
+				t.Fatalf("unsafe state recovery apply=%#v, %v", got, err)
+			}
+			if contents, err := os.ReadDir(outside); err != nil || len(contents) != 1 || contents[0].Name() != "sentinel" {
+				t.Fatalf("unsafe state recovery changed outside target=%v, %v", contents, err)
+			}
+			if data, err := os.ReadFile(sentinel); err != nil || string(data) != "outside remains untouched" {
+				t.Fatalf("outside sentinel=%q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestFreshRecoveryRevalidatesUnderLockBeforeAnyMutation(t *testing.T) {
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	home := filepath.Join(t.TempDir(), "fresh-home")
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("a", 64), GitHubOwner: "owner", PAT: "secret"}
+	initial := Engine{BundleRoot: bundle, VerifyPAT: verifiedTestPAT, ReconcilePath: func(string) error { return errors.New("PATH denied") }}
+	request.AcceptedCapabilities = requiredCapabilities(t, initial, request)
+	if got, err := initial.Apply(context.Background(), request); err != nil || got.Status != "repair_required" {
+		t.Fatalf("initial repair state=%#v, %v", got, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("initial attempt=%v, %v", entries, err)
+	}
+	attemptID := strings.TrimSuffix(entries[0].Name(), ".json")
+	foreign := filepath.Join(home, "foreign-state.txt")
+	lifecycle := &fakeLifecycle{}
+	verificationCalls := 0
+	retry := Engine{
+		BundleRoot: bundle,
+		Lifecycle:  lifecycle,
+		VerifyPAT: func(ctx context.Context, token, owner string) (githubcredential.Verification, error) {
+			verificationCalls++
+			return verifiedTestPAT(ctx, token, owner)
+		},
+		BeforeRecoveryLock: func(string) {
+			if err := os.WriteFile(foreign, []byte("foreign"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	if got, err := retry.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: readOnlyConsentID(t, home), PAT: "secret"}); err != nil || got.Status != "blocked" {
+		t.Fatalf("TOCTOU recovery apply=%#v, %v", got, err)
+	}
+	if verificationCalls != 0 || len(lifecycle.calls) != 0 {
+		t.Fatalf("TOCTOU reached credential or dependency preparation: verification=%d lifecycle=%v", verificationCalls, lifecycle.calls)
+	}
+	if data, err := os.ReadFile(foreign); err != nil || string(data) != "foreign" {
+		t.Fatalf("TOCTOU recovery removed foreign state: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "platform", "generations", generationName(request.BundleDigest))); !os.IsNotExist(err) {
+		t.Fatalf("TOCTOU recovery staged generation: %v", err)
+	}
+	attempt, err := readAttempt(home, attemptID)
+	if err != nil || attempt.ID != attemptID || attempt.Phase != "failed" {
+		t.Fatalf("TOCTOU recovery changed retained attempt=%#v, %v", attempt, err)
+	}
+}
+
+func readOnlyConsentID(t *testing.T, home string) string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(home, "platform", "consents"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("recovery consent=%v, %v", entries, err)
+	}
+	return strings.TrimSuffix(entries[0].Name(), ".json")
+}
+
+func TestConsentAttemptCrashWindowResumesWithExactConsent(t *testing.T) {
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	home := filepath.Join(t.TempDir(), "fresh-home")
+	verify := func(_ context.Context, token, owner string) (githubcredential.Verification, error) {
+		return githubcredential.Verification{FingerprintSHA256: credential.Fingerprint(token), Login: owner, UserID: 1, Owner: owner, Scopes: []string{"repo", "workflow"}, VerifiedAt: time.Now().UTC()}, nil
+	}
+	crashing := Engine{BundleRoot: bundle, VerifyPAT: verify, AfterConsentWritten: func(string) { panic("simulated process crash") }}
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("c", 64), GitHubOwner: "owner", PAT: "secret"}
+	request.AcceptedCapabilities = requiredCapabilities(t, crashing, request)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("consent hook did not simulate a process crash")
+			}
+		}()
+		_, _ = crashing.Apply(context.Background(), request)
+	}()
+	inspect, err := Engine{BundleRoot: bundle, VerifyPAT: verify}.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspect.Status != "ready" {
+		t.Fatalf("consent crash was not reusable: %#v,%v", inspect, err)
+	}
+	retry := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: inspect.Evidence["consent_id"].(string), PAT: "secret"}
+	if got, err := (Engine{BundleRoot: bundle, VerifyPAT: verify}).Apply(context.Background(), retry); err != nil || got.Status != "ready" {
+		t.Fatalf("consent crash resume=%#v,%v", got, err)
+	}
+}
+
+func TestFreshInitialPATRejectionRecoversSameConsentAttempt(t *testing.T) {
+	bundle, home := t.TempDir(), filepath.Join(t.TempDir(), "fresh-home")
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	fail := true
+	verify := func(ctx context.Context, token, owner string) (githubcredential.Verification, error) {
+		if fail {
+			return githubcredential.Verification{}, errors.New("PAT rejected")
+		}
+		return verifiedTestPAT(ctx, token, owner)
+	}
+	engine := Engine{BundleRoot: bundle, VerifyPAT: verify}
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("f", 64), GitHubOwner: "owner", PAT: "bad"}
+	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+	if got, err := engine.Apply(context.Background(), request); err != nil || got.Status != "repair_required" {
+		t.Fatalf("initial PAT=%#v,%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "state")); !os.IsNotExist(err) {
+		t.Fatalf("PAT rejection created credential state: %v", err)
+	}
+	inspect, err := engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspect.Status != "ready" {
+		t.Fatalf("PAT recovery inspect=%#v,%v", inspect, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+	attemptID := strings.TrimSuffix(entries[0].Name(), ".json")
+	fail = false
+	if got, err := engine.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: inspect.Evidence["consent_id"].(string), PAT: "good"}); err != nil || got.Status != "ready" {
+		t.Fatalf("corrected PAT=%#v,%v", got, err)
+	}
+	active, err := ReadActive(home)
+	if err != nil || active.AttemptID != attemptID {
+		t.Fatalf("PAT retry replaced attempt=%#v,%v", active, err)
+	}
+}
+
+func TestFreshPreActivationArtifactsAreCleanedAndSameAttemptResumes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		engine func(string) Engine
+	}{
+		{
+			name: "dispatcher copied before PATH reconciliation failure",
+			engine: func(bundle string) Engine {
+				return Engine{BundleRoot: bundle, ReconcilePath: func(string) error { return errors.New("PATH denied") }, VerifyPAT: verifiedTestPAT}
+			},
+		},
+		{
+			name: "candidate PAT verification failure",
+			engine: func(bundle string) Engine {
+				calls := 0
+				return Engine{BundleRoot: bundle, VerifyPAT: func(ctx context.Context, token, owner string) (githubcredential.Verification, error) {
+					calls++
+					if calls == 2 {
+						return githubcredential.Verification{}, errors.New("candidate verification failed")
+					}
+					return verifiedTestPAT(ctx, token, owner)
+				}}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+			home := filepath.Join(t.TempDir(), "fresh-home")
+			engine := test.engine(bundle)
+			request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("d", 64), GitHubOwner: "owner", PAT: "secret"}
+			request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+			first, err := engine.Apply(context.Background(), request)
+			if err != nil || first.Status != "repair_required" {
+				t.Fatalf("failed fresh=%#v,%v", first, err)
+			}
+			if _, err := os.Stat(filepath.Join(home, "bin", "workflow.exe")); !os.IsNotExist(err) {
+				t.Fatalf("pre-activation dispatcher was retained: %v", err)
+			}
+			generation := generationName(request.BundleDigest)
+			if _, err := os.Stat(filepath.Join(home, "platform", "generations", generation)); !os.IsNotExist(err) {
+				t.Fatalf("pre-activation generation was retained: %v", err)
+			}
+			attempts, err := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("attempt evidence=%v,%v", attempts, err)
+			}
+			attemptID := strings.TrimSuffix(attempts[0].Name(), ".json")
+			inspect, err := engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+			if err != nil || inspect.Status != "ready" {
+				t.Fatalf("recovery inspect=%#v,%v", inspect, err)
+			}
+			retry := Engine{BundleRoot: bundle, VerifyPAT: verifiedTestPAT}
+			result, err := retry.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: inspect.Evidence["consent_id"].(string), PAT: "secret"})
+			if err != nil || result.Status != "ready" {
+				t.Fatalf("recovery apply=%#v,%v", result, err)
+			}
+			active, err := ReadActive(home)
+			if err != nil || active.AttemptID != attemptID {
+				t.Fatalf("recovery replaced attempt: %#v,%v", active, err)
+			}
+		})
+	}
+}
+
+func TestFreshPartialStageFailureCleansGenerationAndResumesSameAttempt(t *testing.T) {
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	if err := os.RemoveAll(filepath.Join(bundle, "skills")); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(t.TempDir(), "fresh-home")
+	engine := Engine{BundleRoot: bundle, VerifyPAT: verifiedTestPAT}
+	request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("e", 64), GitHubOwner: "owner", PAT: "secret"}
+	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+	if got, err := engine.Apply(context.Background(), request); err != nil || got.Status != "repair_required" {
+		t.Fatalf("partial stage=%#v,%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "platform", "generations", generationName(request.BundleDigest))); !os.IsNotExist(err) {
+		t.Fatalf("partial generation survived stage failure: %v", err)
+	}
+	inspect, err := engine.Inspect(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"})
+	if err != nil || inspect.Status != "ready" {
+		t.Fatalf("partial stage inspect=%#v,%v", inspect, err)
+	}
+	if err := os.MkdirAll(filepath.Join(bundle, "skills", "agent-workflow"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "skills", "agent-workflow", "SKILL.md"), []byte("skill"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := engine.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: inspect.Evidence["consent_id"].(string), PAT: "secret"}); err != nil || got.Status != "ready" {
+		t.Fatalf("partial stage retry=%#v,%v", got, err)
+	}
+}
+
+func verifiedTestPAT(_ context.Context, token, owner string) (githubcredential.Verification, error) {
+	return githubcredential.Verification{FingerprintSHA256: credential.Fingerprint(token), Login: owner, UserID: 1, Owner: owner, Scopes: []string{"repo", "workflow"}, VerifiedAt: time.Now().UTC()}, nil
+}
+
 func TestConcurrentFreshApplyHasOneProspectiveLockOwner(t *testing.T) {
 	bundle := t.TempDir()
 	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
@@ -243,8 +607,9 @@ func TestConcurrentFreshApplyHasOneProspectiveLockOwner(t *testing.T) {
 }
 
 type fakeLifecycle struct {
-	calls     []string
-	failReady bool
+	calls      []string
+	failReady  bool
+	prepareErr error
 }
 
 type upgradeOrderLifecycle struct {
@@ -298,7 +663,7 @@ func (f *upgradeOrderLifecycle) Ready(context.Context, string, Active) error {
 
 func (f *fakeLifecycle) Prepare(context.Context, Request, Consent) error {
 	f.calls = append(f.calls, "prepare")
-	return nil
+	return f.prepareErr
 }
 func (f *fakeLifecycle) Stop(context.Context, string, Active) error {
 	f.calls = append(f.calls, "stop")
