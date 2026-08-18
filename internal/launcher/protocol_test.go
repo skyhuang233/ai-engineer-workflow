@@ -31,3 +31,12 @@ func TestDecodeRequestCarriesGitHubOwnerOnlyForTargetOperations(t *testing.T) {
 		t.Fatal("verify accepted an owner-bearing target field")
 	}
 }
+
+func TestDecodeRequestRejectsNonCanonicalBundleDigest(t *testing.T) {
+	for _, digest := range []string{strings.Repeat("a", 64), "sha256:" + strings.Repeat("g", 64), "sha256:" + strings.Repeat("A", 64)} {
+		request := `{"schema_version":1,"operation":"inspect","purpose":"target_state","workflow_home":"C:\\workflow","target_version":"0.0.3","bundle_digest":"` + digest + `","github_owner":"owner"}`
+		if _, err := DecodeRequest([]byte(request)); err == nil {
+			t.Fatalf("accepted non-canonical digest %q", digest)
+		}
+	}
+}

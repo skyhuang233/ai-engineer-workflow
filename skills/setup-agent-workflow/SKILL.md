@@ -46,8 +46,12 @@ fields, but stop on unknown statuses or malformed known evidence.
    and `owner` (the normalized GitHub owner collected before consent). Never
    use a delimiter-concatenated owner/path value.
 4. After `apply: ready`, invoke the stable Dispatcher's active Launcher
-   `verify`; continue only on `platform_ready`. `repair_required` is a forward
-   repair of the same Bundle/Attempt, never automatic rollback.
+   `verify`; continue only on `platform_ready`. A pre-activation
+   `repair_required` retains the exact Consent and Attempt: reacquire no new
+   target, call `inspect` for its reusable `consent_id`, then retry `apply`
+   with that id (and the PAT again if persistence had not completed).
+   `repair_required` is a forward repair of the same Bundle/Attempt, never
+   automatic rollback.
 5. Use the active versioned CLI only for Repository Onboarding. Generate,
    display, approve, apply, and verify the exact Onboarding Plan Digest for
    this current repository. Finish only at Platform Ready and Repository

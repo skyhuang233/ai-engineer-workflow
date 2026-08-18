@@ -35,6 +35,23 @@ func (d *recordingDependencies) EnsureWorkerImage(_ context.Context, target Work
 	return nil
 }
 
+// repairingDockerDependencies models the one permitted host-state transition:
+// applying an accepted install/upgrade makes the required Desktop version
+// observable to the next inspection.
+type repairingDockerDependencies struct{ recordingDependencies }
+
+func (d *repairingDockerDependencies) EnsureDocker(_ context.Context, target DockerCapabilityTarget) error {
+	d.docker = append(d.docker, target)
+	d.version = target.RequiredVersion
+	return nil
+}
+
+type noOpControlPlane struct{}
+
+func (noOpControlPlane) Stop(context.Context, string, Active) error  { return nil }
+func (noOpControlPlane) Start(context.Context, string, Active) error { return nil }
+func (noOpControlPlane) Ready(context.Context, string, Active) error { return nil }
+
 func TestDependencyCapabilitiesBindExactObservedDockerAndWorkerImage(t *testing.T) {
 	bundle := t.TempDir()
 	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
@@ -120,6 +137,138 @@ func TestDependencyTargetChangeRequiresNewConsentAndPrepareUsesAcceptedTarget(t 
 	engine.BundleRoot, engine.DependencyInspector = changedBundle, fixedDockerInspector{version: "4.86.0"}
 	if got, err := engine.Inspect(context.Background(), inspect); err != nil || got.Status != "consent_required" {
 		t.Fatalf("image change inspect=%#v,%v", got, err)
+	}
+}
+
+func TestFreshDockerRecoveryReusesHostChangingConsentAfterPrepareChangesObservedVersion(t *testing.T) {
+	for _, test := range []struct {
+		name, observed, action string
+	}{
+		{name: "missing Docker installs", observed: "", action: dockerActionInstall},
+		{name: "old Docker upgrades", observed: "4.85.0", action: dockerActionUpgrade},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+			home := filepath.Join(t.TempDir(), "home")
+			digest := "sha256:" + strings.Repeat("a", 64)
+			dependencies := &repairingDockerDependencies{recordingDependencies: recordingDependencies{version: test.observed}}
+			compatibility, err := (Engine{BundleRoot: bundle}).bundleCompatibility()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &BundleLifecycle{Compatibility: compatibility, Dependencies: dependencies, ControlPlane: noOpControlPlane{}}
+			engine := Engine{
+				BundleRoot:          bundle,
+				Lifecycle:           lifecycle,
+				DependencyInspector: dependencies,
+				ReconcilePath:       func(string) error { return errors.New("PATH denied") },
+			}
+			request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner"}
+			request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+			docker, err := dockerCapability(request.AcceptedCapabilities)
+			if err != nil || docker.Action != test.action {
+				t.Fatalf("initial Docker consent=%#v, %v", docker, err)
+			}
+			first, err := engine.Apply(context.Background(), request)
+			if err != nil || first.Status != "repair_required" {
+				t.Fatalf("initial apply=%#v, %v", first, err)
+			}
+			if dependencies.version != compatibility.DockerDesktopVersion {
+				t.Fatalf("Prepare did not update observed Docker version: %q", dependencies.version)
+			}
+			attempts, err := os.ReadDir(filepath.Join(home, "platform", "attempts"))
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("repair attempt=%v, %v", attempts, err)
+			}
+			attemptID := strings.TrimSuffix(attempts[0].Name(), ".json")
+
+			inspectRequest := Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: digest, GitHubOwner: "owner"}
+			inspect, err := engine.Inspect(context.Background(), inspectRequest)
+			if err != nil || inspect.Status != "ready" {
+				t.Fatalf("recovery inspect after Docker repair=%#v, %v", inspect, err)
+			}
+			required := requiredCapabilities(t, engine, inspectRequest)
+			if current, currentErr := dockerCapability(required); currentErr != nil || current.Action != dockerActionReuse {
+				t.Fatalf("post-Prepare Docker requirement=%#v, %v", current, currentErr)
+			}
+
+			retry := Engine{BundleRoot: bundle, Lifecycle: lifecycle, DependencyInspector: dependencies}
+			ready, err := retry.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: digest, ConsentID: inspect.Evidence["consent_id"].(string)})
+			if err != nil || ready.Status != "ready" {
+				t.Fatalf("recovery apply=%#v, %v", ready, err)
+			}
+			active, err := ReadActive(home)
+			if err != nil || active.AttemptID != attemptID {
+				t.Fatalf("recovery replaced attempt=%#v, %v", active, err)
+			}
+		})
+	}
+}
+
+func TestFreshDockerRecoveryRejectsTamperedInstallerContract(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		tamper func(*DockerCapabilityTarget)
+	}{
+		{name: "installer URL", tamper: func(target *DockerCapabilityTarget) { target.InstallerURL = "https://attacker.test/docker.exe" }},
+		{name: "installer checksum", tamper: func(target *DockerCapabilityTarget) { target.InstallerSHA256 = strings.Repeat("c", 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := t.TempDir()
+			writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+			home := filepath.Join(t.TempDir(), "home")
+			dependencies := &repairingDockerDependencies{recordingDependencies: recordingDependencies{version: ""}}
+			compatibility, err := (Engine{BundleRoot: bundle}).bundleCompatibility()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &BundleLifecycle{Compatibility: compatibility, Dependencies: dependencies, ControlPlane: noOpControlPlane{}}
+			engine := Engine{BundleRoot: bundle, Lifecycle: lifecycle, DependencyInspector: dependencies, ReconcilePath: func(string) error { return errors.New("PATH denied") }}
+			request := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("b", 64), GitHubOwner: "owner"}
+			request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+			if got, err := engine.Apply(context.Background(), request); err != nil || got.Status != "repair_required" {
+				t.Fatalf("initial repair state=%#v, %v", got, err)
+			}
+			consents, err := os.ReadDir(filepath.Join(home, "platform", "consents"))
+			if err != nil || len(consents) != 1 {
+				t.Fatalf("repair consent=%v, %v", consents, err)
+			}
+			consentID := strings.TrimSuffix(consents[0].Name(), ".json")
+			consent, err := readConsent(home, consentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range consent.Capabilities {
+				if consent.Capabilities[i].Name != "manage_docker_desktop" {
+					continue
+				}
+				var target DockerCapabilityTarget
+				if err := json.Unmarshal([]byte(consent.Capabilities[i].Value), &target); err != nil {
+					t.Fatal(err)
+				}
+				test.tamper(&target)
+				raw, err := json.Marshal(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				consent.Capabilities[i].Value = string(raw)
+			}
+			if err := writeJSONAtomic(filepath.Join(home, "platform", "consents", consentID+".json"), consent); err != nil {
+				t.Fatal(err)
+			}
+			prepareCalls := len(dependencies.docker)
+			inspectRequest := Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, GitHubOwner: "owner"}
+			if got, err := engine.Inspect(context.Background(), inspectRequest); err != nil || got.Status != "consent_required" {
+				t.Fatalf("tampered recovery inspect=%#v, %v", got, err)
+			}
+			if got, err := engine.Apply(context.Background(), Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: request.TargetVersion, BundleDigest: request.BundleDigest, ConsentID: consentID}); err != nil || got.Status != "blocked" {
+				t.Fatalf("tampered recovery apply=%#v, %v", got, err)
+			}
+			if len(dependencies.docker) != prepareCalls {
+				t.Fatalf("tampered consent reached Docker preparation: %#v", dependencies.docker)
+			}
+		})
 	}
 }
 

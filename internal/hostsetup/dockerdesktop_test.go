@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,6 +57,49 @@ func TestEnsureDockerDesktopVerifiesAssetAndReadsBackEngine(t *testing.T) {
 	}
 	if host.installCalls != 0 {
 		t.Fatal("compatible Docker Desktop reinstalled")
+	}
+}
+
+func TestEnsureDockerDesktopReadyReuseDoesNotStartDesktopAgain(t *testing.T) {
+	host := &fakeDockerHost{version: "4.44.0", ready: true}
+	if err := EnsureDockerDesktop(context.Background(), DockerDesktopContract{Version: "4.44.0"}, host, t.TempDir(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if host.startCalls != 0 || host.installCalls != 0 {
+		t.Fatalf("ready reuse mutated Docker Desktop: start=%d install=%d", host.startCalls, host.installCalls)
+	}
+}
+
+func TestDockerDesktopPowerShellCommandsBindSpacedPathsThroughEnvironment(t *testing.T) {
+	path := `C:\Program Files\Docker\Docker Desktop.exe`
+	installer := dockerDesktopInstallerCommand()
+	if strings.Contains(installer, "$args[0]") || !strings.Contains(installer, "$env:"+dockerDesktopInstallerEnvironment) || !strings.Contains(installer, "exit $p.ExitCode") {
+		t.Fatalf("installer command does not bind or report exact process status: %q", installer)
+	}
+	start := dockerDesktopStartCommand()
+	if strings.Contains(start, "$args[0]") || !strings.Contains(start, "$env:"+dockerDesktopExecutableEnvironment) || !strings.Contains(start, "-WindowStyle Hidden") {
+		t.Fatalf("start command does not bind hidden exact executable: %q", start)
+	}
+	environment := dockerDesktopEnvironment([]string{
+		strings.ToLower(dockerDesktopExecutableEnvironment) + "=old",
+		"wOrKfLoW_DoCkEr_DeSkToP_eXe=older",
+		"OTHER=value",
+	}, dockerDesktopExecutableEnvironment, path)
+	if got := strings.Join(environment, ";"); got != "OTHER=value;"+dockerDesktopExecutableEnvironment+"="+path {
+		t.Fatalf("spaced executable path binding=%q", got)
+	}
+	canonicalCount := 0
+	for _, value := range environment {
+		key, _, _ := strings.Cut(value, "=")
+		if strings.EqualFold(key, dockerDesktopExecutableEnvironment) {
+			canonicalCount++
+			if value != dockerDesktopExecutableEnvironment+"="+path {
+				t.Fatalf("canonical executable binding=%q", value)
+			}
+		}
+	}
+	if canonicalCount != 1 {
+		t.Fatalf("canonical executable binding count=%d environment=%q", canonicalCount, environment)
 	}
 }
 func TestEnsureDockerDesktopRejectsChecksumBeforeUAC(t *testing.T) {
