@@ -23,6 +23,14 @@ import (
 
 type packagedLifecycle struct{}
 
+// DockerVersion pins the packaged test's initial consent to an observed
+// synthetic Docker Desktop product version.  The child launcher deliberately
+// uses its real Windows dependency inspector, so its install/reuse target can
+// never equal this record, independent of the CI host.
+func (packagedLifecycle) DockerVersion(context.Context) (string, error) {
+	return "0.0.0-packaged-test", nil
+}
+
 func (packagedLifecycle) Prepare(context.Context, launcher.Request, launcher.Consent) error {
 	return nil
 }
@@ -70,7 +78,7 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 	}
 	digest := sha256.Sum256(digestBytes)
 	bundleDigest := "sha256:" + hex.EncodeToString(digest[:])
-	engine := launcher.Engine{BundleRoot: extracted, Lifecycle: packagedLifecycle{}}
+	engine := launcher.Engine{BundleRoot: extracted, Lifecycle: packagedLifecycle{}, DependencyInspector: packagedLifecycle{}}
 	inspectRequest := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Inspect, WorkflowHome: home, Purpose: launcher.PurposeTargetState, TargetVersion: "0.0.1", BundleDigest: bundleDigest, GitHubOwner: "owner"}
 	inspection, err := engine.Inspect(context.Background(), inspectRequest)
 	if err != nil {
