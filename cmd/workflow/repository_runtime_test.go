@@ -30,9 +30,10 @@ func TestRepositoryRunnerComposesGatewayAndBusinessLoopWithoutPAT(t *testing.T) 
 		GitHubAPIURL: "https://api.github.com", PollInterval: 45 * time.Second, WorkspaceRetention: 48 * time.Hour, MaxParallelRuns: 2, UpdatedAt: time.Now().UTC(),
 	}
 	const controlToken = "ephemeral-control-token"
-	gateway, poll := (commandRepositoryRunner{Layout: layout, Owner: "owner"}).processArguments(config, 18787, controlToken)
+	databasePath := filepath.Join(layout.Root, "platform", "generations", "generation", "workflow.db")
+	gateway, poll := (commandRepositoryRunner{Layout: layout, Owner: "owner", Database: databasePath}).processArguments(config, 18787, controlToken)
 	joinedGateway, joinedPoll := strings.Join(gateway, "\x00"), strings.Join(poll, "\x00")
-	for _, expected := range []string{"gateway", filepath.Join(layout.State, "workflow.db"), "0.0.0.0:18787", controlToken, `state\credentials\github.pat`} {
+	for _, expected := range []string{"gateway", databasePath, "0.0.0.0:18787", controlToken, `state\credentials\github.pat`} {
 		if !strings.Contains(joinedGateway, expected) {
 			t.Fatalf("Gateway arguments lack %q: %q", expected, gateway)
 		}

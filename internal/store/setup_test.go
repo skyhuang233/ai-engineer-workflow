@@ -2,16 +2,13 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestSetupPlansAreImmutableAndResultsAppend(t *testing.T) {
+func TestOnboardingPlansRemainImmutableAndExecutionResultsAppend(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -19,21 +16,17 @@ func TestSetupPlansAreImmutableAndResultsAppend(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now().UTC()
-	plan := SetupPlanRecord{PlanID: "plan-1", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('a'), CanonicalJSON: `{"plan_id":"plan-1"}`, Projection: "Bootstrap", CreatedAt: now}
-	if err := db.RecordSetupPlan(ctx, plan); err != nil {
-		t.Fatal(err)
-	}
+	plan := SetupPlanRecord{PlanID: "onboard-1", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('a'), CanonicalJSON: `{"plan_id":"onboard-1"}`, Projection: "owner/repo", CreatedAt: now}
 	if err := db.RecordSetupPlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
 	changed := plan
-	changed.Projection = "changed"
+	changed.Projection = "owner/other"
 	if err := db.RecordSetupPlan(ctx, changed); !errors.Is(err, ErrSetupPlanConflict) {
 		t.Fatalf("conflict = %v", err)
 	}
 	for attempt, status := range []string{"incomplete", "succeeded"} {
-		result := SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt + 1, Status: status, EffectsJSON: "[]", StartedAt: now, CompletedAt: now.Add(time.Second)}
-		if err := db.AppendSetupExecutionResult(ctx, result); err != nil {
+		if err := db.AppendSetupExecutionResult(ctx, SetupExecutionResult{PlanID: plan.PlanID, Attempt: attempt + 1, Status: status, EffectsJSON: "[]", StartedAt: now, CompletedAt: now}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,7 +36,7 @@ func TestSetupPlansAreImmutableAndResultsAppend(t *testing.T) {
 	}
 }
 
-func TestRepositoryCreateAttemptEventsAreAppendOnlyAndPlanBound(t *testing.T) {
+func TestRepositoryCreateAttemptEvidenceRemainsPlanBound(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
@@ -51,229 +44,16 @@ func TestRepositoryCreateAttemptEventsAreAppendOnlyAndPlanBound(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now().UTC()
-	plan := SetupPlanRecord{PlanID: "onboarding-1", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('a'), CanonicalJSON: `{}`, Projection: "Onboard", CreatedAt: now}
+	plan := SetupPlanRecord{PlanID: "onboard-2", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('a'), CanonicalJSON: `{}`, Projection: "owner/repo", CreatedAt: now}
 	if err := db.RecordSetupPlan(ctx, plan); err != nil {
 		t.Fatal(err)
 	}
-	started := SetupRepositoryCreateAttemptEvent{
-		PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "create-repository", ExecutionAttempt: 1,
-		Event: RepositoryCreateStarted, Owner: "owner", Name: "repo", Private: true,
-		ApprovalAbsentRepository: "owner/repo", RecordedAt: now,
-	}
-	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, started); err != nil {
+	event := SetupRepositoryCreateAttemptEvent{PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "create-repository", ExecutionAttempt: 1, Event: RepositoryCreateStarted, Owner: "owner", Name: "repo", Private: true, ApprovalAbsentRepository: "owner/repo", RecordedAt: now}
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, event); err != nil {
 		t.Fatal(err)
 	}
-	unknown := started
-	unknown.Event = RepositoryCreateOutcomeUnknown
-	unknown.RecordedAt = now.Add(time.Second)
-	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, unknown); err != nil {
-		t.Fatal(err)
+	event.PlanDigestSHA256 = repeatHex('b')
+	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, event); !errors.Is(err, ErrSetupPlanConflict) {
+		t.Fatalf("wrong digest = %v", err)
 	}
-	conflictingDuplicate := started
-	conflictingDuplicate.RecordedAt = now.Add(2 * time.Second)
-	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, conflictingDuplicate); err != nil {
-		t.Fatalf("idempotent duplicate event with another call timestamp = %v", err)
-	}
-	conflictingDuplicate.Name = "other"
-	conflictingDuplicate.ApprovalAbsentRepository = "owner/other"
-	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, conflictingDuplicate); !errors.Is(err, ErrSetupPlanConflict) {
-		t.Fatalf("duplicate event with another approved identity = %v", err)
-	}
-	events, err := db.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, started.EffectID)
-	if err != nil || len(events) != 2 || events[0].Event != RepositoryCreateStarted || events[1].Event != RepositoryCreateOutcomeUnknown {
-		t.Fatalf("events = %#v, %v", events, err)
-	}
-	if events[0].PlanDigestSHA256 != plan.DigestSHA256 || events[0].Owner != "owner" || events[0].Name != "repo" || !events[0].Private || events[0].ApprovalAbsentRepository != "owner/repo" {
-		t.Fatalf("started event lost approved identity: %#v", events[0])
-	}
-	wrongDigest := started
-	wrongDigest.ExecutionAttempt = 2
-	wrongDigest.PlanDigestSHA256 = repeatHex('b')
-	if err := db.AppendSetupRepositoryCreateAttemptEvent(ctx, wrongDigest); !errors.Is(err, ErrSetupPlanConflict) {
-		t.Fatalf("wrong digest append = %v", err)
-	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE setup_repository_create_attempt_events SET recorded_at='not-a-timestamp' WHERE event_id=?`, events[0].EventID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.SetupRepositoryCreateAttemptEvents(ctx, plan.PlanID, started.EffectID); err == nil {
-		t.Fatal("malformed durable attempt timestamp was accepted")
-	}
-}
-
-func TestLatestSetupPlanSelectsKindAndNewestCreation(t *testing.T) {
-	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Now().UTC()
-	for _, plan := range []SetupPlanRecord{
-		{PlanID: "platform-old", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\home`, DigestSHA256: repeatHex('1'), CanonicalJSON: `{}`, Projection: "old", CreatedAt: now},
-		{PlanID: "repo", Kind: "repository_onboarding", SchemaVersion: 1, Target: `C:\repo`, DigestSHA256: repeatHex('2'), CanonicalJSON: `{}`, Projection: "repo", CreatedAt: now.Add(time.Second)},
-		{PlanID: "platform-new", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\home`, DigestSHA256: repeatHex('3'), CanonicalJSON: `{}`, Projection: "new", CreatedAt: now.Add(2 * time.Second)},
-	} {
-		if err := db.RecordSetupPlan(ctx, plan); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := db.LatestSetupPlan(ctx, "platform_bootstrap")
-	if err != nil || got.PlanID != "platform-new" {
-		t.Fatalf("latest = %#v, %v", got, err)
-	}
-}
-
-func TestPATVerificationAndAdmissionsSurviveReopen(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "workflow.db")
-	now := time.Now().UTC()
-	db, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	verification := GitHubPATVerification{FingerprintSHA256: repeatHex('b'), Login: "user", UserID: 42, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: `C:\home\github.pat`, Status: "verified", VerifiedAt: now}
-	if err := db.RecordGitHubPATVerification(ctx, verification); err != nil {
-		t.Fatal(err)
-	}
-	admission := RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: repeatHex('c'), ContractVersion: "1", ManifestDigestSHA256: repeatHex('d'), Eligible: true, VerifiedAt: now}
-	if err := db.RecordRepositoryAdmission(ctx, admission); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err = Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	got, err := db.GitHubPATVerification(ctx)
-	if err != nil || got.Login != "user" || len(got.Scopes) != 2 {
-		t.Fatalf("verification = %#v, %v", got, err)
-	}
-	gotAdmission, err := db.RepositoryAdmission(ctx, "owner/repo")
-	if err != nil || !gotAdmission.Eligible {
-		t.Fatalf("admission = %#v, %v", gotAdmission, err)
-	}
-}
-
-func TestPlatformAndRuntimeObservationReadBack(t *testing.T) {
-	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Now().UTC()
-	bundleJSON := `[{"path":"bin/workflow.exe","sha256":"` + repeatHex('d') + `"}]`
-	bundleSum := sha256.Sum256([]byte(bundleJSON))
-	platform := PlatformInstallation{PlatformVersion: "1.2.3", ReleaseManifestDigestSHA256: repeatHex('e'), PlatformSetupContractDigestSHA256: repeatHex('c'), WorkflowCLISHA256: repeatHex('d'), ReleaseBundledFilesJSON: bundleJSON, ReleaseBundledFilesDigestSHA256: hex.EncodeToString(bundleSum[:]), WorkflowHome: `C:\Workflow`, InstalledAt: now, VerifiedAt: now}
-	if err := db.RecordPlatformInstallation(ctx, platform); err != nil {
-		t.Fatal(err)
-	}
-	got, err := db.PlatformInstallation(ctx)
-	if err != nil || got.PlatformVersion != "1.2.3" || got.PlatformSetupContractDigestSHA256 != repeatHex('c') || got.WorkflowCLISHA256 != repeatHex('d') || got.ReleaseBundledFilesJSON != bundleJSON || got.ReleaseBundledFilesDigestSHA256 != platform.ReleaseBundledFilesDigestSHA256 {
-		t.Fatalf("platform = %#v, %v", got, err)
-	}
-	if err := db.AuthorizeControlPlane(ctx, platform, repeatHex('a')); err != nil {
-		t.Fatal(err)
-	}
-	got, err = db.PlatformInstallation(ctx)
-	if err != nil || got.ControlPlanePlanDigestSHA256 != repeatHex('a') {
-		t.Fatalf("authorized platform = %#v, %v", got, err)
-	}
-	drifted := platform
-	drifted.WorkflowCLISHA256 = repeatHex('f')
-	if err := db.AuthorizeControlPlane(ctx, drifted, repeatHex('b')); err == nil {
-		t.Fatal("authorized Control Plane against drifted durable pins")
-	}
-	runtime := ControlPlaneRuntimeObservation{PID: 123, ProcessStartedAt: now, EndpointsJSON: `{"health":"http://127.0.0.1:8080/health"}`, PlatformVersion: "1.2.3", PlanDigestSHA256: repeatHex('f'), ObservedAt: now}
-	if err := db.RecordControlPlaneRuntimeObservation(ctx, runtime); err != nil {
-		t.Fatal(err)
-	}
-	runtimeGot, err := db.ControlPlaneRuntimeObservation(ctx)
-	if err != nil || runtimeGot.PID != 123 {
-		t.Fatalf("runtime = %#v, %v", runtimeGot, err)
-	}
-}
-
-func TestSetupCleanupObligationsRemainPendingUntilExactCleanupCompletes(t *testing.T) {
-	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Now().UTC()
-	plan := SetupPlanRecord{PlanID: "cleanup-plan", Kind: "repository_onboarding", SchemaVersion: 1, Target: "owner/repo", DigestSHA256: repeatHex('a'), CanonicalJSON: `{}`, Projection: "cleanup", CreatedAt: now}
-	if err := db.RecordSetupPlan(ctx, plan); err != nil {
-		t.Fatal(err)
-	}
-	value := SetupCleanupObligation{PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "contract", ObligationID: "contract:remote-branch", Kind: "remote_onboarding_branch", Resource: `{"repository":"owner/repo","branch":"workflow/onboarding-aaaa"}`, Status: CleanupPending, UpdatedAt: now}
-	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
-		t.Fatalf("exact pending retry was not idempotent: %v", err)
-	}
-	drift := value
-	drift.Resource = `{"repository":"owner/other"}`
-	if err := db.RecordSetupCleanupObligation(ctx, drift); !errors.Is(err, ErrSetupPlanConflict) {
-		t.Fatalf("cleanup identity drift = %v", err)
-	}
-	pending, err := db.PendingSetupCleanupObligations(ctx, plan.PlanID)
-	if err != nil || len(pending) != 1 || pending[0].Resource != value.Resource {
-		t.Fatalf("pending=%#v err=%v", pending, err)
-	}
-	if err := db.CompleteSetupCleanupObligation(ctx, plan.PlanID, value.ObligationID, now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	pending, err = db.PendingSetupCleanupObligations(ctx, plan.PlanID)
-	if err != nil || len(pending) != 0 {
-		t.Fatalf("completed obligation remains pending: %#v err=%v", pending, err)
-	}
-	value.UpdatedAt = now.Add(2 * time.Second)
-	if err := db.RecordSetupCleanupObligation(ctx, value); err != nil {
-		t.Fatalf("reopen exact cleanup obligation before recreating resource: %v", err)
-	}
-	pending, err = db.PendingSetupCleanupObligations(ctx, plan.PlanID)
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("reopened cleanup obligation = %#v, %v", pending, err)
-	}
-}
-
-func TestPendingSetupCleanupObligationsReturnsEveryPlanInStableOrder(t *testing.T) {
-	ctx := context.Background()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Date(2026, 8, 15, 2, 3, 4, 0, time.UTC)
-	for _, plan := range []SetupPlanRecord{
-		{PlanID: "plan-b", Kind: "platform_bootstrap", SchemaVersion: 1, Target: `C:\\Workflow`, DigestSHA256: strings.Repeat("b", 64), CanonicalJSON: `{}`, Projection: "b", CreatedAt: now},
-		{PlanID: "plan-a", Kind: "repository_onboarding", SchemaVersion: 1, Target: "owner/repo", DigestSHA256: strings.Repeat("a", 64), CanonicalJSON: `{}`, Projection: "a", CreatedAt: now},
-	} {
-		if err := db.RecordSetupPlan(ctx, plan); err != nil {
-			t.Fatal(err)
-		}
-		if err := db.RecordSetupCleanupObligation(ctx, SetupCleanupObligation{PlanID: plan.PlanID, PlanDigestSHA256: plan.DigestSHA256, EffectID: "cleanup", ObligationID: "cleanup:temporary", Kind: "temporary_clone", Resource: `{"root":"C:/tmp","path":"C:/tmp/workflow-onboarding-aaaaaaaaaaaa"}`, Status: CleanupPending, UpdatedAt: now}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	values, err := db.PendingSetupCleanupObligationsAll(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(values) != 2 || values[0].PlanID != "plan-a" || values[1].PlanID != "plan-b" {
-		t.Fatalf("pending=%#v", values)
-	}
-}
-
-func repeatHex(value byte) string {
-	result := make([]byte, 64)
-	for i := range result {
-		result[i] = value
-	}
-	return string(result)
 }

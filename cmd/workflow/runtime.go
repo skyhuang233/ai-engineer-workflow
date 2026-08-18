@@ -15,6 +15,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
@@ -119,7 +120,11 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 		return err
 	}
 	ctx := context.Background()
-	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil || active.Readiness != "ready" {
+		return errors.New("runtime-configure requires a ready active generation")
+	}
+	database, err := store.OpenActivated(ctx, filepath.Join(layout.Root, "platform", "generations", active.Generation, "workflow.db"))
 	if err != nil {
 		return err
 	}

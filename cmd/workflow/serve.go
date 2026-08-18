@@ -18,7 +18,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/admission"
 	"github.com/skyhuang233/workflow/internal/controlplane"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -30,7 +30,6 @@ func serveCommand(args []string, output io.Writer) error {
 	homeOverride := flags.String("workflow-home", os.Getenv("WORKFLOW_HOME"), "absolute Workflow Home")
 	startupTimeout := flags.Duration("startup-timeout", 30*time.Second, "health readiness timeout")
 	listen := flags.String("listen", "127.0.0.1:0", "loopback health endpoint")
-	approvedDigest := flags.String("approved-plan-digest", "", "approved Platform Bootstrap Plan digest")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -41,35 +40,21 @@ func serveCommand(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil || active.Readiness != "ready" {
+		return errors.New("Control Plane launch requires a ready active generation")
+	}
+	databasePath := filepath.Join(layout.Root, "platform", "generations", active.Generation, "workflow.db")
+	database, err := store.OpenActivated(context.Background(), databasePath)
 	if err != nil {
 		return err
 	}
-	installation, err := database.PlatformInstallation(context.Background())
-	if err != nil {
-		database.Close()
-		return fmt.Errorf("read Platform Installation: %w", err)
-	}
-	if err := requireInstalledWorkflowIdentity(installation.PlatformVersion, installation.WorkflowCLISHA256); err != nil {
-		database.Close()
-		return err
-	}
-	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
-	if digest == "" {
-		digest = installation.ControlPlanePlanDigestSHA256
-	}
-	if digest == "" || digest != installation.ControlPlanePlanDigestSHA256 {
-		database.Close()
-		return errors.New("Control Plane launch digest is not the durable Platform Installation authorization")
-	}
-	if err := database.Close(); err != nil {
-		return err
-	}
+	_ = database.Close()
 	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	record, err := controlplane.Start(context.Background(), controlplane.StartOptions{Layout: layout, Executable: executable, PlatformVersion: installation.PlatformVersion, ApprovedPlanDigestSHA256: digest, Listen: *listen, Timeout: *startupTimeout})
+	record, err := controlplane.Start(context.Background(), controlplane.StartOptions{Layout: layout, Executable: executable, PlatformVersion: active.Version, Generation: active.Generation, BundleDigest: strings.TrimPrefix(active.BundleDigest, "sha256:"), Listen: *listen, Timeout: *startupTimeout})
 	if err != nil {
 		return err
 	}
@@ -83,38 +68,23 @@ func serveChildCommand(args []string) error {
 	flags.SetOutput(io.Discard)
 	homeOverride := flags.String("workflow-home", "", "absolute Workflow Home")
 	listenAddress := flags.String("listen", "127.0.0.1:0", "loopback health endpoint")
-	approvedDigest := flags.String("approved-plan-digest", "", "approved Platform Bootstrap Plan digest")
+	generation := flags.String("generation", "", "active generation")
+	bundleDigest := flags.String("bundle-digest", "", "active Bundle digest")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *homeOverride == "" || *approvedDigest == "" {
+	if flags.NArg() != 0 || *homeOverride == "" || *generation == "" || *bundleDigest == "" {
 		return errors.New("invalid internal Control Plane child invocation")
 	}
 	layout, err := workflowhome.Resolve(*homeOverride)
 	if err != nil {
 		return err
 	}
-	database, err := store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
-	if err != nil {
-		return err
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil || active.Generation != *generation || strings.TrimPrefix(active.BundleDigest, "sha256:") != strings.TrimPrefix(*bundleDigest, "sha256:") {
+		return errors.New("Control Plane child does not match the active generation identity")
 	}
-	installation, err := database.PlatformInstallation(context.Background())
-	if err != nil {
-		database.Close()
-		return fmt.Errorf("read Platform Installation: %w", err)
-	}
-	digest := strings.ToLower(strings.TrimSpace(*approvedDigest))
-	if err := requireInstalledWorkflowIdentity(installation.PlatformVersion, installation.WorkflowCLISHA256); err != nil {
-		database.Close()
-		return err
-	}
-	if digest == "" || digest != installation.ControlPlanePlanDigestSHA256 {
-		database.Close()
-		return errors.New("Control Plane child launch digest is not the durable Platform Installation authorization")
-	}
-	if err := database.Close(); err != nil {
-		return err
-	}
+	databasePath := filepath.Join(layout.Root, "platform", "generations", active.Generation, "workflow.db")
 	if err := layout.Ensure(); err != nil {
 		return err
 	}
@@ -132,7 +102,7 @@ func serveChildCommand(args []string) error {
 		return fmt.Errorf("bind Control Plane health endpoint: %w", err)
 	}
 	defer listener.Close()
-	loops, closeLoops, err := currentControlPlaneLoops(context.Background(), layout)
+	loops, closeLoops, err := currentControlPlaneLoops(context.Background(), layout, databasePath)
 	if err != nil {
 		return err
 	}
@@ -142,17 +112,17 @@ func serveChildCommand(args []string) error {
 		return fmt.Errorf("resolve Control Plane process start identity: %w", err)
 	}
 	baseURL := "http://" + listener.Addr().String()
-	record := controlplane.RuntimeRecord{PID: os.Getpid(), PlatformVersion: Version, ProcessStartedAt: started, Endpoints: controlplane.Endpoints{Health: baseURL + "/health", Shutdown: baseURL + "/shutdown"}, ApprovedPlanDigestSHA256: digest}
+	record := controlplane.RuntimeRecord{PID: os.Getpid(), PlatformVersion: active.Version, Generation: active.Generation, BundleDigest: strings.TrimPrefix(active.BundleDigest, "sha256:"), ProcessStartedAt: started, Endpoints: controlplane.Endpoints{Health: baseURL + "/health", Shutdown: baseURL + "/shutdown"}}
 	if err := controlplane.WriteRuntimeRecord(layout, record); err != nil {
 		return err
 	}
-	database, err = store.Open(context.Background(), filepath.Join(layout.State, "workflow.db"))
+	database, err := store.OpenActivated(context.Background(), databasePath)
 	if err != nil {
 		return err
 	}
 	endpoints, _ := json.Marshal(record.Endpoints)
 	now := time.Now().UTC()
-	if err := database.RecordControlPlaneRuntimeObservation(context.Background(), store.ControlPlaneRuntimeObservation{PID: record.PID, ProcessStartedAt: record.ProcessStartedAt, EndpointsJSON: string(endpoints), PlatformVersion: record.PlatformVersion, PlanDigestSHA256: record.ApprovedPlanDigestSHA256, ObservedAt: now}); err != nil {
+	if err := database.RecordControlPlaneRuntimeObservation(context.Background(), store.ControlPlaneRuntimeObservation{PID: record.PID, ProcessStartedAt: record.ProcessStartedAt, EndpointsJSON: string(endpoints), PlatformVersion: record.PlatformVersion, PlanDigestSHA256: record.BundleDigest, ObservedAt: now}); err != nil {
 		database.Close()
 		return err
 	}
@@ -212,8 +182,8 @@ func currentWorkflowExecutableSHA256() (string, error) {
 	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
-func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) ([]controlplane.Loop, func() error, error) {
-	database, err := store.Open(ctx, filepath.Join(layout.State, "workflow.db"))
+func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout, databasePath string) ([]controlplane.Loop, func() error, error) {
+	database, err := store.OpenActivated(ctx, databasePath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -225,17 +195,7 @@ func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) (
 	if err != nil || verification.Status != "verified" {
 		return fail(errors.Join(errors.New("Control Plane PAT verification is unavailable"), err))
 	}
-	contractRaw, err := os.ReadFile(filepath.Join(layout.Config, "platform-setup-contract.json"))
-	if err != nil {
-		return fail(err)
-	}
-	var contract platformrelease.PlatformSetupContract
-	if err := json.Unmarshal(contractRaw, &contract); err != nil {
-		return fail(err)
-	}
-	if err := contract.Validate(); err != nil {
-		return fail(err)
-	}
+	contract := admission.RepositoryContract{Version: "1", RequiredScopes: []string{"repo", "workflow"}}
 	admissions := admission.Service{Store: database, Verifier: admission.DynamicGitHubVerifier{Store: database, Contract: contract}}
 	// Complete one verification pass before advertising health. Individual
 	// repository drift is durably suspended and does not fail unrelated repos.
@@ -248,7 +208,7 @@ func currentControlPlaneLoops(ctx context.Context, layout workflowhome.Layout) (
 	}
 	admissionLoop := func(loopCtx context.Context) error { return admissions.Run(loopCtx, time.Minute) }
 	repositoryLoop := func(loopCtx context.Context) error {
-		return (controlplane.RepositorySupervisor{Store: database, Runner: commandRepositoryRunner{Executable: executable, Layout: layout, Owner: verification.Owner}, Interval: time.Second}).Run(loopCtx)
+		return (controlplane.RepositorySupervisor{Store: database, Runner: commandRepositoryRunner{Executable: executable, Layout: layout, Owner: verification.Owner, Database: databasePath}, Interval: time.Second}).Run(loopCtx)
 	}
 	return []controlplane.Loop{admissionLoop, repositoryLoop}, database.Close, nil
 }

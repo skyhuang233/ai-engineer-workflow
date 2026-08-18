@@ -10,7 +10,6 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -20,12 +19,12 @@ type PATVerificationStore interface {
 
 type DynamicGitHubVerifier struct {
 	Store            PATVerificationStore
-	Contract         platformrelease.PlatformSetupContract
+	Contract         RepositoryContract
 	APIBase          string
 	HTTPClient       *http.Client
 	ReadPAT          func(context.Context, string) (string, error)
 	VerifyPAT        func(context.Context, string, string) (githubcredential.Verification, error)
-	VerifyRepository func(context.Context, string, string, store.RepositoryAdmission, platformrelease.PlatformSetupContract) error
+	VerifyRepository func(context.Context, string, string, store.RepositoryAdmission, RepositoryContract) error
 }
 
 // Verify deliberately rereads and revalidates the plaintext PAT for every
@@ -63,14 +62,14 @@ func (v DynamicGitHubVerifier) Verify(ctx context.Context, value store.Repositor
 	if live.FingerprintSHA256 != recorded.FingerprintSHA256 || live.UserID != recorded.UserID || !strings.EqualFold(live.Login, recorded.Login) || !strings.EqualFold(live.Owner, recorded.Owner) {
 		return errors.New("Control Plane PAT live identity differs from its verified record")
 	}
-	for _, required := range v.Contract.Credential.RequiredScopes {
+	for _, required := range v.Contract.RequiredScopes {
 		if !containsFold(live.Scopes, required) {
 			return errors.New("Control Plane PAT live scopes differ from the installed platform contract")
 		}
 	}
 	verifyRepository := v.VerifyRepository
 	if verifyRepository == nil {
-		verifyRepository = func(ctx context.Context, token, owner string, value store.RepositoryAdmission, contract platformrelease.PlatformSetupContract) error {
+		verifyRepository = func(ctx context.Context, token, owner string, value store.RepositoryAdmission, contract RepositoryContract) error {
 			client := github.NewClient(v.APIBase, token, v.HTTPClient).WithRepositoryOwner(owner)
 			return (GitHubVerifier{Client: client, Contract: contract}).Verify(ctx, value)
 		}

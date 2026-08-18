@@ -167,6 +167,13 @@ func (s *Store) claimReady(ctx context.Context, request ClaimRequest) (TicketCla
 		return TicketClaim{}, err
 	}
 	defer tx.Rollback()
+	fenced, err := maintenanceFencedTx(ctx, tx)
+	if err != nil {
+		return TicketClaim{}, err
+	}
+	if fenced {
+		return TicketClaim{}, ErrMaintenanceFenced
+	}
 	snapshot, err := loadFrontierTx(ctx, tx, request.VersionID, request.Now)
 	if err != nil {
 		return TicketClaim{}, err

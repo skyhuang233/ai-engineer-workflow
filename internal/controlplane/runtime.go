@@ -32,19 +32,31 @@ type Endpoints struct {
 }
 
 type RuntimeRecord struct {
-	PID                      int       `json:"pid"`
-	PlatformVersion          string    `json:"platform_version"`
-	ProcessStartedAt         time.Time `json:"process_started_at"`
-	Endpoints                Endpoints `json:"endpoints"`
-	ApprovedPlanDigestSHA256 string    `json:"approved_platform_bootstrap_plan_digest_sha256"`
+	PID              int       `json:"pid"`
+	PlatformVersion  string    `json:"platform_version"`
+	ProcessStartedAt time.Time `json:"process_started_at"`
+	Endpoints        Endpoints `json:"endpoints"`
+	Generation       string    `json:"generation"`
+	BundleDigest     string    `json:"bundle_digest"`
 }
 
 func (r RuntimeRecord) Identity() Identity {
-	return Identity{PID: r.PID, ProcessStartedAt: r.ProcessStartedAt, PlatformVersion: r.PlatformVersion, ApprovedPlanDigestSHA256: r.ApprovedPlanDigestSHA256}
+	return Identity{PID: r.PID, ProcessStartedAt: r.ProcessStartedAt, PlatformVersion: r.PlatformVersion, Generation: r.Generation, BundleDigest: r.BundleDigest}
 }
 
 func RuntimeRecordPath(layout workflowhome.Layout) string {
-	return filepath.Join(layout.State, "runtime.json")
+	// The pointer is intentionally read here rather than inferred from the
+	// executable: one active generation owns one runtime record and database.
+	raw, err := os.ReadFile(filepath.Join(layout.Root, "platform", "active.json"))
+	if err == nil {
+		var active struct {
+			Generation string `json:"generation"`
+		}
+		if json.Unmarshal(raw, &active) == nil && active.Generation != "" {
+			return filepath.Join(layout.Root, "platform", "generations", active.Generation, "runtime.json")
+		}
+	}
+	return filepath.Join(layout.Root, "platform", "runtime.json")
 }
 
 func LogPaths(layout workflowhome.Layout) (string, string) {
@@ -64,6 +76,9 @@ func WriteRuntimeRecord(layout workflowhome.Layout, record RuntimeRecord) error 
 	}
 	raw = append(raw, '\n')
 	path := RuntimeRecordPath(layout)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".runtime-*.tmp")
 	if err != nil {
 		return err
@@ -106,7 +121,7 @@ func ReadRuntimeRecord(layout workflowhome.Layout) (RuntimeRecord, error) {
 }
 
 func validateRuntimeRecord(record RuntimeRecord) error {
-	if record.PID <= 0 || record.PlatformVersion == "" || record.ProcessStartedAt.IsZero() || !validDigest(record.ApprovedPlanDigestSHA256) {
+	if record.PID <= 0 || record.PlatformVersion == "" || record.Generation == "" || record.ProcessStartedAt.IsZero() || !validDigest(record.BundleDigest) {
 		return errors.New("invalid Control Plane Runtime Record identity")
 	}
 	if !localHTTPURL(record.Endpoints.Health, "/health") || !localHTTPURL(record.Endpoints.Shutdown, "/shutdown") {
@@ -147,21 +162,22 @@ type Observation struct {
 }
 
 type StartOptions struct {
-	Layout                   workflowhome.Layout
-	Executable               string
-	PlatformVersion          string
-	ApprovedPlanDigestSHA256 string
-	Listen                   string
-	Timeout                  time.Duration
-	Inspector                Inspector
-	Launch                   func(string, []string, string, string) (int, error)
-	Replace                  bool
-	AuthorizeReplacement     func(int) error
+	Layout               workflowhome.Layout
+	Executable           string
+	PlatformVersion      string
+	Generation           string
+	BundleDigest         string
+	Listen               string
+	Timeout              time.Duration
+	Inspector            Inspector
+	Launch               func(string, []string, string, string) (int, error)
+	Replace              bool
+	AuthorizeReplacement func(int) error
 }
 
 func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
-	if options.Executable == "" || options.PlatformVersion == "" || !validDigest(options.ApprovedPlanDigestSHA256) {
-		return RuntimeRecord{}, errors.New("Control Plane launch requires executable, platform version, and approved bootstrap digest")
+	if options.Executable == "" || options.PlatformVersion == "" || options.Generation == "" || !validDigest(options.BundleDigest) {
+		return RuntimeRecord{}, errors.New("Control Plane launch requires executable, platform version, generation, and Bundle digest")
 	}
 	if err := options.Layout.Ensure(); err != nil {
 		return RuntimeRecord{}, err
@@ -176,7 +192,7 @@ func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
 		observation := options.Inspector.Inspect(ctx, &existing)
 		switch observation.State {
 		case StateReady:
-			if existing.PlatformVersion == options.PlatformVersion && existing.ApprovedPlanDigestSHA256 == options.ApprovedPlanDigestSHA256 {
+			if existing.PlatformVersion == options.PlatformVersion && existing.Generation == options.Generation && existing.BundleDigest == options.BundleDigest {
 				return existing, nil
 			}
 			if !options.Replace {
@@ -210,7 +226,7 @@ func Start(ctx context.Context, options StartOptions) (RuntimeRecord, error) {
 	if launch == nil {
 		launch = LaunchDetached
 	}
-	args := []string{"serve-child", "--workflow-home", options.Layout.Root, "--listen", listen, "--approved-plan-digest", options.ApprovedPlanDigestSHA256}
+	args := []string{"serve-child", "--workflow-home", options.Layout.Root, "--listen", listen, "--generation", options.Generation, "--bundle-digest", options.BundleDigest}
 	pid, err := launch(options.Executable, args, stdout, stderr)
 	if err != nil {
 		return RuntimeRecord{}, err

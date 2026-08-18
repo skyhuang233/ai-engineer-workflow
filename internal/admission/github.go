@@ -7,7 +7,6 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/onboarding"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
 	"github.com/skyhuang233/workflow/internal/store"
 )
@@ -16,8 +15,15 @@ import (
 // new work. It is non-mutating; repair remains an explicit Setup operation.
 type GitHubVerifier struct {
 	Client   *github.Client
-	Contract platformrelease.PlatformSetupContract
+	Contract RepositoryContract
 }
+
+type RepositoryContract struct {
+	Version        string
+	Labels         []RepositoryLabel
+	RequiredScopes []string
+}
+type RepositoryLabel struct{ Name, Color, Description string }
 
 func (v GitHubVerifier) Verify(ctx context.Context, value store.RepositoryAdmission) error {
 	if v.Client == nil {
@@ -33,10 +39,10 @@ func (v GitHubVerifier) Verify(ctx context.Context, value store.RepositoryAdmiss
 	if err != nil {
 		return err
 	}
-	if manifest.ContractVersion != value.ContractVersion || manifest.ContractVersion != v.Contract.RepositoryContract.Version {
+	if manifest.ContractVersion != value.ContractVersion || manifest.ContractVersion != v.Contract.Version {
 		return errors.New("Repository Contract version differs from the installed platform")
 	}
-	for _, expected := range v.Contract.RepositoryContract.Labels {
+	for _, expected := range v.Contract.Labels {
 		actual, labelErr := v.Client.Label(ctx, value.Repository, expected.Name)
 		if labelErr != nil {
 			return labelErr

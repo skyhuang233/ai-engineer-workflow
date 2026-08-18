@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 62
+	latestSchemaVersion = 63
 )
 
 var (
@@ -112,7 +112,7 @@ func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
 	}
 	if version != latestSchemaVersion {
 		store.Close()
-		return nil, fmt.Errorf("%w: found schema %d, require schema %d; apply an approved Platform repair before planning", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
 	}
 	return store, nil
 }
@@ -121,6 +121,146 @@ func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
 // repeating startup integrity checks or migration discovery.
 func OpenForRuntime(ctx context.Context, dsn string) (*Store, error) {
 	return openForStartup(ctx, dsn, true)
+}
+
+// OpenActivated is the versioned CLI entry point. Schema creation and
+// migration belong to the Bundle Launcher; an activated CLI fails closed when
+// its generation-local database is not already the exact compiled schema.
+func OpenActivated(ctx context.Context, dsn string) (*Store, error) {
+	// Prove the schema is exact before joining the generation as a writable
+	// runtime participant.  In particular, a mismatched active generation must
+	// not gain a WAL, access lock, backup, migration, or other on-disk side
+	// effect merely because a Dispatcher or upgrade preflight attempted to use
+	// it.  The Launcher is the sole migration authority.
+	if err := verifyActivatedSchema(ctx, dsn); err != nil {
+		return nil, err
+	}
+	store, err := openForStartup(ctx, dsn, true)
+	if err != nil {
+		return nil, err
+	}
+	version, err := store.schemaVersion(ctx)
+	if err != nil || version != latestSchemaVersion {
+		_ = store.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	}
+	return store, nil
+}
+
+// OpenForLauncherMaintenance is the only non-migrating writable opener for a
+// prior active generation during a Launcher upgrade. It admits an older
+// generation when it already carries the stable maintenance contract, then
+// allows only fence/count, backup, and fence-clear operations. The copied
+// candidate is the sole database the Launcher may migrate.
+func OpenForLauncherMaintenance(ctx context.Context, dsn string) (*Store, error) {
+	if err := verifyMaintenanceSchema(ctx, dsn); err != nil {
+		return nil, err
+	}
+	store, err := openForStartup(ctx, dsn, true)
+	if err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// verifyActivatedSchema uses an immutable read-only connection because it runs
+// before a versioned command is allowed to touch the active generation. Unlike
+// normal planning reads, this check must not create WAL/SHM sidecars for a
+// generation that is already incompatible. Schema changes are Launcher-only,
+// so an immutable snapshot is sufficient for this admission boundary.
+func verifyActivatedSchema(ctx context.Context, dsn string) error {
+	databasePath, err := startup.DatabaseFilePath(dsn)
+	if err != nil {
+		return err
+	}
+	if databasePath == "" {
+		return errors.New("activated Store requires a generation-local database file")
+	}
+	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro&immutable=1"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	inspected := &Store{db: db, databasePath: databasePath}
+	version, err := inspected.schemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect activated workflow database schema: %w", err)
+	}
+	if version != latestSchemaVersion {
+		return fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	}
+	return nil
+}
+
+// verifyMaintenanceSchema is deliberately independent of the target binary's
+// exact schema. A prior generation may be older than the target, but it must
+// already contain every table/column used by the atomic maintenance fence and
+// active-work count. The immutable probe fails before an incompatible or
+// corrupt generation can gain runtime lock/WAL side effects.
+func verifyMaintenanceSchema(ctx context.Context, dsn string) error {
+	databasePath, err := startup.DatabaseFilePath(dsn)
+	if err != nil {
+		return err
+	}
+	if databasePath == "" {
+		return errors.New("Launcher maintenance requires a generation-local database file")
+	}
+	uri := (&url.URL{Scheme: "file", Path: "/" + strings.TrimLeft(filepath.ToSlash(databasePath), "/"), RawQuery: "mode=ro&immutable=1"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	inspected := &Store{db: db, databasePath: databasePath}
+	if err := inspected.IntegrityCheck(ctx); err != nil {
+		return fmt.Errorf("inspect Launcher maintenance database: %w", err)
+	}
+	version, err := inspected.schemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect Launcher maintenance schema: %w", err)
+	}
+	if version > latestSchemaVersion {
+		return fmt.Errorf("%w: found future schema %d, target supports through %d", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	}
+	for table, columns := range map[string][]string{
+		"worker_runs":                 {"run_id", "lease_generation", "state"},
+		"run_leases":                  {"run_id", "generation", "state", "expires_at"},
+		"platform_maintenance_fences": {"singleton", "operation_id", "bundle_digest", "created_at"},
+	} {
+		if err := requireTableColumns(ctx, db, table, columns); err != nil {
+			return fmt.Errorf("%w: Launcher maintenance contract %s: %v", ErrSchemaUpgradeRequired, table, err)
+		}
+	}
+	return nil
+}
+
+func requireTableColumns(ctx context.Context, db *sql.DB, table string, required []string) error {
+	rows, err := db.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	available := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		available[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, name := range required {
+		if !available[name] {
+			return fmt.Errorf("missing required column %q", name)
+		}
+	}
+	return nil
 }
 
 func open(ctx context.Context, dsn string, restoreBarrier bool) (*Store, error) {
@@ -1593,17 +1733,9 @@ SELECT backup_path, kind, reference_path, checksum_sha256, available FROM contro
 	}
 	if applied < 57 {
 		statements := []string{
-			`CREATE TABLE IF NOT EXISTS platform_installation (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    platform_version TEXT NOT NULL,
-    release_manifest_digest TEXT NOT NULL,
-    workflow_home TEXT NOT NULL,
-    installed_at TEXT NOT NULL,
-    verified_at TEXT NOT NULL
-)`,
 			`CREATE TABLE IF NOT EXISTS setup_plans (
     plan_id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('platform_bootstrap', 'repository_onboarding')),
+    kind TEXT NOT NULL CHECK (kind = 'repository_onboarding'),
     schema_version INTEGER NOT NULL,
     target TEXT NOT NULL,
     digest_sha256 TEXT NOT NULL UNIQUE,
@@ -1695,43 +1827,11 @@ FROM repository_admissions r`,
 		}
 	}
 	if applied < 59 {
-		columns := []struct{ name, statement string }{
-			{"platform_setup_contract_digest", `ALTER TABLE platform_installation ADD COLUMN platform_setup_contract_digest TEXT NOT NULL DEFAULT ''`},
-			{"workflow_cli_sha256", `ALTER TABLE platform_installation ADD COLUMN workflow_cli_sha256 TEXT NOT NULL DEFAULT ''`},
-			{"control_plane_plan_digest", `ALTER TABLE platform_installation ADD COLUMN control_plane_plan_digest TEXT NOT NULL DEFAULT ''`},
-		}
-		for _, column := range columns {
-			exists, err := tableHasColumnTx(ctx, tx, "platform_installation", column.name)
-			if err != nil {
-				return err
-			}
-			if exists {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, column.statement); err != nil {
-				return fmt.Errorf("migration 59: %w", err)
-			}
-		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (59, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
 	if applied < 60 {
-		columns := []struct{ name, statement string }{
-			{"release_bundled_files_json", `ALTER TABLE platform_installation ADD COLUMN release_bundled_files_json TEXT NOT NULL DEFAULT ''`},
-			{"release_bundled_files_digest", `ALTER TABLE platform_installation ADD COLUMN release_bundled_files_digest TEXT NOT NULL DEFAULT ''`},
-		}
-		for _, column := range columns {
-			exists, err := tableHasColumnTx(ctx, tx, "platform_installation", column.name)
-			if err != nil {
-				return err
-			}
-			if !exists {
-				if _, err := tx.ExecContext(ctx, column.statement); err != nil {
-					return fmt.Errorf("migration 60: %w", err)
-				}
-			}
-		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (60, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
@@ -1775,7 +1875,32 @@ FROM repository_admissions r`,
 			return err
 		}
 	}
-	return tx.Commit()
+	if applied < 63 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS platform_maintenance_fences (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    operation_id TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migration 63: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (63, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Publish the schema ledger into the main database before any generation is
+	// activated. OpenActivated performs a side-effect-free immutable schema
+	// admission check, so the launcher-created schema cannot remain visible only
+	// in a transient WAL file.
+	if s.databasePath != "" {
+		if _, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			return fmt.Errorf("checkpoint migrated schema: %w", err)
+		}
+	}
+	return nil
 }
 
 func tableHasColumnTx(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {

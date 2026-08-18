@@ -22,7 +22,7 @@ func TestRuntimeRecordRoundTripAndLogPathsStayInWorkflowHome(t *testing.T) {
 	if err := layout.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", ProcessStartedAt: time.Now().UTC().Round(0), Endpoints: Endpoints{Health: "http://127.0.0.1:12345/health", Shutdown: "http://127.0.0.1:12345/shutdown"}, ApprovedPlanDigestSHA256: repeatDigest('c')}
+	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", Generation: "generation-c", BundleDigest: repeatDigest('c'), ProcessStartedAt: time.Now().UTC().Round(0), Endpoints: Endpoints{Health: "http://127.0.0.1:12345/health", Shutdown: "http://127.0.0.1:12345/shutdown"}}
 	if err := WriteRuntimeRecord(layout, record); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestRuntimeRecordRoundTripAndLogPathsStayInWorkflowHome(t *testing.T) {
 
 func TestInspectorDistinguishesReadyStaleMismatchedAndStopped(t *testing.T) {
 	started := time.Now().UTC().Round(0)
-	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", ProcessStartedAt: started, ApprovedPlanDigestSHA256: repeatDigest('d')}
+	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", Generation: "generation-d", BundleDigest: repeatDigest('d'), ProcessStartedAt: started}
 	healthIdentity := record.Identity()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(Health{Status: "ready", Identity: healthIdentity})
@@ -83,7 +83,7 @@ func TestInspectorDistinguishesReadyStaleMismatchedAndStopped(t *testing.T) {
 
 func TestInspectorReportsStoppedWhenOwnedProcessIsUnhealthy(t *testing.T) {
 	started := time.Now().UTC().Round(0)
-	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", ProcessStartedAt: started, Endpoints: Endpoints{Health: "http://127.0.0.1:1/health"}, ApprovedPlanDigestSHA256: repeatDigest('e')}
+	record := RuntimeRecord{PID: 123, PlatformVersion: "1.2.3", Generation: "generation-e", BundleDigest: repeatDigest('e'), ProcessStartedAt: started, Endpoints: Endpoints{Health: "http://127.0.0.1:1/health"}}
 	observation := (Inspector{ProcessIdentity: func(int) (time.Time, bool, error) { return started, true, nil }, Client: &http.Client{Timeout: 50 * time.Millisecond}}).Inspect(context.Background(), &record)
 	if observation.State != StateStopped {
 		t.Fatalf("observation = %#v", observation)
@@ -110,7 +110,7 @@ func TestStartLaunchesOnceAndReturnsExistingMatchingInstance(t *testing.T) {
 				t.Fatalf("detached Control Plane launch exposes a runtime platform version override: %#v", args)
 			}
 		}
-		record := RuntimeRecord{PID: 321, PlatformVersion: "1.0.0", ProcessStartedAt: started, ApprovedPlanDigestSHA256: digest}
+		record := RuntimeRecord{PID: 321, PlatformVersion: "1.0.0", Generation: "generation-start", BundleDigest: digest, ProcessStartedAt: started}
 		server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(writer).Encode(Health{Status: "ready", Identity: record.Identity()})
 		}))
@@ -120,7 +120,7 @@ func TestStartLaunchesOnceAndReturnsExistingMatchingInstance(t *testing.T) {
 		}
 		return 321, nil
 	}
-	options := StartOptions{Layout: layout, Executable: `C:\workflow.exe`, PlatformVersion: "1.0.0", ApprovedPlanDigestSHA256: digest, Timeout: time.Second, Inspector: inspector, Launch: launch}
+	options := StartOptions{Layout: layout, Executable: `C:\workflow.exe`, PlatformVersion: "1.0.0", Generation: "generation-start", BundleDigest: digest, Timeout: time.Second, Inspector: inspector, Launch: launch}
 	if _, err := Start(context.Background(), options); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestStartReplacesDifferentVerifiedCurrentUserInstanceOnlyWhenAuthorized(t *
 	oldStarted, newStarted := time.Now().UTC().Add(-time.Minute).Round(0), time.Now().UTC().Round(0)
 	oldDigest, newDigest := repeatDigest('a'), repeatDigest('b')
 	oldLive, launches, authorized := true, 0, 0
-	old := RuntimeRecord{PID: 111, PlatformVersion: "1.0.0", ProcessStartedAt: oldStarted, ApprovedPlanDigestSHA256: oldDigest}
+	old := RuntimeRecord{PID: 111, PlatformVersion: "1.0.0", Generation: "generation-old", BundleDigest: oldDigest, ProcessStartedAt: oldStarted}
 	var launched RuntimeRecord
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -168,10 +168,10 @@ func TestStartReplacesDifferentVerifiedCurrentUserInstanceOnlyWhenAuthorized(t *
 	}}
 	launch := func(_ string, _ []string, _, _ string) (int, error) {
 		launches++
-		launched = RuntimeRecord{PID: 222, PlatformVersion: "2.0.0", ProcessStartedAt: newStarted, Endpoints: old.Endpoints, ApprovedPlanDigestSHA256: newDigest}
+		launched = RuntimeRecord{PID: 222, PlatformVersion: "2.0.0", Generation: "generation-new", BundleDigest: newDigest, ProcessStartedAt: newStarted, Endpoints: old.Endpoints}
 		return 222, WriteRuntimeRecord(layout, launched)
 	}
-	options := StartOptions{Layout: layout, Executable: `C:\workflow.exe`, PlatformVersion: "2.0.0", ApprovedPlanDigestSHA256: newDigest, Timeout: time.Second, Inspector: inspector, Launch: launch, Replace: true, AuthorizeReplacement: func(pid int) error {
+	options := StartOptions{Layout: layout, Executable: `C:\workflow.exe`, PlatformVersion: "2.0.0", Generation: "generation-new", BundleDigest: newDigest, Timeout: time.Second, Inspector: inspector, Launch: launch, Replace: true, AuthorizeReplacement: func(pid int) error {
 		authorized++
 		if pid != 111 {
 			t.Fatalf("authorized pid %d", pid)

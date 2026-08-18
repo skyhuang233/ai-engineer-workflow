@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,7 +22,6 @@ func main() {
 
 func run(arguments []string) error {
 	flags := flag.NewFlagSet("platform-release", flag.ContinueOnError)
-	templatePath := flags.String("template", "deploy/platform/release-manifest.json", "Platform Release Manifest source template")
 	executable := flags.String("workflow-exe", "", "Windows amd64 workflow.exe")
 	payload := flags.String("payload", "", "staged package payload root")
 	output := flags.String("output", "", "release output directory")
@@ -34,13 +32,17 @@ func run(arguments []string) error {
 	dockerURL := flags.String("docker-installer-url", "", "Docker Desktop Windows amd64 installer URL")
 	dockerSHA := flags.String("docker-installer-sha256", "", "Docker Desktop Windows amd64 installer SHA-256")
 	workerImage := flags.String("worker-image", "", "immutable Worker image reference")
+	setupExecutable := flags.String("setup-exe", "", "Windows amd64 workflow-setup.exe")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("platform-release does not accept positional arguments")
 	}
-	for name, value := range map[string]string{"workflow-exe": *executable, "payload": *payload, "output": *output, "version": *version, "source-commit": *sourceCommit, "docker-version": *dockerVersion, "docker-installer-url": *dockerURL, "docker-installer-sha256": *dockerSHA, "worker-image": *workerImage} {
+	if err := platformrelease.ValidatePlatformVersion(*version); err != nil {
+		return fmt.Errorf("-version: %w", err)
+	}
+	for name, value := range map[string]string{"workflow-exe": *executable, "setup-exe": *setupExecutable, "payload": *payload, "output": *output, "version": *version, "source-commit": *sourceCommit, "docker-version": *dockerVersion, "docker-installer-url": *dockerURL, "docker-installer-sha256": *dockerSHA, "worker-image": *workerImage} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("-%s is required", name)
 		}
@@ -48,32 +50,22 @@ func run(arguments []string) error {
 	if *runID <= 0 {
 		return errors.New("-github-actions-run-id must be positive")
 	}
-	if err := platformrelease.ValidatePlatformVersion(*version); err != nil {
-		return fmt.Errorf("-version: %w", err)
-	}
 	if err := verifyWorkflowExecutableVersion(*executable, *version); err != nil {
 		return err
 	}
-	manifest, err := loadTemplate(*templatePath)
-	if err != nil {
-		return err
+	manifest := platformrelease.BundleManifest{
+		SchemaVersion: 1, SetupProtocolVersion: 1, Version: *version,
+		Compatibility: platformrelease.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: *dockerVersion, DockerInstallerURL: *dockerURL, DockerInstallerSHA256: strings.ToLower(*dockerSHA), WorkerImage: strings.ToLower(*workerImage)},
 	}
-	manifest.Release.Version = *version
-	manifest.Release.Tag = "platform-v" + *version
-	manifest.Release.SourceCommit = strings.ToLower(*sourceCommit)
-	manifest.Release.GitHubActionsRunID = *runID
-	manifest.Provenance.SourceCommit = manifest.Release.SourceCommit
-	manifest.Provenance.GitHubActionsRunID = *runID
-	manifest.PlatformSetup.Docker.Version = *dockerVersion
-	manifest.PlatformSetup.Docker.InstallerURL = *dockerURL
-	manifest.PlatformSetup.Docker.WindowsAMD64SHA256 = strings.ToLower(*dockerSHA)
-	manifest.PlatformSetup.Worker.Image = strings.ToLower(*workerImage)
-	_, err = platformrelease.Assemble(platformrelease.AssembleOptions{OutputDirectory: *output, WorkflowExecutable: *executable, PayloadDirectory: *payload, Manifest: manifest})
-	return err
+	return platformrelease.AssembleBundle(platformrelease.BundleAssembleOptions{Output: *output, SetupExecutable: *setupExecutable, WorkflowExecutable: *executable, PayloadDirectory: *payload, Manifest: manifest})
 }
 
 func verifyWorkflowExecutableVersion(executable, expectedVersion string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// The publisher executes a freshly cross-compiled Windows binary. On the
+	// Windows GitHub runner that first process start can contend with the
+	// concurrent release build, so keep the bounded probe comfortably above the
+	// normal cold-start budget while still failing closed.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, executable, "version").CombinedOutput()
 	if ctx.Err() != nil {
@@ -87,19 +79,4 @@ func verifyWorkflowExecutableVersion(executable, expectedVersion string) error {
 		return fmt.Errorf("Workflow CLI published version %q differs from Platform Release Manifest version %q", got, want)
 	}
 	return nil
-}
-
-func loadTemplate(path string) (platformrelease.Manifest, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return platformrelease.Manifest{}, fmt.Errorf("open Platform Release template: %w", err)
-	}
-	defer file.Close()
-	var manifest platformrelease.Manifest
-	decoder := json.NewDecoder(file)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil {
-		return platformrelease.Manifest{}, fmt.Errorf("decode Platform Release template: %w", err)
-	}
-	return manifest, nil
 }

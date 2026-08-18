@@ -26,6 +26,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
+	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/scheduler"
@@ -36,9 +37,7 @@ import (
 )
 
 const (
-	defaultControlPlaneDatabase = "workflow.db"
-	doctorVerificationTimeout   = 10 * time.Minute
-	restoreIsolationTimeout     = 30 * time.Second
+	doctorVerificationTimeout = 10 * time.Minute
 )
 
 // Version is "dev" for source builds. Immutable Platform Release builds set
@@ -73,6 +72,75 @@ func controlPlaneContainerID(databasePath string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// activeCommandDatabase resolves the only implicit database allowed to a
+// normal versioned command. Dispatcher supplies the identity variables, but
+// the child derives the path again from active.json and rejects spoofed or
+// stale values. Direct/source callers may use an explicit absolute advanced
+// override; there is deliberately no cwd workflow.db fallback.
+func activeCommandDatabase(override string) (string, error) {
+	override = strings.TrimSpace(override)
+	if override != "" && !filepath.IsAbs(override) {
+		return "", errors.New("--database override must be absolute")
+	}
+	home := strings.TrimSpace(os.Getenv("WORKFLOW_ACTIVE_HOME"))
+	if home == "" {
+		home = strings.TrimSpace(os.Getenv("WORKFLOW_HOME"))
+	}
+	boundHome := home != ""
+	if override != "" && !boundHome {
+		return filepath.Clean(override), nil
+	}
+	// A Dispatcher- or Control-Plane-launched child is bound to a Home even
+	// with an explicit advanced override: validate that its executable belongs
+	// to active.json before allowing any SQLite open.
+	if override != "" {
+		authoritative, err := activeCommandDatabaseForHome(home)
+		if err != nil {
+			return "", err
+		}
+		if !strings.EqualFold(filepath.Clean(override), authoritative) {
+			return "", errors.New("dispatcher-bound --database must equal the active generation database")
+		}
+		return filepath.Clean(override), nil
+	}
+	return activeCommandDatabaseForHome(home)
+}
+
+func activeCommandDatabaseForHome(home string) (string, error) {
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("runtime command requires --database or a Workflow Home active generation")
+	}
+	layout, err := workflowhome.Resolve(home)
+	if err != nil {
+		return "", err
+	}
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil {
+		return "", fmt.Errorf("runtime command requires an authoritative active generation: %w", err)
+	}
+	if active.Readiness != "ready" {
+		return "", errors.New("runtime command requires a ready active generation")
+	}
+	if expected := strings.TrimSpace(os.Getenv("WORKFLOW_ACTIVE_GENERATION")); expected != "" && expected != active.Generation {
+		return "", errors.New("dispatcher active generation differs from active.json")
+	}
+	if err := validateVersionedActiveExecutable(layout.Root, active); err != nil {
+		return "", err
+	}
+	database := generationDatabasePath(layout.Root, active)
+	if expected := strings.TrimSpace(os.Getenv("WORKFLOW_ACTIVE_DATABASE")); expected != "" && !strings.EqualFold(filepath.Clean(expected), database) {
+		return "", errors.New("dispatcher active database differs from active.json")
+	}
+	info, err := os.Stat(database)
+	if err != nil || info.IsDir() {
+		if err == nil {
+			err = errors.New("active generation database is a directory")
+		}
+		return "", fmt.Errorf("active generation database is unavailable: %w", err)
+	}
+	return database, nil
+}
+
 type githubTokenProvider interface {
 	Token(context.Context) (string, error)
 }
@@ -88,8 +156,8 @@ func main() {
 	switch os.Args[1] {
 	case "--version", "version":
 		fmt.Fprintln(os.Stdout, "workflow "+Version)
-	case "setup":
-		if err := setupCommand(os.Args[2:]); err != nil {
+	case "onboarding":
+		if err := onboardingCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
 			fail(err)
 		}
 	case "github":
@@ -136,8 +204,6 @@ func main() {
 		runRecoverInboxDelivery(os.Args[2:])
 	case "backup":
 		runBackup(os.Args[2:])
-	case "restore":
-		runRestore(os.Args[2:])
 	case "drill-backup":
 		runBackupDrill(os.Args[2:])
 	case "metrics":
@@ -160,14 +226,8 @@ func validateWorkflowBuildVersion() error {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  workflow setup plan --repo <absolute>")
-	fmt.Fprintln(os.Stderr, "  workflow setup apply --plan <path> --approved-digest <sha256>")
-	fmt.Fprintln(os.Stderr, "  workflow setup verify --repo <absolute>")
+	fmt.Fprintln(os.Stderr, "  workflow onboarding plan|apply|verify [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
-	fmt.Fprintln(os.Stderr, "  workflow serve [--workflow-home <absolute>]")
-	fmt.Fprintln(os.Stderr, "  workflow status [--workflow-home <absolute>]")
-	fmt.Fprintln(os.Stderr, "  workflow logs [--workflow-home <absolute>] [--lines 200] [--follow]")
-	fmt.Fprintln(os.Stderr, "  workflow stop [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
@@ -176,20 +236,24 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow answer-inbox [options]")
 	fmt.Fprintln(os.Stderr, "  workflow recover-inbox-delivery [options]")
 	fmt.Fprintln(os.Stderr, "  workflow backup [--database path] [--output path]")
-	fmt.Fprintln(os.Stderr, "  workflow restore --backup path [--database path]")
 	fmt.Fprintln(os.Stderr, "  workflow drill-backup --backup path")
 	fmt.Fprintln(os.Stderr, "  workflow metrics [--database path] [--backup path]")
 }
 
 func runBackup(args []string) {
 	flags := flag.NewFlagSet("backup", flag.ExitOnError)
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	outputPath := flags.String("output", "", "online SQLite backup destination")
 	_ = flags.Parse(args)
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	if *outputPath == "" {
 		*outputPath = *databasePath + ".backup"
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	db, err := store.OpenActivated(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
@@ -200,127 +264,6 @@ func runBackup(args []string) {
 	}
 	writeJSON(os.Stdout, metadata)
 	writeStructuredLog("sqlite_backup", metadata)
-}
-
-func runRestore(args []string) {
-	flags := flag.NewFlagSet("restore", flag.ExitOnError)
-	backupPath := flags.String("backup", "", "verified SQLite online backup")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "restored SQLite control-plane database")
-	_ = flags.Parse(args)
-	if *backupPath == "" {
-		fmt.Fprintln(os.Stderr, "restore requires backup")
-		os.Exit(2)
-	}
-	lock, err := startup.AcquireLock(*databasePath)
-	if err != nil {
-		fail(err)
-	}
-	defer lock.Close()
-	ctx := context.Background()
-	isolator := worker.DockerRuntime{ControlPlaneID: controlPlaneContainerID(*databasePath)}
-	if err := restoreControlPlane(ctx, *backupPath, *databasePath, isolator, time.Now().UTC()); err != nil {
-		fail(err)
-	}
-	writeStructuredLog("sqlite_restore_reconciled", map[string]string{"backup": *backupPath, "database": *databasePath})
-}
-
-type restoreContainerIsolator interface {
-	worker.ContainerIsolator
-	IsolateControlPlaneContainers(context.Context) error
-}
-
-func restoreControlPlane(ctx context.Context, backupPath, databasePath string, isolator restoreContainerIsolator, now time.Time) error {
-	if err := os.MkdirAll(filepath.Dir(databasePath), 0o700); err != nil {
-		return err
-	}
-	staged, err := os.CreateTemp(filepath.Dir(databasePath), filepath.Base(databasePath)+".restore-staged-*.db")
-	if err != nil {
-		return err
-	}
-	stagedPath := staged.Name()
-	if err := staged.Close(); err != nil {
-		return err
-	}
-	defer os.Remove(stagedPath)
-	defer os.Remove(stagedPath + "-wal")
-	defer os.Remove(stagedPath + "-shm")
-	if err := store.RestoreBackup(ctx, backupPath, stagedPath); err != nil {
-		return err
-	}
-	db, err := store.Open(ctx, stagedPath)
-	if err != nil {
-		return err
-	}
-	if err := db.ReconcileRestoredControlPlaneDryRun(ctx, now); err != nil {
-		db.Close()
-		return err
-	}
-	restoreBarrier, err := startup.AcquireRestoreBarrier(ctx, databasePath)
-	if err != nil {
-		db.Close()
-		return err
-	}
-	defer restoreBarrier.Close()
-	if err := isolateCurrentControlPlane(ctx, databasePath, isolator); err != nil {
-		db.Close()
-		return err
-	}
-	if err := reconcileRestoredControlPlane(ctx, db, isolator, now); err != nil {
-		db.Close()
-		return err
-	}
-	if err := db.Close(); err != nil {
-		return err
-	}
-	return store.PublishRestoredBackup(ctx, stagedPath, databasePath)
-}
-
-func isolateCurrentControlPlane(ctx context.Context, databasePath string, isolator restoreContainerIsolator) error {
-	if _, err := os.Stat(databasePath); errors.Is(err, os.ErrNotExist) {
-		return isolateControlPlaneContainers(ctx, isolator)
-	} else if err != nil {
-		return err
-	}
-	db, err := store.OpenForRestore(ctx, databasePath)
-	if err != nil {
-		if store.IsDatabaseError(err) || errors.Is(err, store.ErrDatabaseIntegrity) {
-			return isolateControlPlaneContainers(ctx, isolator)
-		}
-		return fmt.Errorf("open current Control Plane before restore: %w", err)
-	}
-	targets, targetErr := db.WorkerIsolationTargets(ctx)
-	if targetErr == nil && len(targets) > 0 {
-		_, targetErr = isolateWorkerTargets(ctx, db, isolator, targets)
-	}
-	if closeErr := db.Close(); targetErr != nil || closeErr != nil {
-		return errors.Join(targetErr, closeErr)
-	}
-	return isolateControlPlaneContainers(ctx, isolator)
-}
-
-func isolateWorkerTargets(ctx context.Context, db *store.Store, isolator worker.ContainerIsolator, targets []store.TicketClaim) ([]store.WorkerIsolationProof, error) {
-	if isolator == nil {
-		return nil, errors.New("restore cannot isolate an active Worker")
-	}
-	return workerisolation.IsolateWorkers(ctx, db, isolator, targets)
-}
-
-func isolateControlPlaneContainers(ctx context.Context, isolator restoreContainerIsolator) error {
-	if isolator == nil {
-		return errors.New("restore cannot isolate active Worker containers without the current database")
-	}
-	isolationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreIsolationTimeout)
-	defer cancel()
-	if err := isolator.IsolateControlPlaneContainers(isolationCtx); err != nil {
-		return fmt.Errorf("isolate Control Plane Worker containers: %w", err)
-	}
-	return nil
-}
-
-func reconcileRestoredControlPlane(ctx context.Context, db *store.Store, isolator restoreContainerIsolator, now time.Time) error {
-	return workerisolation.RetryWorkerTransition(ctx, db, isolator, func(isolated []store.WorkerIsolationProof) error {
-		return db.ReconcileRestoredControlPlane(ctx, now, isolated...)
-	})
 }
 
 func runBackupDrill(args []string) {
@@ -341,13 +284,18 @@ func runBackupDrill(args []string) {
 
 func runMetrics(args []string) {
 	flags := flag.NewFlagSet("metrics", flag.ExitOnError)
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	backupPath := flags.String("backup", "", "verified SQLite online backup")
 	_ = flags.Parse(args)
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	if *backupPath == "" {
 		*backupPath = *databasePath + ".backup"
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	db, err := store.OpenActivated(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
@@ -373,7 +321,7 @@ func writeStructuredLog(event string, value any) {
 func runDoctor(args []string) {
 	flags := flag.NewFlagSet("doctor", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	reportPath := flags.String("report", "", "optional Markdown report path")
 	workflowRepository := flags.String("workflow-repository", "", "GitHub repository containing the Worker publisher workflow")
 	codexAuthFile := flags.String("codex-auth-file", defaultCodexAuthFile(), "optional controlled override for the ChatGPT source verified through Codex doctor")
@@ -382,6 +330,12 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, "doctor requires workflow-repository")
 		os.Exit(2)
 	}
+	resolvedDatabase, databaseErr := activeCommandDatabase(*databasePath)
+	if databaseErr != nil {
+		fmt.Fprintln(os.Stderr, databaseErr)
+		os.Exit(1)
+	}
+	*databasePath = resolvedDatabase
 	resolvedCodexAuth, err := resolveDoctorCodexAuth(context.Background(), *codexAuthFile, codexauth.ResolveChatGPT)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -394,7 +348,7 @@ func runDoctor(args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	database, err := store.Open(context.Background(), *databasePath)
+	database, err := store.OpenActivated(context.Background(), *databasePath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -489,7 +443,7 @@ func runDoctor(args []string) {
 func runTicket(args []string) {
 	flags := flag.NewFlagSet("run-ticket", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	rootNumber := flags.Int64("root", 0, "plan root issue number")
 	ticketID := flags.Int64("ticket-id", 0, "GitHub ticket node ID")
@@ -509,13 +463,18 @@ func runTicket(args []string) {
 		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, ChatGPT authentication, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
 		fail(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	db, err := store.Open(ctx, *databasePath)
+	db, err := store.OpenActivated(ctx, *databasePath)
 	if err != nil {
 		fail(err)
 	}
@@ -644,7 +603,7 @@ func firstProvisioner(provisioners []store.SessionProvisioner) store.SessionProv
 func runReconcileDelivered(args []string) {
 	flags := flag.NewFlagSet("reconcile-delivered", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
@@ -652,13 +611,18 @@ func runReconcileDelivered(args []string) {
 		fmt.Fprintln(os.Stderr, "reconcile-delivered requires repository")
 		os.Exit(2)
 	}
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	config, err := doctor.LoadConfig(*configPath)
 	if err != nil {
 		fail(err)
 	}
-	db, err := store.Open(ctx, *databasePath)
+	db, err := store.OpenActivated(ctx, *databasePath)
 	if err != nil {
 		fail(err)
 	}
@@ -678,7 +642,7 @@ func runReconcileDelivered(args []string) {
 func runPollGitHub(args []string) {
 	flags := flag.NewFlagSet("poll-github", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	rootNumber := flags.Int64("root", 0, "approved plan root issue number")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
@@ -701,20 +665,22 @@ func runPollGitHub(args []string) {
 		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and ChatGPT authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	lock, err := startup.AcquireLock(*databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer lock.Close()
-	db, err := store.OpenForStartup(context.Background(), *databasePath)
+	db, err := store.OpenActivated(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
 	defer db.Close()
 	if err := db.IntegrityCheck(context.Background()); err != nil {
-		fail(err)
-	}
-	if err := db.Migrate(context.Background()); err != nil {
 		fail(err)
 	}
 	var config doctor.Config
@@ -1046,7 +1012,7 @@ func runAnswerInbox(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	db, err := store.Open(context.Background(), resolvedDatabase)
+	db, err := store.OpenActivated(context.Background(), resolvedDatabase)
 	if err != nil {
 		fail(err)
 	}
@@ -1059,17 +1025,69 @@ func runAnswerInbox(args []string) {
 }
 
 func answerInboxDatabasePath(databasePath, homeOverride string) (string, error) {
+	// A Dispatcher-bound command is never an advanced source invocation: even
+	// an explicit absolute path must be the authoritative active generation.
+	// This closes the last alternate DB path for inbox decisions.
+	if strings.TrimSpace(os.Getenv("WORKFLOW_ACTIVE_HOME")) != "" {
+		return activeCommandDatabase(databasePath)
+	}
 	if strings.TrimSpace(databasePath) != "" {
 		if !filepath.IsAbs(databasePath) {
 			return "", errors.New("answer-inbox --database override must be absolute")
 		}
 		return filepath.Clean(databasePath), nil
 	}
+	if strings.TrimSpace(os.Getenv("WORKFLOW_ACTIVE_HOME")) != "" {
+		return activeCommandDatabase("")
+	}
 	layout, err := workflowhome.Resolve(homeOverride)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(layout.State, defaultControlPlaneDatabase), nil
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil {
+		return "", fmt.Errorf("answer-inbox requires an authoritative active generation: %w", err)
+	}
+	if active.Readiness != "ready" {
+		return "", errors.New("answer-inbox requires a ready active generation")
+	}
+	if err := validateVersionedActiveExecutable(layout.Root, active); err != nil {
+		return "", err
+	}
+	path := generationDatabasePath(layout.Root, active)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		if err == nil {
+			err = errors.New("generation database is a directory")
+		}
+		return "", fmt.Errorf("answer-inbox active generation database is unavailable: %w", err)
+	}
+	return path, nil
+}
+
+// validateVersionedActiveExecutable fail-closes a CLI copied from any
+// generation other than active.json's generation. Source/test binaries remain
+// valid direct callers; only a versioned generation path asserts this identity.
+func validateVersionedActiveExecutable(home string, active launcher.Active) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return validateActiveExecutablePath(executable, home, active)
+}
+
+func validateActiveExecutablePath(executable, home string, active launcher.Active) error {
+	directory := filepath.Clean(filepath.Dir(executable))
+	generationsRoot := filepath.Clean(filepath.Join(home, "platform", "generations"))
+	relative, err := filepath.Rel(generationsRoot, directory)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") || filepath.IsAbs(relative) {
+		return nil
+	}
+	expected := filepath.Clean(filepath.Join(generationsRoot, active.Generation))
+	if directory != expected || !strings.EqualFold(filepath.Base(executable), "workflow.exe") {
+		return errors.New("versioned Workflow CLI generation differs from active.json")
+	}
+	return nil
 }
 
 type workflowInboxAnswerStore interface {
@@ -1086,7 +1104,7 @@ func answerWorkflowInboxQuestion(ctx context.Context, db workflowInboxAnswerStor
 
 func runRecoverInboxDelivery(args []string) {
 	flags := flag.NewFlagSet("recover-inbox-delivery", flag.ExitOnError)
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	repository := flags.String("repository", "", "GitHub owner/repository")
 	deliveryKey := flags.String("delivery", "", "rejected uncertain Workflow Inbox delivery key")
 	questionID := flags.String("question", "", "stable Workflow Inbox recovery question ID")
@@ -1096,7 +1114,12 @@ func runRecoverInboxDelivery(args []string) {
 		fmt.Fprintln(os.Stderr, "recover-inbox-delivery requires repository")
 		os.Exit(2)
 	}
-	db, err := store.Open(context.Background(), *databasePath)
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
+	db, err := store.OpenActivated(context.Background(), *databasePath)
 	if err != nil {
 		fail(err)
 	}
@@ -1168,7 +1191,7 @@ func deliverySourceRefresher(database *store.Store, provider githubTokenProvider
 	}
 }
 
-type restoreFencedGateway struct {
+type generationGateway struct {
 	databasePath    string
 	config          doctor.Config
 	githubURL       string
@@ -1178,12 +1201,12 @@ type restoreFencedGateway struct {
 	mu              sync.Mutex
 }
 
-func newRestoreFencedGateway(databasePath string, config doctor.Config, githubURL, pushURL string) (*restoreFencedGateway, error) {
+func newGenerationGateway(databasePath string, config doctor.Config, githubURL, pushURL string) (*generationGateway, error) {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
 		return nil, err
 	}
-	return &restoreFencedGateway{
+	return &generationGateway{
 		databasePath:    databasePath,
 		config:          config,
 		githubURL:       githubURL,
@@ -1193,11 +1216,11 @@ func newRestoreFencedGateway(databasePath string, config doctor.Config, githubUR
 	}, nil
 }
 
-func (g *restoreFencedGateway) withGateway(ctx context.Context, action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
-	return g.withGatewayStore(ctx, store.OpenForRuntime, action)
+func (g *generationGateway) withGateway(ctx context.Context, action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
+	return g.withGatewayStore(ctx, store.OpenActivated, action)
 }
 
-func (g *restoreFencedGateway) withGatewayStore(ctx context.Context, openStore func(context.Context, string) (*store.Store, error), action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
+func (g *generationGateway) withGatewayStore(ctx context.Context, openStore func(context.Context, string) (*store.Store, error), action func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error) (resultErr error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	db, err := openStore(ctx, g.databasePath)
@@ -1223,7 +1246,7 @@ func (g *restoreFencedGateway) withGatewayStore(ctx context.Context, openStore f
 	return action(db, gateway, credentialSource)
 }
 
-func (g *restoreFencedGateway) Deliver(ctx context.Context, request store.DeliveryRequest) (outbox store.DeliveryOutbox, resultErr error) {
+func (g *generationGateway) Deliver(ctx context.Context, request store.DeliveryRequest) (outbox store.DeliveryOutbox, resultErr error) {
 	resultErr = g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
 		var err error
 		outbox, err = gateway.Deliver(ctx, request)
@@ -1232,8 +1255,8 @@ func (g *restoreFencedGateway) Deliver(ctx context.Context, request store.Delive
 	return outbox, resultErr
 }
 
-func (g *restoreFencedGateway) Initialize(ctx context.Context) error {
-	return g.withGatewayStore(ctx, store.Open, func(db *store.Store, gateway delivery.Gateway, credentialSource func(context.Context) (string, error)) error {
+func (g *generationGateway) Initialize(ctx context.Context) error {
+	return g.withGatewayStore(ctx, store.OpenActivated, func(db *store.Store, gateway delivery.Gateway, credentialSource func(context.Context) (string, error)) error {
 		if _, err := credentialSource(ctx); shouldPauseGatewayForCredential(err) {
 			if pauseErr := db.PauseGatewayWrites(ctx, store.ControlPlaneGitHubCredentialRecoveryRemediation, time.Now().UTC()); pauseErr != nil {
 				return pauseErr
@@ -1243,13 +1266,13 @@ func (g *restoreFencedGateway) Initialize(ctx context.Context) error {
 	})
 }
 
-func (g *restoreFencedGateway) QueueGatewayCredentialInboxProjections(ctx context.Context) error {
+func (g *generationGateway) QueueGatewayCredentialInboxProjections(ctx context.Context) error {
 	return g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
 		return gateway.QueueGatewayCredentialInboxProjections(ctx)
 	})
 }
 
-func (g *restoreFencedGateway) DispatchPending(ctx context.Context, limit int) error {
+func (g *generationGateway) DispatchPending(ctx context.Context, limit int) error {
 	return g.withGateway(ctx, func(_ *store.Store, gateway delivery.Gateway, _ func(context.Context) (string, error)) error {
 		return gateway.DispatchPending(ctx, limit)
 	})
@@ -1258,7 +1281,7 @@ func (g *restoreFencedGateway) DispatchPending(ctx context.Context, limit int) e
 func runGateway(args []string) {
 	flags := flag.NewFlagSet("gateway", flag.ExitOnError)
 	configPath := flags.String("config", "config/toolchain.json", "toolchain baseline")
-	databasePath := flags.String("database", defaultControlPlaneDatabase, "SQLite control-plane database")
+	databasePath := flags.String("database", "", "advanced absolute SQLite control-plane database override")
 	listen := flags.String("listen", "", "Gateway listen address")
 	controlToken := flags.String("control-token", os.Getenv("WORKFLOW_GATEWAY_CONTROL_TOKEN"), "Gateway control-plane credential")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
@@ -1271,8 +1294,12 @@ func runGateway(args []string) {
 		fmt.Fprintln(os.Stderr, "gateway requires listen address and control-plane credential")
 		os.Exit(2)
 	}
+	resolvedDatabase, err := activeCommandDatabase(*databasePath)
+	if err != nil {
+		fail(err)
+	}
+	*databasePath = resolvedDatabase
 	var config doctor.Config
-	var err error
 	if *runtimeOwner != "" {
 		config.GitHub.Credential = doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: *runtimeOwner, PlaintextRelativePath: *runtimeCredentialPath}
 	} else {
@@ -1281,7 +1308,7 @@ func runGateway(args []string) {
 			fail(err)
 		}
 	}
-	gateway, err := newRestoreFencedGateway(*databasePath, config, *githubURL, *pushURL)
+	gateway, err := newGenerationGateway(*databasePath, config, *githubURL, *pushURL)
 	if err != nil {
 		fail(err)
 	}

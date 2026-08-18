@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - "cmd/platform-release/**"
+      - "cmd/workflow-setup/**"
+      - "internal/launcher/**"
       - "internal/platformrelease/**"
       - "internal/setupcontract/**"
       - "deploy/platform/**"
@@ -85,6 +87,7 @@ jobs:
           New-Item -ItemType Directory -Force build | Out-Null
           go build -trimpath -ldflags "-buildid= -X main.Version=$env:PLATFORM_VERSION" -o build/workflow.exe ./cmd/workflow
           if ((& build/workflow.exe version | Out-String).Trim() -cne "workflow $env:PLATFORM_VERSION") { throw "built Workflow CLI version differs from platform-release.json" }
+          go build -trimpath -ldflags "-buildid=" -o build/workflow-setup.exe ./cmd/workflow-setup
           go build -trimpath -ldflags "-buildid=" -o build/platform-release.exe ./cmd/platform-release
           New-Item -ItemType Directory -Force build/payload/repository-contract | Out-Null
           New-Item -ItemType Directory -Force build/payload/skills | Out-Null
@@ -95,18 +98,15 @@ jobs:
         shell: pwsh
         run: |
           build/platform-release.exe `
-            -workflow-exe build/workflow.exe -payload build/payload -output build/release `
+            -workflow-exe build/workflow.exe -setup-exe build/workflow-setup.exe -payload build/payload -output build/release/workflow-windows-amd64.zip `
             -version '${{ steps.release.outputs.version }}' -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
             -docker-version '${{ steps.release.outputs.docker_version }}' -docker-installer-url '${{ steps.release.outputs.docker_url }}' `
             -docker-installer-sha256 '${{ steps.release.outputs.docker_sha256 }}' -worker-image '${{ steps.release.outputs.worker_image }}'
-      - name: Verify the minimal release package
+      - name: Verify the one-asset Windows Bundle
         if: steps.version-change.outputs.publish == 'true'
         shell: bash
         run: |
-          cd build/release
-          sha256sum --check SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 2
-          test "$(find . -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" = "SHA256SUMS platform-release.json workflow-windows-amd64.zip "
+          test "$(find build/release -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" = "workflow-windows-amd64.zip "
       - name: Stage immutable Platform Release
         if: steps.version-change.outputs.publish == 'true'
         shell: bash
@@ -119,7 +119,7 @@ jobs:
             echo "Refusing to replace existing Platform Release $tag" >&2
             exit 1
           fi
-          gh release create "$tag" build/release/* --draft --target "$GITHUB_SHA" --title "Platform ${PLATFORM_VERSION}" --notes "Immutable Agent Workflow platform release."
+          gh release create "$tag" build/release/workflow-windows-amd64.zip --draft --target "$GITHUB_SHA" --title "Platform ${PLATFORM_VERSION}" --notes "Immutable Agent Workflow platform release."
           gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["SHA256SUMS","platform-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
+          jq --exit-status --arg sha "$GITHUB_SHA" '(.draft == false) and (.prerelease == false) and (.immutable == true) and (.target_commitish == $sha) and ([.assets[].name] | sort) == (["workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null

@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"net/url"
 	"os"
@@ -56,7 +54,7 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if opened != nil {
 		opened.Close()
 	}
-	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 62") {
+	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 63") {
 		t.Fatalf("read-only old schema err=%v", err)
 	}
 	after, err := os.Stat(path)
@@ -82,47 +80,149 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	}
 }
 
-func TestOpenReadOnlyObservesCommittedWALStateWithoutCreatingWorkflowLocks(t *testing.T) {
+func TestOpenActivatedRejectsOlderAndNewerSchemaWithoutChangingGenerationFiles(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	path := filepath.Join(root, "workflow.db")
-	writer, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "older",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				raw, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer raw.Close()
+				if _, err := raw.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations(version,applied_at) VALUES(62,'old')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "newer",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				db, err := Open(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				raw, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer raw.Close()
+				if _, err := raw.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(64,'future')`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "workflow.db")
+			test.setup(t, path)
+			before := snapshotDirectoryTree(t, filepath.Dir(path))
+			opened, err := OpenActivated(ctx, path)
+			if opened != nil {
+				opened.Close()
+			}
+			if !errors.Is(err, ErrSchemaUpgradeRequired) {
+				t.Fatalf("OpenActivated() error = %v, want schema failure", err)
+			}
+			after := snapshotDirectoryTree(t, filepath.Dir(path))
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("activated open changed mismatched generation files:\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
 	}
-	defer writer.Close()
-	installedAt := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
-	bundleJSON := `[{"path":"bin/workflow.exe","sha256":"` + strings.Repeat("c", 64) + `"}]`
-	bundleSum := sha256.Sum256([]byte(bundleJSON))
-	want := PlatformInstallation{
-		PlatformVersion:                   "1.2.3",
-		ReleaseManifestDigestSHA256:       strings.Repeat("a", 64),
-		PlatformSetupContractDigestSHA256: strings.Repeat("b", 64),
-		WorkflowCLISHA256:                 strings.Repeat("c", 64),
-		ReleaseBundledFilesJSON:           bundleJSON,
-		ReleaseBundledFilesDigestSHA256:   hex.EncodeToString(bundleSum[:]),
-		WorkflowHome:                      filepath.Join(root, "home"),
-		InstalledAt:                       installedAt,
-		VerifiedAt:                        installedAt,
-	}
-	if err := writer.RecordPlatformInstallation(ctx, want); err != nil {
-		t.Fatal(err)
-	}
-	before := snapshotDirectoryTree(t, root)
-	reader, err := OpenReadOnly(ctx, path)
-	if err != nil {
-		t.Fatalf("open alongside active WAL writer: %v", err)
-	}
-	defer reader.Close()
-	got, err := reader.PlatformInstallation(ctx)
-	if err != nil || got.PlatformVersion != want.PlatformVersion || got.ReleaseManifestDigestSHA256 != want.ReleaseManifestDigestSHA256 {
-		t.Fatalf("read-only Store returned stale WAL state: got=%#v err=%v", got, err)
-	}
-	after := snapshotDirectoryTree(t, root)
-	for path := range after {
-		if _, existed := before[path]; !existed {
-			t.Fatalf("read-only Store created %q while observing an active database", path)
+}
+
+func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOtherwise(t *testing.T) {
+	ctx := context.Background()
+	newCurrent := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "workflow.db")
+		db, err := Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	mutate := func(t *testing.T, path, statement string) {
+		t.Helper()
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("older ledger with stable contract", func(t *testing.T) {
+		path := newCurrent(t)
+		mutate(t, path, `DELETE FROM schema_migrations WHERE version = 63`)
+		maintenance, err := OpenForLauncherMaintenance(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count, err := maintenance.BeginMaintenanceFence(ctx, MaintenanceFence{OperationID: "upgrade", BundleDigest: "sha256:target"}, time.Now().UTC()); err != nil || count != 0 {
+			maintenance.Close()
+			t.Fatalf("maintenance fence=%d,%v", count, err)
+		}
+		if err := maintenance.ClearMaintenanceFence(ctx, "upgrade"); err != nil {
+			maintenance.Close()
+			t.Fatal(err)
+		}
+		if err := maintenance.Close(); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		var version int
+		if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 62 {
+			t.Fatalf("old maintenance ledger=%d,%v", version, err)
+		}
+	})
+	for _, test := range []struct {
+		name      string
+		statement string
+	}{
+		{name: "future ledger", statement: `INSERT INTO schema_migrations(version, applied_at) VALUES(64, 'future')`},
+		{name: "missing fence contract", statement: `DROP TABLE platform_maintenance_fences`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := newCurrent(t)
+			mutate(t, path, test.statement)
+			before := snapshotDirectoryTree(t, filepath.Dir(path))
+			maintenance, err := OpenForLauncherMaintenance(ctx, path)
+			if maintenance != nil {
+				maintenance.Close()
+			}
+			if !errors.Is(err, ErrSchemaUpgradeRequired) {
+				t.Fatalf("maintenance open=%v, want schema failure", err)
+			}
+			after := snapshotDirectoryTree(t, filepath.Dir(path))
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("maintenance preflight changed rejected generation:\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
 	}
 }
 

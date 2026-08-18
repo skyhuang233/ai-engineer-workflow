@@ -18,6 +18,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
+	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -54,7 +55,11 @@ func githubCommand(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	database, err := store.OpenReadOnly(ctx, filepath.Join(layout.State, "workflow.db"))
+	active, err := launcher.ReadActive(layout.Root)
+	if err != nil {
+		return err
+	}
+	database, err := store.OpenReadOnly(ctx, generationDatabasePath(layout.Root, active))
 	if err != nil {
 		return err
 	}
@@ -99,7 +104,7 @@ func managedGitHubClient(ctx context.Context, database *store.Store, layout work
 	if err != nil {
 		return managedGitHubSession{}, fmt.Errorf("read admitted origin: %w", err)
 	}
-	repository, err := parseOriginRepository(origin)
+	repository, err := onboarding.ParseGitHubOrigin(origin)
 	if err != nil {
 		return managedGitHubSession{}, err
 	}
