@@ -22,8 +22,8 @@ type DockerDesktopHost interface {
 }
 
 func EnsureDockerDesktop(ctx context.Context, contract DockerDesktopContract, host DockerDesktopHost, temporaryRoot string, timeout time.Duration) error {
-	if host == nil || contract.Version == "" || !strings.HasPrefix(contract.InstallerURL, "https://") || len(contract.WindowsAMD64SHA256) != 64 {
-		return errors.New("complete verified Docker Desktop contract is required")
+	if host == nil || contract.Version == "" {
+		return errors.New("Docker Desktop host and version are required")
 	}
 	installed, err := host.InstalledVersion(ctx)
 	if err != nil {
@@ -35,14 +35,24 @@ func EnsureDockerDesktop(ctx context.Context, contract DockerDesktopContract, ho
 		}
 		return waitEngine(ctx, host, timeout)
 	}
+	if !strings.HasPrefix(contract.InstallerURL, "https://") || len(contract.WindowsAMD64SHA256) != 64 {
+		return errors.New("complete verified Docker Desktop installer contract is required")
+	}
 	if err := os.MkdirAll(temporaryRoot, 0o700); err != nil {
 		return err
 	}
-	installer := filepath.Join(temporaryRoot, "DockerDesktopInstaller.exe")
+	// A unique directory prevents concurrent setup attempts from colliding on
+	// O_EXCL downloads. Register cleanup before Download because a failed copy
+	// can already have left a partial installer on disk.
+	downloadRoot, err := os.MkdirTemp(temporaryRoot, "docker-desktop-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(downloadRoot)
+	installer := filepath.Join(downloadRoot, "DockerDesktopInstaller.exe")
 	if err := host.Download(ctx, contract.InstallerURL, installer); err != nil {
 		return fmt.Errorf("download Docker Desktop: %w", err)
 	}
-	defer os.Remove(installer)
 	data, err := os.ReadFile(installer)
 	if err != nil {
 		return err

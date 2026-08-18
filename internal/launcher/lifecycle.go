@@ -7,8 +7,6 @@ package launcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +14,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/hostsetup"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
@@ -120,11 +120,18 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-// WindowsDependencies reuses an already live Docker-compatible daemon. If it
-// is absent it downloads the digest-pinned installer, invokes its unattended
-// install mode, starts Docker Desktop, and then verifies the daemon before
-// pulling and inspecting the exact worker digest.
-type WindowsDependencies struct{ Runner CommandRunner }
+// WindowsDependencies treats the Docker Desktop registry DisplayVersion as
+// the consent-bound product version. Docker Engine versions are intentionally
+// not comparable to Bundle Docker Desktop versions. The Runner remains the
+// worker-image seam; Docker Desktop itself is delegated to the existing host
+// adapter so its registry readback, elevated install, start, and bounded
+// daemon readiness contract stay in one place.
+type WindowsDependencies struct {
+	Runner        CommandRunner
+	DockerHost    hostsetup.DockerDesktopHost
+	TemporaryRoot string
+	DockerTimeout time.Duration
+}
 
 func (d WindowsDependencies) runner() CommandRunner {
 	if d.Runner != nil {
@@ -132,12 +139,27 @@ func (d WindowsDependencies) runner() CommandRunner {
 	}
 	return execRunner{}
 }
-func (d WindowsDependencies) DockerVersion(ctx context.Context) (string, error) {
-	raw, err := d.runner().Run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
-	if err != nil {
-		return "", nil
+
+func (d WindowsDependencies) dockerHost() hostsetup.DockerDesktopHost {
+	if d.DockerHost != nil {
+		return d.DockerHost
 	}
-	return strings.TrimSpace(string(raw)), nil
+	return hostsetup.WindowsDockerDesktopHost{}
+}
+
+func (d WindowsDependencies) dockerTemporaryRoot() string {
+	if strings.TrimSpace(d.TemporaryRoot) != "" {
+		return d.TemporaryRoot
+	}
+	return filepath.Join(os.TempDir(), "workflow-docker-desktop")
+}
+
+func (d WindowsDependencies) DockerVersion(ctx context.Context) (string, error) {
+	version, err := d.dockerHost().InstalledVersion(ctx)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(version), nil
 }
 
 func (d WindowsDependencies) EnsureDocker(ctx context.Context, target DockerCapabilityTarget) error {
@@ -152,29 +174,10 @@ func (d WindowsDependencies) EnsureDocker(ctx context.Context, target DockerCapa
 		if observed != target.ObservedVersion || observed != target.RequiredVersion {
 			return errors.New("Docker Desktop version no longer matches accepted reuse target")
 		}
-		return nil
 	}
-	installer := filepath.Join(os.TempDir(), "workflow-docker-desktop-installer.exe")
-	if _, err := d.runner().Run(ctx, "curl.exe", "--fail", "--location", target.InstallerURL, "--output", installer); err != nil {
-		return fmt.Errorf("download Docker Desktop: %w", err)
-	}
-	raw, err := os.ReadFile(installer)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(raw)
-	if hex.EncodeToString(sum[:]) != target.InstallerSHA256 {
-		return errors.New("Docker Desktop installer checksum differs from Bundle manifest")
-	}
-	if _, err := d.runner().Run(ctx, installer, "install", "--quiet"); err != nil {
-		return fmt.Errorf("install Docker Desktop: %w", err)
-	}
-	observed, err := d.DockerVersion(ctx)
-	if err != nil || observed != target.RequiredVersion {
-		if err == nil {
-			err = errors.New("installed Docker Desktop version differs from accepted target")
-		}
-		return fmt.Errorf("start and verify Docker Desktop: %w", err)
+	contract := hostsetup.DockerDesktopContract{Version: target.RequiredVersion, InstallerURL: target.InstallerURL, WindowsAMD64SHA256: target.InstallerSHA256}
+	if err := hostsetup.EnsureDockerDesktop(ctx, contract, d.dockerHost(), d.dockerTemporaryRoot(), d.DockerTimeout); err != nil {
+		return fmt.Errorf("ensure Docker Desktop: %w", err)
 	}
 	return nil
 }
