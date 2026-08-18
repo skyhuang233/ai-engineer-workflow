@@ -1,6 +1,5 @@
 // Package setupcontract defines the immutable, digest-bound authority used by
-// platform bootstrap and repository onboarding. It deliberately contains no
-// mutation logic.
+// Repository Onboarding. It deliberately contains no platform mutation logic.
 package setupcontract
 
 import "time"
@@ -10,7 +9,6 @@ const SchemaVersion = 1
 type PlanKind string
 
 const (
-	PlatformBootstrap    PlanKind = "platform_bootstrap"
 	RepositoryOnboarding PlanKind = "repository_onboarding"
 )
 

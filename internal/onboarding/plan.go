@@ -222,7 +222,15 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	requiredChecks := CanonicalRequiredChecks(append([]RequiredCheck{{Context: repositorycontract.RequiredCheckName, AppID: repositorycontract.GitHubActionsAppID}}, policy.RequiredChecks...))
 	requiredChecksJSON, _ := json.Marshal(requiredChecks)
 	if !state.ContractSatisfied {
-		parameters := map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON)}
+		mergeMethod := approvedMergeMethod(policy)
+		// A repository created by this exact plan is initialized with the
+		// onboarding-owned squash policy.  Persisting it in the effect makes the
+		// authority explicit and digest-bound, just like discovered repository
+		// policy does for an existing repository.
+		if !discovery.Published {
+			mergeMethod = "squash"
+		}
+		parameters := map[string]string{"base_branch": discovery.DefaultBranch, "base_head": discovery.Head, "source_url": sourceURL, "before_files_json": string(encodedBeforeFiles), "files_json": string(encodedFiles), "manifest_digest": manifestDigest, "required_checks_json": string(requiredChecksJSON), "merge_method": mergeMethod}
 		if !discovery.HasCommits {
 			parameters["base_head_effect_id"] = "initial-baseline"
 		}
@@ -239,6 +247,18 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	identity := sha256.Sum256(identityJSON)
 	plan.PlanID = "onboard-" + hex.EncodeToString(identity[:12])
 	return plan, nil
+}
+func approvedMergeMethod(policy RepositoryPolicy) string {
+	if policy.AllowSquashMerge {
+		return "squash"
+	}
+	if policy.AllowMergeCommit {
+		return "merge"
+	}
+	if policy.AllowRebaseMerge {
+		return "rebase"
+	}
+	return ""
 }
 func uniqueStrings(values []string) []string {
 	seen := map[string]bool{}

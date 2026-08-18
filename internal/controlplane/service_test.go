@@ -15,7 +15,7 @@ func TestServicePublishesIdentityAndStopsGracefully(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Date(2026, 8, 14, 9, 30, 0, 123000000, time.UTC)
-	identity := Identity{PID: 42, ProcessStartedAt: started, PlatformVersion: "1.2.3", ApprovedPlanDigestSHA256: repeatDigest('a')}
+	identity := Identity{PID: 42, ProcessStartedAt: started, PlatformVersion: "1.2.3", Generation: "generation-a", BundleDigest: repeatDigest('a')}
 	service := Service{Listener: listener, Identity: identity}
 	done := make(chan error, 1)
 	go func() { done <- service.Run(context.Background()) }()
@@ -55,7 +55,7 @@ func TestServiceCancelsComposedLoopsOnShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	loopStopped := make(chan struct{})
-	service := Service{Listener: listener, Identity: Identity{PID: 1, ProcessStartedAt: time.Now().UTC(), PlatformVersion: "dev", ApprovedPlanDigestSHA256: repeatDigest('b')}, Loops: []Loop{
+	service := Service{Listener: listener, Identity: Identity{PID: 1, ProcessStartedAt: time.Now().UTC(), PlatformVersion: "dev", Generation: "generation-b", BundleDigest: repeatDigest('b')}, Loops: []Loop{
 		func(ctx context.Context) error { <-ctx.Done(); close(loopStopped); return nil },
 	}}
 	done := make(chan error, 1)

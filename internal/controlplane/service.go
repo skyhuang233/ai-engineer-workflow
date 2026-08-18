@@ -13,10 +13,11 @@ import (
 )
 
 type Identity struct {
-	PID                      int       `json:"pid"`
-	ProcessStartedAt         time.Time `json:"process_started_at"`
-	PlatformVersion          string    `json:"platform_version"`
-	ApprovedPlanDigestSHA256 string    `json:"approved_platform_bootstrap_plan_digest_sha256"`
+	PID              int       `json:"pid"`
+	ProcessStartedAt time.Time `json:"process_started_at"`
+	PlatformVersion  string    `json:"platform_version"`
+	Generation       string    `json:"generation"`
+	BundleDigest     string    `json:"bundle_digest"`
 }
 
 type Health struct {

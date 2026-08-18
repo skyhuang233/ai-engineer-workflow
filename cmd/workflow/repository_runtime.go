@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -21,6 +20,7 @@ type commandRepositoryRunner struct {
 	Executable string
 	Layout     workflowhome.Layout
 	Owner      string
+	Database   string
 }
 
 func (r commandRepositoryRunner) Run(ctx context.Context, config store.RepositoryRuntimeConfiguration) error {
@@ -77,7 +77,10 @@ func (r commandRepositoryRunner) Run(ctx context.Context, config store.Repositor
 }
 
 func (r commandRepositoryRunner) processArguments(config store.RepositoryRuntimeConfiguration, port int, controlToken string) ([]string, []string) {
-	databasePath := filepath.Join(r.Layout.State, "workflow.db")
+	databasePath := r.Database
+	if databasePath == "" {
+		return nil, nil
+	}
 	listen := "0.0.0.0:" + strconv.Itoa(port)
 	controlURL := "http://127.0.0.1:" + strconv.Itoa(port)
 	workerURL := "http://host.docker.internal:" + strconv.Itoa(port)

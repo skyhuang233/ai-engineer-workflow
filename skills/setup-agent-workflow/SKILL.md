@@ -1,124 +1,100 @@
 ---
 name: setup-agent-workflow
-description: Prepare the current Windows machine and repository for Agent Workflow.
+description: Set up the current Windows host from one verified Agent Workflow Bundle and onboard this repository.
 ---
 
 # Setup Agent Workflow
 
-Treat the current directory as the target. Keep discovery read-only and use the bundled scripts instead of reproducing host checks by hand.
+Run only on Windows and treat the current directory as the first Repository
+Onboarding target. Keep Git and Codex-login gates read-only. Ask for one
+absolute local Workflow Home (default `%LOCALAPPDATA%\AgentWorkflow`) and one
+classic GitHub PAT with `repo,workflow`; never put the PAT in command arguments
+or ordinary output.
 
-1. Confirm the absolute local Workflow Home once before the first host inspection. Use `%LOCALAPPDATA%\AgentWorkflow` only when the user did not select another absolute local path; reject relative and UNC paths. Keep this exact `$confirmedWorkflowHome` for every inspection, plan, apply, verify, and serve operation. Create a task-temporary directory, then run only the Git probe:
+The platform download contract is exactly one private GitHub Release asset:
+`workflow-windows-amd64.zip`. Query the fixed repository with the Control Plane
+PAT, accept only a published immutable non-prerelease `platform-vX.Y.Z` Release
+whose source commit and tag match, and require exactly that one asset with size
+and `sha256:` digest metadata. Download it once, verify its bytes before
+opening it, then verify root `platform-release.json`, protocol/schema versions,
+the complete listed regular-file inventory, and each listed SHA-256. Reject
+unsafe, duplicate, absent, or unlisted archive entries. Do not use a split
+manifest, `SHA256SUMS`, a Bootstrap Plan, an installed-CLI bridge, a legacy
+resolver, or an arbitrary version selector.
 
-   ```powershell
-   $confirmedWorkflowHome = [IO.Path]::GetFullPath(<confirmed-absolute-local-workflow-home>)
-   $setupTaskRoot = Join-Path ([IO.Path]::GetTempPath()) ("workflow-setup-" + [Guid]::NewGuid().ToString("N"))
-   New-Item -ItemType Directory -Path $setupTaskRoot | Out-Null
-   $hostFactsPath = Join-Path $setupTaskRoot "host-facts.json"
-   $gitFacts = & scripts/inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome -GitProbeOnly | ConvertFrom-Json
-   ```
+Use `workflow-setup.exe` only through one UTF-8 JSON object on stdin and one
+JSON result on stdout. Requests use schema 1. Ignore unknown response extension
+fields, but stop on unknown statuses or malformed known evidence.
 
-   Stop immediately if Git is unavailable. If the directory is not a Git repository, explain that Git is required and ask once whether to run `git init`. Stop immediately if declined. If accepted, run `git init`, then rerun the Git-only probe and require it to report `installed=true` and `is_repository=true`. Do not run full host inspection, Docker inspection, Control Plane inspection, release resolution, or `workflow.exe serve` until the Git-only probe confirms a repository. An unsafe or ambiguous repository probe is a rejection, not a reason to continue into Platform discovery.
+1. For ordinary onboarding, if the stable Dispatcher exists, call its active
+   Launcher `verify`. `platform_ready` means reuse it with no Bundle download;
+   `repair_required` reacquires the exact active Bundle. Missing or invalid
+   state follows fresh-install path-conflict handling. Never silently adopt a
+   nonempty unknown Workflow Home.
+2. An explicit upgrade bypasses healthy reuse. Call Dispatcher `inspect` with
+   `purpose=active_work_preflight` before target download; `active_work` asks
+   the user to rerun later. Select latest eligible stable only when higher than
+   the active version. Fresh chooses latest stable; repair and unfinished
+   attempts choose their exact target.
+3. For a verified target Bundle call `inspect` with `purpose=target_state`.
+   Present its fixed concrete Platform Setup Consent capabilities. Send the
+   accepted capability values in `apply`, or reuse only its returned unchanged
+   `consent_id`. First setup may carry the PAT; later setup lets Launcher read
+   its plaintext credential file. Do not create platform state before consent.
+   The `persist_plaintext_pat` accepted capability is a JSON value with exactly
+   `path` (the normalized absolute `WorkflowHome\state\credentials\github.pat`)
+   and `owner` (the normalized GitHub owner collected before consent). Never
+   use a delimiter-concatenated owner/path value.
+4. After `apply: ready`, invoke the stable Dispatcher's active Launcher
+   `verify`; continue only on `platform_ready`. `repair_required` is a forward
+   repair of the same Bundle/Attempt, never automatic rollback.
+5. Use the active versioned CLI only for Repository Onboarding. Generate,
+   display, approve, apply, and verify the exact Onboarding Plan Digest for
+   this current repository. Finish only at Platform Ready and Repository
+   Admitted.
 
-   After the Git-only gate succeeds and before full host inspection, run `codex doctor --json` and `codex login status`. Parse the redacted doctor JSON even when the command exits nonzero: unrelated terminal checks may fail and must not override valid required checks. Continue only when the machine-readable doctor report has schema 1, an `ok` `auth.credentials` check with `stored ChatGPT tokens=true`, `stored auth mode=chatgpt`, and an absolute `auth file` beneath the `CODEX_HOME` reported by the `ok` `config.load` check, and login status reports ChatGPT. The Workflow CLI performs the same checks and resolves the source automatically; never ask an ordinary user to locate or configure a private Codex file.
+The Launcher owns generation state, migration, active-work fencing, Docker and
+worker preparation, PATH reconciliation, and Control Plane lifecycle. The
+skill only owns conversation, current-repository identity, bundle acquisition,
+consent narration, and exact Onboarding Plan approval. Preserve user Git state.
 
-   Only after that Git gate succeeds, run full host inspection once and read its saved JSON:
+Use these concrete command shapes; do not replace them with explanatory
+pseudo-commands. `$dispatcher` is the stable `WorkflowHome\bin\workflow.exe`,
+`$launcher` is the verified Bundle's `setup\workflow-setup.exe`, and every
+setup object is UTF-8 JSON without extra stdin bytes:
 
-   ```powershell
-   $hostFactsJSON = & scripts/inspect-host.ps1 -Repository (Get-Location) -WorkflowHome $confirmedWorkflowHome | Out-String
-   [IO.File]::WriteAllText($hostFactsPath, $hostFactsJSON, (New-Object Text.UTF8Encoding($false)))
-   $hostFacts = Get-Content -LiteralPath $hostFactsPath -Raw | ConvertFrom-Json
-   ```
+```powershell
+$verify = @{schema_version=1;operation='verify';workflow_home=$workflowHome} | ConvertTo-Json -Compress
+$state = $verify | & $dispatcher setup verify | ConvertFrom-Json
+# Explicit upgrade only:
+$preflight = @{schema_version=1;operation='inspect';purpose='active_work_preflight';workflow_home=$workflowHome} | ConvertTo-Json -Compress
+$preflight | & $dispatcher setup inspect | ConvertFrom-Json
+$target = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner} | ConvertTo-Json -Compress
+$inspection = $target | & $launcher | ConvertFrom-Json
+# Do not invent or submit an empty consent surface. A fresh/changed target
+# returns the exact field `required_capabilities`; present those values, then
+# return that same nonempty array unchanged. An unchanged target instead
+# returns the exact reusable consent_id and must not send capabilities.
+if ($inspection.status -eq 'consent_required') {
+  $acceptedCapabilities = @($inspection.evidence.required_capabilities)
+  if ($acceptedCapabilities.Count -eq 0) { throw 'Launcher consent_required result omitted required_capabilities' }
+  # Present exactly $acceptedCapabilities and collect the user's acceptance.
+  $applyRequest = @{schema_version=1;operation='apply';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner;accepted_capabilities=$acceptedCapabilities;pat=$pat}
+} elseif ($inspection.status -eq 'ready') {
+  $consentID = [string]$inspection.evidence.consent_id
+  if ([string]::IsNullOrWhiteSpace($consentID)) { throw 'Launcher ready result omitted reusable consent_id' }
+  $applyRequest = @{schema_version=1;operation='apply';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner;consent_id=$consentID}
+  if (-not [string]::IsNullOrWhiteSpace($pat)) { $applyRequest.pat = $pat }
+} else {
+  throw "Unexpected target_state status: $($inspection.status)"
+}
+$apply = $applyRequest | ConvertTo-Json -Depth 16 -Compress
+$apply | & $launcher | ConvertFrom-Json
+# Repository authority is only the active versioned CLI, never the launcher:
+$plan = & $dispatcher onboarding plan --workflow-home $workflowHome --repo $repo | ConvertFrom-Json
+$plan.onboarding_plan | ConvertTo-Json -Depth 100 -Compress | & $dispatcher onboarding apply --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
+& $dispatcher onboarding verify --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
+```
 
-   Compare both Workflow Home paths by filesystem identity when the target exists (or by the same normalized Windows path form when it does not); otherwise fail closed. Every later reinspection must pass `-WorkflowHome $confirmedWorkflowHome` again; never recover the default from process environment after this choice.
-
-   Before release resolution, handle an already-authorized absent Control Plane process as an existing-authorization Control Plane restart. Use an explicit exact predicate; do not infer restart authority from a state label alone:
-
-   ```powershell
-   $sha256Pattern = '^[0-9a-f]{64}$'
-   $durableAuthorityExact =
-       $hostFacts.workflow.trust_state -eq "pinned" -and
-       [bool]$hostFacts.workflow.owned -and
-       [bool]$hostFacts.platform.installation_recorded -and
-       -not [string]::IsNullOrWhiteSpace([string]$hostFacts.platform.version) -and
-       [string]$hostFacts.workflow.version -ceq [string]$hostFacts.platform.version -and
-       $hostFacts.platform.release_manifest_digest -cmatch $sha256Pattern -and
-       $hostFacts.platform.platform_setup_contract_digest -cmatch $sha256Pattern -and
-       $hostFacts.platform.workflow_cli_sha256 -cmatch $sha256Pattern -and
-       [string]$hostFacts.workflow.sha256 -ceq [string]$hostFacts.platform.workflow_cli_sha256 -and
-       -not [string]::IsNullOrWhiteSpace([string]$hostFacts.platform.release_bundled_files_json) -and
-       $hostFacts.platform.release_bundled_files_digest -cmatch $sha256Pattern -and
-       $hostFacts.platform.control_plane_plan_digest_sha256 -cmatch $sha256Pattern
-   $staleNonLiveRecord =
-       $hostFacts.control_plane.state -eq "stale" -and
-       $null -ne $hostFacts.control_plane.runtime -and
-       [string]$hostFacts.control_plane.runtime.platform_version -ceq [string]$hostFacts.platform.version -and
-       [string]$hostFacts.control_plane.runtime.approved_platform_bootstrap_plan_digest_sha256 -ceq [string]$hostFacts.platform.control_plane_plan_digest_sha256
-   $stoppedWithoutRecord =
-       $hostFacts.control_plane.state -eq "stopped" -and
-       $null -eq $hostFacts.control_plane.runtime
-   $restartEligible = $durableAuthorityExact -and ($staleNonLiveRecord -or $stoppedWithoutRecord)
-   ```
-
-   Only when `$restartEligible` is true, run the installed `workflow.exe serve --workflow-home` command using the same confirmed home:
-
-   ```powershell
-   & (Join-Path $confirmedWorkflowHome "bin\workflow.exe") serve --workflow-home $confirmedWorkflowHome --approved-plan-digest $hostFacts.platform.control_plane_plan_digest_sha256
-   ```
-
-   Then rerun host inspection for `$confirmedWorkflowHome` and require `ready` runtime identity bound to that same version and digest. This restart reuses durable authorization and must not produce a new Platform Bootstrap Plan or ask for a new approval. Continue repository intent and credential discovery, but skip Platform release resolution, planning, and installation when the restarted Platform is ready.
-
-   Incomplete or conflicting durable trust fails closed: never execute the installed Workflow CLI, guess a digest, or treat a Control Plane state alone as restart authority. Never restart `stopped` with a Runtime Record: that represents a live process whose health is unavailable. Never restart `ready` or `mismatched`. A `stale` record is eligible only because inspection proved its recorded process is not live and its exact runtime identity still matches the durable authorization. Continue only through the exact verified pin-repair path below; the restart shortcut remains unavailable until inspection proves the complete authorization identity and process absence.
-
-   Record the confirmed owner, repository name, visibility, publication state, and domain layout once; pass these same values to every subsequent plan command without asking again.
-   Require the already-approved classic PAT scopes `repo,workflow` for a personal owner. Organization ownership remains supported in the design but must stop with `requires an approved organization scope contract` until that additional credential contract is explicitly approved; do not infer or request extra scopes. Capture the verifier's redacted JSON result and pass its `owner_type` and `fingerprint_sha256` unchanged to the bootstrap planner. When the persisted credential is already live-verified, reuse those two fields from `$hostFacts.github_credential`; never calculate a fingerprint from an unverified value.
-2. Determine the complete GitHub repository intent before Platform planning and before any Platform mutation. Ask once for the owner, repository name, and private/public visibility, then reuse that decision throughout the setup loop without asking again. For an existing canonical GitHub `origin`, present its owner as the candidate together with its repository name and ask the user to confirm them; do not silently choose them. With no `origin`, explicitly ask whether the target belongs to the user's personal account or an organization and obtain that exact owner, repository name and private/public visibility. A non-GitHub `origin` blocks. Before any verifier or Release request, ask once for the classic PAT even when `$hostFacts.github_credential` is already live-verified; retain it only as `$setupPAT` in the current Setup invocation's memory. Send a BOM-free copy of the same in-memory PAT to the Control Plane credential verifier, the Release Resolver, and, after plan approval, the exact-package installer over standard input; never put it in an argument, file, plan, ordinary output, or a later Setup invocation. When no verified credential exists, first pipe `$setupPAT` to `scripts/verify-github-pat.ps1 -Owner <owner> -RepositoryName <name> -Visibility <private|public> -PublicationState <published|unpublished>`. When it is already live-verified, skip only the Control Plane credential verifier and reuse its recorded `owner_type` and `fingerprint_sha256`; do not reuse its stored plaintext PAT. A personal owner must verify personal identity, exact `repo,workflow` scopes, repository access or absence, and Actions checkout feasibility. Observe active review/merge-queue policy when GitHub makes those optional capabilities readable; a 403 from repository rulesets or branch protection is capability-unavailable, not a credential failure, so proceed in Owner-Guarded Mode. Positively observed review, merge-queue, or required-check policy remains applicable to the Onboarding Pull Request and must still be handled safely. An organization owner stops pending the approved organization scope contract. On any verification, resolution, planning, approval, or installation failure, clear `$setupPAT` before stopping. Never fall back to another owner after rejection.
-
-   Resolve the trusted Platform Release automatically from the fixed repository. Reuse the PAT already captured for this Setup invocation; do not read `gh`, a host credential store, or the persisted Control Plane credential. Send it to the resolver and later installer on BOM-free standard input, never as an argument, file, or ordinary output. A fresh host may either use the default latest stable release or the user's explicitly confirmed exact version. `AllowUpgrade` is only for an installed lower version moving to a higher exact version:
-
-   ```powershell
-   $releaseArguments = @{ HostFactsPath = $hostFactsPath }
-   # On a fresh host, add Version alone only when the user explicitly selected an exact version:
-   $releaseArguments.Version = <confirmed-version>
-   # Add AllowUpgrade only when an installed lower version is explicitly moving to that higher version:
-   $releaseArguments.AllowUpgrade = $true
-   # Start scripts/resolve-platform-release.ps1 with a ProcessStartInfo StandardInput writer created
-   # with [Text.UTF8Encoding]::new($false), then write a BOM-free copy of the same in-memory PAT.
-   # Do not use a Windows PowerShell 5.1 text pipeline because it prefixes UTF-8 BOM bytes.
-   $resolvedRelease = <resolver-standard-output> | ConvertFrom-Json
-   ```
-
-   Branch on the inspected pin state without inventing release authority:
-
-   - For a true fresh installation, omit `Version` only when the user selected latest stable.
-   - When either verified durable pin is available, the verified backup pin automatically supplies exact repair authority if the primary is missing; omit `Version` for that exact pin repair. The resolver selects the pinned release and the later approved apply recreates the missing primary or backup.
-   - When both verified pins are missing while the Workflow CLI exists, never use latest-stable selection. For an exact repair, ask the user to confirm the exact installed version, add `$releaseArguments.Version = <confirmed-exact-installed-version>`, and omit `AllowUpgrade`. For an explicitly requested upgrade, add the exact target version and `AllowUpgrade`; the resolver must recover the prior Platform Installation through the verified target CLI and prove that the target version is greater before it emits planning inputs.
-
-   Resolution and Platform Plan generation are a contract-validated, forward-only dry run: they do not rewrite either pin or the Platform Installation. The resolver accepts the fixed repository's immutable stable release and downloads its functional `platform-release.json` through the authenticated Release Asset API. For a pinless existing CLI only, it also verifies `SHA256SUMS` and `workflow-windows-amd64.zip`, then runs the verified target CLI's strictly read-only `setup inspect-platform-installation` command to recover the exact prior installation into `$resolvedRelease.host_facts_path`. This is the only authority for a pinless installation transition; never copy or infer old pins. The installer uses the same explicit PAT to download and independently verify the exact archive again. Neither path consults SBOM, provenance, a signature, a `gh` login, or a persisted release credential.
-
-   Produce the Platform Plan only from the resolver output:
-
-   ```powershell
-   $platformPlanPath = Join-Path $setupTaskRoot "platform-plan.json"
-   & scripts/new-platform-bootstrap-plan.ps1 -ManifestPath $resolvedRelease.manifest_path -HostFactsPath $resolvedRelease.host_facts_path -OutputPath $platformPlanPath -GitHubOwner <confirmed-owner> -GitHubOwnerType <personal|organization> -GitHubPATFingerprintSHA256 <verified-fingerprint>
-   ```
-
-   Pass `-AllowUpgrade` to the planner only for the same explicitly confirmed upgrade. If it returns `plan_required`, show its complete readable projection and ask for one approval of the displayed SHA-256 digest.
-3. After approval, run the exact installer command:
-
-   ```powershell
-   <start installer with the same BOM-free standard-input PAT writer>
-   ```
-
-   It checks the approved plan before downloading the exact checksummed platform archive. `workflow setup apply` verifies any prior Platform Installation transition before the first effect, so a drifted upgrade cannot replace the CLI and leave the old installation record behind. Allow UAC, Docker first launch, and Codex login restoration only when the corresponding approved plan declares them; do not ask for the PAT again. The installer passes the same in-memory PAT to `workflow setup apply` with a BOM-free standard-input writer; keep it out of arguments and ordinary output, then discard it when the Setup invocation finishes or fails. Remove `$resolvedRelease.temp_directory` and `$setupTaskRoot` only after setup finishes or fails; never treat their paths as durable state.
-4. Use the installed CLI for the remaining deterministic loop:
-
-   ```powershell
-   workflow setup plan --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path --repository-name <confirmed-name> --visibility <private|public> --publication-state <published|unpublished> --domain-layout <single-context|multi-context>
-   workflow setup apply --plan <plan-path> --approved-digest <digest>
-   workflow setup verify --workflow-home $confirmedWorkflowHome --repo (Get-Location).Path
-   ```
-
-   Before approval or apply, parse the emitted Onboarding Plan and confirm its plan target.workflow_home exactly equals `$confirmedWorkflowHome`; `setup apply` intentionally has no Workflow Home override and consumes only that bound target. Present each complete Onboarding Plan once. An approval authorizes only its exact digest. If facts drift, present the replacement plan rather than expanding the old one.
-5. Finish only when verification reports both `platform_ready` and `repository_admitted`. Otherwise report the exact blocker and whether the same digest can continue forward.
-
-Preserve user-owned Git state. Never stage, commit, stash, reset, clean, switch branches, push existing commits, or rewrite `origin` during discovery. The CLI owns approved mutations and safe readback.
+Treat `platform_ready`, `repair_required`, and `active_work` exactly as the
+branching rules above prescribe. Reject any other status rather than guessing.

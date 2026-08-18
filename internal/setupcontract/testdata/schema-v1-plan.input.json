@@ -1,9 +1,0 @@
-{
-  "expected_results": [{"subject":"C:\\Users\\Ada\\AgentWorkflow","expected":"ready","kind":"platform_readiness","id":"platform-ready"}],
-  "effects": [{"parameters":{"version":"1.0.0","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform_setup_contract_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","workflow_cli_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","release_bundled_files_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"action":"install","subject":"workflow.exe","kind":"platform_cli","id":"install-cli"}],
-  "preconditions": [{"expected":"Windows 用户 雪","subject":"current-user","kind":"host_identity","id":"windows-user"}],
-  "target": {"repository_path":"","github_repository":"","workflow_home":"C:\\Users\\Ada\\AgentWorkflow"},
-  "kind": "platform_bootstrap",
-  "plan_id": "platform-001",
-  "schema_version": 1
-}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,8 +20,8 @@ import (
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/plan"
-	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
@@ -132,30 +133,190 @@ func (restoreContainerIsolatorFunc) IsolateControlPlaneContainers(context.Contex
 	return nil
 }
 
-type fakeRestoreContainerIsolator struct {
-	isolateRun          func(context.Context, string) error
-	isolateControlPlane func(context.Context) error
-}
-
-func (f fakeRestoreContainerIsolator) IsolateContainer(ctx context.Context, runID string) error {
-	return f.isolateRun(ctx, runID)
-}
-
-func (f fakeRestoreContainerIsolator) IsolateControlPlaneContainers(ctx context.Context) error {
-	return f.isolateControlPlane(ctx)
-}
-
-func TestAnswerInboxDefaultsToWorkflowHomeDatabase(t *testing.T) {
+func TestAnswerInboxUsesOnlyReadyActiveGenerationDatabase(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "home")
+	generation := strings.Repeat("a", 64)
+	activeDatabase := filepath.Join(home, "platform", "generations", generation, "workflow.db")
+	if err := os.MkdirAll(filepath.Dir(activeDatabase), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	active := launcher.Active{SchemaVersion: launcher.ProtocolVersion, Generation: generation, Version: "0.0.1", BundleDigest: "sha256:" + generation, AttemptID: "attempt", ConsentID: "consent", Readiness: "ready"}
+	raw, err := json.Marshal(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeStore, err := store.Open(context.Background(), activeDatabase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activeStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(home, "state", "workflow.db")
+	if err := os.MkdirAll(filepath.Dir(decoy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	decoyStore, err := store.Open(context.Background(), decoy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := decoyStore.Close(); err != nil {
+		t.Fatal(err)
+	}
 	got, err := answerInboxDatabasePath("", home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(home, "state", defaultControlPlaneDatabase)
-	if got != want {
-		t.Fatalf("answer-inbox database = %q, want %q", got, want)
+	if got != activeDatabase || got == decoy {
+		t.Fatalf("answer-inbox database = %q, want active generation %q", got, activeDatabase)
+	}
+	// Dispatcher binding makes --database an identity assertion, not an
+	// arbitrary advanced override. The exact active path remains accepted.
+	t.Setenv("WORKFLOW_ACTIVE_HOME", home)
+	if got, err := answerInboxDatabasePath(activeDatabase, home); err != nil || got != activeDatabase {
+		t.Fatalf("dispatcher-bound active override=%q,%v", got, err)
+	}
+	if _, err := answerInboxDatabasePath(decoy, home); err == nil {
+		t.Fatal("dispatcher-bound answer-inbox accepted another database")
+	}
+	t.Setenv("WORKFLOW_ACTIVE_HOME", "")
+	// answer-inbox opens this resolved path with OpenActivated.  A representative
+	// runtime write must therefore land in the generation DB, never the legacy
+	// state/workflow.db decoy.
+	resolved, err := store.OpenActivated(context.Background(), got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := store.GitHubPATVerification{FingerprintSHA256: strings.Repeat("f", 64), Login: "active", UserID: 1, Owner: "owner", Scopes: []string{"repo"}, CredentialPath: filepath.Join(home, "state", "credentials", "github.pat"), Status: "active-marker", VerifiedAt: time.Now().UTC()}
+	if err := resolved.RecordGitHubPATVerification(context.Background(), marker); err != nil {
+		resolved.Close()
+		t.Fatal(err)
+	}
+	if err := resolved.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := store.Open(context.Background(), decoy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.GitHubPATVerification(context.Background()); !errors.Is(err, store.ErrNotFound) {
+		legacy.Close()
+		t.Fatalf("legacy state DB was mutated: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := answerInboxDatabasePath("relative.db", home); err == nil {
+		t.Fatal("relative advanced database override was accepted")
+	}
+	if _, err := answerInboxDatabasePath("", filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing active pointer was accepted")
+	}
+	active.Readiness = "repair_required"
+	raw, _ = json.Marshal(active)
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := answerInboxDatabasePath("", home); err == nil {
+		t.Fatal("repair-required pointer was accepted")
+	}
+	if err := validateActiveExecutablePath(filepath.Join(home, "platform", "generations", strings.Repeat("b", 64), "workflow.exe"), home, launcher.Active{Generation: generation}); err == nil {
+		t.Fatal("generation drift executable was accepted")
+	}
+}
+
+func TestActiveCommandDatabaseFailsClosedAndNeverUsesCWDDefault(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	generation := strings.Repeat("c", 64)
+	database := filepath.Join(home, "platform", "generations", generation, "workflow.db")
+	if err := os.MkdirAll(filepath.Dir(database), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	activeStore, err := store.Open(context.Background(), database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activeStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "platform"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	active := launcher.Active{SchemaVersion: launcher.ProtocolVersion, Generation: generation, Version: "0.0.1", BundleDigest: "sha256:" + strings.Repeat("c", 64), AttemptID: "attempt", ConsentID: "consent", Readiness: "ready"}
+	raw, err := json.Marshal(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decoyDirectory := t.TempDir()
+	decoy := filepath.Join(decoyDirectory, "workflow.db")
+	if err := os.WriteFile(decoy, []byte("cwd decoy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(decoyDirectory)
+	t.Setenv("WORKFLOW_ACTIVE_HOME", home)
+	t.Setenv("WORKFLOW_ACTIVE_GENERATION", generation)
+	t.Setenv("WORKFLOW_ACTIVE_DATABASE", database)
+
+	for _, test := range []struct {
+		name      string
+		mutate    func()
+		override  string
+		wantError bool
+	}{
+		{name: "exact active generation"},
+		{name: "missing active pointer", mutate: func() { _ = os.Remove(filepath.Join(home, "platform", "active.json")) }, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.mutate != nil {
+				test.mutate()
+			}
+			got, err := activeCommandDatabase(test.override)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("database=%q, want failure", got)
+				}
+				return
+			}
+			if err != nil || got != database || got == decoy {
+				t.Fatalf("database=%q err=%v want active=%q", got, err, database)
+			}
+		})
+	}
+	// Restore active for the remaining independently fail-closed identities.
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WORKFLOW_ACTIVE_GENERATION", "other-generation")
+	if _, err := activeCommandDatabase(""); err == nil {
+		t.Fatal("dispatcher generation drift was accepted")
+	}
+	t.Setenv("WORKFLOW_ACTIVE_GENERATION", generation)
+	t.Setenv("WORKFLOW_ACTIVE_DATABASE", filepath.Join(home, "elsewhere.db"))
+	if _, err := activeCommandDatabase(""); err == nil {
+		t.Fatal("dispatcher database drift was accepted")
+	}
+	t.Setenv("WORKFLOW_ACTIVE_DATABASE", database)
+	if got, err := activeCommandDatabase(database); err != nil || got != database {
+		t.Fatalf("same active override=%q,%v", got, err)
+	}
+	if _, err := activeCommandDatabase(filepath.Join(home, "other.db")); err == nil {
+		t.Fatal("dispatcher-bound foreign database override was accepted")
+	}
+	active.Readiness = "repair_required"
+	raw, _ = json.Marshal(active)
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := activeCommandDatabase(""); err == nil {
+		t.Fatal("repair-required generation was accepted")
+	}
+	if _, err := activeCommandDatabase("relative.db"); err == nil {
 		t.Fatal("relative advanced database override was accepted")
 	}
 }
@@ -177,245 +338,6 @@ func TestAnswerWorkflowInboxQuestionIsolatesDeliveryControllerBeforeReplay(t *te
 	}
 	if len(isolated) != 1 || isolated[0] != target.RunID {
 		t.Fatalf("isolated Delivery Controllers = %#v", isolated)
-	}
-}
-
-func TestReconcileRestoredControlPlaneIsolatesPreparedDeliveryBeforeApplying(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	snapshot := plan.Snapshot{
-		Repository: "owner/repository",
-		Root:       plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}},
-		Children:   []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
-	}
-	fingerprint, err := snapshot.Fingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.MarkActive(ctx, version.ID); err != nil {
-		t.Fatal(err)
-	}
-	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
-		t.Fatal(err)
-	}
-	var isolated []string
-	err = reconcileRestoredControlPlane(ctx, db, restoreContainerIsolatorFunc(func(_ context.Context, runID string) error {
-		isolated = append(isolated, runID)
-		return nil
-	}), now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(isolated) != 1 || isolated[0] != delivery.RunID {
-		t.Fatalf("restored Delivery Controller isolation = %#v", isolated)
-	}
-	projection, err := db.PlanProjectionAt(ctx, version.ID, now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projection.Tickets[0].State != "Needs Attention" {
-		t.Fatalf("restored Delivery Controller state = %q", projection.Tickets[0].State)
-	}
-}
-
-func TestRestoreValidatesStagedBackupBeforeCurrentIsolation(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	databasePath := filepath.Join(t.TempDir(), "workflow.db")
-	db, err := store.Open(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	snapshot := plan.Snapshot{Repository: "owner/repository", Root: plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}}, Children: []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}}}
-	fingerprint, err := snapshot.Fingerprint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.MarkActive(ctx, version.ID); err != nil {
-		t.Fatal(err)
-	}
-	claim, err := db.ClaimReady(ctx, store.ClaimRequest{VersionID: version.ID, TicketID: 1, Owner: "agent", MaxParallelRuns: 1, LeaseTTL: time.Hour, Now: now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	delivery, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex", CommitSHA: "accepted", StructuredOutput: []byte(`{"summary":"candidate","checks":[{"command":"go test","outcome":"passed"}]}`), Now: now, Publication: store.CandidatePublication{Repository: snapshot.Repository, Branch: "ticket-1", ExpectRemoteAbsent: true, Title: "ticket"}}, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ReserveDeliveryControllerPrelaunch(ctx, delivery, now); err != nil {
-		t.Fatal(err)
-	}
-	var isolated []string
-	err = restoreControlPlane(ctx, filepath.Join(t.TempDir(), "missing.backup"), databasePath, restoreContainerIsolatorFunc(func(_ context.Context, runID string) error {
-		isolated = append(isolated, runID)
-		return nil
-	}), now)
-	if err == nil {
-		t.Fatal("invalid backup passed staged validation")
-	}
-	if len(isolated) != 0 {
-		t.Fatalf("current control plane isolated before staged validation: %#v", isolated)
-	}
-}
-
-func TestRestoreReplacesCorruptCurrentDatabase(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	directory := t.TempDir()
-	sourcePath := filepath.Join(directory, "source.db")
-	source, err := store.Open(ctx, sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	backupPath := filepath.Join(directory, "workflow.backup")
-	if _, err := source.CreateOnlineBackup(ctx, backupPath, now); err != nil {
-		source.Close()
-		t.Fatal(err)
-	}
-	if err := source.Close(); err != nil {
-		t.Fatal(err)
-	}
-	databasePath := filepath.Join(directory, "workflow.db")
-	if err := os.WriteFile(databasePath, []byte("not a sqlite database"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	contained := false
-	isolator := fakeRestoreContainerIsolator{
-		isolateRun: func(context.Context, string) error { return nil },
-		isolateControlPlane: func(context.Context) error {
-			contained = true
-			return nil
-		},
-	}
-	if err := restoreControlPlane(ctx, backupPath, databasePath, isolator, now); err != nil {
-		t.Fatal(err)
-	}
-	if !contained {
-		t.Fatal("corrupt current Control Plane was replaced without database-independent container isolation")
-	}
-	restored, err := store.Open(ctx, databasePath)
-	if err != nil {
-		t.Fatalf("open restored database: %v", err)
-	}
-	defer restored.Close()
-	if _, err := restored.ReconcilePreview(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestRestoreFencedGatewayDrainsAndReopensPublishedDatabase(t *testing.T) {
-	ctx := context.Background()
-	directory := t.TempDir()
-	databasePath := filepath.Join(directory, "workflow.db")
-	db, err := store.Open(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot := plan.Snapshot{
-		Repository: "owner/repository",
-		Root:       plan.Issue{ID: 100, Number: 100, Labels: []string{plan.PlanLabel}},
-		Children:   []plan.Issue{{ID: 1, Number: 1, Title: "ticket", Labels: []string{plan.TicketLabel}, State: "open"}},
-	}
-	fingerprint, err := snapshot.Fingerprint()
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	version, err := db.BeginActivation(ctx, snapshot, fingerprint, "revision-1")
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.MarkActive(ctx, version.ID); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	replacementPath := filepath.Join(directory, "replacement.db")
-	replacement, err := store.Open(ctx, replacementPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := replacement.Close(); err != nil {
-		t.Fatal(err)
-	}
-	gateway, err := newRestoreFencedGateway(databasePath, doctor.Config{}, "https://api.github.com", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	gatewayDone := make(chan error, 1)
-	go func() {
-		gatewayDone <- gateway.withGateway(ctx, func(*store.Store, delivery.Gateway, func(context.Context) (string, error)) error {
-			close(entered)
-			<-release
-			return nil
-		})
-	}()
-	<-entered
-	type barrierResult struct {
-		lock *startup.Lock
-		err  error
-	}
-	barrierDone := make(chan barrierResult, 1)
-	go func() {
-		lock, err := startup.AcquireRestoreBarrier(ctx, databasePath)
-		barrierDone <- barrierResult{lock: lock, err: err}
-	}()
-	select {
-	case result := <-barrierDone:
-		if result.lock != nil {
-			result.lock.Close()
-		}
-		t.Fatalf("restore crossed active Gateway database access: %v", result.err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	if err := <-gatewayDone; err != nil {
-		t.Fatal(err)
-	}
-	result := <-barrierDone
-	if result.err != nil {
-		t.Fatal(result.err)
-	}
-	if err := store.PublishRestoredBackup(ctx, replacementPath, databasePath); err != nil {
-		result.lock.Close()
-		t.Fatal(err)
-	}
-	if err := result.lock.Close(); err != nil {
-		t.Fatal(err)
-	}
-	err = gateway.withGateway(ctx, func(db *store.Store, _ delivery.Gateway, _ func(context.Context) (string, error)) error {
-		_, err := db.PlanProjectionAt(ctx, version.ID, time.Now().UTC())
-		return err
-	})
-	if !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("Gateway retained pre-restore database = %v", err)
 	}
 }
 

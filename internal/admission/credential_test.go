@@ -11,7 +11,6 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
 )
 
@@ -38,7 +37,7 @@ func TestDynamicGitHubVerifierRereadsAndLiveVerifiesPATEveryAdmission(t *testing
 			verifications++
 			return githubcredential.Verification{FingerprintSHA256: stored.FingerprintSHA256, Login: stored.Login, UserID: stored.UserID, Owner: stored.Owner, Scopes: stored.Scopes}, nil
 		},
-		VerifyRepository: func(context.Context, string, string, store.RepositoryAdmission, platformrelease.PlatformSetupContract) error {
+		VerifyRepository: func(context.Context, string, string, store.RepositoryAdmission, RepositoryContract) error {
 			return nil
 		},
 	}
@@ -122,7 +121,7 @@ func TestOrganizationAdmissionSuspendsPendingApprovedScopeContract(t *testing.T)
 			APIBase:    server.URL,
 			HTTPClient: server.Client(),
 			ReadPAT:    func(context.Context, string) (string, error) { return token, nil },
-			VerifyRepository: func(context.Context, string, string, store.RepositoryAdmission, platformrelease.PlatformSetupContract) error {
+			VerifyRepository: func(context.Context, string, string, store.RepositoryAdmission, RepositoryContract) error {
 				return nil
 			},
 		},

@@ -12,6 +12,72 @@ _Avoid_: Control Plane, product workflow, production entry point
 The human-approved transition from the Bootstrap Development Harness to developing Agent Workflow through its own product workflow, permitted only after independent end-to-end production validation.
 _Avoid_: automatic rollout, release publication, completion inferred from closed issues or passing tests
 
+## Windows platform installation
+
+**Workflow Setup（Workflow 配置）**:
+The human-invoked, Codex-led operation that prepares one current-user Windows host and then onboards the current repository.
+_Avoid_: remote-host deployment, user-run installation checklist
+
+**Platform Setup Consent（平台配置同意）**:
+The readable confirmation of disclosed host-facing installation changes. It authorizes Bundle-owned deterministic installation and recovery but is not a plan digest.
+_Avoid_: Platform Bootstrap Plan, Onboarding Plan
+
+**Platform Setup Consent Record（平台配置同意记录）**:
+The immutable Launcher-owned audit record of an accepted target and concrete capabilities, referenced by Attempts and the active installation.
+_Avoid_: approval digest, mutable permission set
+
+**Onboarding Plan Digest（接入计划摘要）**:
+The SHA-256 identity of a canonical immutable Onboarding Plan. Repository and GitHub mutations bind to this exact digest.
+_Avoid_: Platform Setup Consent
+
+**Workflow Bootstrap Skill（Workflow 引导技能）**:
+The independently installed Codex skill that validates the current repository and login, obtains one Bundle, narrates consent, invokes Launcher protocol, then drives Repository Onboarding.
+_Avoid_: versioned Workflow CLI, platform planner
+
+**Windows Installation Bundle（Windows 安装包）**:
+The sole `workflow-windows-amd64.zip` platform download carrying root Platform Release Manifest, dual-mode Setup Launcher/Dispatcher, versioned CLI, skill bundle, and repository contract.
+_Avoid_: split Release assets, loose checksum file
+
+**Setup Launcher（配置启动器）**:
+The Bundle executable that exclusively owns platform inspection, consent, installation, migration, activation, verification, and forward repair. Installed as `bin\\workflow.exe`, its same bytes implement Dispatcher-only delegation.
+_Avoid_: PowerShell planner, installed-CLI installer
+
+**Setup Launcher Protocol（配置启动器协议）**:
+The schema-versioned one-JSON-stdin/one-JSON-stdout `inspect`, `apply`, and `verify` contract between Bootstrap Skill and Launcher.
+_Avoid_: Platform Setup Contract, Platform Bootstrap Plan
+
+**Platform Release Manifest（平台发布清单）**:
+The root Bundle metadata binding exact version, compatibility contract, inventory, and per-file digests after GitHub immutable asset metadata authenticates the archive.
+_Avoid_: external manifest, SHA256SUMS
+
+**Workflow Home（Workflow 主目录）**:
+The one current-user local root for immutable platform generations, shared credentials, workspaces, logs, and backups.
+_Avoid_: repository root, ProgramData
+
+**Platform Installation（平台安装）**:
+The one active platform represented solely by atomic `platform/active.json`, identifying active Generation, Attempt, Consent, version, and `repair_required` or `ready` readiness.
+_Avoid_: partial installation, Platform Generation
+
+**Platform Generation（平台代际）**:
+One bundle-digest-named immutable payload slot with its generation-local database; only an active Generation's database receives ordinary runtime writes.
+_Avoid_: Windows Installation Bundle, shared Workflow Home state
+
+**Workflow Dispatcher（Workflow 分派器）**:
+The stable `workflow.exe` that validates only `active.json` and delegates ordinary commands to the exact versioned CLI or setup inspection/verification to its active Launcher.
+_Avoid_: copied active CLI, setup mutator
+
+**Platform Installation Attempt（平台安装尝试）**:
+One candidate transition to one target Bundle under one Consent, staged through migrated, verified, activation-as-repair-required and ready, or failed only before activation.
+_Avoid_: Platform Installation, Setup Execution Result
+
+**Platform Maintenance Window（平台维护窗口）**:
+The exclusive bounded install interval that writes a target-bound scheduling fence, proves zero active Worker Runs, migrates one candidate, and activates it. Post-activation failure repairs forward without rollback.
+_Avoid_: zero-downtime deployment, concurrent Control Planes
+
+**Shared Credential Initialization（共享凭据初始化）**:
+First setup's capture and, after consent, plaintext persistence of one owner-bound classic PAT for Release access and trusted Control Plane operations; Workers never receive it.
+_Avoid_: separate Release credential, GitHub App
+
 **Delivery Plan（交付计划）**:
 An approved intended outcome and the complete set of Executable Tickets that collectively deliver it.
 _Avoid_: Executable Ticket, dependency chain, pull request
