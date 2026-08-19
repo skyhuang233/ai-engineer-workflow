@@ -18,7 +18,26 @@ $setup-agent-workflow
 
 The skill first checks whether the current directory is a Git repository. It then presents at most two complete approvals: a Platform Bootstrap Plan for host changes and an Onboarding Plan for repository changes. An approved Platform Bootstrap can create the selected Workflow Home when it is absent; Repository Onboarding requires that bootstrap database and never creates the home itself. A classic GitHub PAT with `repo` and `workflow` scopes is stored in plaintext under the current user's Workflow Home; the PAT is available to trusted host components but never to Worker containers.
 
-Platform installation resolves an immutable stable release from this canonical GitHub repository and verifies its source commit, GitHub Actions provenance, the required `SHA256SUMS`, `platform-release.json`, and `workflow-windows-amd64.zip` assets, and exact SHA-256 checksums. Extra Release assets (such as SBOMs, signatures, or packages for other platforms) are ignored with a warning. Publication uses GitHub's job-scoped token, so setup requires no separate platform credential.
+Platform installation resolves the highest stable immutable `workflow-vX.Y.Z`
+release from this canonical repository. A Workflow Release contains exactly
+`workflow-windows-amd64.zip`, `workflow-release.json`, and
+`worker-sbom.spdx.json`. Setup authenticates the manifest using GitHub asset
+metadata, validates its complete schema before downloading the other assets,
+then verifies the Bundle inventory and publisher provenance. Extra, missing, or
+duplicate assets fail closed.
+
+The Worker builds no-mistakes from its pinned repository commit with the pinned
+Go toolchain. It also rebuilds the pinned GitHub CLI release commit with the
+security-fixed `golang.org/x/mod` dependency and verifies the deterministic
+binary hash recorded in the manifest. The Workflow Release—not a separate
+no-mistakes Release—is the supply-chain boundary; Doctor verifies the final
+assets, direct source tag, publisher run, and immutable Worker digest.
+
+Platform and Worker are released atomically under one product version. Legacy
+split-release artifacts and tags have been retired. Until the first owner-approved
+`workflow-v0.0.1` is published, the repository is intentionally in a release
+blackout: fresh installation and release-dependent repair or recovery are not
+available, and consumers never fall back to legacy tags.
 
 The Control Plane is supported and validated only on a current-user Windows host; Linux is limited to the Worker container runtime contract. The host requires Docker Desktop, the invoking user's existing Codex ChatGPT login, and a GitHub `origin`. Setup resolves that login automatically from the redacted machine-readable `codex doctor --json` report and confirms it with `codex login status`; ordinary users do not configure a credential path. With no `origin`, setup can create a private GitHub repository. A non-GitHub `origin`, a different GitHub owner, or an organization that rejects classic PATs blocks setup.
 

@@ -32,11 +32,8 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"codex version", func(c *Config) { c.Codex.Version = "" }},
 		{"GitHub CLI version", func(c *Config) { c.GitHubCLI.Version = "" }},
 		{"GitHub CLI checksum", func(c *Config) { c.GitHubCLI.LinuxAMD64SHA256 = "latest" }},
-		{"upstream commit", func(c *Config) { c.NoMistakes.UpstreamCommit = "main" }},
-		{"fork commit", func(c *Config) { c.NoMistakes.ForkCommit = "main" }},
-		{"fork release", func(c *Config) { c.NoMistakes.ForkRelease = "" }},
-		{"asset checksum", func(c *Config) { c.NoMistakes.LinuxAMD64SHA256 = "latest" }},
-		{"worker version", func(c *Config) { c.Worker.Version = "" }},
+		{"no-mistakes repository", func(c *Config) { c.NoMistakes.Repository = "main" }},
+		{"no-mistakes commit", func(c *Config) { c.NoMistakes.Commit = "main" }},
 		{"worker image repository", func(c *Config) { c.Worker.ImageRepository = "latest" }},
 		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
 		{"release repository owner", func(c *Config) { c.Worker.ReleaseRepository = "collaborator/workflow" }},
@@ -213,28 +210,23 @@ func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 6,
-		Codex:         ToolPin{Version: "0.147.0"},
+		SchemaVersion: 7,
+		Codex:         ToolPin{Version: "0.148.0"},
 		GitHubCLI:     GitHubCLIPin{Version: "2.97.0", LinuxAMD64SHA256: "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"},
-		Go:            GoPin{Version: "1.25.12", LinuxAMD64SHA256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"},
+		Go:            GoPin{Version: "1.26.6", LinuxAMD64SHA256: "708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89"},
 		NoMistakes: NoMistakesPin{
-			Version:            "v1.41.2",
-			UpstreamRepository: "kunchenguid/no-mistakes",
-			UpstreamCommit:     "867d64d9c2df89f3f204ad1f5528e5bf7b460caa",
-			ForkRepository:     "skyhuang233/no-mistakes",
-			ForkCommit:         "e073fd0dc51c64004468b04de8cf2ab50cd5d177",
-			ForkRelease:        "workflow-v1.41.2.2",
-			LinuxAMD64SHA256:   "bd19d18ba20af1905b0f13ac6b0f9c283d299da48279da7dd0a5ff2242a58d4c",
+			Version:    "v1.41.2",
+			Repository: "skyhuang233/no-mistakes",
+			Commit:     "eafc10e0fc7306be3af1750524aa2067e5048942",
 		},
 		Worker: WorkerPin{
-			Version:           "0.1.0",
 			ImageRepository:   "ghcr.io/skyhuang233/workflow-worker",
 			ReleaseRepository: "skyhuang233/ai-engineer-workflow",
 		},
 		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
 			TestRepository: "skyhuang233/workflow-integration-test",
-			DefaultBranch:  "main",
+			DefaultBranch:  "develop",
 			RequiredCheck:  "workflow-contract",
 			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
@@ -248,7 +240,7 @@ func validConfig() Config {
 	}
 }
 
-func TestConfigAcceptsClassicPATSchemaSix(t *testing.T) {
+func TestConfigAcceptsClassicPATSchemaSeven(t *testing.T) {
 	config := validConfig()
 	config.GitHub.TestRepository = ""
 	if err := config.Validate(); err != nil {

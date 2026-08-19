@@ -24,13 +24,13 @@ $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = "<separate cleanup credential with list/
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <disposable-owner> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@platform-vX.Y.Z `
+  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
   -PlatformVersion X.Y.Z `
   -DifferentOwnerRepository <public-owner/public-repository>
 ```
 
 `EntrySkillSpec` is an interface boundary, not a floating source: the release
-pipeline must pin it to the exact produced Platform Release tag or source commit,
+pipeline must pin it to the exact produced Workflow Release tag or source commit,
 never a development checkout or an unpinned branch. The harness resolves the
 operator's source from the redacted machine-readable `codex doctor --json`
 report, verifies its ChatGPT mode and `CODEX_HOME` boundary, and copies it into
@@ -54,7 +54,7 @@ mismatch cannot mask it:
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <organization-that-rejects-classic-pats> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@platform-vX.Y.Z `
+  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
   -PlatformVersion X.Y.Z `
   -QualificationMode organization-policy `
   -ClassicPATRejectedRepository <organization/public-fixture>

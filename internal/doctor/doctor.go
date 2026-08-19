@@ -43,17 +43,12 @@ type GitHubCLIPin struct {
 }
 
 type NoMistakesPin struct {
-	Version            string `json:"version"`
-	UpstreamRepository string `json:"upstream_repository"`
-	UpstreamCommit     string `json:"upstream_commit"`
-	ForkRepository     string `json:"fork_repository"`
-	ForkCommit         string `json:"fork_commit"`
-	ForkRelease        string `json:"fork_release"`
-	LinuxAMD64SHA256   string `json:"linux_amd64_sha256"`
+	Version    string `json:"version"`
+	Repository string `json:"repository"`
+	Commit     string `json:"commit"`
 }
 
 type WorkerPin struct {
-	Version           string `json:"version"`
 	ImageRepository   string `json:"image_repository"`
 	ReleaseRepository string `json:"release_repository"`
 }
@@ -139,7 +134,7 @@ func (c Config) Validate() error {
 	case !repositoryOwnedBy(c.Worker.ReleaseRepository, c.GitHub.Credential.Owner):
 		return errors.New("worker release repository owner must match the Control Plane GitHub credential owner")
 	case c.GitHub.Credential.Kind != "classic-pat":
-		return errors.New("schema 6 Control Plane GitHub credential must be a classic PAT")
+		return errors.New("schema 7 Control Plane GitHub credential must be a classic PAT")
 	case !requiredPATScopes(c.GitHub.Credential.RequiredScopes):
 		return errors.New("classic PAT requires repo and workflow scopes")
 	case filepath.Clean(c.GitHub.Credential.PlaintextRelativePath) != filepath.Clean(`state\credentials\github.pat`):
@@ -153,7 +148,7 @@ func (c Config) Validate() error {
 
 func (c Config) validateWorkerBuildInputs() error {
 	switch {
-	case c.SchemaVersion != 6:
+	case c.SchemaVersion != 7:
 		return fmt.Errorf("unsupported toolchain schema version %d", c.SchemaVersion)
 	case strings.TrimSpace(c.Codex.Version) == "":
 		return errors.New("Codex version is required")
@@ -167,22 +162,10 @@ func (c Config) validateWorkerBuildInputs() error {
 		return errors.New("Go Linux asset checksum must be SHA-256")
 	case strings.TrimSpace(c.NoMistakes.Version) == "":
 		return errors.New("no-mistakes version is required")
-	case !repoPattern.MatchString(c.NoMistakes.UpstreamRepository):
-		return errors.New("no-mistakes upstream repository must be owner/name")
-	case !shaPattern.MatchString(c.NoMistakes.UpstreamCommit):
-		return errors.New("no-mistakes upstream commit must be a full SHA")
-	case !repoPattern.MatchString(c.NoMistakes.ForkRepository):
-		return errors.New("no-mistakes fork repository must be owner/name")
-	case !shaPattern.MatchString(c.NoMistakes.ForkCommit):
-		return errors.New("no-mistakes fork commit must be a full SHA")
-	case strings.TrimSpace(c.NoMistakes.ForkRelease) == "":
-		return errors.New("no-mistakes fork release is required")
-	case !sha256Pattern.MatchString(c.NoMistakes.LinuxAMD64SHA256):
-		return errors.New("no-mistakes Linux asset checksum must be SHA-256")
-	case !versionPattern.MatchString(c.Worker.Version):
-		return errors.New("worker version must be a path-safe version")
-	case len(c.Worker.Version) > 55:
-		return errors.New("worker version is too long for a source-keyed image tag")
+	case !repoPattern.MatchString(c.NoMistakes.Repository):
+		return errors.New("no-mistakes repository must be owner/name")
+	case !shaPattern.MatchString(c.NoMistakes.Commit):
+		return errors.New("no-mistakes commit must be a full SHA")
 	case !strings.HasPrefix(c.Worker.ImageRepository, "ghcr.io/") || strings.Contains(c.Worker.ImageRepository, "@"):
 		return errors.New("worker image repository must be an unpinned GHCR repository")
 	case !repoPattern.MatchString(c.Worker.ReleaseRepository):

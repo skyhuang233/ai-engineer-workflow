@@ -15,7 +15,7 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") { throw "Workflow
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN)) { throw "WORKFLOW_SETUP_E2E_CLEANUP_TOKEN with repository listing and deletion capability is required" }
 if (-not (Test-Path -LiteralPath $DriverScript -PathType Leaf)) { throw "DriverScript does not exist" }
-if ($EntrySkillSpec -notmatch '@(platform-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "EntrySkillSpec must pin an exact published release tag or commit" }
+if ($EntrySkillSpec -notmatch '@(workflow-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "EntrySkillSpec must pin an exact published release tag or commit" }
 if ($QualificationMode -eq "standard" -and [string]::IsNullOrWhiteSpace($DifferentOwnerRepository)) { throw "DifferentOwnerRepository is required for the standard qualification" }
 if ($QualificationMode -eq "organization-policy" -and [string]::IsNullOrWhiteSpace($ClassicPATRejectedRepository)) { throw "ClassicPATRejectedRepository is required for organization-policy qualification" }
 

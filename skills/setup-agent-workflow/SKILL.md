@@ -11,16 +11,46 @@ absolute local Workflow Home (default `%LOCALAPPDATA%\AgentWorkflow`) and one
 classic GitHub PAT with `repo,workflow`; never put the PAT in command arguments
 or ordinary output.
 
-The platform download contract is exactly one private GitHub Release asset:
-`workflow-windows-amd64.zip`. Query the fixed repository with the Control Plane
-PAT, accept only a published immutable non-prerelease `platform-vX.Y.Z` Release
-whose source commit and tag match, and require exactly that one asset with size
-and `sha256:` digest metadata. Download it once, verify its bytes before
-opening it, then verify root `platform-release.json`, protocol/schema versions,
-the complete listed regular-file inventory, and each listed SHA-256. Reject
-unsafe, duplicate, absent, or unlisted archive entries. Do not use a split
-manifest, `SHA256SUMS`, a Bootstrap Plan, an installed-CLI bridge, a legacy
-resolver, or an arbitrary version selector.
+The download contract is one atomic private Workflow Release. Query only the
+fixed repository in `trust/release-policy.json` with the Control Plane PAT.
+Accept only a published, immutable, non-prerelease `workflow-vX.Y.Z` Release,
+choose the highest semantic version, and require exactly these three uploaded
+assets, each with positive size and `sha256:` digest metadata:
+`workflow-windows-amd64.zip`, `workflow-release.json`, and
+`worker-sbom.spdx.json`. Missing, extra, duplicate, or legacy component assets
+fail closed; never fall back to `platform-v*` or `worker-v*`.
+
+Download only `workflow-release.json` first and authenticate its bytes against
+the GitHub asset digest. Before downloading either other asset, run the
+PowerShell bootstrap verifier, require the Release tag to resolve directly to
+the manifest `source_commit`, and require its successful Actions run to have
+that same head SHA, event `push`, and the trusted publisher path
+`.github/workflows/publish-workflow.yml`. The verifier enforces schema 1 with
+exact case-sensitive fields: unknown, duplicate, absent, mistyped, or invalid
+values fail. It does not execute downloaded code. Then download the Bundle and
+SBOM, verify their GitHub asset digests, and require those digests to equal the
+manifest. Finally verify the Bundle before opening or executing it: require
+root `platform-release.json`, matching Workflow version and Worker image,
+protocol/schema versions, the complete listed regular-file inventory, and each
+listed SHA-256. Reject unsafe, duplicate, absent, or unlisted archive entries.
+Do not use a split checksum file, a Bootstrap Plan, an installed-CLI bridge, a
+legacy resolver, or an arbitrary version selector.
+
+Use the repository-owned scripts in this order. `$downloadRoot` must be a new
+empty temporary directory outside Workflow Home. The resolver authenticates
+the manifest and publisher before acquiring the other two assets; the Bundle
+verifier authenticates and inspects the archive before `$launcher` is assigned
+or invoked:
+
+```powershell
+$release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
+$bundle = & "$skillRoot\scripts\verify-windows-bundle.ps1" `
+  -BundlePath $release.bundle_path `
+  -ExpectedSHA256 $release.bundle_sha256 `
+  -ExpectedVersion $release.version `
+  -ExpectedWorkerImage $release.worker_image | ConvertFrom-Json
+$launcher = Join-Path $verifiedExtractedBundle 'setup\workflow-setup.exe'
+```
 
 Use `workflow-setup.exe` only through one UTF-8 JSON object on stdin and one
 JSON result on stdout. Requests use schema 1. Ignore unknown response extension

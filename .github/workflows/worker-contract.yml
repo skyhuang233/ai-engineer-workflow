@@ -2,14 +2,16 @@ name: worker-contract
 
 on:
   pull_request:
+    branches: [develop, main]
     paths:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
       - "deploy/worker/**"
       - "config/toolchain.json"
+      - "config/workflow-release.json"
       - ".github/workflows/worker-contract.yml"
-      - ".github/workflows/publish-worker.yml"
+      - ".github/workflows/publish-workflow.yml"
 
 permissions:
   contents: read
@@ -43,10 +45,17 @@ jobs:
       - name: Detect Worker image input changes
         id: worker-changes
         shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if git diff --quiet "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" -- \
+          if [ "$BASE_REF" = main ] && { [[ "$HEAD_REF" == release-* ]] || [[ "$HEAD_REF" == hotfix-* ]]; }; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
             cmd/delivery-source-digest internal/deliverysource deploy/worker config/toolchain.json go.mod go.sum \
-            .github/workflows/publish-worker.yml; then
+            .github/workflows/publish-workflow.yml; then
             echo "required=false" >> "$GITHUB_OUTPUT"
           else
             echo "required=true" >> "$GITHUB_OUTPUT"
@@ -56,18 +65,14 @@ jobs:
         id: pins
         shell: bash
         run: |
-          echo "worker_version=$(jq -r .worker.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "github_cli_version=$(jq -r .github_cli.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "github_cli_sha256=$(jq -r .github_cli.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_upstream_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_commit=$(jq -r .no_mistakes.fork_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_repository=$(jq -r .no_mistakes.repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Build without publishing
         if: steps.worker-changes.outputs.required == 'true'
         run: |
@@ -78,34 +83,32 @@ jobs:
             --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
             --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}" \
             --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
-            --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_upstream_commit }}" \
-            --build-arg "NO_MISTAKES_FORK_COMMIT=${{ steps.pins.outputs.no_mistakes_fork_commit }}" \
-            --build-arg "NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
-            --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
-            --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}" \
-            --tag "workflow-worker:${{ steps.pins.outputs.worker_version }}" \
+            --build-arg "NO_MISTAKES_REPOSITORY=${{ steps.pins.outputs.no_mistakes_repository }}" \
+            --build-arg "NO_MISTAKES_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --tag "workflow-worker:candidate-${{ github.event.pull_request.head.sha }}" \
             --file deploy/worker/Dockerfile .
       - name: Verify Worker contract
         if: steps.worker-changes.outputs.required == 'true'
         shell: bash
         run: |
-          codex_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" codex --version)"
+          candidate="workflow-worker:candidate-${{ github.event.pull_request.head.sha }}"
+          codex_output="$(docker run --rm "$candidate" codex --version)"
           if [[ "$codex_output" =~ ^codex-cli[[:space:]]+([^[:space:]]+)$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.codex_version }}"
           else
             echo "Codex emitted an unrecognized version string: $codex_output" >&2
             exit 1
           fi
-          github_cli_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" gh --version | head -n 1)"
+          github_cli_output="$(docker run --rm "$candidate" gh --version | head -n 1)"
           if [[ "$github_cli_output" =~ ^gh[[:space:]]version[[:space:]]([^[:space:]]+)([[:space:]].*)?$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.github_cli_version }}"
           else
             echo "GitHub CLI emitted an unrecognized version string: $github_cli_output" >&2
             exit 1
           fi
-          no_mistakes_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" no-mistakes --version)"
-          go_output="$(docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" go version)"
-          docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu 'command -v delivery-source-digest >/dev/null'
+          no_mistakes_output="$(docker run --rm "$candidate" no-mistakes --version)"
+          go_output="$(docker run --rm "$candidate" go version)"
+          docker run --rm "$candidate" sh -ceu 'command -v delivery-source-digest >/dev/null'
           test "$go_output" = "go version go${{ steps.pins.outputs.go_version }} linux/amd64"
           if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.no_mistakes_version }}"
@@ -114,16 +117,16 @@ jobs:
             echo "no-mistakes emitted an unrecognized version string: $no_mistakes_output" >&2
             exit 1
           fi
-          docker run --rm "workflow-worker:${{ steps.pins.outputs.worker_version }}" sh -ceu \
+          docker run --rm "$candidate" sh -ceu \
             'no-mistakes daemon start; daemon_status="$(no-mistakes daemon status)"; printf "%s\n" "$daemon_status"; case "$daemon_status" in *"daemon running"*) ;; *) echo "no-mistakes daemon is not running" >&2; exit 1 ;; esac'
-          worker_container="$(docker create "workflow-worker:${{ steps.pins.outputs.worker_version }}")"
+          worker_container="$(docker create "$candidate")"
           trap 'docker rm --force "$worker_container" >/dev/null' EXIT
           worker_binary="$RUNNER_TEMP/no-mistakes"
           docker cp "$worker_container:/usr/local/bin/no-mistakes" "$worker_binary"
           mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
           test "${#embedded_no_mistakes_commits[@]}" -eq 1
           embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
-          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_fork_commit }}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
           mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
           test "${#embedded_no_mistakes_modified[@]}" -eq 1
           test "${embedded_no_mistakes_modified[0]}" = false
@@ -132,7 +135,7 @@ jobs:
         if: steps.worker-changes.outputs.required == 'true'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          image: workflow-worker:${{ steps.pins.outputs.worker_version }}
+          image: workflow-worker:candidate-${{ github.event.pull_request.head.sha }}
           format: spdx-json
           output-file: worker-sbom.spdx.json
           upload-artifact: false
@@ -145,3 +148,52 @@ jobs:
           severity-cutoff: high
           only-fixed: true
           output-format: table
+      - name: Transfer scanned SBOM to the release dry run
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-worker-sbom
+          path: worker-sbom.spdx.json
+          if-no-files-found: error
+
+  release-dry-run:
+    if: github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+    needs: [build-and-test, worker-contract]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-worker-sbom
+          path: build/release-inputs
+      - name: Verify candidate branch version
+        shell: pwsh
+        run: |
+          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_HEAD_REF -cne "release-$version" -and $env:GITHUB_HEAD_REF -cne "hotfix-$version") { throw 'candidate branch and version differ' }
+      - name: Build both release components without publication
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/payload/repository-contract,build/payload/skills,build/release | Out-Null
+          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
+          go build -trimpath -ldflags "-buildid= -X main.Version=$version" -o build/workflow.exe ./cmd/workflow
+          go build -trimpath -ldflags "-buildid=" -o build/workflow-setup.exe ./cmd/workflow-setup
+          Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
+          Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
+          $dryRunBytes = [Text.Encoding]::UTF8.GetBytes('dry-run')
+          $dryRunDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($dryRunBytes)).ToLowerInvariant()
+          go run ./cmd/workflow-release assemble `
+            -config config/workflow-release.json -toolchain config/toolchain.json `
+            -workflow-exe build/workflow.exe -setup-exe build/workflow-setup.exe -payload build/payload `
+            -output build/release -source-commit '${{ github.event.pull_request.head.sha }}' `
+            -github-actions-run-id '${{ github.run_id }}' `
+            -worker-image "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" `
+            -sbom build/release-inputs/worker-sbom.spdx.json
+          $bundleDigest = (Get-FileHash -LiteralPath build/release/workflow-windows-amd64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          & skills/setup-agent-workflow/scripts/verify-windows-bundle.ps1 `
+            -BundlePath build/release/workflow-windows-amd64.zip -ExpectedSHA256 $bundleDigest `
+            -ExpectedVersion $version -ExpectedWorkerImage "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" | Out-Null
+          $names = @(Get-ChildItem build/release -File | Sort-Object Name | ForEach-Object Name)
+          if (($names -join ' ') -cne 'worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip') { throw 'dry run output is not exact' }
