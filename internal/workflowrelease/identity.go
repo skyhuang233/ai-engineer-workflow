@@ -152,7 +152,7 @@ func DecodeToolchain(raw []byte) (ToolchainConfig, error) {
 		return ToolchainConfig{}, fmt.Errorf("Worker image repository must be %s", WorkerRepository)
 	}
 	if !repositoryPattern.MatchString(config.Worker.ReleaseRepository) {
-		return ToolchainConfig{}, errors.New("Worker image release repository is invalid")
+		return ToolchainConfig{}, errors.New("Workflow Release repository is invalid")
 	}
 	return config, nil
 }
