@@ -64,7 +64,7 @@ func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testin
 	for _, required := range []string{
 		"workflow-windows-amd64.zip", "workflow-release.json", "worker-sbom.spdx.json",
 		"severity-cutoff: high", "only-fixed: true", "immutable == true",
-		"build-${identity}", "-build-input build/release-inputs/build-input.json",
+		"build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
 		`([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)`,
 	} {
 		if !strings.Contains(text, required) {
@@ -72,8 +72,45 @@ func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testin
 		}
 	}
 	if strings.Count(text, "for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip") != 2 ||
-		strings.Count(text, `git/ref/tags/${tag}`) != 2 {
+		strings.Count(text, `git/ref/tags/${tag}`) < 4 {
 		t.Fatal("fresh and idempotent publication do not both verify asset digests and the direct tag ref")
+	}
+	for _, retired := range []string{"build_input_identity", "build-input.json", "no_mistakes_fork_release", "no_mistakes_upstream_commit"} {
+		if strings.Contains(text, retired) {
+			t.Fatalf("unified publisher retains retired provenance contract %q", retired)
+		}
+	}
+}
+
+func TestUnifiedPublisherResolvesRetryBeforeBuildingWorker(t *testing.T) {
+	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	preflight := strings.Index(text, "name: Preflight Workflow Release target")
+	build := strings.Index(text, "name: Build release candidate locally")
+	push := strings.Index(text, "name: Push only the scan-passing image")
+	resolve := strings.Index(text, "name: Resolve fresh, retry, or immutable state")
+	if preflight < 0 || build <= preflight || push <= build || resolve <= push {
+		t.Fatal("unified publisher does not preflight release retry state before building and pushing the Worker")
+	}
+	deleteDraft := strings.Index(text, `gh release delete "$tag" --yes --cleanup-tag=false`)
+	if deleteDraft < preflight || deleteDraft >= build {
+		t.Fatal("unified publisher does not delete a same-source retry draft during preflight")
+	}
+	if strings.Contains(text[resolve:], `gh release delete "$tag"`) {
+		t.Fatal("unified publisher can delete a release after pushing the Worker")
+	}
+	stage := strings.Index(text, "name: Stage exactly three assets")
+	if stage <= resolve || !strings.Contains(text[preflight:build], `.object.type == "commit" and .object.sha == $sha`) ||
+		!strings.Contains(text[resolve:stage], `.object.type == "commit" and .object.sha == $sha`) {
+		t.Fatal("unified publisher does not validate the direct Git tag before either building or creating a release")
+	}
+	for _, required := range []string{
+		`[ "$release_state" = "fresh" ] && [ "$tag_exists" = "true" ]`,
+		`allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}`,
+		`test "${{ needs.worker.outputs.allow_existing_tag }}" = "true"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("unified publisher does not reserve an existing tag exclusively for a verified retry: missing %q", required)
+		}
 	}
 }
 

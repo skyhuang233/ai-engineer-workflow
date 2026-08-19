@@ -29,9 +29,9 @@ jobs:
     outputs:
       version: ${{ steps.admission.outputs.version }}
       tag: ${{ steps.admission.outputs.tag }}
-      identity: ${{ steps.identity.outputs.identity }}
       image_repository: ${{ steps.pins.outputs.worker_image_repository }}
       image_digest: ${{ steps.pushed.outputs.digest }}
+      allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -67,72 +67,84 @@ jobs:
           ' <<<"$pull" >/dev/null
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=workflow-v${version}" >> "$GITHUB_OUTPUT"
+      - name: Preflight Workflow Release target
+        id: preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.admission.outputs.tag }}"
+          release_state="fresh"
+          if ! release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/tmp/release-error)"; then
+            grep -q 'HTTP 404' /tmp/release-error || { cat /tmp/release-error >&2; exit 1; }
+          else
+            test "$(jq -r .target_commitish <<<"$release")" = "$GITHUB_SHA" || { echo "version belongs to another source" >&2; exit 1; }
+            if jq -e '.draft == true and .immutable != true' <<<"$release" >/dev/null; then
+              release_state="retry"
+            elif jq -e '.immutable == true and .draft == false and .prerelease == false' <<<"$release" >/dev/null; then
+              release_state="immutable"
+            else
+              echo "existing release is not retryable or an exact immutable result" >&2
+              exit 1
+            fi
+          fi
+          tag_exists="false"
+          if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/tag-error)"; then
+            grep -q 'HTTP 404' /tmp/tag-error || { cat /tmp/tag-error >&2; exit 1; }
+          else
+            tag_exists="true"
+            jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null || { echo "tag does not directly reference this source commit" >&2; exit 1; }
+          fi
+          if [ "$release_state" = "fresh" ] && [ "$tag_exists" = "true" ]; then
+            echo "fresh release target already has a tag" >&2
+            exit 1
+          elif [ "$release_state" = "immutable" ] && [ "$tag_exists" != "true" ]; then
+            echo "immutable release is missing its direct source tag" >&2
+            exit 1
+          elif [ "$release_state" = "retry" ]; then
+            gh release delete "$tag" --yes --cleanup-tag=false
+          elif [ "$release_state" = "immutable" ]; then
+            : # Build the fresh candidate so the immutable result can be compared exactly.
+          fi
+          if [ "$release_state" = "retry" ] && [ "$tag_exists" = "true" ]; then
+            echo "allow_existing_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allow_existing_tag=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Read Worker pins
         id: pins
         shell: bash
         run: |
           jq --exit-status '.worker.version? | not' config/toolchain.json >/dev/null
-          for key in codex.version github_cli.version github_cli.linux_amd64_sha256 go.version go.linux_amd64_sha256 no_mistakes.version no_mistakes.upstream_commit no_mistakes.fork_repository no_mistakes.fork_commit no_mistakes.fork_release no_mistakes.linux_amd64_sha256 worker.image_repository; do
+          for key in codex.version github_cli.version github_cli.linux_amd64_sha256 go.version go.linux_amd64_sha256 no_mistakes.version no_mistakes.repository no_mistakes.commit worker.image_repository; do
             echo "${key//./_}=$(jq --exit-status --raw-output ".${key}" config/toolchain.json)" >> "$GITHUB_OUTPUT"
           done
-      - name: Compute canonical Worker build identity
-        id: identity
-        shell: bash
-        run: |
-          go run ./cmd/workflow-release identity \
-            -toolchain config/toolchain.json \
-            -deploy-worker-tree "$(git rev-parse "${GITHUB_SHA}:deploy/worker")" \
-            -delivery-source-digest-tree "$(git rev-parse "${GITHUB_SHA}:cmd/delivery-source-digest")" \
-            -delivery-source-tree "$(git rev-parse "${GITHUB_SHA}:internal/deliverysource")" \
-            -go-mod-blob "$(git rev-parse "${GITHUB_SHA}:go.mod")" \
-            -go-sum-blob "$(git rev-parse "${GITHUB_SHA}:go.sum")" \
-            -publish-workflow-blob "$(git rev-parse "${GITHUB_SHA}:.github/workflows/publish-workflow.yml")" \
-            -output build-input.json > build-input.sha256
-          identity="$(tr -d '\r\n' < build-input.sha256)"
-          [[ "$identity" =~ ^[0-9a-f]{64}$ ]]
-          echo "identity=$identity" >> "$GITHUB_OUTPUT"
-          echo "staging=${{ steps.pins.outputs.worker_image_repository }}:build-${identity}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve retry image or build locally
+      - name: Build release candidate locally
         id: image
         shell: bash
         run: |
-          staging="${{ steps.identity.outputs.staging }}"
-          pull_error="$(mktemp)"
-          if docker pull "$staging" 2>"$pull_error"; then
-            rm "$pull_error"
-            echo "reused=true" >> "$GITHUB_OUTPUT"
-          elif grep --extended-regexp --ignore-case --quiet 'not found|manifest unknown|no such manifest|HTTP 404' "$pull_error"; then
-            rm "$pull_error"
-            docker build \
-              --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
-              --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
-              --build-arg "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_linux_amd64_sha256 }}" \
-              --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
-              --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_linux_amd64_sha256 }}" \
-              --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
-              --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_upstream_commit }}" \
-              --build-arg "NO_MISTAKES_FORK_COMMIT=${{ steps.pins.outputs.no_mistakes_fork_commit }}" \
-              --build-arg "NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
-              --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
-              --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_linux_amd64_sha256 }}" \
-              --tag "$staging" --file deploy/worker/Dockerfile .
-            echo "reused=false" >> "$GITHUB_OUTPUT"
-          else
-            cat "$pull_error" >&2
-            rm "$pull_error"
-            echo "unable to determine whether the deterministic staging image exists" >&2
-            exit 1
-          fi
+          staging="${{ steps.pins.outputs.worker_image_repository }}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build \
+            --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
+            --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
+            --build-arg "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_linux_amd64_sha256 }}" \
+            --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
+            --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_linux_amd64_sha256 }}" \
+            --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
+            --build-arg "NO_MISTAKES_REPOSITORY=${{ steps.pins.outputs.no_mistakes_repository }}" \
+            --build-arg "NO_MISTAKES_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
+            --tag "$staging" --file deploy/worker/Dockerfile .
+          echo "staging=$staging" >> "$GITHUB_OUTPUT"
       - name: Generate Worker SBOM before push
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          image: ${{ steps.identity.outputs.staging }}
+          image: ${{ steps.image.outputs.staging }}
           format: spdx-json
           output-file: worker-sbom.spdx.json
           upload-artifact: false
@@ -148,17 +160,15 @@ jobs:
         id: pushed
         shell: bash
         run: |
-          if [ "${{ steps.image.outputs.reused }}" != true ]; then docker push "${{ steps.identity.outputs.staging }}"; fi
-          digest="$(docker buildx imagetools inspect "${{ steps.identity.outputs.staging }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          docker push "${{ steps.image.outputs.staging }}"
+          digest="$(docker buildx imagetools inspect "${{ steps.image.outputs.staging }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Transfer verified Worker inputs to Windows publisher
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: workflow-release-inputs
-          path: |
-            build-input.json
-            worker-sbom.spdx.json
+          path: worker-sbom.spdx.json
           if-no-files-found: error
 
   publish:
@@ -185,7 +195,7 @@ jobs:
             -workflow-exe build/workflow.exe -setup-exe build/workflow-setup.exe -payload build/payload `
             -output build/release -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
             -worker-image '${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}' `
-            -build-input build/release-inputs/build-input.json -sbom build/release-inputs/worker-sbom.spdx.json
+            -sbom build/release-inputs/worker-sbom.spdx.json
           $names = @(Get-ChildItem build/release -File | Sort-Object Name | ForEach-Object Name)
           if (($names -join ' ') -cne 'worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip') { throw "release output is not the exact three-asset set" }
       - name: Resolve fresh, retry, or immutable state
@@ -196,7 +206,14 @@ jobs:
         run: |
           tag="${{ needs.worker.outputs.tag }}"
           if ! release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/tmp/release-error)"; then
-            grep -q 'HTTP 404' /tmp/release-error; echo "state=fresh" >> "$GITHUB_OUTPUT"; exit 0
+            grep -q 'HTTP 404' /tmp/release-error || { cat /tmp/release-error >&2; exit 1; }
+            if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/tag-error)"; then
+              grep -q 'HTTP 404' /tmp/tag-error || { cat /tmp/tag-error >&2; exit 1; }
+            else
+              test "${{ needs.worker.outputs.allow_existing_tag }}" = "true" || { echo "fresh release target acquired a tag after preflight" >&2; exit 1; }
+              jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null || { echo "tag changed after preflight" >&2; exit 1; }
+            fi
+            echo "state=fresh" >> "$GITHUB_OUTPUT"; exit 0
           fi
           test "$(jq -r .target_commitish <<<"$release")" = "$GITHUB_SHA" || { echo "version belongs to another source" >&2; exit 1; }
           if jq -e '.immutable == true and .draft == false and .prerelease == false' <<<"$release" >/dev/null; then
@@ -208,22 +225,8 @@ jobs:
             tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
             jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null
             echo "state=immutable" >> "$GITHUB_OUTPUT"
-          elif jq -e '.draft == true and .immutable != true' <<<"$release" >/dev/null; then
-            mapfile -t draft_manifest_ids < <(jq -r '.assets[] | select(.name == "workflow-release.json") | .id' <<<"$release")
-            test "${#draft_manifest_ids[@]}" -le 1 || { echo "retry draft contains duplicate manifests" >&2; exit 1; }
-            if [ "${#draft_manifest_ids[@]}" -eq 1 ]; then
-              gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${draft_manifest_ids[0]}" > /tmp/draft-workflow-release.json
-              jq -e \
-                --arg version "${{ needs.worker.outputs.version }}" \
-                --arg source "$GITHUB_SHA" \
-                --arg identity "${{ needs.worker.outputs.identity }}" \
-                --arg image "${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}" \
-                '.version == $version and .source_commit == $source and .worker.build_input_identity == $identity and .worker.image == $image' \
-                /tmp/draft-workflow-release.json >/dev/null || { echo "retry image digest differs from the failed draft" >&2; exit 1; }
-            fi
-            gh release delete "$tag" --yes --cleanup-tag=false; echo "state=fresh" >> "$GITHUB_OUTPUT"
           else
-            echo "existing release is not retryable or an exact immutable result" >&2; exit 1
+            echo "release target changed after preflight" >&2; exit 1
           fi
       - name: Stage exactly three assets
         if: steps.release.outputs.state == 'fresh'

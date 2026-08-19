@@ -1,85 +1,11 @@
 package workflowrelease
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 )
-
-type BuildInput struct {
-	SchemaVersion int         `json:"schema_version"`
-	GitInputs     GitInputs   `json:"git_inputs"`
-	Toolchain     Tools       `json:"toolchain"`
-	Worker        BuildWorker `json:"worker"`
-}
-
-type GitInputs struct {
-	DeployWorkerTree         string `json:"deploy_worker_tree"`
-	DeliverySourceDigestTree string `json:"delivery_source_digest_tree"`
-	DeliverySourceTree       string `json:"delivery_source_tree"`
-	GoModBlob                string `json:"go_mod_blob"`
-	GoSumBlob                string `json:"go_sum_blob"`
-	PublishWorkflowBlob      string `json:"publish_workflow_blob"`
-}
-
-type BuildWorker struct {
-	ImageRepository string `json:"image_repository"`
-}
-
-func DecodeBuildInput(raw []byte) (BuildInput, error) {
-	var input BuildInput
-	if err := decodeStrict(raw, &input); err != nil {
-		return BuildInput{}, fmt.Errorf("decode Worker build input: %w", err)
-	}
-	if err := input.Validate(); err != nil {
-		return BuildInput{}, err
-	}
-	return input, nil
-}
-
-func (i BuildInput) Validate() error {
-	if i.SchemaVersion != 1 {
-		return errors.New("unsupported Worker build-input schema")
-	}
-	for name, oid := range map[string]string{
-		"deploy Worker tree":          i.GitInputs.DeployWorkerTree,
-		"delivery-source-digest tree": i.GitInputs.DeliverySourceDigestTree,
-		"delivery source tree":        i.GitInputs.DeliverySourceTree,
-		"go.mod blob":                 i.GitInputs.GoModBlob,
-		"go.sum blob":                 i.GitInputs.GoSumBlob,
-		"publish workflow blob":       i.GitInputs.PublishWorkflowBlob,
-	} {
-		if !hex40Pattern.MatchString(oid) {
-			return fmt.Errorf("%s must be a lowercase 40-character Git object ID", name)
-		}
-	}
-	if err := i.Toolchain.Validate(); err != nil {
-		return err
-	}
-	if i.Worker.ImageRepository != WorkerRepository {
-		return fmt.Errorf("Worker image repository must be %s", WorkerRepository)
-	}
-	return nil
-}
-
-func (i BuildInput) Canonical() ([]byte, error) {
-	if err := i.Validate(); err != nil {
-		return nil, err
-	}
-	return json.Marshal(i)
-}
-
-func (i BuildInput) Identity() (string, error) {
-	canonical, err := i.Canonical()
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:]), nil
-}
 
 type ToolchainConfig struct {
 	SchemaVersion int             `json:"schema_version"`

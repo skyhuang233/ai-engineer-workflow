@@ -39,9 +39,8 @@ type Bundle struct {
 }
 
 type Worker struct {
-	Image              string `json:"image"`
-	BuildInputIdentity string `json:"build_input_identity"`
-	Tools              Tools  `json:"tools"`
+	Image string `json:"image"`
+	Tools Tools  `json:"tools"`
 }
 
 type Tools struct {
@@ -61,13 +60,9 @@ type ArchiveTool struct {
 }
 
 type NoMistakesTool struct {
-	Version            string `json:"version"`
-	UpstreamRepository string `json:"upstream_repository"`
-	UpstreamCommit     string `json:"upstream_commit"`
-	ForkRepository     string `json:"fork_repository"`
-	ForkCommit         string `json:"fork_commit"`
-	ForkRelease        string `json:"fork_release"`
-	LinuxAMD64SHA256   string `json:"linux_amd64_sha256"`
+	Version    string `json:"version"`
+	Repository string `json:"repository"`
+	Commit     string `json:"commit"`
 }
 
 type SBOM struct {
@@ -112,8 +107,6 @@ func (m Manifest) Validate() error {
 		!strings.HasPrefix(m.Worker.Image, WorkerRepository+"@sha256:") ||
 		!hex64Pattern.MatchString(strings.TrimPrefix(m.Worker.Image, WorkerRepository+"@sha256:")):
 		return fmt.Errorf("Worker image must be an immutable %s digest reference", WorkerRepository)
-	case !hex64Pattern.MatchString(m.Worker.BuildInputIdentity):
-		return errors.New("Worker build-input identity must be lowercase hexadecimal")
 	case m.SBOM.Name != SBOMAssetName:
 		return fmt.Errorf("SBOM name must be %s", SBOMAssetName)
 	case m.SBOM.Format != "spdx-json":
@@ -143,12 +136,8 @@ func (t Tools) Validate() error {
 		return errors.New("Go version and Linux amd64 SHA-256 are required")
 	case strings.TrimSpace(t.NoMistakes.Version) == "":
 		return errors.New("no-mistakes version is required")
-	case !repositoryPattern.MatchString(t.NoMistakes.UpstreamRepository) || !hex40Pattern.MatchString(t.NoMistakes.UpstreamCommit):
-		return errors.New("no-mistakes upstream repository and commit are invalid")
-	case !repositoryPattern.MatchString(t.NoMistakes.ForkRepository) || !hex40Pattern.MatchString(t.NoMistakes.ForkCommit):
-		return errors.New("no-mistakes fork repository and commit are invalid")
-	case strings.TrimSpace(t.NoMistakes.ForkRelease) == "" || !hex64Pattern.MatchString(t.NoMistakes.LinuxAMD64SHA256):
-		return errors.New("no-mistakes fork release and Linux amd64 SHA-256 are required")
+	case !repositoryPattern.MatchString(t.NoMistakes.Repository) || !hex40Pattern.MatchString(t.NoMistakes.Commit):
+		return errors.New("no-mistakes repository and commit are invalid")
 	}
 	return nil
 }
@@ -167,16 +156,12 @@ type ManifestOptions struct {
 	GitHubActionsRunID int64
 	BundlePath         string
 	WorkerImage        string
-	BuildInput         BuildInput
+	Tools              Tools
 	SBOMPath           string
 }
 
 func CreateManifest(options ManifestOptions) (Manifest, error) {
 	if err := options.Config.Validate(); err != nil {
-		return Manifest{}, err
-	}
-	identity, err := options.BuildInput.Identity()
-	if err != nil {
 		return Manifest{}, err
 	}
 	bundleDigest, err := fileSHA256(options.BundlePath)
@@ -193,7 +178,7 @@ func CreateManifest(options ManifestOptions) (Manifest, error) {
 		SourceCommit:       options.SourceCommit,
 		GitHubActionsRunID: options.GitHubActionsRunID,
 		Bundle:             Bundle{Name: BundleAssetName, SHA256: bundleDigest},
-		Worker:             Worker{Image: options.WorkerImage, BuildInputIdentity: identity, Tools: options.BuildInput.Toolchain},
+		Worker:             Worker{Image: options.WorkerImage, Tools: options.Tools},
 		SBOM:               SBOM{Name: SBOMAssetName, Format: "spdx-json", SHA256: sbomDigest, Scan: Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
 	}
 	if err := manifest.Validate(); err != nil {

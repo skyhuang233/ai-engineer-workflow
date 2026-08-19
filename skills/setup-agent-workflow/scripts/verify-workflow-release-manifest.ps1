@@ -118,9 +118,8 @@ try {
   $bundleDigest = Assert-String (Get-RequiredProperty $bundle 'sha256') '$.bundle.sha256' '^[0-9a-f]{64}$'
 
   $worker = Get-RequiredProperty $root 'worker'
-  Assert-ExactObject $worker '$.worker' @('image','build_input_identity','tools')
+  Assert-ExactObject $worker '$.worker' @('image','tools')
   $workerImage = Assert-String (Get-RequiredProperty $worker 'image') '$.worker.image' '^ghcr\.io/skyhuang233/workflow-worker@sha256:[0-9a-f]{64}$'
-  $buildIdentity = Assert-String (Get-RequiredProperty $worker 'build_input_identity') '$.worker.build_input_identity' '^[0-9a-f]{64}$'
 
   $tools = Get-RequiredProperty $worker 'tools'
   Assert-ExactObject $tools '$.worker.tools' @('codex','github_cli','go','no_mistakes')
@@ -134,16 +133,10 @@ try {
     [void](Assert-String (Get-RequiredProperty $tool 'linux_amd64_sha256') "$.worker.tools.$toolName.linux_amd64_sha256" '^[0-9a-f]{64}$')
   }
   $noMistakes = Get-RequiredProperty $tools 'no_mistakes'
-  Assert-ExactObject $noMistakes '$.worker.tools.no_mistakes' @('version','upstream_repository','upstream_commit','fork_repository','fork_commit','fork_release','linux_amd64_sha256')
+  Assert-ExactObject $noMistakes '$.worker.tools.no_mistakes' @('version','repository','commit')
   [void](Assert-NonWhitespaceString (Get-RequiredProperty $noMistakes 'version') '$.worker.tools.no_mistakes.version')
-  foreach ($field in @('upstream_repository','fork_repository')) {
-    [void](Assert-String (Get-RequiredProperty $noMistakes $field) "$.worker.tools.no_mistakes.$field" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
-  }
-  [void](Assert-NonWhitespaceString (Get-RequiredProperty $noMistakes 'fork_release') '$.worker.tools.no_mistakes.fork_release')
-  foreach ($field in @('upstream_commit','fork_commit')) {
-    [void](Assert-String (Get-RequiredProperty $noMistakes $field) "$.worker.tools.no_mistakes.$field" '^[0-9a-f]{40}$')
-  }
-  [void](Assert-String (Get-RequiredProperty $noMistakes 'linux_amd64_sha256') '$.worker.tools.no_mistakes.linux_amd64_sha256' '^[0-9a-f]{64}$')
+  [void](Assert-String (Get-RequiredProperty $noMistakes 'repository') '$.worker.tools.no_mistakes.repository' '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+  [void](Assert-String (Get-RequiredProperty $noMistakes 'commit') '$.worker.tools.no_mistakes.commit' '^[0-9a-f]{40}$')
 
   $sbom = Get-RequiredProperty $root 'sbom'
   Assert-ExactObject $sbom '$.sbom' @('name','format','sha256','scan')
@@ -164,7 +157,6 @@ try {
     github_actions_run_id = $runID
     bundle_sha256 = $bundleDigest
     worker_image = $workerImage
-    build_input_identity = $buildIdentity
     sbom_sha256 = $sbomDigest
     manifest_sha256 = $actualDigest
   } | ConvertTo-Json -Compress

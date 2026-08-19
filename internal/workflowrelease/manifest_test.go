@@ -49,7 +49,7 @@ func TestManifestGoldenCorpus(t *testing.T) {
 }
 
 func validManifestJSON() string {
-	return `{"schema_version":1,"version":"0.0.1","source_commit":"` + strings.Repeat("a", 40) + `","github_actions_run_id":42,"bundle":{"name":"workflow-windows-amd64.zip","sha256":"` + strings.Repeat("b", 64) + `"},"worker":{"image":"ghcr.io/skyhuang233/workflow-worker@sha256:` + strings.Repeat("c", 64) + `","build_input_identity":"` + strings.Repeat("d", 64) + `","tools":{"codex":{"version":"0.147.0"},"github_cli":{"version":"2.97.0","linux_amd64_sha256":"` + strings.Repeat("e", 64) + `"},"go":{"version":"1.25.12","linux_amd64_sha256":"` + strings.Repeat("f", 64) + `"},"no_mistakes":{"version":"v1.41.2","upstream_repository":"kunchenguid/no-mistakes","upstream_commit":"` + strings.Repeat("1", 40) + `","fork_repository":"skyhuang233/no-mistakes","fork_commit":"` + strings.Repeat("2", 40) + `","fork_release":"workflow-v1.41.2.3","linux_amd64_sha256":"` + strings.Repeat("3", 64) + `"}}},"sbom":{"name":"worker-sbom.spdx.json","format":"spdx-json","sha256":"` + strings.Repeat("4", 64) + `","scan":{"scanner":"grype","severity_cutoff":"high","only_fixed":true}}}`
+	return `{"schema_version":1,"version":"0.0.1","source_commit":"` + strings.Repeat("a", 40) + `","github_actions_run_id":42,"bundle":{"name":"workflow-windows-amd64.zip","sha256":"` + strings.Repeat("b", 64) + `"},"worker":{"image":"ghcr.io/skyhuang233/workflow-worker@sha256:` + strings.Repeat("c", 64) + `","tools":{"codex":{"version":"0.148.0"},"github_cli":{"version":"2.97.0","linux_amd64_sha256":"` + strings.Repeat("e", 64) + `"},"go":{"version":"1.26.6","linux_amd64_sha256":"` + strings.Repeat("f", 64) + `"},"no_mistakes":{"version":"v1.41.2","repository":"skyhuang233/no-mistakes","commit":"` + strings.Repeat("2", 40) + `"}}},"sbom":{"name":"worker-sbom.spdx.json","format":"spdx-json","sha256":"` + strings.Repeat("4", 64) + `","scan":{"scanner":"grype","severity_cutoff":"high","only_fixed":true}}}`
 }
 
 func TestDecodeManifestAcceptsTheAtomicWorkflowReleaseContract(t *testing.T) {
@@ -82,7 +82,9 @@ func TestDecodeManifestRejectsReleaseContractDrift(t *testing.T) {
 		{name: "uppercase source", raw: strings.Replace(valid, strings.Repeat("a", 40), strings.Repeat("A", 40), 1)},
 		{name: "zero run ID", raw: strings.Replace(valid, `"github_actions_run_id":42`, `"github_actions_run_id":0`, 1)},
 		{name: "weaker scan", raw: strings.Replace(valid, `"only_fixed":true`, `"only_fixed":false`, 1)},
-		{name: "missing tool version", raw: strings.Replace(valid, `"version":"0.147.0"`, `"version":""`, 1)},
+		{name: "missing tool version", raw: strings.Replace(valid, `"version":"0.148.0"`, `"version":""`, 1)},
+		{name: "retired build identity", raw: strings.Replace(valid, `"tools":`, `"build_input_identity":"`+strings.Repeat("d", 64)+`","tools":`, 1)},
+		{name: "retired release provenance", raw: strings.Replace(valid, `"repository":"skyhuang233/no-mistakes"`, `"upstream_repository":"kunchenguid/no-mistakes","repository":"skyhuang233/no-mistakes"`, 1)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

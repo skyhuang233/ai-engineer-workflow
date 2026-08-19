@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,28 +12,9 @@ import (
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
-func TestIdentityAndAssembleProduceOneAtomicWorkflowRelease(t *testing.T) {
+func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	repositoryRoot := filepath.Join("..", "..")
 	root := t.TempDir()
-	buildInputPath := filepath.Join(root, "build-input.json")
-	var stdout bytes.Buffer
-	oidFlags := []string{
-		"-deploy-worker-tree", strings.Repeat("1", 40),
-		"-delivery-source-digest-tree", strings.Repeat("2", 40),
-		"-delivery-source-tree", strings.Repeat("3", 40),
-		"-go-mod-blob", strings.Repeat("4", 40),
-		"-go-sum-blob", strings.Repeat("5", 40),
-		"-publish-workflow-blob", strings.Repeat("6", 40),
-	}
-	identityArguments := []string{"identity", "-toolchain", filepath.Join(repositoryRoot, "config", "toolchain.json"), "-output", buildInputPath}
-	identityArguments = append(identityArguments, oidFlags...)
-	if err := run(identityArguments, &stdout); err != nil {
-		t.Fatal(err)
-	}
-	identity := strings.TrimSpace(stdout.String())
-	if len(identity) != 64 {
-		t.Fatalf("identity = %q", identity)
-	}
 
 	workflowExecutable := filepath.Join(root, "workflow.exe")
 	versionProbeSource := filepath.Join(root, "version-probe.go")
@@ -69,7 +49,6 @@ func TestIdentityAndAssembleProduceOneAtomicWorkflowRelease(t *testing.T) {
 		"assemble",
 		"-config", filepath.Join(repositoryRoot, "config", "workflow-release.json"),
 		"-toolchain", filepath.Join(repositoryRoot, "config", "toolchain.json"),
-		"-build-input", buildInputPath,
 		"-workflow-exe", workflowExecutable,
 		"-setup-exe", setupExecutable,
 		"-payload", payload,
@@ -78,7 +57,7 @@ func TestIdentityAndAssembleProduceOneAtomicWorkflowRelease(t *testing.T) {
 		"-github-actions-run-id", "42",
 		"-worker-image", image,
 		"-sbom", sbom,
-	}, &bytes.Buffer{}); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(outputDirectory)
@@ -103,13 +82,13 @@ func TestIdentityAndAssembleProduceOneAtomicWorkflowRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Worker.BuildInputIdentity != identity || manifest.Worker.Image != image || manifest.Version != "0.0.0" {
+	if manifest.Worker.Image != image || manifest.Version != "0.0.0" || manifest.Worker.Tools.NoMistakes.Commit == "" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 }
 
-func TestAssembleRejectsAChangedToolchainAfterIdentityWasCalculated(t *testing.T) {
-	if err := run([]string{"assemble"}, &bytes.Buffer{}); err == nil {
+func TestAssembleRejectsMissingVerifiedInputs(t *testing.T) {
+	if err := run([]string{"assemble"}); err == nil {
 		t.Fatal("assemble accepted missing verified inputs")
 	}
 }

@@ -71,11 +71,8 @@ jobs:
           echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_upstream_commit=$(jq -r .no_mistakes.upstream_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_commit=$(jq -r .no_mistakes.fork_commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_repository=$(jq -r .no_mistakes.fork_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_fork_release=$(jq -r .no_mistakes.fork_release config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          echo "no_mistakes_sha256=$(jq -r .no_mistakes.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_repository=$(jq -r .no_mistakes.repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Build without publishing
         if: steps.worker-changes.outputs.required == 'true'
         run: |
@@ -86,11 +83,8 @@ jobs:
             --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
             --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}" \
             --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
-            --build-arg "NO_MISTAKES_UPSTREAM_COMMIT=${{ steps.pins.outputs.no_mistakes_upstream_commit }}" \
-            --build-arg "NO_MISTAKES_FORK_COMMIT=${{ steps.pins.outputs.no_mistakes_fork_commit }}" \
-            --build-arg "NO_MISTAKES_FORK_REPOSITORY=${{ steps.pins.outputs.no_mistakes_fork_repository }}" \
-            --build-arg "NO_MISTAKES_FORK_RELEASE=${{ steps.pins.outputs.no_mistakes_fork_release }}" \
-            --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_sha256 }}" \
+            --build-arg "NO_MISTAKES_REPOSITORY=${{ steps.pins.outputs.no_mistakes_repository }}" \
+            --build-arg "NO_MISTAKES_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
             --tag "workflow-worker:candidate-${{ github.event.pull_request.head.sha }}" \
             --file deploy/worker/Dockerfile .
       - name: Verify Worker contract
@@ -132,7 +126,7 @@ jobs:
           mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
           test "${#embedded_no_mistakes_commits[@]}" -eq 1
           embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
-          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_fork_commit }}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
           mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
           test "${#embedded_no_mistakes_modified[@]}" -eq 1
           test "${embedded_no_mistakes_modified[0]}" = false
@@ -188,15 +182,6 @@ jobs:
           go build -trimpath -ldflags "-buildid=" -o build/workflow-setup.exe ./cmd/workflow-setup
           Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
           Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
-          go run ./cmd/workflow-release identity `
-            -toolchain config/toolchain.json `
-            -deploy-worker-tree (git rev-parse "${{ github.event.pull_request.head.sha }}:deploy/worker") `
-            -delivery-source-digest-tree (git rev-parse "${{ github.event.pull_request.head.sha }}:cmd/delivery-source-digest") `
-            -delivery-source-tree (git rev-parse "${{ github.event.pull_request.head.sha }}:internal/deliverysource") `
-            -go-mod-blob (git rev-parse "${{ github.event.pull_request.head.sha }}:go.mod") `
-            -go-sum-blob (git rev-parse "${{ github.event.pull_request.head.sha }}:go.sum") `
-            -publish-workflow-blob (git rev-parse "${{ github.event.pull_request.head.sha }}:.github/workflows/publish-workflow.yml") `
-            -output build/build-input.json | Out-File -Encoding ascii build/build-input.sha256
           $dryRunBytes = [Text.Encoding]::UTF8.GetBytes('dry-run')
           $dryRunDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($dryRunBytes)).ToLowerInvariant()
           go run ./cmd/workflow-release assemble `
@@ -205,7 +190,7 @@ jobs:
             -output build/release -source-commit '${{ github.event.pull_request.head.sha }}' `
             -github-actions-run-id '${{ github.run_id }}' `
             -worker-image "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" `
-            -build-input build/build-input.json -sbom build/release-inputs/worker-sbom.spdx.json
+            -sbom build/release-inputs/worker-sbom.spdx.json
           $bundleDigest = (Get-FileHash -LiteralPath build/release/workflow-windows-amd64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           & skills/setup-agent-workflow/scripts/verify-windows-bundle.ps1 `
             -BundlePath build/release/workflow-windows-amd64.zip -ExpectedSHA256 $bundleDigest `

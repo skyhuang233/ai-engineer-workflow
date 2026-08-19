@@ -26,6 +26,13 @@ metadata, validates its complete schema before downloading the other assets,
 then verifies the Bundle inventory and publisher provenance. Extra, missing, or
 duplicate assets fail closed.
 
+The Worker builds no-mistakes from its pinned repository commit with the pinned
+Go toolchain. It also rebuilds the pinned GitHub CLI release commit with the
+security-fixed `golang.org/x/mod` dependency and verifies the deterministic
+binary hash recorded in the manifest. The Workflow Release—not a separate
+no-mistakes Release—is the supply-chain boundary; Doctor verifies the final
+assets, direct source tag, publisher run, and immutable Worker digest.
+
 Platform and Worker are released atomically under one product version. Legacy
 split-release artifacts and tags have been retired. Until the first owner-approved
 `workflow-v0.0.1` is published, the repository is intentionally in a release

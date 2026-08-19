@@ -3,7 +3,6 @@ package doctor
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -94,7 +93,7 @@ func verifyWorkerNoMistakesBuildMetadata(output, expectedCommit string) error {
 		}
 	}
 	if revisionCount != 1 || revision != expectedCommit {
-		return fmt.Errorf("Worker no-mistakes VCS revision %q does not equal pinned fork commit %q", revision, expectedCommit)
+		return fmt.Errorf("Worker no-mistakes VCS revision %q does not equal pinned source commit %q", revision, expectedCommit)
 	}
 	if modifiedCount != 1 || modified != "false" {
 		return fmt.Errorf("Worker no-mistakes VCS modified state %q is not a clean build", modified)
@@ -404,7 +403,7 @@ env | cut -d= -f1`
 	if err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("read Worker no-mistakes build metadata: %v (%s)", err, strings.TrimSpace(string(metadataOutput)))}
 	}
-	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.Worker.Tools.NoMistakes.ForkCommit); err != nil {
+	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.Worker.Tools.NoMistakes.Commit); err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
 	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, no-mistakes daemon, and absence of GitHub write credentials verified"}
@@ -523,79 +522,19 @@ func (c GitHubCheck) Run(ctx context.Context) Result {
 	if !contractPassed {
 		return Result{Status: Fail, Summary: "integration workflow has not succeeded for the current default-branch revision"}
 	}
-	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.UpstreamRepository, "no-mistakes upstream"); result != nil {
+	if result := requirePublicRepository(ctx, c.APIBase, token, c.NoMistakes.Repository, "no-mistakes source"); result != nil {
 		return *result
 	}
-	if result := requirePublicProvenanceRepository(ctx, c.APIBase, token, c.NoMistakes.ForkRepository, "no-mistakes fork"); result != nil {
-		return *result
-	}
-	var upstreamCommit struct {
+	var sourceCommit struct {
 		SHA string `json:"sha"`
 	}
-	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.UpstreamRepository+"/git/commits/"+c.NoMistakes.UpstreamCommit, &upstreamCommit); err != nil || upstreamCommit.SHA != c.NoMistakes.UpstreamCommit {
-		return Result{Status: Fail, Summary: "pinned upstream commit is unavailable from the configured no-mistakes upstream repository", Err: err}
+	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.Repository+"/git/commits/"+c.NoMistakes.Commit, &sourceCommit); err != nil || sourceCommit.SHA != c.NoMistakes.Commit {
+		return Result{Status: Fail, Summary: "pinned commit is unavailable from the configured no-mistakes repository", Err: err}
 	}
-	var forkCommit struct {
-		SHA string `json:"sha"`
-	}
-	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/git/commits/"+c.NoMistakes.ForkCommit, &forkCommit); err != nil || forkCommit.SHA != c.NoMistakes.ForkCommit {
-		return Result{Status: Fail, Summary: "pinned fork commit is unavailable from the configured no-mistakes fork repository", Err: err}
-	}
-	var comparison struct {
-		Status          string `json:"status"`
-		BehindBy        int    `json:"behind_by"`
-		MergeBaseCommit struct {
-			SHA string `json:"sha"`
-		} `json:"merge_base_commit"`
-	}
-	comparePath := "repos/" + c.NoMistakes.ForkRepository + "/compare/" + c.NoMistakes.UpstreamCommit + "..." + c.NoMistakes.ForkCommit
-	if err := githubGET(ctx, c.APIBase, token, comparePath, &comparison); err != nil ||
-		comparison.MergeBaseCommit.SHA != c.NoMistakes.UpstreamCommit || comparison.BehindBy != 0 ||
-		(comparison.Status != "ahead" && comparison.Status != "identical") {
-		return Result{Status: Fail, Summary: "pinned upstream commit is not the merge base of the pinned no-mistakes fork commit", Err: err}
-	}
-	var forkRelease struct {
-		TargetCommitish string `json:"target_commitish"`
-		Immutable       bool   `json:"immutable"`
-		Assets          []struct {
-			ID   int64  `json:"id"`
-			Name string `json:"name"`
-		} `json:"assets"`
-	}
-	if err := githubGET(ctx, c.APIBase, token, "repos/"+c.NoMistakes.ForkRepository+"/releases/tags/"+c.NoMistakes.ForkRelease, &forkRelease); err != nil ||
-		forkRelease.TargetCommitish != c.NoMistakes.ForkCommit {
-		return Result{Status: Fail, Summary: "fork release target does not equal the pinned fork commit", Err: err}
-	}
-	if !forkRelease.Immutable {
-		return Result{Status: Fail, Summary: "pinned no-mistakes fork release is not immutable"}
-	}
-	assetName := "no-mistakes-" + c.NoMistakes.Version + "-linux-amd64.tar.gz"
-	assetID := int64(0)
-	for _, asset := range forkRelease.Assets {
-		if asset.Name != assetName {
-			continue
-		}
-		if assetID != 0 {
-			return Result{Status: Fail, Summary: "fork release has multiple pinned no-mistakes Linux assets"}
-		}
-		assetID = asset.ID
-	}
-	if assetID == 0 {
-		return Result{Status: Fail, Summary: "fork release is missing the pinned no-mistakes Linux asset"}
-	}
-	asset, err := githubapi.NewClient(c.APIBase, token, nil).RequestBytes(ctx,
-		fmt.Sprintf("/repos/%s/releases/assets/%d", c.NoMistakes.ForkRepository, assetID), "application/octet-stream")
-	if err != nil {
-		return Result{Status: Fail, Summary: fmt.Sprintf("download pinned no-mistakes Linux asset: %v", err), Err: err}
-	}
-	digest := sha256.Sum256(asset)
-	if hex.EncodeToString(digest[:]) != c.NoMistakes.LinuxAMD64SHA256 {
-		return Result{Status: Fail, Summary: "pinned no-mistakes Linux asset checksum does not match"}
-	}
-	return Result{Status: Pass, Summary: "integration workflow, upstream-to-fork ancestry, pinned fork release, and Linux asset checksum verified; owner-only merge remains the governance boundary"}
+	return Result{Status: Pass, Summary: "integration workflow and pinned no-mistakes source commit verified; owner-only merge remains the governance boundary"}
 }
 
-func requirePublicProvenanceRepository(ctx context.Context, apiBase, token, repository, name string) *Result {
+func requirePublicRepository(ctx context.Context, apiBase, token, repository, name string) *Result {
 	var target struct {
 		Private bool `json:"private"`
 	}

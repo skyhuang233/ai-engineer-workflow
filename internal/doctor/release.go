@@ -51,6 +51,17 @@ type releasePull struct {
 	} `json:"merged_by"`
 }
 
+type workflowTagRef struct {
+	Object struct {
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	} `json:"object"`
+}
+
+func (r workflowTagRef) matchesDirectCommit(sourceCommit string) bool {
+	return r.Object.Type == "commit" && r.Object.SHA == sourceCommit
+}
+
 func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkflowReleaseManifest, []byte, error) {
 	if !repoPattern.MatchString(f.WorkflowRepository) {
 		return WorkflowReleaseManifest{}, nil, errors.New("workflow repository must be an owner/name")
@@ -124,6 +135,13 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if manifest.Version != releaseConfig.Version || release.TargetCommitish != manifest.SourceCommit {
 		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag, configuration, target, and manifest source do not agree")
 	}
+	var tagRef workflowTagRef
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository+"/git/ref/tags/"+tag, nil, &tagRef); err != nil {
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release source tag: %w", err)
+	}
+	if !tagRef.matchesDirectCommit(manifest.SourceCommit) {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag must directly reference the manifest source commit")
+	}
 	bundle, err := download(workflowrelease.BundleAssetName)
 	if err != nil {
 		return WorkflowReleaseManifest{}, nil, err
@@ -140,17 +158,6 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	}
 	if fmt.Sprintf("%x", sha256.Sum256(sbom)) != manifest.SBOM.SHA256 {
 		return WorkflowReleaseManifest{}, nil, errors.New("Worker SBOM checksum does not match the manifest")
-	}
-	input, err := resolveWorkerBuildInput(ctx, client, f.WorkflowRepository, manifest.SourceCommit)
-	if err != nil {
-		return WorkflowReleaseManifest{}, nil, fmt.Errorf("resolve Workflow Release source build inputs: %w", err)
-	}
-	identity, err := input.Identity()
-	if err != nil {
-		return WorkflowReleaseManifest{}, nil, err
-	}
-	if identity != manifest.Worker.BuildInputIdentity || input.Toolchain != manifest.Worker.Tools {
-		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release manifest does not match its source Worker build inputs")
 	}
 	if manifest.Worker.Image != config.Worker.ImageRepository+"@sha256:"+strings.TrimPrefix(manifest.Worker.Image, config.Worker.ImageRepository+"@sha256:") {
 		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release image does not match the configured repository")
@@ -188,95 +195,6 @@ func validateWorkerSBOM(raw []byte) error {
 		return errors.New("authoritative Worker SBOM must be a named SPDX 2.3 document")
 	}
 	return nil
-}
-
-func resolveWorkerBuildInput(ctx context.Context, client *githubapi.Client, repository, ref string) (workflowrelease.BuildInput, error) {
-	var commit struct {
-		SHA    string `json:"sha"`
-		Commit struct {
-			Tree struct {
-				SHA string `json:"sha"`
-			} `json:"tree"`
-		} `json:"commit"`
-	}
-	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/commits/"+ref, nil, &commit); err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	if !shaPattern.MatchString(commit.SHA) || !shaPattern.MatchString(commit.Commit.Tree.SHA) || commit.SHA != ref {
-		return workflowrelease.BuildInput{}, errors.New("Worker build-input commit identity is invalid")
-	}
-	raw, err := client.RequestBytes(ctx, "/repos/"+repository+"/contents/config/toolchain.json?ref="+ref, "application/vnd.github.raw+json")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	toolchain, err := workflowrelease.DecodeToolchain(raw)
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	root := commit.Commit.Tree.SHA
-	deploy, err := gitTreeEntry(ctx, client, repository, root, "deploy", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	worker, err := gitTreeEntry(ctx, client, repository, deploy, "worker", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	cmd, err := gitTreeEntry(ctx, client, repository, root, "cmd", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	digestCommand, err := gitTreeEntry(ctx, client, repository, cmd, "delivery-source-digest", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	internal, err := gitTreeEntry(ctx, client, repository, root, "internal", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	deliverySource, err := gitTreeEntry(ctx, client, repository, internal, "deliverysource", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	goMod, err := gitTreeEntry(ctx, client, repository, root, "go.mod", "blob")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	goSum, err := gitTreeEntry(ctx, client, repository, root, "go.sum", "blob")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	github, err := gitTreeEntry(ctx, client, repository, root, ".github", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	workflows, err := gitTreeEntry(ctx, client, repository, github, "workflows", "tree")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	publisher, err := gitTreeEntry(ctx, client, repository, workflows, "publish-workflow.yml", "blob")
-	if err != nil {
-		return workflowrelease.BuildInput{}, err
-	}
-	return workflowrelease.BuildInput{SchemaVersion: 1, GitInputs: workflowrelease.GitInputs{
-		DeployWorkerTree: worker, DeliverySourceDigestTree: digestCommand, DeliverySourceTree: deliverySource,
-		GoModBlob: goMod, GoSumBlob: goSum, PublishWorkflowBlob: publisher,
-	}, Toolchain: toolchain.Tools(), Worker: workflowrelease.BuildWorker{ImageRepository: toolchain.Worker.ImageRepository}}, nil
-}
-
-func gitTreeEntry(ctx context.Context, client *githubapi.Client, repository, tree, name, objectType string) (string, error) {
-	var response struct {
-		Tree []struct{ Path, Type, SHA string } `json:"tree"`
-	}
-	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/git/trees/"+tree, nil, &response); err != nil {
-		return "", err
-	}
-	for _, entry := range response.Tree {
-		if entry.Path == name && entry.Type == objectType && shaPattern.MatchString(entry.SHA) {
-			return entry.SHA, nil
-		}
-	}
-	return "", fmt.Errorf("Git tree %q lacks %s %q", tree, objectType, name)
 }
 
 func verifyPublisher(ctx context.Context, client *githubapi.Client, repository string, config Config, manifest workflowrelease.Manifest) error {

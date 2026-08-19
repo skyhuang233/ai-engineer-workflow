@@ -2,8 +2,6 @@ package doctor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,9 +63,9 @@ func TestWorkerNoMistakesBuildMetadataRequiresExactCleanForkRevision(t *testing.
 			metadata: "\tbuild\tvcs.revision=" + forkCommit + "\n\tbuild\tvcs.modified=false\n",
 		},
 		{
-			name:     "upstream revision",
+			name:     "different revision",
 			metadata: "\tbuild\tvcs.revision=867d64d9c2df89f3f204ad1f5528e5bf7b460caa\n\tbuild\tvcs.modified=false\n",
-			wantErr:  "does not equal pinned fork commit",
+			wantErr:  "does not equal pinned source commit",
 		},
 		{
 			name:     "modified fork build",
@@ -77,7 +75,7 @@ func TestWorkerNoMistakesBuildMetadataRequiresExactCleanForkRevision(t *testing.
 		{
 			name:     "missing metadata",
 			metadata: "no VCS settings",
-			wantErr:  "does not equal pinned fork commit",
+			wantErr:  "does not equal pinned source commit",
 		},
 	}
 	for _, test := range tests {
@@ -105,13 +103,13 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 					Codex:      workflowrelease.CodexTool{Version: "0.147.0"},
 					GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0"},
 					Go:         workflowrelease.ArchiveTool{Version: "1.25.12"},
-					NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", ForkCommit: forkCommit},
+					NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Commit: forkCommit},
 				},
 			},
 		},
 	}).Run(context.Background())
 
-	if result.Status != Fail || !strings.Contains(result.Summary, "does not equal pinned fork commit") {
+	if result.Status != Fail || !strings.Contains(result.Summary, "does not equal pinned source commit") {
 		t.Fatalf("DockerCheck.Run() = %#v, want isolated metadata failure", result)
 	}
 	if len(executor.commands) != 4 {
@@ -191,13 +189,7 @@ func (m memoryCredential) Set(context.Context, string, string) error   { return 
 func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *testing.T) {
 	config := validConfig()
 	token := "github_pat_test"
-	asset := []byte("pinned no-mistakes asset")
-	digest := sha256.Sum256(asset)
-	config.NoMistakes.LinuxAMD64SHA256 = hex.EncodeToString(digest[:])
 	var paths []string
-	immutableRelease := true
-	forkIsBasedOnUpstream := true
-	releaseTargetsFork := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -210,30 +202,12 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
-		case r.URL.Path == "/repos/kunchenguid/no-mistakes":
-			_, _ = w.Write([]byte(`{"private":false}`))
-		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.ForkCommit:
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.ForkCommit})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/compare/"+config.NoMistakes.UpstreamCommit+"..."+config.NoMistakes.ForkCommit:
-			mergeBase := config.NoMistakes.UpstreamCommit
-			if !forkIsBasedOnUpstream {
-				mergeBase = strings.Repeat("f", 40)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "behind_by": 0, "merge_base_commit": map[string]string{"sha": mergeBase}})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/releases/assets/9":
-			_, _ = w.Write(asset)
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.Commit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.Commit})
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_, _ = w.Write([]byte(`{"workflows":[{"id":7,"name":"workflow-contract","path":".github/workflows/workflow-contract.yml"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			target := config.NoMistakes.ForkCommit
-			if !releaseTargetsFork {
-				target = config.NoMistakes.UpstreamCommit
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": target, "immutable": immutableRelease, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -246,28 +220,9 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 	}).Run(context.Background()); result.Status != Pass {
 		t.Fatalf("GitHub check = %#v", result)
 	}
-	immutableRelease = false
-	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "immutable") {
-		t.Fatalf("GitHub check accepted a mutable no-mistakes release: %#v", result)
-	}
-	immutableRelease = true
-	releaseTargetsFork = false
-	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "fork release target") {
-		t.Fatalf("GitHub check accepted a release targeting the upstream instead of the fork: %#v", result)
-	}
-	releaseTargetsFork = true
-	forkIsBasedOnUpstream = false
-	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "merge base") {
-		t.Fatalf("GitHub check accepted a fork unrelated to the pinned upstream commit: %#v", result)
-	}
-	forkIsBasedOnUpstream = true
-	asset = []byte("tampered no-mistakes asset")
-	if result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: credentials, APIBase: server.URL}).Run(context.Background()); result.Status != Fail || !strings.Contains(result.Summary, "checksum") {
-		t.Fatalf("GitHub check accepted tampered no-mistakes asset: %#v", result)
-	}
 	for _, path := range paths {
-		if strings.Contains(path, "protection") {
-			t.Fatalf("Owner-Guarded doctor queried branch protection: %s", path)
+		if strings.Contains(path, "protection") || strings.Contains(path, "/releases/") || strings.Contains(path, "/compare/") {
+			t.Fatalf("Owner-Guarded doctor queried retired provenance endpoint: %s", path)
 		}
 	}
 }
@@ -292,7 +247,7 @@ func TestGitHubCheckRejectsCanonicalIntegrationRepositoryOwnedByAnotherAccount(t
 	}
 }
 
-func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
+func TestGitHubCheckRejectsUnavailablePinnedNoMistakesCommit(t *testing.T) {
 	config := validConfig()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -308,15 +263,15 @@ func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
 		case r.URL.Path == "/repos/kunchenguid/no-mistakes", r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
 		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"target_commitish": config.NoMistakes.UpstreamCommit})
+			_ = json.NewEncoder(w).Encode(map[string]string{"target_commitish": config.NoMistakes.Commit})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: memoryCredential{secret: "github_pat_test"}, APIBase: server.URL}).Run(context.Background())
-	if result.Status != Fail || !strings.Contains(result.Summary, "pinned upstream commit") {
-		t.Fatalf("GitHub check = %#v, want unavailable upstream commit failure", result)
+	if result.Status != Fail || !strings.Contains(result.Summary, "pinned commit") {
+		t.Fatalf("GitHub check = %#v, want unavailable commit failure", result)
 	}
 }
 
@@ -349,7 +304,7 @@ func TestGitHubCheckRejectsContractRunFromAnOldDefaultHead(t *testing.T) {
 	}
 }
 
-func TestGitHubCheckRejectsPrivateNoMistakesFork(t *testing.T) {
+func TestGitHubCheckRejectsPrivateNoMistakesSourceRepository(t *testing.T) {
 	config := validConfig()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -377,37 +332,8 @@ func TestGitHubCheckRejectsPrivateNoMistakesFork(t *testing.T) {
 	}
 }
 
-func TestGitHubCheckRejectsPrivateNoMistakesUpstream(t *testing.T) {
-	config := validConfig()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
-			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
-		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
-		case strings.HasSuffix(r.URL.Path, "/actions/workflows/7/runs"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
-		case r.URL.Path == "/repos/kunchenguid/no-mistakes":
-			_, _ = w.Write([]byte(`{"private":true}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	result := (GitHubCheck{GitHub: config.GitHub, NoMistakes: config.NoMistakes, Credentials: memoryCredential{secret: "github_pat_test"}, APIBase: server.URL}).Run(context.Background())
-	if result.Status != Fail || !strings.Contains(result.Summary, "upstream repository must be public") {
-		t.Fatalf("GitHub check = %#v, want private upstream failure", result)
-	}
-}
-
 func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 	config := validConfig()
-	asset := []byte("pinned no-mistakes asset")
-	digest := sha256.Sum256(asset)
-	config.NoMistakes.LinuxAMD64SHA256 = hex.EncodeToString(digest[:])
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -417,16 +343,8 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
-		case r.URL.Path == "/repos/kunchenguid/no-mistakes":
-			_, _ = w.Write([]byte(`{"private":false}`))
-		case r.URL.Path == "/repos/kunchenguid/no-mistakes/git/commits/"+config.NoMistakes.UpstreamCommit:
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.UpstreamCommit})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.ForkCommit:
-			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.ForkCommit})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/compare/"+config.NoMistakes.UpstreamCommit+"..."+config.NoMistakes.ForkCommit:
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "behind_by": 0, "merge_base_commit": map[string]string{"sha": config.NoMistakes.UpstreamCommit}})
-		case r.URL.Path == "/repos/skyhuang233/no-mistakes/releases/assets/9":
-			_, _ = w.Write(asset)
+		case r.URL.Path == "/repos/skyhuang233/no-mistakes/git/commits/"+config.NoMistakes.Commit:
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha": config.NoMistakes.Commit})
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{
 				{"id": 7, "name": config.GitHub.RequiredCheck, "path": ".github/workflows/unrelated.yml"},
@@ -434,8 +352,6 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 			}})
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows/8/runs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"head_sha": "current", "status": "completed", "conclusion": "success"}}})
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"target_commitish": config.NoMistakes.ForkCommit, "immutable": true, "assets": []map[string]any{{"id": 9, "name": "no-mistakes-" + config.NoMistakes.Version + "-linux-amd64.tar.gz"}}})
 		default:
 			http.NotFound(w, r)
 		}
