@@ -15,8 +15,10 @@ Use only these short-lived branch types:
   assignment, release metadata or documentation, and release-blocking fixes.
   Merge it separately to `main` and `develop`.
 - `hotfix-<version>` starts from `main` for an urgent production repair. Merge
-  it to `main` and `develop`, or to the active `release-*` branch instead of
-  `develop`. Never roll a target branch's version backward.
+  it to `main` and, when no release branch is active, to `develop`. When a
+  `release-*` branch is active, the hotfix must merge to `main` and that active
+  release branch; if integration cannot wait, it may additionally merge
+  directly to `develop`. Never roll a target branch's version backward.
 
 Every integration uses a pull request and a merge commit equivalent to
 `git merge --no-ff`. Do not squash, rebase, or push development commits

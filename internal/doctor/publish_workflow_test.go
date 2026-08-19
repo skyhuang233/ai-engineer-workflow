@@ -35,6 +35,25 @@ func TestUnifiedPublisherAdmitsOnlyOwnerMergedVersionBranches(t *testing.T) {
 	}
 }
 
+func TestUnifiedPublisherTestsTheAcceptedMergeBeforeMutation(t *testing.T) {
+	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	acceptedMerge := strings.Index(text, "  accepted-merge:")
+	worker := strings.Index(text, "  worker:")
+	if acceptedMerge < 0 || worker <= acceptedMerge {
+		t.Fatal("unified publisher omits the accepted-merge gate before the Worker build")
+	}
+	gate := text[acceptedMerge:worker]
+	for _, required := range []string{"runs-on: windows-latest", "go test -p 1 ./...", "go vet ./..."} {
+		if !strings.Contains(gate, required) {
+			t.Fatalf("accepted-merge gate omits %q", required)
+		}
+	}
+	workerBlock := text[worker:]
+	if !strings.Contains(workerBlock, "needs: accepted-merge") {
+		t.Fatal("Worker mutation does not wait for the accepted-merge gate")
+	}
+}
+
 func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
 	scan := strings.Index(text, "name: Scan Worker before push")

@@ -27,6 +27,8 @@ func TestDecodeConfigRejectsContractDrift(t *testing.T) {
 		raw  string
 	}{
 		{name: "unknown field", raw: strings.Replace(valid, `"version":"0.0.0"`, `"version":"0.0.0","extra":true`, 1)},
+		{name: "wrong-case field", raw: strings.Replace(valid, `"version":"0.0.0"`, `"Version":"0.0.0"`, 1)},
+		{name: "mixed-case collision", raw: strings.Replace(valid, `"version":"0.0.0"`, `"version":"0.0.0","Version":"0.0.0"`, 1)},
 		{name: "duplicate field", raw: strings.Replace(valid, `"version":"0.0.0"`, `"version":"0.0.0","version":"0.0.1"`, 1)},
 		{name: "non HTTPS installer", raw: strings.Replace(valid, "https://example.test", "http://example.test", 1)},
 		{name: "uppercase digest", raw: strings.Replace(valid, strings.Repeat("a", 64), strings.Repeat("A", 64), 1)},

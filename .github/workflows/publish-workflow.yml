@@ -14,7 +14,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  accepted-merge:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Test the accepted main merge
+        run: go test -p 1 ./...
+      - name: Vet the accepted main merge
+        run: go vet ./...
+
   worker:
+    needs: accepted-merge
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.admission.outputs.version }}

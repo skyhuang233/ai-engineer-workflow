@@ -27,7 +27,7 @@ then verifies the Bundle inventory and publisher provenance. Extra, missing, or
 duplicate assets fail closed.
 
 Platform and Worker are released atomically under one product version. Legacy
-component Releases have been retired. Until the first owner-approved
+split-release artifacts and tags have been retired. Until the first owner-approved
 `workflow-v0.0.1` is published, the repository is intentionally in a release
 blackout: fresh installation and release-dependent repair or recovery are not
 available, and consumers never fall back to legacy tags.
