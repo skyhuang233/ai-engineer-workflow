@@ -22,7 +22,11 @@ try {
   $manifest = $entries | Where-Object { $_.FullName -ceq 'platform-release.json' }
   if (@($manifest).Count -ne 1) { throw 'Bundle requires one root platform-release.json' }
   foreach ($entry in $entries) {
-    if ($entry.FullName.StartsWith('/') -or $entry.FullName.Contains('..') -or $entry.FullName.Contains('\')) { throw "Unsafe Bundle entry: $($entry.FullName)" }
+    $segments = @($entry.FullName.Split('/'))
+    if ($entry.FullName.StartsWith('/') -or $entry.FullName.Contains('\') -or $entry.FullName.Contains(':') -or
+        @($segments | Where-Object { $_ -ceq '' -or $_ -ceq '.' -or $_ -ceq '..' }).Count -ne 0) {
+      throw "Unsafe Bundle entry: $($entry.FullName)"
+    }
   }
   $reader = [IO.StreamReader]::new($manifest.Open(), [Text.UTF8Encoding]::new($false), $true)
   try { $contract = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
