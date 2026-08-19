@@ -206,5 +206,9 @@ jobs:
             -github-actions-run-id '${{ github.run_id }}' `
             -worker-image "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" `
             -build-input build/build-input.json -sbom build/release-inputs/worker-sbom.spdx.json
+          $bundleDigest = (Get-FileHash -LiteralPath build/release/workflow-windows-amd64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          & skills/setup-agent-workflow/scripts/verify-windows-bundle.ps1 `
+            -BundlePath build/release/workflow-windows-amd64.zip -ExpectedSHA256 $bundleDigest `
+            -ExpectedVersion $version -ExpectedWorkerImage "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" | Out-Null
           $names = @(Get-ChildItem build/release -File | Sort-Object Name | ForEach-Object Name)
           if (($names -join ' ') -cne 'worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip') { throw 'dry run output is not exact' }

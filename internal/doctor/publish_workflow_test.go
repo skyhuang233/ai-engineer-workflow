@@ -28,6 +28,11 @@ func TestUnifiedPublisherAdmitsOnlyOwnerMergedVersionBranches(t *testing.T) {
 			t.Fatalf("unified publisher retains legacy/manual entry %q", forbidden)
 		}
 	}
+	for _, required := range []string{"0.0.0 is never publishable", "the first Workflow Release must be workflow-v0.0.1"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("unified publisher omits initial namespace guard %q", required)
+		}
+	}
 }
 
 func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testing.T) {
@@ -47,6 +52,10 @@ func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testin
 			t.Fatalf("unified publisher omits atomic release contract %q", required)
 		}
 	}
+	if strings.Count(text, "for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip") != 2 ||
+		strings.Count(text, `git/ref/tags/${tag}`) != 2 {
+		t.Fatal("fresh and idempotent publication do not both verify asset digests and the direct tag ref")
+	}
 }
 
 func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
@@ -55,6 +64,7 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Build both release components without publication", "workflow-release assemble",
+		"verify-windows-bundle.ps1",
 		"worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip",
 	} {
 		if !strings.Contains(text, required) {

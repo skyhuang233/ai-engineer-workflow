@@ -115,6 +115,7 @@ $validator = Join-Path $PSScriptRoot 'verify-workflow-release-manifest.ps1'
 $validatedJSON = & $validator -ManifestPath $manifestPath -ExpectedSHA256 ([string]$manifestAsset.digest) -ExpectedSize ([long]$manifestAsset.size) -ExpectedTag ([string]$release.tag_name)
 if ($LASTEXITCODE -ne 0) { throw 'Workflow Release manifest bootstrap validation failed' }
 $validated = $validatedJSON | ConvertFrom-Json
+if ([string]$release.target_commitish -cne [string]$validated.source_commit) { throw 'Workflow Release target does not match its manifest source commit' }
 
 $tagRef = Invoke-GhJSON "repos/$repository/git/ref/tags/$([Uri]::EscapeDataString([string]$release.tag_name))"
 if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne [string]$validated.source_commit) { throw 'Workflow Release tag does not resolve to its manifest source commit' }

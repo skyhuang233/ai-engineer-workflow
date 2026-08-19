@@ -20,7 +20,7 @@ try {
   $releasePage = @(
     @{tag_name='platform-v99.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
     @{tag_name='workflow-v0.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
-    @{tag_name='workflow-v0.0.1';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
+    @{tag_name='workflow-v0.0.1';target_commitish=('a' * 40);draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
       @{name='workflow-windows-amd64.zip';state='uploaded';size=(Get-Item $global:workflowResolutionBundle).Length;digest=('sha256:'+$bundleDigest)},
       @{name='workflow-release.json';state='uploaded';size=(Get-Item $global:workflowResolutionFixture).Length;digest=('sha256:'+$manifestDigest)},
       @{name='worker-sbom.spdx.json';state='uploaded';size=(Get-Item $global:workflowResolutionSBOM).Length;digest=('sha256:'+$sbomDigest)}
@@ -63,6 +63,15 @@ try {
 
   $releaseObjects = @($global:workflowResolutionRelease | ConvertFrom-Json)
   $selected = @($releaseObjects | Where-Object tag_name -EQ 'workflow-v0.0.1')[0]
+  $selected.target_commitish = ('b' * 40)
+  $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
+  $global:workflowResolutionCalls.Clear()
+  $accepted = $true
+  try { & $resolver -DownloadDirectory (Join-Path $scratch 'target-mismatch') *> $null } catch { $accepted = $false }
+  if ($accepted) { throw 'Resolver accepted a Release target different from the manifest source commit' }
+  if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' }).Count -ne 1) { throw 'Resolver downloaded Bundle or SBOM before rejecting the Release target' }
+
+  $selected.target_commitish = ('a' * 40)
   $selected.assets += [pscustomobject]@{name='unexpected.txt';state='uploaded';size=1;digest=('sha256:'+('4'*64))}
   $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
   $global:workflowResolutionCalls.Clear()

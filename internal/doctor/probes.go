@@ -70,7 +70,7 @@ func rootCause(err error) error {
 }
 
 type DockerCheck struct {
-	Manifest WorkerReleaseManifest
+	Manifest WorkflowReleaseManifest
 	Executor Executor
 }
 

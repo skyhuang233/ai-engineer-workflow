@@ -98,7 +98,7 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 	executor := &dockerCheckExecutor{metadata: []byte("/usr/local/bin/no-mistakes: go1.25.12\n")}
 	result := (DockerCheck{
 		Executor: executor,
-		Manifest: WorkerReleaseManifest{
+		Manifest: WorkflowReleaseManifest{
 			Worker: workflowrelease.Worker{
 				Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 				Tools: workflowrelease.Tools{
@@ -140,7 +140,7 @@ func TestDockerCheckRejectsStoppedNoMistakesDaemon(t *testing.T) {
 	executor := &dockerCheckExecutor{probe: []byte("gateway=ok\nmount=ok\n0.147.0\ngh version 2.97.0\ngo1.25.12\nv1.41.2\n  ○ daemon not running\n")}
 	result := (DockerCheck{
 		Executor: executor,
-		Manifest: WorkerReleaseManifest{
+		Manifest: WorkflowReleaseManifest{
 			Worker: workflowrelease.Worker{
 				Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 				Tools: workflowrelease.Tools{

@@ -17,7 +17,7 @@ type ToolProvenance struct {
 func DecodeToolProvenance(raw []byte) (ToolProvenance, error) {
 	var provenance ToolProvenance
 	if err := json.Unmarshal(raw, &provenance); err != nil {
-		return ToolProvenance{}, fmt.Errorf("decode Worker Release tool provenance: %w", err)
+		return ToolProvenance{}, fmt.Errorf("decode Workflow Release tool provenance: %w", err)
 	}
 	if _, err := provenance.ToolVersions(); err != nil {
 		return ToolProvenance{}, err
@@ -28,13 +28,13 @@ func DecodeToolProvenance(raw []byte) (ToolProvenance, error) {
 func (p ToolProvenance) ToolVersions() (map[string]string, error) {
 	switch {
 	case strings.TrimSpace(p.CodexVersion) == "":
-		return nil, errors.New("Worker Release Manifest Codex version is required")
+		return nil, errors.New("Workflow Release Manifest Codex version is required")
 	case strings.TrimSpace(p.GitHubCLIVersion) == "":
-		return nil, errors.New("Worker Release Manifest GitHub CLI version is required")
+		return nil, errors.New("Workflow Release Manifest GitHub CLI version is required")
 	case strings.TrimSpace(p.GoVersion) == "":
-		return nil, errors.New("Worker Release Manifest Go version is required")
+		return nil, errors.New("Workflow Release Manifest Go version is required")
 	case strings.TrimSpace(p.NoMistakesVersion) == "":
-		return nil, errors.New("Worker Release Manifest no-mistakes version is required")
+		return nil, errors.New("Workflow Release Manifest no-mistakes version is required")
 	}
 	return map[string]string{
 		"codex":       p.CodexVersion,

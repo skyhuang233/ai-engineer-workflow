@@ -40,7 +40,7 @@ const (
 	doctorVerificationTimeout = 10 * time.Minute
 )
 
-// Version is "dev" for source builds. Immutable Platform Release builds set
+// Version is "dev" for source builds. Immutable Workflow Release builds set
 // this exact variable with -ldflags "-X main.Version=<manifest-version>".
 var Version = "dev"
 
@@ -426,7 +426,7 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	if currentManifest != manifest || string(currentManifestJSON) != string(manifestJSON) {
-		fmt.Fprintln(os.Stderr, "Worker Release changed during doctor verification")
+		fmt.Fprintln(os.Stderr, "Workflow Release changed during doctor verification")
 		os.Exit(1)
 	}
 	if err := database.ActivateWorkerReleaseFenced(context.Background(), store.WorkerRelease{

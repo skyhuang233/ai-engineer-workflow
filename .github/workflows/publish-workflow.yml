@@ -33,7 +33,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="$(jq --exit-status --raw-output '.version | select(test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))' config/workflow-release.json)"
+          test "$version" != "0.0.0" || { echo "the development baseline 0.0.0 is never publishable" >&2; exit 1; }
           owner="$(jq --exit-status --raw-output '.github.credential.owner | select(type == "string" and length > 0)' config/toolchain.json)"
+          workflow_release_count="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --slurp | jq '[.[][] | select(.draft == false and .prerelease == false and .immutable == true and (.tag_name | test("^workflow-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")))] | length')"
+          if [ "$workflow_release_count" -eq 0 ] && [ "$version" != "0.0.1" ]; then
+            echo "the first Workflow Release must be workflow-v0.0.1" >&2
+            exit 1
+          fi
           pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
           pull_number="$(jq --raw-output --arg sha "$GITHUB_SHA" '[.[] | select(.merged_at != null and .merge_commit_sha == $sha and .base.ref == "main")] | if length == 1 then .[0].number else empty end' <<<"$pulls")"
           test -n "$pull_number" || { echo "main commit lacks one merged pull request" >&2; exit 1; }
@@ -183,14 +189,28 @@ jobs:
             grep -q 'HTTP 404' /tmp/release-error; echo "state=fresh" >> "$GITHUB_OUTPUT"; exit 0
           fi
           test "$(jq -r .target_commitish <<<"$release")" = "$GITHUB_SHA" || { echo "version belongs to another source" >&2; exit 1; }
-          if jq -e '.immutable == true and .draft == false' <<<"$release" >/dev/null; then
+          if jq -e '.immutable == true and .draft == false and .prerelease == false' <<<"$release" >/dev/null; then
             jq -e '([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
             for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip; do
               digest="$(sha256sum "build/release/$name" | awk '{print $1}')"
               jq -e --arg name "$name" --arg digest "sha256:$digest" '[.assets[] | select(.name == $name and .digest == $digest)] | length == 1' <<<"$release" >/dev/null
             done
+            tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+            jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null
             echo "state=immutable" >> "$GITHUB_OUTPUT"
           elif jq -e '.draft == true and .immutable != true' <<<"$release" >/dev/null; then
+            mapfile -t draft_manifest_ids < <(jq -r '.assets[] | select(.name == "workflow-release.json") | .id' <<<"$release")
+            test "${#draft_manifest_ids[@]}" -le 1 || { echo "retry draft contains duplicate manifests" >&2; exit 1; }
+            if [ "${#draft_manifest_ids[@]}" -eq 1 ]; then
+              gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${draft_manifest_ids[0]}" > /tmp/draft-workflow-release.json
+              jq -e \
+                --arg version "${{ needs.worker.outputs.version }}" \
+                --arg source "$GITHUB_SHA" \
+                --arg identity "${{ needs.worker.outputs.identity }}" \
+                --arg image "${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}" \
+                '.version == $version and .source_commit == $source and .worker.build_input_identity == $identity and .worker.image == $image' \
+                /tmp/draft-workflow-release.json >/dev/null || { echo "retry image digest differs from the failed draft" >&2; exit 1; }
+            fi
             gh release delete "$tag" --yes --cleanup-tag=false; echo "state=fresh" >> "$GITHUB_OUTPUT"
           else
             echo "existing release is not retryable or an exact immutable result" >&2; exit 1
@@ -211,3 +231,9 @@ jobs:
           tag="${{ needs.worker.outputs.tag }}"; gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
           jq --exit-status --arg sha "$GITHUB_SHA" '.draft == false and .prerelease == false and .immutable == true and .target_commitish == $sha and ([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
+          for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip; do
+            digest="$(sha256sum "build/release/$name" | awk '{print $1}')"
+            jq -e --arg name "$name" --arg digest "sha256:$digest" '[.assets[] | select(.name == $name and .digest == $digest)] | length == 1' <<<"$release" >/dev/null
+          done
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+          jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null

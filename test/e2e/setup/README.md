@@ -24,7 +24,7 @@ $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = "<separate cleanup credential with list/
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <disposable-owner> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@platform-vX.Y.Z `
+  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
   -PlatformVersion X.Y.Z `
   -DifferentOwnerRepository <public-owner/public-repository>
 ```
@@ -54,7 +54,7 @@ mismatch cannot mask it:
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <organization-that-rejects-classic-pats> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@platform-vX.Y.Z `
+  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
   -PlatformVersion X.Y.Z `
   -QualificationMode organization-policy `
   -ClassicPATRejectedRepository <organization/public-fixture>

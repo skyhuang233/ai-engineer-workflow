@@ -13,7 +13,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
-type WorkerReleaseManifest = workflowrelease.Manifest
+type WorkflowReleaseManifest = workflowrelease.Manifest
 
 type ReleaseFetcher struct {
 	APIBase            string
@@ -51,32 +51,32 @@ type releasePull struct {
 	} `json:"merged_by"`
 }
 
-func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkerReleaseManifest, []byte, error) {
+func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) (WorkflowReleaseManifest, []byte, error) {
 	if !repoPattern.MatchString(f.WorkflowRepository) {
-		return WorkerReleaseManifest{}, nil, errors.New("workflow repository must be an owner/name")
+		return WorkflowReleaseManifest{}, nil, errors.New("workflow repository must be an owner/name")
 	}
 	if config.Worker.ReleaseRepository != f.WorkflowRepository {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Release repository must match the workflow repository")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release repository must match the workflow repository")
 	}
 	if err := githubapi.ValidateOwnerGuardedRepositoryName(f.WorkflowRepository, config.GitHub.Credential.Owner); err != nil {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Release repository owner must match the configured owner")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release repository owner must match the configured owner")
 	}
 	client := githubapi.NewClient(f.APIBase, token, f.HTTP)
 	var repository githubapi.RepositoryMetadata
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository, nil, &repository); err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release repository access: %w", err)
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release repository access: %w", err)
 	}
 	if err := repository.ValidateOwnerGuarded(f.WorkflowRepository, config.GitHub.Credential.Owner); err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release repository owner: %w", err)
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release repository owner: %w", err)
 	}
 
 	releaseConfigRaw, err := client.RequestBytes(ctx, "/repos/"+f.WorkflowRepository+"/contents/config/workflow-release.json?ref=main", "application/vnd.github.raw+json")
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("read current Workflow Release configuration: %w", err)
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("read current Workflow Release configuration: %w", err)
 	}
 	releaseConfig, err := workflowrelease.DecodeConfig(releaseConfigRaw)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	tag := "workflow-v" + releaseConfig.Version
 	var release struct {
@@ -87,14 +87,14 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 		Assets          []releaseAsset `json:"assets"`
 	}
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository+"/releases/tags/"+tag, nil, &release); err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("read authoritative Workflow Release: %w", err)
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("read authoritative Workflow Release: %w", err)
 	}
 	if release.Draft || release.Prerelease || !release.Immutable {
-		return WorkerReleaseManifest{}, nil, errors.New("authoritative Workflow Release must be published, stable, and immutable")
+		return WorkflowReleaseManifest{}, nil, errors.New("authoritative Workflow Release must be published, stable, and immutable")
 	}
 	assets, err := exactWorkflowAssets(release.Assets)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 
 	download := func(name string) ([]byte, error) {
@@ -115,48 +115,48 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	}
 	manifestRaw, err := download(workflowrelease.ManifestAssetName)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	manifest, err := workflowrelease.DecodeManifest(manifestRaw)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	if manifest.Version != releaseConfig.Version || release.TargetCommitish != manifest.SourceCommit {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Release tag, configuration, target, and manifest source do not agree")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag, configuration, target, and manifest source do not agree")
 	}
 	bundle, err := download(workflowrelease.BundleAssetName)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	if fmt.Sprintf("%x", sha256.Sum256(bundle)) != manifest.Bundle.SHA256 {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Bundle checksum does not match the manifest")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Bundle checksum does not match the manifest")
 	}
 	sbom, err := download(workflowrelease.SBOMAssetName)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	if err := validateWorkerSBOM(sbom); err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	if fmt.Sprintf("%x", sha256.Sum256(sbom)) != manifest.SBOM.SHA256 {
-		return WorkerReleaseManifest{}, nil, errors.New("Worker SBOM checksum does not match the manifest")
+		return WorkflowReleaseManifest{}, nil, errors.New("Worker SBOM checksum does not match the manifest")
 	}
 	input, err := resolveWorkerBuildInput(ctx, client, f.WorkflowRepository, manifest.SourceCommit)
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, fmt.Errorf("resolve Workflow Release source build inputs: %w", err)
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("resolve Workflow Release source build inputs: %w", err)
 	}
 	identity, err := input.Identity()
 	if err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	if identity != manifest.Worker.BuildInputIdentity || input.Toolchain != manifest.Worker.Tools {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Release manifest does not match its source Worker build inputs")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release manifest does not match its source Worker build inputs")
 	}
 	if manifest.Worker.Image != config.Worker.ImageRepository+"@sha256:"+strings.TrimPrefix(manifest.Worker.Image, config.Worker.ImageRepository+"@sha256:") {
-		return WorkerReleaseManifest{}, nil, errors.New("Workflow Release image does not match the configured repository")
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release image does not match the configured repository")
 	}
 	if err := verifyPublisher(ctx, client, f.WorkflowRepository, config, manifest); err != nil {
-		return WorkerReleaseManifest{}, nil, err
+		return WorkflowReleaseManifest{}, nil, err
 	}
 	return manifest, manifestRaw, nil
 }
