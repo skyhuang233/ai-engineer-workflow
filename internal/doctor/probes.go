@@ -306,7 +306,7 @@ func (c DockerCheck) Run(ctx context.Context) Result {
 	if err != nil || strings.TrimSpace(string(info)) != "linux/x86_64" {
 		return Result{Status: Fail, Summary: fmt.Sprintf("Docker Engine must be linux/x86_64: %v (%s)", err, strings.TrimSpace(string(info)))}
 	}
-	image := c.Manifest.Image
+	image := c.Manifest.Worker.Image
 	if output, err := executor.Run(ctx, []string{"docker", "pull", image}); err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("pull exact Worker digest: %v (%s)", err, strings.TrimSpace(string(output)))}
 	}
@@ -390,7 +390,7 @@ env | cut -d= -f1`
 			return Result{Status: Fail, Summary: "Worker environment contains a forbidden GitHub write credential name"}
 		}
 	}
-	required := []string{"gateway=ok", "mount=ok", c.Manifest.CodexVersion, "gh version " + c.Manifest.GitHubCLIVersion, "go" + c.Manifest.GoVersion, c.Manifest.NoMistakesVersion, "daemon running"}
+	required := []string{"gateway=ok", "mount=ok", c.Manifest.Worker.Tools.Codex.Version, "gh version " + c.Manifest.Worker.Tools.GitHubCLI.Version, "go" + c.Manifest.Worker.Tools.Go.Version, c.Manifest.Worker.Tools.NoMistakes.Version, "daemon running"}
 	for _, value := range required {
 		if !strings.Contains(text, value) {
 			return Result{Status: Fail, Summary: fmt.Sprintf("Worker probe omitted required evidence %q", value)}
@@ -404,7 +404,7 @@ env | cut -d= -f1`
 	if err != nil {
 		return Result{Status: Fail, Summary: fmt.Sprintf("read Worker no-mistakes build metadata: %v (%s)", err, strings.TrimSpace(string(metadataOutput)))}
 	}
-	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.NoMistakesForkCommit); err != nil {
+	if err := verifyWorkerNoMistakesBuildMetadata(string(metadataOutput), c.Manifest.Worker.Tools.NoMistakes.ForkCommit); err != nil {
 		return Result{Status: Fail, Summary: err.Error()}
 	}
 	return Result{Status: Pass, Summary: "Linux Engine, bind mounts, host.docker.internal Gateway, pinned tools, no-mistakes daemon, and absence of GitHub write credentials verified"}

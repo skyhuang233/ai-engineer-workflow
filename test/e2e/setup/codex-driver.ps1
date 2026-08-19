@@ -22,7 +22,7 @@ if (-not (Test-Path -LiteralPath $patInputPath -PathType Leaf)) { throw "WORKFLO
 $setupToken = [IO.File]::ReadAllText($patInputPath).Trim()
 if ([string]::IsNullOrWhiteSpace($setupToken)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is empty" }
 if (-not (Test-Path -LiteralPath $repositoryPath -PathType Container)) { throw "Scenario repository does not exist" }
-if ($entrySkillSpec -notmatch '@(platform-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must pin an exact release tag or commit" }
+if ($entrySkillSpec -notmatch '@(workflow-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must pin an exact release tag or commit" }
 
 $driverRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $schemaPath = Join-Path $driverRoot "driver-result.schema.json"

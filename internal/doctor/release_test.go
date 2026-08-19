@@ -1,164 +1,98 @@
 package doctor
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
+	"context"
 	"fmt"
-	"os/exec"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/skyhuang233/workflow/internal/workerrelease"
+	githubapi "github.com/skyhuang233/workflow/internal/github"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
-func TestWorkerBuildInputIdentityUsesCanonicalBase64JSON(t *testing.T) {
-	config := validConfig()
-	config.NoMistakes.ForkRelease = "worker&release"
-	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	deliverySourceDigestCommandTree := "cccccccccccccccccccccccccccccccccccccccc"
-	deliverySourceDigestPackageTree := "dddddddddddddddddddddddddddddddddddddddd"
-	goModBlob := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	goSumBlob := "ffffffffffffffffffffffffffffffffffffffff"
-	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	b64 := base64.StdEncoding.EncodeToString
-	canonical := fmt.Sprintf(`{"schema_version":6,"deploy_worker_tree":%q,"delivery_source_digest_command_tree":%q,"delivery_source_digest_package_tree":%q,"go_mod_blob":%q,"go_sum_blob":%q,"publish_worker_workflow_blob":%q,"codex":{"version":%q},"github_cli":{"version":%q,"linux_amd64_sha256":%q},"go":{"version":%q,"linux_amd64_sha256":%q},"no_mistakes":{"version":%q,"upstream_repository":%q,"upstream_commit":%q,"fork_repository":%q,"fork_commit":%q,"fork_release":%q,"linux_amd64_sha256":%q},"worker":{"version":%q,"image_repository":%q,"release_repository":%q}}`,
-		b64([]byte(workerTree)), b64([]byte(deliverySourceDigestCommandTree)), b64([]byte(deliverySourceDigestPackageTree)), b64([]byte(goModBlob)), b64([]byte(goSumBlob)), b64([]byte(publisherWorkflow)), b64([]byte(config.Codex.Version)), b64([]byte(config.GitHubCLI.Version)), b64([]byte(config.GitHubCLI.LinuxAMD64SHA256)), b64([]byte(config.Go.Version)), b64([]byte(config.Go.LinuxAMD64SHA256)), b64([]byte(config.NoMistakes.Version)),
-		b64([]byte(config.NoMistakes.UpstreamRepository)), b64([]byte(config.NoMistakes.UpstreamCommit)),
-		b64([]byte(config.NoMistakes.ForkRepository)), b64([]byte(config.NoMistakes.ForkCommit)), b64([]byte(config.NoMistakes.ForkRelease)),
-		b64([]byte(config.NoMistakes.LinuxAMD64SHA256)), b64([]byte(config.Worker.Version)),
-		b64([]byte(config.Worker.ImageRepository)), b64([]byte(config.Worker.ReleaseRepository)))
-	want := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
-	if got := workerBuildInputIdentity(config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow); got != want {
-		t.Fatalf("identity = %s, want canonical newline-free SHA-256 %s", got, want)
+func TestExactWorkflowAssetsRequiresTheAtomicSet(t *testing.T) {
+	valid := []releaseAsset{
+		{ID: 1, Name: workflowrelease.BundleAssetName, Digest: "sha256:" + strings.Repeat("a", 64)},
+		{ID: 2, Name: workflowrelease.ManifestAssetName, Digest: "sha256:" + strings.Repeat("b", 64)},
+		{ID: 3, Name: workflowrelease.SBOMAssetName, Digest: "sha256:" + strings.Repeat("c", 64)},
+	}
+	if _, err := exactWorkflowAssets(valid); err != nil {
+		t.Fatalf("valid assets: %v", err)
+	}
+	for name, mutate := range map[string]func([]releaseAsset) []releaseAsset{
+		"missing":   func(v []releaseAsset) []releaseAsset { return v[:2] },
+		"duplicate": func(v []releaseAsset) []releaseAsset { v[2].Name = v[1].Name; return v },
+		"extra":     func(v []releaseAsset) []releaseAsset { return append(v, releaseAsset{ID: 4, Name: "extra"}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := append([]releaseAsset(nil), valid...)
+			if _, err := exactWorkflowAssets(mutate(input)); err == nil {
+				t.Fatal("accepted a non-atomic asset set")
+			}
+		})
 	}
 }
 
-func TestWorkerReleaseTagIncludesVersionAndBuildInputIdentity(t *testing.T) {
-	identity := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	if got, want := workerReleaseTag("0.1.0", identity), "worker-v0.1.0-"+identity; got != want {
-		t.Fatalf("release tag = %q, want %q", got, want)
+func TestWorkerSBOMRequiresNamedSPDX23(t *testing.T) {
+	if err := validateWorkerSBOM([]byte(`{"spdxVersion":"SPDX-2.3","name":"workflow-worker"}`)); err != nil {
+		t.Fatal(err)
 	}
-	config := validConfig()
-	config.Worker.Version = strings.Repeat("a", 56)
-	if err := config.Validate(); err == nil {
-		t.Fatal("accepted a Worker version too long for a source-keyed image tag")
+	if err := validateWorkerSBOM([]byte(`{"spdxVersion":"SPDX-2.2","name":"workflow-worker"}`)); err == nil {
+		t.Fatal("accepted a non-SPDX-2.3 document")
 	}
 }
 
-func TestWorkerBuildInputIdentityMatchesPublisherJQ(t *testing.T) {
-	jq, err := exec.LookPath("jq")
-	if err != nil {
-		t.Skip("jq is required by the GitHub publisher workflow")
+func TestResolveWorkerBuildInputUsesThePublishedWorkflowBlob(t *testing.T) {
+	sha := func(ch string) string { return strings.Repeat(ch, 40) }
+	commit, root := sha("a"), sha("b")
+	objects := map[string]string{
+		"deploy": sha("c"), "worker": sha("d"), "cmd": sha("e"), "digest": sha("1"),
+		"internal": sha("2"), "source": sha("3"), "go.mod": sha("4"), "go.sum": sha("5"),
+		".github": sha("6"), "workflows": sha("7"), "publisher": sha("8"),
 	}
-	config := validConfig()
-	config.NoMistakes.ForkRelease = "worker&release"
-	workerTree := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	deliverySourceDigestCommandTree := "cccccccccccccccccccccccccccccccccccccccc"
-	deliverySourceDigestPackageTree := "dddddddddddddddddddddddddddddddddddddddd"
-	goModBlob := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	goSumBlob := "ffffffffffffffffffffffffffffffffffffffff"
-	publisherWorkflow := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	configJSON, err := json.Marshal(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	filter := `{schema_version:6,deploy_worker_tree:($deploy_worker_tree | @base64),delivery_source_digest_command_tree:($delivery_source_digest_command_tree | @base64),delivery_source_digest_package_tree:($delivery_source_digest_package_tree | @base64),go_mod_blob:($go_mod_blob | @base64),go_sum_blob:($go_sum_blob | @base64),publish_worker_workflow_blob:($publish_worker_workflow_blob | @base64),codex:{version:(.codex.version | @base64)},github_cli:{version:(.github_cli.version | @base64),linux_amd64_sha256:(.github_cli.linux_amd64_sha256 | @base64)},go:{version:(.go.version | @base64),linux_amd64_sha256:(.go.linux_amd64_sha256 | @base64)},no_mistakes:{version:(.no_mistakes.version | @base64),upstream_repository:(.no_mistakes.upstream_repository | @base64),upstream_commit:(.no_mistakes.upstream_commit | @base64),fork_repository:(.no_mistakes.fork_repository | @base64),fork_commit:(.no_mistakes.fork_commit | @base64),fork_release:(.no_mistakes.fork_release | @base64),linux_amd64_sha256:(.no_mistakes.linux_amd64_sha256 | @base64)},worker:{version:(.worker.version | @base64),image_repository:(.worker.image_repository | @base64),release_repository:(.worker.release_repository | @base64)}}`
-	command := exec.Command(jq, "--compact-output", "--arg", "deploy_worker_tree", workerTree, "--arg", "delivery_source_digest_command_tree", deliverySourceDigestCommandTree, "--arg", "delivery_source_digest_package_tree", deliverySourceDigestPackageTree, "--arg", "go_mod_blob", goModBlob, "--arg", "go_sum_blob", goSumBlob, "--arg", "publish_worker_workflow_blob", publisherWorkflow, filter)
-	command.Stdin = bytes.NewReader(configJSON)
-	publisherJSON, err := command.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	publisherCanonicalJSON := strings.TrimRight(string(publisherJSON), "\r\n")
-	goJSON, err := json.Marshal(canonicalizeWorkerBuildInputs(workerBuildInputs{
-		SchemaVersion:                   6,
-		DeployWorkerTree:                workerTree,
-		DeliverySourceDigestCommandTree: deliverySourceDigestCommandTree,
-		DeliverySourceDigestPackageTree: deliverySourceDigestPackageTree,
-		GoModBlob:                       goModBlob,
-		GoSumBlob:                       goSumBlob,
-		PublishWorkerWorkflowBlob:       publisherWorkflow,
-		Codex:                           config.Codex,
-		GitHubCLI:                       config.GitHubCLI,
-		Go:                              config.Go,
-		NoMistakes:                      config.NoMistakes,
-		Worker:                          config.Worker,
+	toolchain := `{"schema_version":7,"codex":{"version":"0.147.0"},"github_cli":{"version":"2.97.0","linux_amd64_sha256":"` + strings.Repeat("a", 64) + `"},"go":{"version":"1.25.12","linux_amd64_sha256":"` + strings.Repeat("b", 64) + `"},"no_mistakes":{"version":"v1","upstream_repository":"owner/upstream","upstream_commit":"` + sha("9") + `","fork_repository":"owner/fork","fork_commit":"` + sha("a") + `","fork_release":"v1","linux_amd64_sha256":"` + strings.Repeat("c", 64) + `"},"worker":{"image_repository":"ghcr.io/skyhuang233/workflow-worker","release_repository":"skyhuang233/ai-engineer-workflow"},"runtime":{},"github":{},"upgrade":{}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/skyhuang233/ai-engineer-workflow/commits/" + commit:
+			fmt.Fprintf(w, `{"sha":"%s","commit":{"tree":{"sha":"%s"}}}`, commit, root)
+		case "/repos/skyhuang233/ai-engineer-workflow/contents/config/toolchain.json":
+			fmt.Fprint(w, toolchain)
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + root:
+			fmt.Fprintf(w, `{"tree":[{"path":"deploy","type":"tree","sha":"%s"},{"path":"cmd","type":"tree","sha":"%s"},{"path":"internal","type":"tree","sha":"%s"},{"path":"go.mod","type":"blob","sha":"%s"},{"path":"go.sum","type":"blob","sha":"%s"},{"path":".github","type":"tree","sha":"%s"}]}`, objects["deploy"], objects["cmd"], objects["internal"], objects["go.mod"], objects["go.sum"], objects[".github"])
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + objects["deploy"]:
+			fmt.Fprintf(w, `{"tree":[{"path":"worker","type":"tree","sha":"%s"}]}`, objects["worker"])
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + objects["cmd"]:
+			fmt.Fprintf(w, `{"tree":[{"path":"delivery-source-digest","type":"tree","sha":"%s"}]}`, objects["digest"])
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + objects["internal"]:
+			fmt.Fprintf(w, `{"tree":[{"path":"deliverysource","type":"tree","sha":"%s"}]}`, objects["source"])
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + objects[".github"]:
+			fmt.Fprintf(w, `{"tree":[{"path":"workflows","type":"tree","sha":"%s"}]}`, objects["workflows"])
+		case "/repos/skyhuang233/ai-engineer-workflow/git/trees/" + objects["workflows"]:
+			fmt.Fprintf(w, `{"tree":[{"path":"publish-workflow.yml","type":"blob","sha":"%s"}]}`, objects["publisher"])
+		default:
+			http.NotFound(w, r)
+		}
 	}))
+	defer server.Close()
+	client := githubapi.NewClient(server.URL, "token", server.Client())
+	input, err := resolveWorkerBuildInput(context.Background(), client, "skyhuang233/ai-engineer-workflow", commit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(goJSON) != publisherCanonicalJSON {
-		t.Fatalf("Go canonical JSON = %s, publisher canonical JSON = %s", goJSON, publisherCanonicalJSON)
+	if input.GitInputs.PublishWorkflowBlob != objects["publisher"] || input.GitInputs.DeployWorkerTree != objects["worker"] {
+		t.Fatalf("resolved wrong build input: %#v", input.GitInputs)
 	}
-	want := fmt.Sprintf("%x", sha256.Sum256([]byte(publisherCanonicalJSON)))
-	if got := workerBuildInputIdentity(config, workerTree, deliverySourceDigestCommandTree, deliverySourceDigestPackageTree, goModBlob, goSumBlob, publisherWorkflow); got != want {
-		t.Fatalf("Go identity = %s, publisher jq identity = %s", got, want)
+	if _, err := input.Identity(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestWorkerReleaseManifestBindsAcceptedInputsToPublishedDigest(t *testing.T) {
+func TestReleaseFetcherRejectsAnUnboundRepositoryBeforeNetwork(t *testing.T) {
 	config := validConfig()
-	manifest := WorkerReleaseManifest{
-		ToolProvenance: workerrelease.ToolProvenance{
-			CodexVersion: config.Codex.Version, GitHubCLIVersion: config.GitHubCLI.Version,
-			GoVersion: config.Go.Version, NoMistakesVersion: config.NoMistakes.Version,
-		},
-		SchemaVersion:                6,
-		WorkerVersion:                config.Worker.Version,
-		SourceCommit:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Image:                        config.Worker.ImageRepository + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		GitHubCLILinuxAMD64SHA256:    config.GitHubCLI.LinuxAMD64SHA256,
-		GoLinuxAMD64SHA256:           config.Go.LinuxAMD64SHA256,
-		NoMistakesUpstreamRepository: config.NoMistakes.UpstreamRepository,
-		NoMistakesUpstreamCommit:     config.NoMistakes.UpstreamCommit,
-		NoMistakesForkRepository:     config.NoMistakes.ForkRepository,
-		NoMistakesForkCommit:         config.NoMistakes.ForkCommit,
-		NoMistakesForkRelease:        config.NoMistakes.ForkRelease,
-		NoMistakesLinuxAMD64SHA256:   config.NoMistakes.LinuxAMD64SHA256,
-		BuildInputIdentity:           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		SBOMSHA256:                   "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		VulnerabilityScan: VulnerabilityScanPolicy{
-			Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true,
-		},
-		GitHubActionsRunID: 123,
-	}
-	if err := manifest.Validate(config); err != nil {
-		t.Fatalf("valid manifest: %v", err)
-	}
-	manifest.SourceCommit = "main"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a floating source revision")
-	}
-	manifest.SourceCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	manifest.NoMistakesForkRelease = "wrong-release"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a different no-mistakes fork release")
-	}
-	manifest.NoMistakesForkRelease = config.NoMistakes.ForkRelease
-	manifest.NoMistakesForkRepository = "wrong/repository"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a different no-mistakes fork repository")
-	}
-	manifest.NoMistakesForkRepository = config.NoMistakes.ForkRepository
-	manifest.NoMistakesUpstreamRepository = "wrong/repository"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a different no-mistakes upstream repository")
-	}
-	manifest.NoMistakesUpstreamRepository = config.NoMistakes.UpstreamRepository
-	manifest.NoMistakesForkCommit = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a different no-mistakes fork commit")
-	}
-	manifest.NoMistakesForkCommit = config.NoMistakes.ForkCommit
-	manifest.SBOMSHA256 = "missing"
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted an unbound Worker SBOM")
-	}
-	manifest.SBOMSHA256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-	manifest.VulnerabilityScan.OnlyFixed = false
-	if err := manifest.Validate(config); err == nil {
-		t.Fatal("manifest accepted a weaker vulnerability policy")
+	if _, _, err := (ReleaseFetcher{WorkflowRepository: "other/repo"}).Fetch(context.Background(), config, "token"); err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

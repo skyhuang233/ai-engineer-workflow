@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
   "repository": "skyhuang233/ai-engineer-workflow",
-  "workflow_path": ".github/workflows/publish-platform.yml",
-  "minimum_platform_version": "0.0.0"
+  "workflow_path": ".github/workflows/publish-workflow.yml",
+  "minimum_workflow_version": "0.0.0"
 }

@@ -36,7 +36,6 @@ func TestConfigRequiresImmutableProductionPins(t *testing.T) {
 		{"fork commit", func(c *Config) { c.NoMistakes.ForkCommit = "main" }},
 		{"fork release", func(c *Config) { c.NoMistakes.ForkRelease = "" }},
 		{"asset checksum", func(c *Config) { c.NoMistakes.LinuxAMD64SHA256 = "latest" }},
-		{"worker version", func(c *Config) { c.Worker.Version = "" }},
 		{"worker image repository", func(c *Config) { c.Worker.ImageRepository = "latest" }},
 		{"release repository", func(c *Config) { c.Worker.ReleaseRepository = "" }},
 		{"release repository owner", func(c *Config) { c.Worker.ReleaseRepository = "collaborator/workflow" }},
@@ -213,7 +212,7 @@ func fakeNoMistakesBuildInfoWithModified(commit, modified string) func(string) (
 
 func validConfig() Config {
 	return Config{
-		SchemaVersion: 6,
+		SchemaVersion: 7,
 		Codex:         ToolPin{Version: "0.147.0"},
 		GitHubCLI:     GitHubCLIPin{Version: "2.97.0", LinuxAMD64SHA256: "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"},
 		Go:            GoPin{Version: "1.25.12", LinuxAMD64SHA256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"},
@@ -227,14 +226,13 @@ func validConfig() Config {
 			LinuxAMD64SHA256:   "bd19d18ba20af1905b0f13ac6b0f9c283d299da48279da7dd0a5ff2242a58d4c",
 		},
 		Worker: WorkerPin{
-			Version:           "0.1.0",
 			ImageRepository:   "ghcr.io/skyhuang233/workflow-worker",
 			ReleaseRepository: "skyhuang233/ai-engineer-workflow",
 		},
 		Runtime: RuntimePolicy{MaxWorkerAttempts: 3},
 		GitHub: GitHubPin{
 			TestRepository: "skyhuang233/workflow-integration-test",
-			DefaultBranch:  "main",
+			DefaultBranch:  "develop",
 			RequiredCheck:  "workflow-contract",
 			WorkflowPath:   ".github/workflows/workflow-contract.yml",
 			Credential: GitHubCredentialPin{
@@ -248,7 +246,7 @@ func validConfig() Config {
 	}
 }
 
-func TestConfigAcceptsClassicPATSchemaSix(t *testing.T) {
+func TestConfigAcceptsClassicPATSchemaSeven(t *testing.T) {
 	config := validConfig()
 	config.GitHub.TestRepository = ""
 	if err := config.Validate(); err != nil {

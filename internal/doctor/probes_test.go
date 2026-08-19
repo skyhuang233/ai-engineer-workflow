@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/store"
-	"github.com/skyhuang233/workflow/internal/workerrelease"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
 type dockerCheckExecutor struct {
@@ -99,11 +99,15 @@ func TestDockerCheckRejectsBuildMetadataFromOtherProbeOutput(t *testing.T) {
 	result := (DockerCheck{
 		Executor: executor,
 		Manifest: WorkerReleaseManifest{
-			ToolProvenance: workerrelease.ToolProvenance{
-				CodexVersion: "0.147.0", GitHubCLIVersion: "2.97.0", GoVersion: "1.25.12", NoMistakesVersion: "v1.41.2",
+			Worker: workflowrelease.Worker{
+				Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				Tools: workflowrelease.Tools{
+					Codex:      workflowrelease.CodexTool{Version: "0.147.0"},
+					GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0"},
+					Go:         workflowrelease.ArchiveTool{Version: "1.25.12"},
+					NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", ForkCommit: forkCommit},
+				},
 			},
-			Image:                "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			NoMistakesForkCommit: forkCommit,
 		},
 	}).Run(context.Background())
 
@@ -137,10 +141,15 @@ func TestDockerCheckRejectsStoppedNoMistakesDaemon(t *testing.T) {
 	result := (DockerCheck{
 		Executor: executor,
 		Manifest: WorkerReleaseManifest{
-			ToolProvenance: workerrelease.ToolProvenance{
-				CodexVersion: "0.147.0", GitHubCLIVersion: "2.97.0", GoVersion: "1.25.12", NoMistakesVersion: "v1.41.2",
+			Worker: workflowrelease.Worker{
+				Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				Tools: workflowrelease.Tools{
+					Codex:      workflowrelease.CodexTool{Version: "0.147.0"},
+					GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0"},
+					Go:         workflowrelease.ArchiveTool{Version: "1.25.12"},
+					NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2"},
+				},
 			},
-			Image: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}).Run(context.Background())
 
@@ -196,8 +205,8 @@ func TestGitHubChecksUseOwnerGuardedReadOnlyContractWithoutBranchProtection(t *t
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"skyhuang233"}`))
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":true}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":true}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
@@ -268,7 +277,7 @@ func TestGitHubCheckRejectsCanonicalIntegrationRepositoryOwnedByAnotherAccount(t
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/repos/skyhuang233/workflow-integration-test" {
-			_, _ = w.Write([]byte(`{"full_name":"collaborator/workflow-integration-test","owner":{"login":"collaborator"},"default_branch":"main","private":true}`))
+			_, _ = w.Write([]byte(`{"full_name":"collaborator/workflow-integration-test","owner":{"login":"collaborator"},"default_branch":"develop","private":true}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -289,8 +298,8 @@ func TestGitHubCheckRejectsUnavailablePinnedUpstreamCommit(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
@@ -317,8 +326,8 @@ func TestGitHubCheckRejectsContractRunFromAnOldDefaultHead(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))
@@ -346,8 +355,8 @@ func TestGitHubCheckRejectsPrivateNoMistakesFork(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
@@ -374,8 +383,8 @@ func TestGitHubCheckRejectsPrivateNoMistakesUpstream(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case strings.HasSuffix(r.URL.Path, "/actions/workflows"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"workflows": []map[string]any{{"id": 7, "path": config.GitHub.WorkflowPath}}})
@@ -403,8 +412,8 @@ func TestGitHubCheckPinsTheIntegrationWorkflowByConfiguredPath(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test":
-			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"main","private":false}`))
-		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/main":
+			_, _ = w.Write([]byte(`{"full_name":"skyhuang233/workflow-integration-test","owner":{"login":"skyhuang233"},"default_branch":"develop","private":false}`))
+		case r.URL.Path == "/repos/skyhuang233/workflow-integration-test/git/ref/heads/develop":
 			_, _ = w.Write([]byte(`{"object":{"sha":"current"}}`))
 		case r.URL.Path == "/repos/skyhuang233/no-mistakes":
 			_, _ = w.Write([]byte(`{"private":false}`))

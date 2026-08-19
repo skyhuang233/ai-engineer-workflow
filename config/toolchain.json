@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "codex": {
     "version": "0.147.0"
   },
@@ -21,7 +21,6 @@
     "linux_amd64_sha256": "af3ecfd4e010d131e998482a577d879cabf2fdb994447724ee1982c32c147c61"
   },
   "worker": {
-    "version": "0.1.0",
     "image_repository": "ghcr.io/skyhuang233/workflow-worker",
     "release_repository": "skyhuang233/ai-engineer-workflow"
   },
@@ -29,7 +28,7 @@
     "max_worker_attempts": 3
   },
   "github": {
-    "default_branch": "main",
+    "default_branch": "develop",
     "required_check": "workflow-contract",
     "workflow_path": ".github/workflows/workflow-contract.yml",
     "credential": {
@@ -40,6 +39,6 @@
     }
   },
   "upgrade": {
-    "rule": "Upgrade only through a verified upstream commit, fork release, asset checksum, accepted main commit, Worker Release Manifest, complete doctor run, and automatic activation for new Worker Runs."
+    "rule": "Upgrade only through a verified upstream commit, fork release, asset checksum, accepted main commit, Workflow Release Manifest, complete doctor run, and automatic activation for new Worker Runs."
   }
 }

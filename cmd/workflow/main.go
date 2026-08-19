@@ -383,10 +383,10 @@ func runDoctor(args []string) {
 				Contains: []string{"resume", "--json", "--output-schema", "--ephemeral"},
 			}},
 		},
-		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Image, AuthFile: *codexAuthFile},
+		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Worker.Image, AuthFile: *codexAuthFile},
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},
-		doctor.WorkerRegistryCheck{Image: manifest.Image},
+		doctor.WorkerRegistryCheck{Image: manifest.Worker.Image},
 	}
 	patVerification, readErr := database.GitHubPATVerification(context.Background())
 	if readErr != nil {
@@ -430,14 +430,14 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	if err := database.ActivateWorkerReleaseFenced(context.Background(), store.WorkerRelease{
-		Version: manifest.WorkerVersion, SourceCommit: manifest.SourceCommit,
-		ImageReference: manifest.Image, ManifestJSON: string(manifestJSON),
+		Version: manifest.Version, SourceCommit: manifest.SourceCommit,
+		ImageReference: manifest.Worker.Image, ManifestJSON: string(manifestJSON),
 		VerifiedAt: report.GeneratedAt, ActivatedAt: report.GeneratedAt,
 	}, expectedActiveImage); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("activated Worker image %s for new Worker Runs\n", manifest.Image)
+	fmt.Printf("activated Worker image %s for new Worker Runs\n", manifest.Worker.Image)
 }
 
 func runTicket(args []string) {
