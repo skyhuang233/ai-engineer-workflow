@@ -87,9 +87,12 @@ jobs:
         shell: bash
         run: |
           staging="${{ steps.identity.outputs.staging }}"
-          if docker pull "$staging"; then
+          pull_error="$(mktemp)"
+          if docker pull "$staging" 2>"$pull_error"; then
+            rm "$pull_error"
             echo "reused=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep --extended-regexp --ignore-case --quiet 'not found|manifest unknown|no such manifest|HTTP 404' "$pull_error"; then
+            rm "$pull_error"
             docker build \
               --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
               --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
@@ -104,6 +107,11 @@ jobs:
               --build-arg "NO_MISTAKES_SHA256=${{ steps.pins.outputs.no_mistakes_linux_amd64_sha256 }}" \
               --tag "$staging" --file deploy/worker/Dockerfile .
             echo "reused=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$pull_error" >&2
+            rm "$pull_error"
+            echo "unable to determine whether the deterministic staging image exists" >&2
+            exit 1
           fi
       - name: Generate Worker SBOM before push
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
