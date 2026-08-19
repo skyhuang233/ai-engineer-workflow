@@ -54,7 +54,7 @@ try {
 Manually invoke `$setup-agent-workflow for the repository at: $repositoryPath
 
 This is the authorized, disposable setup qualification scenario "$scenario" under GitHub owner "$owner".
-Select exact Platform Release version "$platformVersion"; do not fall back to a different stable release.
+Select exact Workflow Release version "$platformVersion"; do not fall back to a different stable release.
 Follow the installed skill exactly. If the directory is not a Git repository, answer yes to its Git initialization question. For every plan_required response, inspect the complete projection and approve only the exact displayed digest, then continue applying and verifying it. When a classic PAT is required, never read, echo, print, place it in an argument, or copy it into an environment variable; pipe the bytes from the file named by WORKFLOW_SETUP_E2E_PAT_FILE directly to the documented verification/apply command from PowerShell. Do not approve effects outside the scenario repository, isolated Workflow Home, current-user Codex skills/PATH, Docker Desktop dependency, and repositories named $owner/workflow-setup-e2e-*.
 
 Positive scenarios clean-new-repository, unrelated-dirty-files, and second-same-owner must finish with both Platform Ready and Repository Admitted. Negative scenarios must stop at the exact expected blocker without weakening or bypassing the contract. Preserve unrelated dirty files byte-for-byte.

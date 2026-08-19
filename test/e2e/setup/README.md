@@ -30,7 +30,7 @@ pwsh ./test/e2e/setup/setup-e2e.ps1 `
 ```
 
 `EntrySkillSpec` is an interface boundary, not a floating source: the release
-pipeline must pin it to the exact produced Platform Release tag or source commit,
+pipeline must pin it to the exact produced Workflow Release tag or source commit,
 never a development checkout or an unpinned branch. The harness resolves the
 operator's source from the redacted machine-readable `codex doctor --json`
 report, verifies its ChatGPT mode and `CODEX_HOME` boundary, and copies it into
