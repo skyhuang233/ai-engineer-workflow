@@ -48,6 +48,13 @@ func TestDriverResultSchemaIsStrictAndComplete(t *testing.T) {
 	}
 }
 
+func TestDriverResultSchemaUsesCodexStructuredOutputsSubset(t *testing.T) {
+	schema := read(t, "driver-result.schema.json")
+	if strings.Contains(schema, `"uniqueItems"`) {
+		t.Fatal("driver result schema uses unsupported Codex Structured Outputs keyword uniqueItems")
+	}
+}
+
 func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
 	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`} {
