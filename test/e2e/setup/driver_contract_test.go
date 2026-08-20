@@ -16,6 +16,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT_FILE`,
 		`WORKFLOW_SETUP_QUALIFICATION`, `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, `WORKFLOW_SETUP_CANDIDATE_VERSION`, `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`,
 		`Do not query, download, or require a published GitHub Release`,
+		`git init -b main`, `Do not reuse an earlier approved digest after any plan command failure`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
@@ -27,6 +28,24 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 	for _, line := range strings.Split(driver, "\n") {
 		if strings.Contains(line, "codex exec") && strings.Contains(line, "WORKFLOW_SETUP_E2E_PAT") {
 			t.Fatal("Codex DriverScript places the PAT on the Codex command line")
+		}
+	}
+}
+
+func TestSetupSkillPinsFreshRepositoryMainAndExactOnboardingJSON(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "skills", "setup-agent-workflow", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill := string(raw)
+	for _, required := range []string{
+		"git init -b main",
+		"Never initialize an unpublished repository with the machine's implicit default branch",
+		"Do not reuse an earlier approved digest after any plan command failure",
+		"one JSON object on stdin",
+	} {
+		if !strings.Contains(skill, required) {
+			t.Fatalf("Setup Skill lacks fresh-repository/Onboarding contract %q", required)
 		}
 	}
 }

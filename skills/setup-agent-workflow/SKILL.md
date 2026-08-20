@@ -11,6 +11,11 @@ absolute local Workflow Home (default `%LOCALAPPDATA%\AgentWorkflow`) and one
 classic GitHub PAT with `repo,workflow`; never put the PAT in command arguments
 or ordinary output.
 
+If the current unpublished directory is not yet a Git repository, ask whether
+to initialize it. After acceptance run exactly `git init -b main`.
+Never initialize an unpublished repository with the machine's implicit default branch;
+the first Delivery Plan must use the supported `main` delivery base.
+
 The download contract is one atomic private Workflow Release. Query only the
 fixed repository in `trust/release-policy.json` with the Control Plane PAT.
 Accept only a published, immutable, non-prerelease `workflow-vX.Y.Z` Release,
@@ -120,8 +125,14 @@ fields, but stop on unknown statuses or malformed known evidence.
    automatic rollback.
 5. Use the active versioned CLI only for Repository Onboarding. Generate,
    display, approve, apply, and verify the exact Onboarding Plan Digest for
-   this current repository. Finish only at Platform Ready and Repository
-   Admitted.
+   this current repository.
+   Send the exact `$plan.onboarding_plan` as one JSON object on stdin using the
+   command shape below; do not join, reconstruct, or
+   wrap native command output.
+   Do not reuse an earlier approved digest after any plan command failure:
+   regenerate the complete Plan, display its current
+   projection and digest, and obtain approval again. Finish only at Platform
+   Ready and Repository Admitted.
 
 The Launcher owns generation state, migration, active-work fencing, Docker and
 worker preparation, PATH reconciliation, and Control Plane lifecycle. The
