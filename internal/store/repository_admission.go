@@ -17,12 +17,51 @@ type RepositoryAdmission struct {
 	VerifiedAt                 time.Time
 }
 
-func (s *Store) RecordRepositoryAdmission(ctx context.Context, value RepositoryAdmission) error {
+type repositoryRecordExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func validateRepositoryAdmission(value RepositoryAdmission) error {
 	if value.Repository == "" || !fingerprintPattern.MatchString(value.OnboardingPlanDigestSHA256) || value.ContractVersion == "" || !fingerprintPattern.MatchString(value.ManifestDigestSHA256) || value.VerifiedAt.IsZero() {
 		return errors.New("invalid Repository Admission")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO repository_admissions(repository,onboarding_plan_digest_sha256,contract_version,manifest_digest_sha256,eligible,suspension_reason,verified_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET onboarding_plan_digest_sha256=excluded.onboarding_plan_digest_sha256,contract_version=excluded.contract_version,manifest_digest_sha256=excluded.manifest_digest_sha256,eligible=excluded.eligible,suspension_reason=excluded.suspension_reason,verified_at=excluded.verified_at`, value.Repository, value.OnboardingPlanDigestSHA256, value.ContractVersion, value.ManifestDigestSHA256, boolInt(value.Eligible), value.SuspensionReason, formatTimestamp(value.VerifiedAt))
+	return nil
+}
+
+func recordRepositoryAdmission(ctx context.Context, executor repositoryRecordExecutor, value RepositoryAdmission) error {
+	if err := validateRepositoryAdmission(value); err != nil {
+		return err
+	}
+	_, err := executor.ExecContext(ctx, `INSERT INTO repository_admissions(repository,onboarding_plan_digest_sha256,contract_version,manifest_digest_sha256,eligible,suspension_reason,verified_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET onboarding_plan_digest_sha256=excluded.onboarding_plan_digest_sha256,contract_version=excluded.contract_version,manifest_digest_sha256=excluded.manifest_digest_sha256,eligible=excluded.eligible,suspension_reason=excluded.suspension_reason,verified_at=excluded.verified_at`, value.Repository, value.OnboardingPlanDigestSHA256, value.ContractVersion, value.ManifestDigestSHA256, boolInt(value.Eligible), value.SuspensionReason, formatTimestamp(value.VerifiedAt))
 	return err
+}
+
+func (s *Store) RecordRepositoryAdmission(ctx context.Context, value RepositoryAdmission) error {
+	return recordRepositoryAdmission(ctx, s.db, value)
+}
+
+func (s *Store) RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx context.Context, admission RepositoryAdmission, runtime RepositoryRuntimeConfiguration) error {
+	if err := validateRepositoryAdmission(admission); err != nil {
+		return err
+	}
+	if err := runtime.Validate(); err != nil {
+		return err
+	}
+	if admission.Repository != runtime.Repository {
+		return errors.New("Repository Admission and runtime configuration repositories differ")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := recordRepositoryAdmission(ctx, tx, admission); err != nil {
+		return err
+	}
+	if err := recordRepositoryRuntimeConfiguration(ctx, tx, runtime, repositoryRuntimePreserveConflict); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RepositoryAdmission(ctx context.Context, repository string) (RepositoryAdmission, error) {

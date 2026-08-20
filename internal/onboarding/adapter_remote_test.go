@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -300,6 +301,33 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	}
 	if runtime.Repository != effect.Subject || runtime.DefaultBranch != "main" || runtime.SourcePath != repositoryPath || runtime.RootIssueNumber != 0 {
 		t.Fatalf("runtime configuration seed = %#v", runtime)
+	}
+}
+
+func TestRepositoryAdmissionReadbackRetriesMissingRuntimeSeed(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	digest := strings.Repeat("a", 64)
+	manifestDigest := strings.Repeat("b", 64)
+	if err := database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifestDigest, Eligible: true, VerifiedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	effect := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": manifestDigest, "contract_version": "1"}}
+	adapter := RepositoryAdapter{Remote: &memoryRemote{}, Store: database, PlanDigest: digest, RepositoryPath: filepath.Join(t.TempDir(), "repo")}
+	status, _, err := adapter.Readback(ctx, effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("partial admission readback = %s, %v", status, err)
+	}
+	if err := adapter.Apply(ctx, effect); err != nil {
+		t.Fatalf("retry partial admission: %v", err)
+	}
+	if _, err := database.RepositoryRuntimeConfiguration(ctx, effect.Subject); err != nil {
+		t.Fatalf("retry did not repair runtime seed: %v", err)
 	}
 }
 

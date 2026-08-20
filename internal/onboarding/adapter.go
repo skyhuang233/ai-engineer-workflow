@@ -158,6 +158,11 @@ func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.E
 		if record.OnboardingPlanDigestSHA256 != a.PlanDigest || record.ContractVersion != effect.Parameters["contract_version"] || record.ManifestDigestSHA256 != effect.Parameters["manifest_digest"] || !record.Eligible {
 			return setupcontract.EffectConflicting, "Repository Admission record differs from the exact approved onboarding", nil
 		}
+		if _, err := a.Store.RepositoryRuntimeConfiguration(ctx, effect.Subject); errors.Is(err, store.ErrNotFound) {
+			return setupcontract.EffectRequired, "Repository Runtime Configuration seed is absent", nil
+		} else if err != nil {
+			return setupcontract.EffectFailed, "", err
+		}
 		if err := a.Remote.VerifyContract(ctx, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"]); err != nil {
 			if errors.Is(err, ErrRepositoryContractNotFound) {
 				return setupcontract.EffectRequired, "managed Repository Contract is absent", nil
@@ -341,15 +346,7 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 			return err
 		}
 		now := nowUTC()
-		if err := a.Store.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: now}); err != nil {
-			return err
-		}
-		if _, err := a.Store.RepositoryRuntimeConfiguration(ctx, effect.Subject); err == nil {
-			return nil
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return err
-		}
-		return a.Store.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{
+		return a.Store.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: now}, store.RepositoryRuntimeConfiguration{
 			Repository:         effect.Subject,
 			DefaultBranch:      effect.Parameters["default_branch"],
 			SourcePath:         a.RepositoryPath,
