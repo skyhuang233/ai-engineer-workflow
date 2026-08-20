@@ -22,18 +22,25 @@ if (-not (Test-Path -LiteralPath $patInputPath -PathType Leaf)) { throw "WORKFLO
 $setupToken = [IO.File]::ReadAllText($patInputPath).Trim()
 if ([string]::IsNullOrWhiteSpace($setupToken)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is empty" }
 if (-not (Test-Path -LiteralPath $repositoryPath -PathType Container)) { throw "Scenario repository does not exist" }
-if ($entrySkillSpec -notmatch '@(workflow-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must pin an exact release tag or commit" }
+$qualificationMode = $env:WORKFLOW_SETUP_QUALIFICATION -ceq "1"
+if (-not $qualificationMode -and $entrySkillSpec -notmatch '#workflow-v[0-9A-Za-z._-]+$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must use the skills CLI #workflow-v Git ref syntax" }
 
 $qualificationInstruction = ""
-if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq "1") {
+if ($qualificationMode) {
     $candidateDirectory = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_CANDIDATE_DIRECTORY"))
     $candidateVersion = Require-Environment "WORKFLOW_SETUP_CANDIDATE_VERSION"
     $candidateSourceCommit = Require-Environment "WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT"
     if (-not (Test-Path -LiteralPath $candidateDirectory -PathType Container)) { throw "WORKFLOW_SETUP_CANDIDATE_DIRECTORY is unavailable" }
     if ($candidateVersion -cne $platformVersion) { throw "Workflow qualification candidate version differs from the requested Platform version" }
-    if ($candidateSourceCommit -cnotmatch '^[0-9a-f]{40}$' -or -not $entrySkillSpec.EndsWith("@$candidateSourceCommit", [StringComparison]::OrdinalIgnoreCase)) { throw "Workflow qualification candidate source differs from the pinned Setup Skill source" }
+    if ($candidateSourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw "Workflow qualification candidate source commit is invalid" }
+    $entrySkillSpec = [IO.Path]::GetFullPath($entrySkillSpec)
+    if (-not (Test-Path -LiteralPath (Join-Path $entrySkillSpec ".git") -PathType Container)) { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must be a local qualification checkout" }
+    $entryHead = [string](git -C $entrySkillSpec rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0 -or $entryHead.Trim() -cne $candidateSourceCommit) { throw "local qualification checkout HEAD differs from WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT" }
+    $entrySkillStatus = [string](git -C $entrySkillSpec status --porcelain=v1 -- skills/setup-agent-workflow)
+    if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($entrySkillStatus)) { throw "local qualification checkout has uncommitted Setup Skill changes" }
     $qualificationInstruction = @"
-This is release-branch qualification with WORKFLOW_SETUP_QUALIFICATION=1. Immediately use the installed skill's explicit test-only candidate acquisition boundary with the exact WORKFLOW_SETUP_CANDIDATE_DIRECTORY, WORKFLOW_SETUP_CANDIDATE_VERSION, and WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT values already present in the process environment. Do not query, download, or require a published GitHub Release. Do not fall back from the candidate path to published acquisition.
+This is release-branch qualification with WORKFLOW_SETUP_QUALIFICATION=1. The Setup Skill was installed from the exact local qualification checkout whose git rev-parse HEAD equals WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT. Immediately use the installed skill's explicit test-only candidate acquisition boundary with the exact WORKFLOW_SETUP_CANDIDATE_DIRECTORY, WORKFLOW_SETUP_CANDIDATE_VERSION, and WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT values already present in the process environment. Do not query, download, or require a published GitHub Release. Do not fall back from the candidate path to published acquisition.
 "@
 }
 

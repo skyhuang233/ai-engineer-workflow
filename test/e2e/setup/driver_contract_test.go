@@ -15,6 +15,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 	for _, required := range []string{
 		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT_FILE`,
 		`WORKFLOW_SETUP_QUALIFICATION`, `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, `WORKFLOW_SETUP_CANDIDATE_VERSION`, `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`,
+		`local qualification checkout`, `git rev-parse HEAD`, `#workflow-v`,
 		`Do not query, download, or require a published GitHub Release`,
 		`git init -b main`, `Do not reuse an earlier approved digest after any plan command failure`,
 		`powershell.exe -NoProfile -NonInteractive -File`, `verify-github-pat.ps1`,
@@ -31,6 +32,20 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		if strings.Contains(line, "codex exec") && strings.Contains(line, "WORKFLOW_SETUP_E2E_PAT") {
 			t.Fatal("Codex DriverScript places the PAT on the Codex command line")
 		}
+	}
+}
+
+func TestReadmePinsSetupSkillToImmutableWorkflowReleaseRef(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+	if !strings.Contains(readme, "skyhuang233/ai-engineer-workflow#workflow-v0.0.1") {
+		t.Fatal("README setup command is not pinned with the skills CLI Git ref syntax")
+	}
+	if strings.Contains(readme, "skills@latest add skyhuang233/ai-engineer-workflow --skill setup-agent-workflow") {
+		t.Fatal("README setup command still acquires the default branch")
 	}
 }
 
@@ -86,7 +101,7 @@ func TestDriverResultSchemaUsesCodexStructuredOutputsSubset(t *testing.T) {
 
 func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
-	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`} {
+	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`, `#workflow-v`, `local qualification checkout`, `git rev-parse HEAD`} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("setup harness lacks %q", required)
 		}

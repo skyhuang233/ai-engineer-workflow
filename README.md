@@ -7,7 +7,7 @@ Agent Workflow turns a Windows machine into a single-host Control Plane and admi
 Install the manually invoked Codex skill:
 
 ```powershell
-npx skills@latest add skyhuang233/ai-engineer-workflow --skill setup-agent-workflow --agent codex -g -y
+npx skills@latest add "skyhuang233/ai-engineer-workflow#workflow-v0.0.1" --skill setup-agent-workflow --agent codex -g -y
 ```
 
 Open Codex in the repository directory and invoke:

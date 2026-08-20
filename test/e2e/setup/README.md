@@ -6,7 +6,7 @@ classic PAT in `WORKFLOW_SETUP_E2E_PAT`, a disposable GitHub owner, and a releas
 pipeline driver capable of invoking `$setup-agent-workflow` and approving the
 declared plans. The repository-owned `codex-driver.ps1` is the reference
 `DriverScript`: it runs the README `npx skills@latest add` command against an
-exact release tag or commit, runs `codex exec` with the strict result schema, approves only the
+exact `#workflow-v...` release tag, runs `codex exec` with the strict result schema, approves only the
 displayed setup-plan digests, and records disposable repositories for cleanup.
 
 The driver receives an isolated user profile, Codex home, Workflow Home, target
@@ -24,14 +24,16 @@ $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = "<separate cleanup credential with list/
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <disposable-owner> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
+  -EntrySkillSpec "skyhuang233/ai-engineer-workflow#workflow-vX.Y.Z" `
   -PlatformVersion X.Y.Z `
   -DifferentOwnerRepository <public-owner/public-repository>
 ```
 
 `EntrySkillSpec` is an interface boundary, not a floating source: the release
-pipeline must pin it to the exact produced Workflow Release tag or source commit,
-never a development checkout or an unpinned branch. The harness resolves the
+pipeline must pin it to the exact produced Workflow Release tag with the skills
+CLI `#workflow-v...` Git ref syntax, never an unpinned branch. Release-branch
+qualification instead passes the local qualification checkout and proves its
+`git rev-parse HEAD` equals `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`. The harness resolves the
 operator's source from the redacted machine-readable `codex doctor --json`
 report, verifies its ChatGPT mode and `CODEX_HOME` boundary, and copies it into
 the disposable profile; the driver never captures or reports its contents. The
@@ -54,7 +56,7 @@ mismatch cannot mask it:
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <organization-that-rejects-classic-pats> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
-  -EntrySkillSpec skyhuang233/ai-engineer-workflow@workflow-vX.Y.Z `
+  -EntrySkillSpec "skyhuang233/ai-engineer-workflow#workflow-vX.Y.Z" `
   -PlatformVersion X.Y.Z `
   -QualificationMode organization-policy `
   -ClassicPATRejectedRepository <organization/public-fixture>

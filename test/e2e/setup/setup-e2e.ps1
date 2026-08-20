@@ -15,7 +15,16 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") { throw "Workflow
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN)) { throw "WORKFLOW_SETUP_E2E_CLEANUP_TOKEN with repository listing and deletion capability is required" }
 if (-not (Test-Path -LiteralPath $DriverScript -PathType Leaf)) { throw "DriverScript does not exist" }
-if ($EntrySkillSpec -notmatch '@(workflow-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "EntrySkillSpec must pin an exact published release tag or commit" }
+$qualificationMode = $env:WORKFLOW_SETUP_QUALIFICATION -eq "1"
+if ($qualificationMode) {
+    # Bind the local qualification checkout with git rev-parse HEAD before any skill executes.
+    $EntrySkillSpec = [IO.Path]::GetFullPath($EntrySkillSpec)
+    if (-not (Test-Path -LiteralPath (Join-Path $EntrySkillSpec ".git") -PathType Container)) { throw "EntrySkillSpec must be a local qualification checkout" }
+    $entryHead = [string](git -C $EntrySkillSpec rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0 -or $entryHead.Trim() -cne $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT) { throw "local qualification checkout HEAD differs from the candidate source commit" }
+} elseif ($EntrySkillSpec -notmatch '#workflow-v[0-9A-Za-z._-]+$') {
+    throw "EntrySkillSpec must use the skills CLI #workflow-v Git ref syntax"
+}
 if ($QualificationMode -eq "standard" -and [string]::IsNullOrWhiteSpace($DifferentOwnerRepository)) { throw "DifferentOwnerRepository is required for the standard qualification" }
 if ($QualificationMode -eq "organization-policy" -and [string]::IsNullOrWhiteSpace($ClassicPATRejectedRepository)) { throw "ClassicPATRejectedRepository is required for organization-policy qualification" }
 
