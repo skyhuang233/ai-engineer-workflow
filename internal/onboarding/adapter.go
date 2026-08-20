@@ -340,7 +340,25 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 		if err := a.Remote.VerifyContract(ctx, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"]); err != nil {
 			return err
 		}
-		return a.Store.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: nowUTC()})
+		now := nowUTC()
+		if err := a.Store.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: now}); err != nil {
+			return err
+		}
+		if _, err := a.Store.RepositoryRuntimeConfiguration(ctx, effect.Subject); err == nil {
+			return nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		return a.Store.RecordRepositoryRuntimeConfiguration(ctx, store.RepositoryRuntimeConfiguration{
+			Repository:         effect.Subject,
+			DefaultBranch:      effect.Parameters["default_branch"],
+			SourcePath:         a.RepositoryPath,
+			GitHubAPIURL:       "https://api.github.com",
+			PollInterval:       time.Minute,
+			WorkspaceRetention: 7 * 24 * time.Hour,
+			MaxParallelRuns:    1,
+			UpdatedAt:          now,
+		})
 	case "initial_baseline":
 		var files []BaselineFile
 		if err := json.Unmarshal([]byte(effect.Parameters["files_json"]), &files); err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,10 +16,16 @@ import (
 func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	repositoryRoot := filepath.Join("..", "..")
 	root := t.TempDir()
+	configPath := filepath.Join(repositoryRoot, "config", "workflow-release.json")
+	config, err := workflowrelease.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	workflowExecutable := filepath.Join(root, "workflow.exe")
 	versionProbeSource := filepath.Join(root, "version-probe.go")
-	if err := os.WriteFile(versionProbeSource, []byte("package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"workflow 0.0.0\")}\n"), 0o600); err != nil {
+	versionProbe := fmt.Sprintf("package main\nimport \"fmt\"\nfunc main(){fmt.Println(%q)}\n", "workflow "+config.Version)
+	if err := os.WriteFile(versionProbeSource, []byte(versionProbe), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	build := exec.Command("go", "build", "-o", workflowExecutable, versionProbeSource)
@@ -47,7 +54,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	image := workflowrelease.WorkerRepository + "@sha256:" + strings.Repeat("c", 64)
 	if err := run([]string{
 		"assemble",
-		"-config", filepath.Join(repositoryRoot, "config", "workflow-release.json"),
+		"-config", configPath,
 		"-toolchain", filepath.Join(repositoryRoot, "config", "toolchain.json"),
 		"-workflow-exe", workflowExecutable,
 		"-setup-exe", setupExecutable,
@@ -82,7 +89,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Worker.Image != image || manifest.Version != "0.0.0" || manifest.Worker.Tools.NoMistakes.Commit == "" {
+	if manifest.Worker.Image != image || manifest.Version != config.Version || manifest.Worker.Tools.NoMistakes.Commit == "" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 }

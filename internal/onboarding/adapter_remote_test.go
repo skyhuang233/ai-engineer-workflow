@@ -278,7 +278,8 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	defer database.Close()
 	effect := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": strings.Repeat("b", 64), "contract_version": "1"}}
 	remote := &memoryRemote{contractErr: errors.New("remote contract unavailable")}
-	adapter := RepositoryAdapter{Remote: remote, Store: database, PlanDigest: strings.Repeat("a", 64)}
+	repositoryPath := filepath.Join(t.TempDir(), "repo")
+	adapter := RepositoryAdapter{Remote: remote, Store: database, PlanDigest: strings.Repeat("a", 64), RepositoryPath: repositoryPath}
 	if err := adapter.Apply(context.Background(), effect); err == nil {
 		t.Fatal("admission was recorded without a live contract")
 	}
@@ -292,6 +293,13 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	record, err := database.RepositoryAdmission(context.Background(), effect.Subject)
 	if err != nil || !record.Eligible {
 		t.Fatalf("live verification did not record eligible admission: %#v,%v", record, err)
+	}
+	runtime, err := database.RepositoryRuntimeConfiguration(context.Background(), effect.Subject)
+	if err != nil {
+		t.Fatalf("clean Repository Admission did not seed runtime configuration: %v", err)
+	}
+	if runtime.Repository != effect.Subject || runtime.DefaultBranch != "main" || runtime.SourcePath != repositoryPath || runtime.RootIssueNumber != 0 {
+		t.Fatalf("runtime configuration seed = %#v", runtime)
 	}
 }
 
