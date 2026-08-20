@@ -24,6 +24,10 @@ After the fully published ticket graph for a newly created or newly activated Pl
 workflow runtime-configure --source (git rev-parse --show-toplevel) --root <plan-root-issue-number>
 ```
 
-This is Workflow bookkeeping, not a user step or approval. If publication, activation, or binding fails, report the Plan Root operation as incomplete and do not claim execution started.
+This is Workflow bookkeeping, not a user step or approval. The binding completes
+the admitted runtime configuration and creates the repository Workspace and
+Codex state roots before it succeeds. If publication, activation, or binding
+fails, report the Plan Root operation as incomplete and do not claim execution
+started.
 
 The Workflow CLI resolves ChatGPT authentication through `codex doctor --json` and verifies `codex login status`; it must not ask the user to locate a private Codex file.

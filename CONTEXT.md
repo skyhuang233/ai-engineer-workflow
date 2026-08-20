@@ -21,5 +21,5 @@ _Avoid_: no-mistakes Release, fork Release provenance, build-input identity
 The first Workflow Release, `workflow-v0.0.1`, qualified from the documented
 clean Windows setup through Platform Ready and Repository Admitted, then through
 a real minimal Delivery Plan whose pull request is human-merged and whose Ticket
-becomes Delivered.
+becomes Delivered, after which its Plan Root becomes Completed.
 _Avoid_: setup-only release, first installable build

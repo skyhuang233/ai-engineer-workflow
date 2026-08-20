@@ -80,6 +80,17 @@ func TestRuntimeConfigureCreatesCleanRepositoryRuntimeDirectories(t *testing.T) 
 	}, &output); err != nil {
 		t.Fatal(err)
 	}
+	var result struct {
+		Status          string `json:"status"`
+		Repository      string `json:"repository"`
+		RootIssueNumber int64  `json:"root_issue_number"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatalf("runtime-configure output = %q: %v", output.String(), err)
+	}
+	if result.Status != "configured" || result.Repository != "owner/repository" || result.RootIssueNumber != 2 {
+		t.Fatalf("runtime-configure result = %#v", result)
+	}
 
 	database, err = store.OpenActivated(ctx, databasePath)
 	if err != nil {
@@ -102,4 +113,6 @@ func TestRuntimeConfigureCreatesCleanRepositoryRuntimeDirectories(t *testing.T) 
 			t.Fatalf("%s %q is not a directory", name, path)
 		}
 	}
+	t.Logf("runtime-configure output: %s", strings.TrimSpace(output.String()))
+	t.Logf("repository runtime directories exist: workspace=%q state=%q", configuration.WorkspaceRoot, configuration.StateRoot)
 }

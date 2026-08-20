@@ -302,6 +302,7 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	if runtime.Repository != effect.Subject || runtime.DefaultBranch != "main" || runtime.SourcePath != repositoryPath || runtime.RootIssueNumber != 0 {
 		t.Fatalf("runtime configuration seed = %#v", runtime)
 	}
+	t.Logf("Repository Admitted after live verification; initial runtime seed repository=%s branch=%s source=%q root=%d", runtime.Repository, runtime.DefaultBranch, runtime.SourcePath, runtime.RootIssueNumber)
 }
 
 func TestRepositoryAdmissionReadbackRetriesMissingRuntimeSeed(t *testing.T) {
