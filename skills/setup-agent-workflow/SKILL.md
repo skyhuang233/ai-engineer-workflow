@@ -11,6 +11,8 @@ absolute local Workflow Home (default `%LOCALAPPDATA%\AgentWorkflow`) and one
 classic GitHub PAT with `repo,workflow`; never put the PAT in command arguments
 or ordinary output.
 
+PAT verification must succeed before any GitHub mutation. Never call gh repo create or push the Onboarding target directly. Repository creation, baseline push, and contract Pull Request creation are owned exclusively by the exact approved `workflow onboarding apply` execution.
+
 If the current unpublished directory is not yet a Git repository, ask whether
 to initialize it. After acceptance run exactly `git init -b main`.
 Never initialize an unpublished repository with the machine's implicit default branch;
