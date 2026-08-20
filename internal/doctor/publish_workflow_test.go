@@ -133,6 +133,7 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 		"packages: write",
 		"Scan qualification Worker dependencies without blocking functional qualification",
 		"fail-build: false",
+		"image: ${{ steps.image.outputs.reference }}",
 		`docker push "$candidate"`,
 		`docker buildx imagetools inspect "$image"`,
 		"qualification_image: ${{ steps.qualification-image.outputs.image }}",
@@ -144,6 +145,12 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 	}
 	if strings.Contains(text, "$dryRunDigest") || strings.Contains(text, "GetBytes('dry-run')") {
 		t.Fatal("qualification candidate retains a synthetic Worker image digest")
+	}
+	if strings.Contains(text, "workflow-worker:candidate-") {
+		t.Fatal("qualification candidate retains the retired local Worker image tag")
+	}
+	if strings.Count(text, "${{ steps.image.outputs.reference }}") != 3 {
+		t.Fatal("qualification candidate does not consistently consume the emitted Worker image reference")
 	}
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
 	scan := strings.Index(publisher, "name: Scan Worker before push")

@@ -147,7 +147,7 @@ jobs:
         if: steps.worker-changes.outputs.required == 'true'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          image: workflow-worker:candidate-${{ github.event.pull_request.head.sha }}
+          image: ${{ steps.image.outputs.reference }}
           format: spdx-json
           output-file: worker-sbom.spdx.json
           upload-artifact: false
