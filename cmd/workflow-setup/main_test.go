@@ -38,6 +38,46 @@ func (packagedLifecycle) Stop(context.Context, string, launcher.Active) error  {
 func (packagedLifecycle) Start(context.Context, string, launcher.Active) error { return nil }
 func (packagedLifecycle) Ready(context.Context, string, launcher.Active) error { return nil }
 
+func TestDispatcherForwardsOrdinaryCommandStandardInput(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	generation := strings.Repeat("a", 64)
+	versioned := filepath.Join(home, "platform", "generations", generation, "workflow.exe")
+	if err := os.MkdirAll(filepath.Dir(versioned), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helperSource := filepath.Join(root, "stdin-echo.go")
+	if err := os.WriteFile(helperSource, []byte(`package main
+import ("io"; "os")
+func main() { _, _ = io.Copy(os.Stdout, os.Stdin) }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", versioned, helperSource)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build stdin helper: %v\n%s", err, output)
+	}
+	active := launcher.Active{SchemaVersion: 1, Generation: generation, Version: "0.0.1", BundleDigest: "sha256:" + generation, AttemptID: "attempt", ConsentID: "consent", Readiness: "ready"}
+	raw, err := json.Marshal(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "platform"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"exact":"onboarding-plan"}`)
+	var output bytes.Buffer
+	if err := dispatch([]string{"echo", "--workflow-home", home}, bytes.NewReader(input), &output); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), input) {
+		t.Fatalf("ordinary command stdin = %q, want %q", output.Bytes(), input)
+	}
+}
+
 func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *testing.T) {
 	root := t.TempDir()
 	launcherSource := filepath.Join(root, "workflow-setup.exe")

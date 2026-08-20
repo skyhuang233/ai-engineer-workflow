@@ -59,6 +59,12 @@ verifier authenticates and inspects the archive before `$launcher` is assigned
 or invoked:
 
 ```powershell
+$patVerification = $pat | powershell.exe -NoProfile -NonInteractive -File `
+  "$skillRoot\scripts\verify-github-pat.ps1" `
+  -Owner $owner -RepositoryName $repositoryName `
+  -Visibility $visibility -PublicationState $publicationState | ConvertFrom-Json
+# verify-github-pat.ps1 reads [Console]::In.
+# Do not pipe the PAT to verify-github-pat.ps1 through PowerShell's call operator (`| &`); invoke the native powershell.exe process exactly as above so it receives standard input.
 if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
   $release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
     -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `

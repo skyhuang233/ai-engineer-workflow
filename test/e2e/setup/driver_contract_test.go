@@ -17,6 +17,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		`WORKFLOW_SETUP_QUALIFICATION`, `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, `WORKFLOW_SETUP_CANDIDATE_VERSION`, `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`,
 		`Do not query, download, or require a published GitHub Release`,
 		`git init -b main`, `Do not reuse an earlier approved digest after any plan command failure`,
+		`powershell.exe -NoProfile -NonInteractive -File`, `verify-github-pat.ps1`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
@@ -43,6 +44,9 @@ func TestSetupSkillPinsFreshRepositoryMainAndExactOnboardingJSON(t *testing.T) {
 		"Never initialize an unpublished repository with the machine's implicit default branch",
 		"Do not reuse an earlier approved digest after any plan command failure",
 		"one JSON object on stdin",
+		"powershell.exe -NoProfile -NonInteractive -File",
+		"verify-github-pat.ps1",
+		"Do not pipe the PAT to verify-github-pat.ps1 through PowerShell's call operator",
 	} {
 		if !strings.Contains(skill, required) {
 			t.Fatalf("Setup Skill lacks fresh-repository/Onboarding contract %q", required)
