@@ -67,7 +67,8 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 	}
 	switch operation {
 	case "plan":
-		plan, err := onboarding.Plan(ctx, onboarding.PlanOptions{RepositoryPath: *repositoryPath, WorkflowHome: *home, Owner: session.owner, AuthenticatedLogin: session.login, Remote: githubRemoteHead{remote: githubOnboardingRemote{client: session.client, owner: session.owner}}, Policy: session.client, Publication: session.client, PlatformReleaseDigest: strings.TrimPrefix(active.BundleDigest, "sha256:")})
+		remote := githubOnboardingRemote{client: session.client, owner: session.owner}
+		plan, err := onboarding.Plan(ctx, onboarding.PlanOptions{RepositoryPath: *repositoryPath, WorkflowHome: *home, Owner: session.owner, AuthenticatedLogin: session.login, Remote: githubRemoteHead{remote: remote}, Labels: requiredWorkflowLabels(), Policy: session.client, Publication: session.client, State: onboardingCurrentState{Client: session.client, Store: database}, PlatformReleaseDigest: strings.TrimPrefix(active.BundleDigest, "sha256:")})
 		if err != nil {
 			return err
 		}

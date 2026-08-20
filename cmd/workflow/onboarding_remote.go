@@ -11,6 +11,7 @@ import (
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/onboarding"
 	"github.com/skyhuang233/workflow/internal/repositorycontract"
+	"github.com/skyhuang233/workflow/internal/store"
 )
 
 // githubOnboardingRemote translates the narrow onboarding boundary to GitHub's
@@ -18,6 +19,56 @@ import (
 type githubOnboardingRemote struct {
 	client *workflowgithub.Client
 	owner  string
+}
+
+func requiredWorkflowLabels() []onboarding.Label {
+	return []onboarding.Label{
+		{Name: "workflow:inbox", Color: "5319e7", Description: "Agent Workflow inbox"},
+		{Name: "workflow:plan", Color: "0e8a16", Description: "Agent Workflow delivery plan"},
+		{Name: "workflow:ticket", Color: "1d76db", Description: "Agent Workflow executable ticket"},
+		{Name: "workflow:active", Color: "fbca04", Description: "Agent Workflow active work"},
+		{Name: "workflow:delivered", Color: "006b75", Description: "Agent Workflow delivered work"},
+	}
+}
+
+type onboardingCurrentState struct {
+	Client *workflowgithub.Client
+	Store  *store.Store
+}
+
+func (d onboardingCurrentState) DiscoverOnboardingState(ctx context.Context, repository, branch, manifestDigest string, labels []onboarding.Label) (onboarding.OnboardingState, error) {
+	if d.Client == nil || d.Store == nil {
+		return onboarding.OnboardingState{}, errors.New("onboarding state discovery is incomplete")
+	}
+	result := onboarding.OnboardingState{SatisfiedLabels: map[string]bool{}}
+	for _, expected := range labels {
+		actual, err := d.Client.Label(ctx, repository, expected.Name)
+		if workflowgithub.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return result, err
+		}
+		result.SatisfiedLabels[expected.Name] = strings.EqualFold(actual.Color, expected.Color) && actual.Description == expected.Description
+	}
+	var fetchErr error
+	_, contractErr := repositorycontract.VerifyRemote(func(path string) ([]byte, error) {
+		content, err := d.Client.RepositoryFile(ctx, repository, path, branch)
+		if err != nil && fetchErr == nil {
+			fetchErr = err
+		}
+		return content, err
+	}, repository, branch, manifestDigest)
+	if fetchErr != nil && !workflowgithub.IsNotFound(fetchErr) {
+		return result, fetchErr
+	}
+	result.ContractSatisfied = contractErr == nil
+	if admission, err := d.Store.RepositoryAdmission(ctx, repository); err == nil {
+		result.AdmissionSatisfied = result.ContractSatisfied && admission.Eligible && admission.ManifestDigestSHA256 == manifestDigest && admission.ContractVersion == "1"
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return result, err
+	}
+	return result, nil
 }
 
 func (r githubOnboardingRemote) Repository(ctx context.Context, repository string) (onboarding.RepositoryPolicy, error) {
