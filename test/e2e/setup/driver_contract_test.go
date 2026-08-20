@@ -20,6 +20,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		`git init -b main`, `Do not reuse an earlier approved digest after any plan command failure`,
 		`powershell.exe -NoProfile -NonInteractive -File`, `verify-github-pat.ps1`,
 		`repository-contract-pr`, `owner merge gate`, `Do not regenerate or reapply an Onboarding Plan before that Pull Request is merged`,
+		`Use pwsh for every other Setup script and Launcher command`, `Do not create helper scripts inside the target repository`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
@@ -66,6 +67,8 @@ func TestSetupSkillPinsFreshRepositoryMainAndExactOnboardingJSON(t *testing.T) {
 		"repository-contract-pr",
 		"Do not generate or apply another Onboarding Plan before the owner merges that exact Pull Request",
 		"After the owner confirms the merge, generate and approve one new current Onboarding Plan",
+		"Use pwsh for every Setup script and Launcher command except the native powershell.exe PAT verification",
+		"Never create a helper script inside the Onboarding target repository",
 	} {
 		if !strings.Contains(skill, required) {
 			t.Fatalf("Setup Skill lacks fresh-repository/Onboarding contract %q", required)

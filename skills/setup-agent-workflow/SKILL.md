@@ -58,6 +58,8 @@ the manifest and publisher before acquiring the other two assets; the Bundle
 verifier authenticates and inspects the archive before `$launcher` is assigned
 or invoked:
 
+Use pwsh for every Setup script and Launcher command except the native powershell.exe PAT verification shown below. Windows PowerShell 5.1 is not a supported host for the manifest and Bundle scripts. Never create a helper script inside the Onboarding target repository; if a temporary script is unavoidable, place it in a new temporary directory outside the repository and remove it before continuing.
+
 ```powershell
 $patVerification = $pat | powershell.exe -NoProfile -NonInteractive -File `
   "$skillRoot\scripts\verify-github-pat.ps1" `
