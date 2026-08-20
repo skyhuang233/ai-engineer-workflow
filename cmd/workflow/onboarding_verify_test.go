@@ -50,7 +50,11 @@ func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	if err = db.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: "p", Kind: string(plan.Kind), SchemaVersion: 1, Target: plan.Target.RepositoryPath, DigestSHA256: digest, CanonicalJSON: string(canon), Projection: "owner/repo", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifest, Eligible: true, VerifiedAt: time.Now()}); err != nil {
+	admittedAt := time.Now()
+	if err = db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx,
+		store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifest, Eligible: true, VerifiedAt: admittedAt},
+		store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: plan.Target.RepositoryPath, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: admittedAt},
+	); err != nil {
 		t.Fatal(err)
 	}
 	contentReads := 0
