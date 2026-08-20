@@ -146,8 +146,11 @@ fields, but stop on unknown statuses or malformed known evidence.
    required effect is `repository-contract-pr` is the expected human merge
    gate, not a plan or command failure. Preserve and report that exact Plan
    Digest and Pull Request, then pause for the repository owner. Do not generate or apply another Onboarding Plan before the owner merges that exact Pull Request.
-   After the owner confirms the merge, generate and approve one new current Onboarding Plan,
-   apply it once, and verify Repository Admission. Any other incomplete result
+   After the owner confirms the merge, do not generate a new Plan or mutate the
+   local branch directly. Resume the immutable stored Plan by calling
+   `onboarding apply` with its preserved approved Digest and no stdin; the CLI
+   reloads the exact canonical Plan from the active-generation Store. Then
+   verify Repository Admission with that same Digest. Any other incomplete result
    is a blocker and must not be retried by guessing. Finish only at Platform
    Ready and Repository Admitted.
 
@@ -194,6 +197,8 @@ $apply | & $launcher | ConvertFrom-Json
 # Repository authority is only the active versioned CLI, never the launcher:
 $plan = & $dispatcher onboarding plan --workflow-home $workflowHome --repo $repo | ConvertFrom-Json
 $plan.onboarding_plan | ConvertTo-Json -Depth 100 -Compress | & $dispatcher onboarding apply --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
+# Only after the owner confirms the exact Onboarding Pull Request was merged:
+& $dispatcher onboarding apply --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
 & $dispatcher onboarding verify --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
 ```
 

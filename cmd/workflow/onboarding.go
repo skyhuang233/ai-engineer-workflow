@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -88,6 +89,13 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		raw, err := io.ReadAll(input)
 		if err != nil {
 			return err
+		}
+		if len(bytes.TrimSpace(raw)) == 0 {
+			record, readErr := database.SetupPlanByDigest(ctx, *approvedDigest)
+			if readErr != nil {
+				return errors.New("stored approved Onboarding Plan is unavailable")
+			}
+			raw = []byte(record.CanonicalJSON)
 		}
 		plan, _, _, err := setupcontract.ParsePlan(raw)
 		if err != nil {

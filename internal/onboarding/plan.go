@@ -241,7 +241,11 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	// Repository Contract instead of treating their individual delta as Ready.
 	plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "record-repository-admission", Kind: "repository_admission", Subject: repositoryID, Action: "verify_and_record", Parameters: map[string]string{"default_branch": discovery.DefaultBranch, "manifest_digest": manifestDigest, "contract_version": "1", "labels_json": string(labelsJSON), "actions_allowed": policy.ActionsAllowed}})
 	if !state.ContractSatisfied {
-		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head, "merge_head_effect_id": "repository-contract-pr"}})
+		parameters := map[string]string{"repository": repositoryID, "branch": discovery.DefaultBranch, "pre_merge_head": discovery.Head, "merge_head_effect_id": "repository-contract-pr"}
+		if !discovery.HasCommits {
+			parameters["pre_merge_head_effect_id"] = "initial-baseline"
+		}
+		plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "synchronize-local-default-branch", Kind: "local_fast_forward", Subject: discovery.Root, Action: "fast_forward_if_safe", Parameters: parameters})
 	}
 	identityJSON, _ := json.Marshal(plan)
 	identity := sha256.Sum256(identityJSON)

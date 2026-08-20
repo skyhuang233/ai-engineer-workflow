@@ -2,7 +2,9 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ type memoryRemote struct {
 	issues, actions bool
 	allowed         string
 	variable        string
+	contentRef      string
 	pull            PullReadback
 	defaultBranch   RepositoryBranch
 	branch          RepositoryBranch
@@ -66,7 +69,8 @@ func (m *memoryRemote) MergeOnboardingPull(_ context.Context, _ string, number i
 	m.defaultBranch.Head = mergeHead
 	return mergeHead, nil
 }
-func (m *memoryRemote) VerifyOnboardingContent(context.Context, string, string, map[string][]byte) error {
+func (m *memoryRemote) VerifyOnboardingContent(_ context.Context, _ string, ref string, _ map[string][]byte) error {
+	m.contentRef = ref
 	return nil
 }
 func (m *memoryRemote) CreateRepository(context.Context, string, string, string, bool) error {
@@ -119,6 +123,9 @@ func TestRepositoryAdapterReadbackBindsOnlyExactMergedPull(t *testing.T) {
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("exact merged PR = %s, %v", status, err)
 	}
+	if remote.contentRef != remote.pull.Head {
+		t.Fatalf("merged PR content ref = %q, want immutable head %q", remote.contentRef, remote.pull.Head)
+	}
 	remote.pull.BaseHead = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	status, _, err = adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectConflicting {
@@ -141,6 +148,66 @@ func TestRepositoryAdapterReadbackRejectsDefaultBaseAdvanceBeforeMerge(t *testin
 		t.Fatalf("advanced base = %s, %v", status, err)
 	}
 }
+
+func TestRepositoryAdapterFastForwardsZeroCommitBaselineFromEffectEvidence(t *testing.T) {
+	repository := newRepo(t)
+	preMerge := testGitOutput(t, repository, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	git(t, "", "clone", "--bare", repository, bare)
+	advance := filepath.Join(t.TempDir(), "advance")
+	git(t, "", "clone", bare, advance)
+	git(t, advance, "config", "user.name", "Test")
+	git(t, advance, "config", "user.email", "test@example.com")
+	git(t, advance, "commit", "--allow-empty", "-m", "approved onboarding merge")
+	mergeHead := testGitOutput(t, advance, "rev-parse", "HEAD")
+	git(t, advance, "push", "origin", "main")
+	installCapturedGitForPushTest(t, "https://github.com/owner/repo.git", bare)
+
+	remote := &memoryRemote{defaultBranch: RepositoryBranch{Name: "main", Head: mergeHead}}
+	adapter := RepositoryAdapter{
+		Remote: remote, PlanDigest: strings.Repeat("a", 64),
+		MergeHeads:   map[string]string{"repository-contract-pr": mergeHead},
+		BaselineHead: map[string]string{"initial-baseline": preMerge},
+	}
+	effect := setupcontract.Effect{Kind: "local_fast_forward", Subject: repository, Parameters: map[string]string{
+		"repository": "owner/repo", "branch": "main", "pre_merge_head": "", "pre_merge_head_effect_id": "initial-baseline", "merge_head_effect_id": "repository-contract-pr",
+	}}
+	if err := adapter.Apply(context.Background(), effect); err != nil {
+		t.Fatalf("zero-commit baseline fast-forward: %v", err)
+	}
+	if head := testGitOutput(t, repository, "rev-parse", "HEAD"); head != mergeHead {
+		t.Fatalf("local HEAD = %s, want approved merge %s", head, mergeHead)
+	}
+}
+
+func TestRepositoryAdapterReadbackKeepsInitialBaselineSatisfiedAfterFastForward(t *testing.T) {
+	repository := newRepo(t)
+	baselineHead := testGitOutput(t, repository, "rev-parse", "HEAD")
+	files, err := BaselineSnapshot(context.Background(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "AGENTS.md"), []byte("managed\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "add", "AGENTS.md")
+	git(t, repository, "commit", "-m", "approved onboarding merge")
+
+	adapter := RepositoryAdapter{Remote: &memoryRemote{}, PlanDigest: strings.Repeat("a", 64)}
+	effect := setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: repository, Parameters: map[string]string{"files_json": string(encoded)}}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("fast-forwarded Initial Repository Baseline readback = %s, %v", status, err)
+	}
+	if got := adapter.BaselineHead[effect.ID]; got != baselineHead {
+		t.Fatalf("Initial Repository Baseline evidence = %q, want root commit %q", got, baselineHead)
+	}
+}
+
 func (m *memoryRemote) ReconcileLabel(_ context.Context, _ string, value Label) error {
 	m.labelCalls++
 	m.label = value

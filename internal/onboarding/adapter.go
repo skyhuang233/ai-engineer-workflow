@@ -171,10 +171,15 @@ func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.E
 		}
 		return setupcontract.EffectSatisfied, "Repository Contract is live", nil
 	case "initial_baseline":
-		head, err := gitOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
+		heads, err := gitOutput(ctx, effect.Subject, "rev-list", "--max-parents=0", "HEAD")
 		if err != nil {
 			return setupcontract.EffectRequired, "Initial Repository Baseline is absent", nil
 		}
+		roots := strings.Fields(heads)
+		if len(roots) != 1 || !isGitObjectID(roots[0]) {
+			return setupcontract.EffectConflicting, "Initial Repository Baseline history is ambiguous", nil
+		}
+		head := roots[0]
 		var files []BaselineFile
 		if json.Unmarshal([]byte(effect.Parameters["files_json"]), &files) != nil {
 			return setupcontract.EffectFailed, "", errors.New("invalid Initial Repository Baseline files")
@@ -248,7 +253,11 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 		if decodeErr != nil {
 			return setupcontract.EffectFailed, "", decodeErr
 		}
-		if verifyErr := a.Remote.VerifyOnboardingContent(ctx, effect.Subject, branch, files); verifyErr != nil {
+		contentRef := branch
+		if pull.Merged && isGitObjectID(pull.Head) {
+			contentRef = pull.Head
+		}
+		if verifyErr := a.Remote.VerifyOnboardingContent(ctx, effect.Subject, contentRef, files); verifyErr != nil {
 			if errors.Is(verifyErr, ErrManagedContentNotFound) {
 				pull.ContentMatches = false
 			} else {
@@ -386,7 +395,19 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 		if remote.Name != effect.Parameters["branch"] || remote.Head != merge {
 			return errors.New("GitHub default branch differs from the approved onboarding merge")
 		}
-		return SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], effect.Parameters["pre_merge_head"], merge, a.Credential)
+		preMergeHead := effect.Parameters["pre_merge_head"]
+		if preMergeHead == "" {
+			baselineEffectID := effect.Parameters["pre_merge_head_effect_id"]
+			if baselineEffectID == "" {
+				// Compatibility for an already-approved zero-commit v0.0.1 Plan.
+				baselineEffectID = "initial-baseline"
+			}
+			preMergeHead = a.BaselineHead[baselineEffectID]
+		}
+		if !isGitObjectID(preMergeHead) {
+			return errors.New("approved local pre-merge head evidence is unavailable")
+		}
+		return SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], preMergeHead, merge, a.Credential)
 	default:
 		return fmt.Errorf("Repository Onboarding effect %q requires its guarded Git primitive", effect.Kind)
 	}

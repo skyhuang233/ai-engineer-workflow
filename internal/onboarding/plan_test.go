@@ -144,8 +144,8 @@ func TestPlanUnpublishedZeroCommitDeclaresBaselineAndRepositoryCreation(t *testi
 		if effect.Kind == "repository_contract_pr" {
 			contract = effect
 		}
-		if effect.Kind == "local_fast_forward" && effect.Parameters["merge_head_effect_id"] != "repository-contract-pr" {
-			t.Fatalf("local fast-forward is not bound to merge evidence: %#v", effect)
+		if effect.Kind == "local_fast_forward" && (effect.Parameters["merge_head_effect_id"] != "repository-contract-pr" || effect.Parameters["pre_merge_head_effect_id"] != "initial-baseline") {
+			t.Fatalf("local fast-forward is not bound to merge and Initial Repository Baseline evidence: %#v", effect)
 		}
 	}
 	if !kinds["create_repository"] || !kinds["initial_baseline"] || !kinds["repository_contract_pr"] {

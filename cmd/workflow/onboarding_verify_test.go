@@ -80,6 +80,9 @@ func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "platform", "active.json"), data, 0600)
 	var out bytes.Buffer
 	wrongRepositoryPath := t.TempDir()
+	if err = onboardingCommand([]string{"apply", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("apply did not resume the stored approved Onboarding Plan before checking its repository path: %v", err)
+	}
 	if err = onboardingCommand([]string{"apply", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(canon), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
 		t.Fatalf("apply accepted repository path outside the approved Onboarding Plan: %v", err)
 	}
