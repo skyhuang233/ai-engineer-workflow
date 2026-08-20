@@ -137,7 +137,14 @@ fields, but stop on unknown statuses or malformed known evidence.
    wrap native command output.
    Do not reuse an earlier approved digest after any plan command failure:
    regenerate the complete Plan, display its current
-   projection and digest, and obtain approval again. Finish only at Platform
+   projection and digest, and obtain approval again.
+   An `incomplete` result whose preceding effects are satisfied and whose only
+   required effect is `repository-contract-pr` is the expected human merge
+   gate, not a plan or command failure. Preserve and report that exact Plan
+   Digest and Pull Request, then pause for the repository owner. Do not generate or apply another Onboarding Plan before the owner merges that exact Pull Request.
+   After the owner confirms the merge, generate and approve one new current Onboarding Plan,
+   apply it once, and verify Repository Admission. Any other incomplete result
+   is a blocker and must not be retried by guessing. Finish only at Platform
    Ready and Repository Admitted.
 
 The Launcher owns generation state, migration, active-work fencing, Docker and
