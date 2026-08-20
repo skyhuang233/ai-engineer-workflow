@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/credential"
@@ -103,8 +104,11 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		if plan.Kind != setupcontract.RepositoryOnboarding {
 			return errors.New("onboarding apply accepts only an Onboarding Plan")
 		}
+		if err := requireApprovedOnboardingRepositoryPath(*repositoryPath, plan.Target.RepositoryPath); err != nil {
+			return err
+		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: *repositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		result, err := (onboarding.Executor{Store: database, Adapter: adapter}).Apply(ctx, raw, *approvedDigest, strings.TrimPrefix(active.BundleDigest, "sha256:"))
 		if err != nil {
 			return err
@@ -125,8 +129,11 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		if parseErr != nil || digest != *approvedDigest {
 			return errors.New("stored Onboarding Plan is not the exact approved digest")
 		}
+		if err := requireApprovedOnboardingRepositoryPath(*repositoryPath, plan.Target.RepositoryPath); err != nil {
+			return err
+		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: *repositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		for _, effect := range plan.Effects {
 			status, _, readErr := adapter.Readback(ctx, effect)
 			if readErr != nil || status != setupcontract.EffectSatisfied {
@@ -150,6 +157,27 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 	default:
 		return errors.New("unknown onboarding operation")
 	}
+}
+
+func requireApprovedOnboardingRepositoryPath(requested, approved string) error {
+	requestedPath, err := filepath.Abs(requested)
+	if err != nil {
+		return err
+	}
+	approvedPath, err := filepath.Abs(approved)
+	if err != nil {
+		return err
+	}
+	requestedPath = filepath.Clean(requestedPath)
+	approvedPath = filepath.Clean(approvedPath)
+	samePath := requestedPath == approvedPath
+	if runtime.GOOS == "windows" {
+		samePath = strings.EqualFold(requestedPath, approvedPath)
+	}
+	if !samePath {
+		return errors.New("onboarding repository path differs from the approved Onboarding Plan")
+	}
+	return nil
 }
 
 type onboardingSession struct {

@@ -193,6 +193,30 @@ func TestCandidateAndPublisherUseSharedWorkflowReleaseAssembler(t *testing.T) {
 	}
 }
 
+func TestCandidateAndPublisherUseSharedWorkerBuilder(t *testing.T) {
+	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
+	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	for name, text := range map[string]string{"candidate": candidate, "publisher": publisher} {
+		if strings.Count(text, "bash scripts/build-workflow-worker.sh") != 1 {
+			t.Fatalf("%s workflow does not use exactly one shared Worker builder", name)
+		}
+		if strings.Contains(text, "docker build \\") {
+			t.Fatalf("%s workflow retains an independent Worker docker build", name)
+		}
+	}
+	builder := readWorkflow(t, "scripts", "build-workflow-worker.sh")
+	for _, required := range []string{
+		"CODEX_VERSION", "GITHUB_CLI_VERSION", "GITHUB_CLI_LINUX_AMD64_SHA256",
+		"GO_VERSION", "GO_LINUX_AMD64_SHA256", "NO_MISTAKES_VERSION",
+		"NO_MISTAKES_REPOSITORY", "NO_MISTAKES_COMMIT",
+		"deploy/worker/Dockerfile", "docker build",
+	} {
+		if !strings.Contains(builder, required) {
+			t.Fatalf("shared Worker builder omits %q", required)
+		}
+	}
+}
+
 func TestLegacyPublisherFilesAreRemoved(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {

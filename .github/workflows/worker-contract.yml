@@ -11,6 +11,7 @@ on:
       - "config/toolchain.json"
       - "config/workflow-release.json"
       - "scripts/assemble-workflow-release.ps1"
+      - "scripts/build-workflow-worker.sh"
       - ".github/workflows/worker-contract.yml"
       - ".github/workflows/publish-workflow.yml"
 
@@ -87,17 +88,7 @@ jobs:
         shell: bash
         run: |
           candidate="${{ steps.pins.outputs.worker_image_repository }}:qualification-${{ github.event.pull_request.head.sha }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker build \
-            --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
-            --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
-            --build-arg "GITHUB_CLI_LINUX_AMD64_SHA256=${{ steps.pins.outputs.github_cli_sha256 }}" \
-            --build-arg "GO_VERSION=${{ steps.pins.outputs.go_version }}" \
-            --build-arg "GO_LINUX_AMD64_SHA256=${{ steps.pins.outputs.go_sha256 }}" \
-            --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
-            --build-arg "NO_MISTAKES_REPOSITORY=${{ steps.pins.outputs.no_mistakes_repository }}" \
-            --build-arg "NO_MISTAKES_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
-            --tag "$candidate" \
-            --file deploy/worker/Dockerfile .
+          bash scripts/build-workflow-worker.sh "$candidate"
           echo "reference=$candidate" >> "$GITHUB_OUTPUT"
       - name: Verify Worker contract
         if: steps.worker-changes.outputs.required == 'true'

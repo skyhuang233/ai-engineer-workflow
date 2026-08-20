@@ -79,6 +79,19 @@ func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	os.MkdirAll(filepath.Join(home, "platform"), 0700)
 	os.WriteFile(filepath.Join(home, "platform", "active.json"), data, 0600)
 	var out bytes.Buffer
+	wrongRepositoryPath := t.TempDir()
+	if err = onboardingCommand([]string{"apply", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(canon), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("apply accepted repository path outside the approved Onboarding Plan: %v", err)
+	}
+	if contentReads != 0 {
+		t.Fatal("repository path mismatch reached remote apply effects")
+	}
+	if err = onboardingCommand([]string{"verify", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("verify accepted repository path outside the approved Onboarding Plan: %v", err)
+	}
+	if contentReads != 0 {
+		t.Fatal("repository path mismatch reached remote contract readback")
+	}
 	if err = onboardingCommand([]string{"verify", "--workflow-home", home, "--repo", plan.Target.RepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err != nil {
 		t.Fatal(err)
 	}
