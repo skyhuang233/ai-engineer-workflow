@@ -21,6 +21,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
 type fakeRuntime struct {
@@ -1467,7 +1468,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
 	}
 	t.Log("Ticket Agent Worker launched with no GitHub token and can reach GitHub writes only through the credential-isolated Gateway")
-	if first.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+	if first.specs[0].ImageDigest != "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("worker did not use Active Worker Image: %#v", first.specs[0])
 	}
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
@@ -2077,8 +2078,8 @@ func TestControllerRetryDeliveryPreservesLegacyCandidateWithoutSourceDigest(t *t
 	}
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version: "0.2.0", SourceCommit: "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`, VerifiedAt: time.Now().UTC(),
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"), VerifiedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2143,8 +2144,8 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -2157,7 +2158,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
 	}
-	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
 		t.Fatalf("retried delivery image = %q, want Active Worker image", retryRuntime.specs[0].ImageDigest)
 	}
 	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["github-cli"] != "2.98.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
@@ -2167,7 +2168,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidateImage != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
+	if candidateImage != "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
 		t.Fatalf("accepted Candidate runtime changed during delivery recovery: image=%q tools=%#v", candidateImage, candidateTools)
 	}
 	audit, err := db.WorkerAudit(ctx, retryRunID)
@@ -2334,8 +2335,8 @@ func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   strings.Replace(testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"), `"github_cli":{"version":"2.98.0","linux_amd64_sha256":"`+strings.Repeat("e", 64)+`"},`, "", 1),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -2751,12 +2752,32 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.1.0",
 		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","github_cli_version":"2.97.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.1.0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("b", 64), "1.0.0", "2.97.0", "1.25.12", "v1.0.0"),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testWorkerReleaseManifest(t *testing.T, version, sourceCommit, image, codexVersion, githubCLIVersion, goVersion, noMistakesVersion string) string {
+	t.Helper()
+	manifest := workflowrelease.Manifest{
+		SchemaVersion: 1, Version: version, SourceCommit: sourceCommit, GitHubActionsRunID: 1,
+		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.Repeat("a", 64)},
+		Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
+			Codex:      workflowrelease.CodexTool{Version: codexVersion},
+			GitHubCLI:  workflowrelease.ArchiveTool{Version: githubCLIVersion, LinuxAMD64SHA256: strings.Repeat("e", 64)},
+			Go:         workflowrelease.ArchiveTool{Version: goVersion, LinuxAMD64SHA256: strings.Repeat("f", 64)},
+			NoMistakes: workflowrelease.NoMistakesTool{Version: noMistakesVersion, Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("2", 40)},
+		}},
+		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+	}
+	raw, err := manifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func initRepository(t *testing.T) string {

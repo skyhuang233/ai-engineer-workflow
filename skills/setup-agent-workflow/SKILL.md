@@ -65,6 +65,14 @@ $bundle = & "$skillRoot\scripts\verify-windows-bundle.ps1" `
   -ExpectedSHA256 $release.bundle_sha256 `
   -ExpectedVersion $release.version `
   -ExpectedWorkerImage $release.worker_image | ConvertFrom-Json
+$qualificationCandidate = $null
+if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
+  $qualificationCandidate = @{
+    manifest_path=[string]$release.manifest_path
+    manifest_sha256=[string]$release.manifest_sha256
+    source_commit=[string]$release.source_commit
+  }
+}
 $launcher = Join-Path $verifiedExtractedBundle 'setup\workflow-setup.exe'
 ```
 
@@ -119,7 +127,9 @@ $state = $verify | & $dispatcher setup verify | ConvertFrom-Json
 # Explicit upgrade only:
 $preflight = @{schema_version=1;operation='inspect';purpose='active_work_preflight';workflow_home=$workflowHome} | ConvertTo-Json -Compress
 $preflight | & $dispatcher setup inspect | ConvertFrom-Json
-$target = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner} | ConvertTo-Json -Compress
+$targetRequest = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner}
+if ($null -ne $qualificationCandidate) { $targetRequest.qualification_candidate = $qualificationCandidate }
+$target = $targetRequest | ConvertTo-Json -Depth 16 -Compress
 $inspection = $target | & $launcher | ConvertFrom-Json
 # Do not invent or submit an empty consent surface. A fresh/changed target
 # returns the exact field `required_capabilities`; present those values, then
@@ -138,6 +148,7 @@ if ($inspection.status -eq 'consent_required') {
 } else {
   throw "Unexpected target_state status: $($inspection.status)"
 }
+if ($null -ne $qualificationCandidate) { $applyRequest.qualification_candidate = $qualificationCandidate }
 $apply = $applyRequest | ConvertTo-Json -Depth 16 -Compress
 $apply | & $launcher | ConvertFrom-Json
 # Repository authority is only the active versioned CLI, never the launcher:

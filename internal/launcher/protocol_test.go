@@ -40,3 +40,18 @@ func TestDecodeRequestRejectsNonCanonicalBundleDigest(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeRequestRejectsQualificationCandidateOutsideExactGate(t *testing.T) {
+	candidate := `"qualification_candidate":{"manifest_path":"C:\\candidate\\workflow-release.json","manifest_sha256":"` + strings.Repeat("a", 64) + `","source_commit":"` + strings.Repeat("b", 40) + `"}`
+	request := `{"schema_version":1,"operation":"inspect","purpose":"target_state","workflow_home":"C:\\workflow","target_version":"0.0.1","bundle_digest":"sha256:` + strings.Repeat("c", 64) + `","github_owner":"owner",` + candidate + `}`
+	if _, err := DecodeRequest([]byte(request)); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("ungated qualification request error = %v", err)
+	}
+	t.Setenv(setupQualificationEnvironment, "1")
+	t.Setenv(candidateDirectoryEnvironment, `C:\candidate`)
+	t.Setenv(candidateVersionEnvironment, "0.0.1")
+	t.Setenv(candidateSourceCommitEnvironment, strings.Repeat("b", 40))
+	if decoded, err := DecodeRequest([]byte(request)); err != nil || decoded.QualificationCandidate == nil {
+		t.Fatalf("gated qualification request = %#v, %v", decoded, err)
+	}
+}

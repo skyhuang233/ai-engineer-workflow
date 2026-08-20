@@ -696,7 +696,7 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
 	}
 	provenance, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
-	if err != nil {
+	if err != nil || provenance.Version != activeRelease.Version || provenance.SourceCommit != activeRelease.SourceCommit || provenance.ImageReference != activeRelease.ImageReference {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}
 	toolVersions, _ := provenance.ToolVersions()

@@ -60,6 +60,7 @@ if ($sbomDigest -cne [string]$validated.sbom_sha256) {
   version = [string]$validated.version
   source_commit = [string]$validated.source_commit
   manifest_path = $manifestPath
+  manifest_sha256 = $manifestDigest
   bundle_path = $bundlePath
   bundle_sha256 = $bundleDigest
   sbom_path = $sbomPath

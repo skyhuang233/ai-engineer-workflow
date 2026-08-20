@@ -18,7 +18,66 @@ import (
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
+
+func TestQualificationApplySeedsActiveWorkerReleaseInFreshGeneration(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	bundle := t.TempDir()
+	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+	candidateDirectory := t.TempDir()
+	sourceCommit := strings.Repeat("c", 40)
+	bundleDigest := strings.Repeat("b", 64)
+	image := "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)
+	manifest := workflowrelease.Manifest{
+		SchemaVersion: 1, Version: "0.0.1", SourceCommit: sourceCommit, GitHubActionsRunID: 1,
+		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: bundleDigest},
+		Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
+			Codex:      workflowrelease.CodexTool{Version: "0.148.0"},
+			GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},
+			Go:         workflowrelease.ArchiveTool{Version: "1.26.6", LinuxAMD64SHA256: strings.Repeat("e", 64)},
+			NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("f", 40)},
+		}},
+		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+	}
+	raw, err := manifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(candidateDirectory, workflowrelease.ManifestAssetName)
+	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest := sha256.Sum256(raw)
+	t.Setenv(setupQualificationEnvironment, "1")
+	t.Setenv(candidateDirectoryEnvironment, candidateDirectory)
+	t.Setenv(candidateVersionEnvironment, manifest.Version)
+	t.Setenv(candidateSourceCommitEnvironment, sourceCommit)
+	engine := Engine{BundleRoot: bundle}
+	request := Request{
+		SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: manifest.Version,
+		BundleDigest: "sha256:" + bundleDigest, GitHubOwner: "owner",
+		QualificationCandidate: &QualificationCandidate{ManifestPath: manifestPath, ManifestSHA256: hex.EncodeToString(manifestDigest[:]), SourceCommit: sourceCommit},
+	}
+	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+	result, err := engine.Apply(context.Background(), request)
+	if err != nil || result.Status != "ready" {
+		t.Fatalf("qualification apply = %#v, %v", result, err)
+	}
+	active, err := ReadActive(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.OpenForRuntime(context.Background(), filepath.Join(home, "platform", "generations", active.Generation, "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	release, err := database.ActiveWorkerRelease(context.Background())
+	if err != nil || release.Version != manifest.Version || release.SourceCommit != sourceCommit || release.ImageReference != image || release.ManifestJSON != string(raw) {
+		t.Fatalf("active qualification Worker Release = %#v, %v", release, err)
+	}
+}
 
 func TestApplyPersistsVerifiedPATInCandidateGenerationBeforeReady(t *testing.T) {
 	home, digest := t.TempDir(), "sha256:"+strings.Repeat("a", 64)

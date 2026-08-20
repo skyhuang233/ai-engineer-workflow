@@ -35,7 +35,8 @@ try {
   $manifest | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath (Join-Path $scratch 'workflow-release.json') -Encoding utf8NoBOM
 
   $resolved = & $resolver -CandidateDirectory $scratch -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit | ConvertFrom-Json
-  if (-not [bool]$resolved.qualification_candidate -or [string]$resolved.bundle_sha256 -cne $bundleDigest) {
+  $manifestDigest = (Get-FileHash -LiteralPath (Join-Path $scratch 'workflow-release.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+  if (-not [bool]$resolved.qualification_candidate -or [string]$resolved.manifest_sha256 -cne $manifestDigest -or [string]$resolved.bundle_sha256 -cne $bundleDigest) {
     throw 'Candidate resolver returned incorrect evidence'
   }
   $acceptedWrongSource = $true

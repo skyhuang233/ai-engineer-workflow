@@ -944,7 +944,7 @@ WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ?`, claim.RunID, 
 	}
 	if !validWorkerToolVersions(toolVersions) {
 		provenance, err := workerrelease.DecodeToolProvenance([]byte(manifestJSON))
-		if err != nil {
+		if err != nil || provenance.ImageReference != imageDigest {
 			return "", nil, false, ErrInvalidClaim
 		}
 		manifestTools, _ := provenance.ToolVersions()

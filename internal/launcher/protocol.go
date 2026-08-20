@@ -43,16 +43,23 @@ type PATCapabilityTarget struct {
 }
 
 type Request struct {
-	SchemaVersion        int          `json:"schema_version"`
-	Operation            Operation    `json:"operation"`
-	WorkflowHome         string       `json:"workflow_home"`
-	Purpose              string       `json:"purpose,omitempty"`
-	TargetVersion        string       `json:"target_version,omitempty"`
-	BundleDigest         string       `json:"bundle_digest,omitempty"`
-	GitHubOwner          string       `json:"github_owner,omitempty"`
-	AcceptedCapabilities []Capability `json:"accepted_capabilities,omitempty"`
-	ConsentID            string       `json:"consent_id,omitempty"`
-	PAT                  string       `json:"pat,omitempty"`
+	SchemaVersion          int                     `json:"schema_version"`
+	Operation              Operation               `json:"operation"`
+	WorkflowHome           string                  `json:"workflow_home"`
+	Purpose                string                  `json:"purpose,omitempty"`
+	TargetVersion          string                  `json:"target_version,omitempty"`
+	BundleDigest           string                  `json:"bundle_digest,omitempty"`
+	GitHubOwner            string                  `json:"github_owner,omitempty"`
+	AcceptedCapabilities   []Capability            `json:"accepted_capabilities,omitempty"`
+	ConsentID              string                  `json:"consent_id,omitempty"`
+	PAT                    string                  `json:"pat,omitempty"`
+	QualificationCandidate *QualificationCandidate `json:"qualification_candidate,omitempty"`
+}
+
+type QualificationCandidate struct {
+	ManifestPath   string `json:"manifest_path"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	SourceCommit   string `json:"source_commit"`
 }
 
 type Result struct {
@@ -103,8 +110,15 @@ func DecodeRequest(raw []byte) (Request, error) {
 		if (request.ConsentID == "") == (len(request.AcceptedCapabilities) == 0) {
 			return Request{}, errors.New("apply requires exactly one consent_id or accepted_capabilities")
 		}
-	} else if request.Purpose != "" || request.TargetVersion != "" || request.BundleDigest != "" || request.GitHubOwner != "" || request.ConsentID != "" || len(request.AcceptedCapabilities) != 0 || request.PAT != "" {
+	} else if request.Purpose != "" || request.TargetVersion != "" || request.BundleDigest != "" || request.GitHubOwner != "" || request.ConsentID != "" || len(request.AcceptedCapabilities) != 0 || request.PAT != "" || request.QualificationCandidate != nil {
 		return Request{}, errors.New("verify accepts only common request fields")
+	}
+	if request.Operation == Apply || request.Purpose == PurposeTargetState {
+		if err := validateQualificationCandidateRequest(request); err != nil {
+			return Request{}, err
+		}
+	} else if request.QualificationCandidate != nil {
+		return Request{}, errors.New("qualification candidate requires a target operation")
 	}
 	return request, nil
 }

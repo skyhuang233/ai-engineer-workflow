@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -14,6 +13,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workerrelease"
 )
 
 type deliveryWorkspaceRuntimeFunc func(context.Context, worker.Spec) (worker.Result, error)
@@ -496,14 +496,12 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load Doctor-activated Worker Release: %v", err)
 	}
-	var manifest struct {
-		Image string `json:"image"`
-	}
-	if err := json.Unmarshal([]byte(activeRelease.ManifestJSON), &manifest); err != nil {
+	manifest, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
+	if err != nil {
 		t.Fatalf("decode active Worker Release Manifest: %v", err)
 	}
-	if manifest.Image != activeRelease.ImageReference {
-		t.Fatalf("active Worker image %q does not match persisted manifest image %q", activeRelease.ImageReference, manifest.Image)
+	if manifest.ImageReference != activeRelease.ImageReference {
+		t.Fatalf("active Worker image %q does not match persisted manifest image %q", activeRelease.ImageReference, manifest.ImageReference)
 	}
 	mount := "type=bind,source=" + deliverySource + ",target=/source-repository,readonly"
 	command := exec.CommandContext(ctx, "docker", "run", "--rm", "--mount", mount, "--entrypoint", "sh", activeRelease.ImageReference, "-ceu", "git init -q /tmp/checkout && git -C /tmp/checkout fetch -q /source-repository refs/heads/main && git -C /tmp/checkout rev-parse FETCH_HEAD")
