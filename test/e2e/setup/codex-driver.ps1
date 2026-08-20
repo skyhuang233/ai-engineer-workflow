@@ -24,6 +24,19 @@ if ([string]::IsNullOrWhiteSpace($setupToken)) { throw "WORKFLOW_SETUP_E2E_PAT_F
 if (-not (Test-Path -LiteralPath $repositoryPath -PathType Container)) { throw "Scenario repository does not exist" }
 if ($entrySkillSpec -notmatch '@(workflow-v[0-9A-Za-z._-]+|[0-9a-fA-F]{40})$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must pin an exact release tag or commit" }
 
+$qualificationInstruction = ""
+if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq "1") {
+    $candidateDirectory = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_CANDIDATE_DIRECTORY"))
+    $candidateVersion = Require-Environment "WORKFLOW_SETUP_CANDIDATE_VERSION"
+    $candidateSourceCommit = Require-Environment "WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT"
+    if (-not (Test-Path -LiteralPath $candidateDirectory -PathType Container)) { throw "WORKFLOW_SETUP_CANDIDATE_DIRECTORY is unavailable" }
+    if ($candidateVersion -cne $platformVersion) { throw "Workflow qualification candidate version differs from the requested Platform version" }
+    if ($candidateSourceCommit -cnotmatch '^[0-9a-f]{40}$' -or -not $entrySkillSpec.EndsWith("@$candidateSourceCommit", [StringComparison]::OrdinalIgnoreCase)) { throw "Workflow qualification candidate source differs from the pinned Setup Skill source" }
+    $qualificationInstruction = @"
+This is release-branch qualification with WORKFLOW_SETUP_QUALIFICATION=1. Immediately use the installed skill's explicit test-only candidate acquisition boundary with the exact WORKFLOW_SETUP_CANDIDATE_DIRECTORY, WORKFLOW_SETUP_CANDIDATE_VERSION, and WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT values already present in the process environment. Do not query, download, or require a published GitHub Release. Do not fall back from the candidate path to published acquisition.
+"@
+}
+
 $driverRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $schemaPath = Join-Path $driverRoot "driver-result.schema.json"
 $agentResultPath = Join-Path ([IO.Path]::GetTempPath()) ("workflow-codex-result-" + $runID + "-" + $scenario + ".json")
@@ -55,6 +68,7 @@ Manually invoke `$setup-agent-workflow for the repository at: $repositoryPath
 
 This is the authorized, disposable setup qualification scenario "$scenario" under GitHub owner "$owner".
 Select exact Workflow Release version "$platformVersion"; do not fall back to a different stable release.
+$qualificationInstruction
 Follow the installed skill exactly. If the directory is not a Git repository, answer yes to its Git initialization question. For every plan_required response, inspect the complete projection and approve only the exact displayed digest, then continue applying and verifying it. When a classic PAT is required, never read, echo, print, place it in an argument, or copy it into an environment variable; pipe the bytes from the file named by WORKFLOW_SETUP_E2E_PAT_FILE directly to the documented verification/apply command from PowerShell. Do not approve effects outside the scenario repository, isolated Workflow Home, current-user Codex skills/PATH, Docker Desktop dependency, and repositories named $owner/workflow-setup-e2e-*.
 
 Positive scenarios clean-new-repository, unrelated-dirty-files, and second-same-owner must finish with both Platform Ready and Repository Admitted. Negative scenarios must stop at the exact expected blocker without weakening or bypassing the contract. Preserve unrelated dirty files byte-for-byte.

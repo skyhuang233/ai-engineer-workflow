@@ -14,6 +14,8 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 	driver := read(t, "codex-driver.ps1")
 	for _, required := range []string{
 		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT_FILE`,
+		`WORKFLOW_SETUP_QUALIFICATION`, `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, `WORKFLOW_SETUP_CANDIDATE_VERSION`, `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`,
+		`Do not query, download, or require a published GitHub Release`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
