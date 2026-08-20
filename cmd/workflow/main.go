@@ -484,7 +484,7 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, DeliverySourceRoot: filepath.Join(filepath.Dir(*workspaceRoot), ".delivery-sources"), CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
@@ -695,7 +695,7 @@ func runPollGitHub(args []string) {
 	}
 	provider := &verifiedGitHubPATSource{Database: db, Config: config}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, DeliverySourceRoot: filepath.Join(filepath.Dir(*workspaceRoot), ".delivery-sources"), CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot, ControlPlaneID: controlPlaneContainerID(*databasePath)}
