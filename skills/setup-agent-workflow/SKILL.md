@@ -54,17 +54,29 @@ verifier authenticates and inspects the archive before `$launcher` is assigned
 or invoked:
 
 ```powershell
-$release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
-# Release-branch qualification only, instead of the published resolver above:
-$release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
-  -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `
-  -ExpectedVersion $env:WORKFLOW_SETUP_CANDIDATE_VERSION `
-  -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT | ConvertFrom-Json
+if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
+  $release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
+    -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `
+    -ExpectedVersion $env:WORKFLOW_SETUP_CANDIDATE_VERSION `
+    -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT | ConvertFrom-Json
+} else {
+  $release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
+}
 $bundle = & "$skillRoot\scripts\verify-windows-bundle.ps1" `
   -BundlePath $release.bundle_path `
   -ExpectedSHA256 $release.bundle_sha256 `
   -ExpectedVersion $release.version `
   -ExpectedWorkerImage $release.worker_image | ConvertFrom-Json
+$preparedBundle = & "$skillRoot\scripts\extract-verified-windows-bundle.ps1" `
+  -BundlePath $release.bundle_path `
+  -WorkingDirectory $downloadRoot `
+  -VerifiedVersion $bundle.version `
+  -VerifiedBundleDigest $bundle.bundle_digest `
+  -ExpectedVersion $release.version `
+  -ExpectedSHA256 $release.bundle_sha256 | ConvertFrom-Json
+$version = [string]$preparedBundle.version
+$bundleDigest = [string]$preparedBundle.bundle_digest
+$verifiedExtractedBundle = [string]$preparedBundle.extracted_bundle
 $qualificationCandidate = $null
 if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
   $qualificationCandidate = @{
