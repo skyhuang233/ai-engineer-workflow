@@ -119,12 +119,62 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 	for _, required := range []string{
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
-		"Build both release components without publication", "workflow-release assemble",
-		"verify-windows-bundle.ps1",
-		"worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip",
+		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("candidate workflow omits %q", required)
+		}
+	}
+}
+
+func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t *testing.T) {
+	text := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
+	for _, required := range []string{
+		"packages: write",
+		"Scan qualification Worker dependencies without blocking functional qualification",
+		"fail-build: false",
+		`docker push "$candidate"`,
+		`docker buildx imagetools inspect "$image"`,
+		"qualification_image: ${{ steps.qualification-image.outputs.image }}",
+		"-WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}'",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("qualification candidate omits available Worker image contract %q", required)
+		}
+	}
+	if strings.Contains(text, "$dryRunDigest") || strings.Contains(text, "GetBytes('dry-run')") {
+		t.Fatal("qualification candidate retains a synthetic Worker image digest")
+	}
+	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	scan := strings.Index(publisher, "name: Scan Worker before push")
+	push := strings.Index(publisher, "name: Push only the scan-passing image")
+	if scan < 0 || push <= scan || !strings.Contains(publisher[scan:push], "fail-build: true") {
+		t.Fatal("formal publisher no longer blocks image publication on its vulnerability scan")
+	}
+}
+
+func TestCandidateAndPublisherUseSharedWorkflowReleaseAssembler(t *testing.T) {
+	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
+	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	for name, text := range map[string]string{"candidate": candidate, "publisher": publisher} {
+		if strings.Count(text, "& scripts/assemble-workflow-release.ps1") != 1 {
+			t.Fatalf("%s workflow does not use exactly one shared assembler", name)
+		}
+		if strings.Contains(text, "go run ./cmd/workflow-release assemble") {
+			t.Fatalf("%s workflow retains an independent release assembler", name)
+		}
+	}
+	assembler := readWorkflow(t, "scripts", "assemble-workflow-release.ps1")
+	for _, required := range []string{
+		"$SourceCommit", "$GitHubActionsRunID", "$WorkerImage", "$SBOMPath",
+		"go run ./cmd/workflow-release assemble",
+		"-workflow-version-exe $workflowVersionExecutable",
+		"Workflow Release manifest Bundle digest differs from assembled asset",
+		"Workflow Release manifest SBOM digest differs from assembled asset",
+		"worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip",
+	} {
+		if !strings.Contains(assembler, required) {
+			t.Fatalf("shared assembler omits %q", required)
 		}
 	}
 }

@@ -10,6 +10,7 @@ on:
       - "deploy/worker/**"
       - "config/toolchain.json"
       - "config/workflow-release.json"
+      - "scripts/assemble-workflow-release.ps1"
       - ".github/workflows/worker-contract.yml"
       - ".github/workflows/publish-workflow.yml"
 
@@ -38,10 +39,16 @@ jobs:
   worker-contract:
     # Linux is the Worker container runtime, not a supported Control Plane host.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      qualification_image: ${{ steps.qualification-image.outputs.image }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Detect Worker image input changes
         id: worker-changes
         shell: bash
@@ -73,9 +80,13 @@ jobs:
           echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_repository=$(jq -r .no_mistakes.repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
           echo "no_mistakes_commit=$(jq -r .no_mistakes.commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "worker_image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
       - name: Build without publishing
+        id: image
         if: steps.worker-changes.outputs.required == 'true'
+        shell: bash
         run: |
+          candidate="${{ steps.pins.outputs.worker_image_repository }}:qualification-${{ github.event.pull_request.head.sha }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker build \
             --build-arg "CODEX_VERSION=${{ steps.pins.outputs.codex_version }}" \
             --build-arg "GITHUB_CLI_VERSION=${{ steps.pins.outputs.github_cli_version }}" \
@@ -85,13 +96,14 @@ jobs:
             --build-arg "NO_MISTAKES_VERSION=${{ steps.pins.outputs.no_mistakes_version }}" \
             --build-arg "NO_MISTAKES_REPOSITORY=${{ steps.pins.outputs.no_mistakes_repository }}" \
             --build-arg "NO_MISTAKES_COMMIT=${{ steps.pins.outputs.no_mistakes_commit }}" \
-            --tag "workflow-worker:candidate-${{ github.event.pull_request.head.sha }}" \
+            --tag "$candidate" \
             --file deploy/worker/Dockerfile .
+          echo "reference=$candidate" >> "$GITHUB_OUTPUT"
       - name: Verify Worker contract
         if: steps.worker-changes.outputs.required == 'true'
         shell: bash
         run: |
-          candidate="workflow-worker:candidate-${{ github.event.pull_request.head.sha }}"
+          candidate="${{ steps.image.outputs.reference }}"
           codex_output="$(docker run --rm "$candidate" codex --version)"
           if [[ "$codex_output" =~ ^codex-cli[[:space:]]+([^[:space:]]+)$ ]]; then
             test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.codex_version }}"
@@ -140,7 +152,7 @@ jobs:
           output-file: worker-sbom.spdx.json
           upload-artifact: false
       - name: Scan candidate Worker dependencies
-        if: steps.worker-changes.outputs.required == 'true'
+        if: steps.worker-changes.outputs.required == 'true' && !(github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-')))
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
         with:
           sbom: worker-sbom.spdx.json
@@ -148,6 +160,34 @@ jobs:
           severity-cutoff: high
           only-fixed: true
           output-format: table
+      - name: Scan qualification Worker dependencies without blocking functional qualification
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: false
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+      - name: Authenticate qualification Worker registry
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish qualification Worker image by immutable digest
+        id: qualification-image
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        shell: bash
+        run: |
+          candidate="${{ steps.image.outputs.reference }}"
+          docker push "$candidate"
+          digest="$(docker buildx imagetools inspect "$candidate" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image="${{ steps.pins.outputs.worker_image_repository }}@$digest"
+          docker buildx imagetools inspect "$image" >/dev/null
+          echo "image=$image" >> "$GITHUB_OUTPUT"
       - name: Transfer scanned SBOM to the release dry run
         if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -164,6 +204,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: candidate-worker-sbom
@@ -173,27 +214,11 @@ jobs:
         run: |
           $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_HEAD_REF -cne "release-$version" -and $env:GITHUB_HEAD_REF -cne "hotfix-$version") { throw 'candidate branch and version differ' }
-      - name: Build both release components without publication
+      - name: Assemble qualification candidate without publication
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force build/payload/repository-contract,build/payload/skills,build/release | Out-Null
-          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
-          go build -trimpath -ldflags "-buildid= -X main.Version=$version" -o build/workflow.exe ./cmd/workflow
-          go build -trimpath -ldflags "-buildid=" -o build/workflow-setup.exe ./cmd/workflow-setup
-          Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
-          Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
-          $dryRunBytes = [Text.Encoding]::UTF8.GetBytes('dry-run')
-          $dryRunDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($dryRunBytes)).ToLowerInvariant()
-          go run ./cmd/workflow-release assemble `
-            -config config/workflow-release.json -toolchain config/toolchain.json `
-            -workflow-exe build/workflow.exe -setup-exe build/workflow-setup.exe -payload build/payload `
-            -output build/release -source-commit '${{ github.event.pull_request.head.sha }}' `
-            -github-actions-run-id '${{ github.run_id }}' `
-            -worker-image "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" `
-            -sbom build/release-inputs/worker-sbom.spdx.json
-          $bundleDigest = (Get-FileHash -LiteralPath build/release/workflow-windows-amd64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          & skills/setup-agent-workflow/scripts/verify-windows-bundle.ps1 `
-            -BundlePath build/release/workflow-windows-amd64.zip -ExpectedSHA256 $bundleDigest `
-            -ExpectedVersion $version -ExpectedWorkerImage "ghcr.io/skyhuang233/workflow-worker@sha256:$dryRunDigest" | Out-Null
-          $names = @(Get-ChildItem build/release -File | Sort-Object Name | ForEach-Object Name)
-          if (($names -join ' ') -cne 'worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip') { throw 'dry run output is not exact' }
+          & scripts/assemble-workflow-release.ps1 `
+            -SourceCommit '${{ github.event.pull_request.head.sha }}' `
+            -GitHubActionsRunID '${{ github.run_id }}' `
+            -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
+            -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release

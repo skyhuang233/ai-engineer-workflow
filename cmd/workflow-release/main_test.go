@@ -23,12 +23,16 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	}
 
 	workflowExecutable := filepath.Join(root, "workflow.exe")
+	if err := os.WriteFile(workflowExecutable, []byte("windows workflow"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workflowVersionExecutable := filepath.Join(root, "workflow-version-check.exe")
 	versionProbeSource := filepath.Join(root, "version-probe.go")
 	versionProbe := fmt.Sprintf("package main\nimport \"fmt\"\nfunc main(){fmt.Println(%q)}\n", "workflow "+config.Version)
 	if err := os.WriteFile(versionProbeSource, []byte(versionProbe), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	build := exec.Command("go", "build", "-o", workflowExecutable, versionProbeSource)
+	build := exec.Command("go", "build", "-o", workflowVersionExecutable, versionProbeSource)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build Workflow executable: %v\n%s", err, output)
 	}
@@ -57,6 +61,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 		"-config", configPath,
 		"-toolchain", filepath.Join(repositoryRoot, "config", "toolchain.json"),
 		"-workflow-exe", workflowExecutable,
+		"-workflow-version-exe", workflowVersionExecutable,
 		"-setup-exe", setupExecutable,
 		"-payload", payload,
 		"-output", outputDirectory,

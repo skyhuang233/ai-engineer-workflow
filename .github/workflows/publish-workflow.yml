@@ -185,19 +185,10 @@ jobs:
       - name: Assemble the atomic Workflow Release
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force build/payload/repository-contract,build/payload/skills,build/release | Out-Null
-          go build -trimpath -ldflags "-buildid= -X main.Version=${{ needs.worker.outputs.version }}" -o build/workflow.exe ./cmd/workflow
-          go build -trimpath -ldflags "-buildid=" -o build/workflow-setup.exe ./cmd/workflow-setup
-          Copy-Item -Recurse -Force deploy/platform/repository-contract/* build/payload/repository-contract/
-          Copy-Item -Recurse -Force deploy/platform/skills/* build/payload/skills/
-          go run ./cmd/workflow-release assemble `
-            -config config/workflow-release.json -toolchain config/toolchain.json `
-            -workflow-exe build/workflow.exe -setup-exe build/workflow-setup.exe -payload build/payload `
-            -output build/release -source-commit $env:GITHUB_SHA -github-actions-run-id $env:GITHUB_RUN_ID `
-            -worker-image '${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}' `
-            -sbom build/release-inputs/worker-sbom.spdx.json
-          $names = @(Get-ChildItem build/release -File | Sort-Object Name | ForEach-Object Name)
-          if (($names -join ' ') -cne 'worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip') { throw "release output is not the exact three-asset set" }
+          & scripts/assemble-workflow-release.ps1 `
+            -SourceCommit $env:GITHUB_SHA -GitHubActionsRunID $env:GITHUB_RUN_ID `
+            -WorkerImage '${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}' `
+            -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
       - name: Resolve fresh, retry, or immutable state
         id: release
         shell: bash

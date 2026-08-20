@@ -39,6 +39,7 @@ func runAssemble(arguments []string) error {
 	configPath := flags.String("config", "", "Workflow Release configuration")
 	toolchainPath := flags.String("toolchain", "", "toolchain configuration")
 	workflowExecutable := flags.String("workflow-exe", "", "Windows amd64 workflow.exe")
+	workflowVersionExecutable := flags.String("workflow-version-exe", "", "host-native workflow executable used to verify the version")
 	setupExecutable := flags.String("setup-exe", "", "Windows amd64 workflow-setup.exe")
 	payload := flags.String("payload", "", "staged package payload root")
 	output := flags.String("output", "", "empty release output directory")
@@ -72,7 +73,11 @@ func runAssemble(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	if err := verifyWorkflowExecutableVersion(*workflowExecutable, config.Version); err != nil {
+	versionExecutable := strings.TrimSpace(*workflowVersionExecutable)
+	if versionExecutable == "" {
+		versionExecutable = *workflowExecutable
+	}
+	if err := verifyWorkflowExecutableVersion(versionExecutable, config.Version); err != nil {
 		return err
 	}
 	if err := requireEmptyDirectory(*output); err != nil {
