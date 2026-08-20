@@ -162,6 +162,7 @@ jobs:
           output-format: table
       - name: Scan qualification Worker dependencies without blocking functional qualification
         if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        continue-on-error: true
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
         with:
           sbom: worker-sbom.spdx.json

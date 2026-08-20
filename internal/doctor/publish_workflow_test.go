@@ -132,7 +132,6 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 	for _, required := range []string{
 		"packages: write",
 		"Scan qualification Worker dependencies without blocking functional qualification",
-		"fail-build: false",
 		"image: ${{ steps.image.outputs.reference }}",
 		`docker push "$candidate"`,
 		`docker buildx imagetools inspect "$image"`,
@@ -152,10 +151,18 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 	if strings.Count(text, "${{ steps.image.outputs.reference }}") != 3 {
 		t.Fatal("qualification candidate does not consistently consume the emitted Worker image reference")
 	}
+	qualificationScan := strings.Index(text, "name: Scan qualification Worker dependencies without blocking functional qualification")
+	authenticate := strings.Index(text, "name: Authenticate qualification Worker registry")
+	if qualificationScan < 0 || authenticate <= qualificationScan ||
+		!strings.Contains(text[qualificationScan:authenticate], "continue-on-error: true") ||
+		!strings.Contains(text[qualificationScan:authenticate], "fail-build: false") {
+		t.Fatal("qualification scan can block functional candidate publication")
+	}
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
 	scan := strings.Index(publisher, "name: Scan Worker before push")
 	push := strings.Index(publisher, "name: Push only the scan-passing image")
-	if scan < 0 || push <= scan || !strings.Contains(publisher[scan:push], "fail-build: true") {
+	if scan < 0 || push <= scan || !strings.Contains(publisher[scan:push], "fail-build: true") ||
+		strings.Contains(publisher[scan:push], "continue-on-error: true") {
 		t.Fatal("formal publisher no longer blocks image publication on its vulnerability scan")
 	}
 }
