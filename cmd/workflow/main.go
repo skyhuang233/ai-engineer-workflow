@@ -29,11 +29,11 @@ import (
 	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/plan"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
@@ -219,7 +219,7 @@ func validateWorkflowBuildVersion() error {
 	if Version == "dev" {
 		return nil
 	}
-	if err := platformrelease.ValidatePlatformVersion(Version); err != nil {
+	if err := workflowbundle.ValidateVersion(Version); err != nil {
 		return fmt.Errorf("invalid published Workflow CLI version: %w", err)
 	}
 	return nil

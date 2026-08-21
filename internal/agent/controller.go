@@ -15,7 +15,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
-	"github.com/skyhuang233/workflow/internal/workerrelease"
+	"github.com/skyhuang233/workflow/internal/workerruntime"
 	toon "github.com/toon-format/toon-go"
 )
 
@@ -695,7 +695,7 @@ func (c Controller) activeWorkerRuntime(ctx context.Context) (string, map[string
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve Active Worker Image: %w", err)
 	}
-	provenance, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
+	provenance, err := workerruntime.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
 	if err != nil || provenance.Version != activeRelease.Version || provenance.SourceCommit != activeRelease.SourceCommit || provenance.ImageReference != activeRelease.ImageReference {
 		return "", nil, errors.New("Active Worker Image has an invalid release manifest")
 	}

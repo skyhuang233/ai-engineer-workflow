@@ -13,7 +13,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
-	"github.com/skyhuang233/workflow/internal/workerrelease"
+	"github.com/skyhuang233/workflow/internal/workerruntime"
 )
 
 type deliveryWorkspaceRuntimeFunc func(context.Context, worker.Spec) (worker.Result, error)
@@ -545,7 +545,7 @@ func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load Doctor-activated Worker Release: %v", err)
 	}
-	manifest, err := workerrelease.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
+	manifest, err := workerruntime.DecodeToolProvenance([]byte(activeRelease.ManifestJSON))
 	if err != nil {
 		t.Fatalf("decode active Worker Release Manifest: %v", err)
 	}

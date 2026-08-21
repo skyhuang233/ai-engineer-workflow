@@ -17,8 +17,8 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 )
 
 const (
@@ -638,7 +638,7 @@ func (e Engine) verifyGeneration(home string, active Active) error {
 	if err != nil {
 		return fmt.Errorf("active generation lacks platform-release.json: %w", err)
 	}
-	var manifest platformrelease.BundleManifest
+	var manifest workflowbundle.BundleManifest
 	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
 		return fmt.Errorf("decode active generation manifest: %w", err)
 	}

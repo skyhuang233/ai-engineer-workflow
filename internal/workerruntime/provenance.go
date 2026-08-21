@@ -1,4 +1,4 @@
-package workerrelease
+package workerruntime
 
 import (
 	"errors"

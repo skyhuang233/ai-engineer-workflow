@@ -11,7 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
@@ -88,15 +89,15 @@ func runAssemble(arguments []string) error {
 		return err
 	}
 	bundlePath := filepath.Join(*output, workflowrelease.BundleAssetName)
-	bundleManifest := platformrelease.BundleManifest{
+	bundleManifest := workflowbundle.BundleManifest{
 		SchemaVersion: 1, SetupProtocolVersion: 1, Version: config.Version,
-		Compatibility: platformrelease.Compatibility{
-			OS: "windows", Architecture: "amd64", DatabaseSchema: 63, WorkerImage: *workerImage,
+		Compatibility: workflowbundle.Compatibility{
+			OS: "windows", Architecture: "amd64", DatabaseSchema: store.LatestSchemaVersion, WorkerImage: *workerImage,
 			DockerDesktopVersion: config.DockerDesktop.Version, DockerInstallerURL: config.DockerDesktop.InstallerURL,
 			DockerInstallerSHA256: config.DockerDesktop.WindowsAMD64SHA256,
 		},
 	}
-	if err := platformrelease.AssembleBundle(platformrelease.BundleAssembleOptions{
+	if err := workflowbundle.AssembleBundle(workflowbundle.BundleAssembleOptions{
 		Output: bundlePath, SetupExecutable: *setupExecutable, WorkflowExecutable: *workflowExecutable,
 		PayloadDirectory: *payload, Manifest: bundleManifest,
 	}); err != nil {

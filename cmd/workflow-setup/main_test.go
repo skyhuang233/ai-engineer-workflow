@@ -17,7 +17,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/launcher"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
@@ -106,8 +106,8 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 		}
 	}
 	bundle := filepath.Join(root, "workflow-windows-amd64.zip")
-	manifest := platformrelease.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: platformrelease.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
-	if err := platformrelease.AssembleBundle(platformrelease.BundleAssembleOptions{Output: bundle, SetupExecutable: launcherSource, WorkflowExecutable: workflowSource, PayloadDirectory: payload, Manifest: manifest}); err != nil {
+	manifest := workflowbundle.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: workflowbundle.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
+	if err := workflowbundle.AssembleBundle(workflowbundle.BundleAssembleOptions{Output: bundle, SetupExecutable: launcherSource, WorkflowExecutable: workflowSource, PayloadDirectory: payload, Manifest: manifest}); err != nil {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(root, "extracted")

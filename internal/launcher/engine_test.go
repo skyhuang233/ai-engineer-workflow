@@ -16,8 +16,8 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
@@ -1359,7 +1359,7 @@ func writeTestVerifiedReleaseManifest(t *testing.T, directory, version, bundleDi
 
 func writeTestBundleVersion(t *testing.T, root, version string, files map[string]string) {
 	t.Helper()
-	inventory := make([]platformrelease.BundleFile, 0, len(files))
+	inventory := make([]workflowbundle.BundleFile, 0, len(files))
 	for path, content := range files {
 		full := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
@@ -1370,9 +1370,9 @@ func writeTestBundleVersion(t *testing.T, root, version string, files map[string
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256(data)
-		inventory = append(inventory, platformrelease.BundleFile{Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))})
+		inventory = append(inventory, workflowbundle.BundleFile{Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))})
 	}
-	manifest := platformrelease.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: version, Compatibility: platformrelease.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}, Files: inventory}
+	manifest := workflowbundle.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: version, Compatibility: workflowbundle.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}, Files: inventory}
 	raw, err := manifest.Canonical()
 	if err != nil {
 		t.Fatal(err)

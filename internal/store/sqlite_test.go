@@ -355,8 +355,8 @@ func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != latestSchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, latestSchemaVersion)
+	if version != LatestSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, LatestSchemaVersion)
 	}
 }
 
