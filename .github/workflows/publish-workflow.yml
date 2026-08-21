@@ -138,8 +138,6 @@ jobs:
       - name: Restore exact qualified candidate from immutable registry digest
         id: stored-candidate
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           head_sha="${{ steps.admission.outputs.head_sha }}"
           run_id="${{ steps.qualification.outputs.run_id }}"
@@ -152,46 +150,31 @@ jobs:
           test "$repository_path" != "$candidate_repository" && test "$candidate_package" != "$repository_path"
           test "${candidate_owner,,}" = "${configured_owner,,}"
           [[ "$candidate_package" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
-          prefix="q-${head_sha}-${run_attempt}-"
-          versions="$(gh api --paginate --slurp "users/${configured_owner}/packages/container/${candidate_package}/versions?per_page=100")"
-          mapfile -t candidates < <(jq --exit-status --raw-output --arg prefix "$prefix" '
-            [.[][] | select(.name | test("^sha256:[0-9a-f]{64}$")) as $version |
-              .metadata.container.tags[]? |
-              select(test("^" + $prefix + "[0-9a-f]{64}$")) |
-              [$version.name, .] | @tsv] | unique | .[]
-          ' <<<"$versions")
-          rm -rf build/qualified
-          mkdir -p build/qualified
-          matches=0
-          selected_manifest=""
-          selected_digest=""
-          for candidate in "${candidates[@]}"; do
-            registry_digest="${candidate%%$'\t'*}"
-            tag="${candidate#*$'\t'}"
-            manifest_sha256="${tag##*-}"
-            image="${candidate_repository}@${registry_digest}"
-            docker pull "$image" >/dev/null
-            labels="$(docker image inspect "$image" --format '{{json .Config.Labels}}')"
-            if jq --exit-status --arg head "$head_sha" --arg run "$run_id" --arg attempt "$run_attempt" --arg manifest "$manifest_sha256" '
+          candidate_tag="q-${head_sha}-${run_id}-${run_attempt}"
+          tagged_reference="${candidate_repository}:${candidate_tag}"
+          registry_digest="$(docker buildx imagetools inspect "$tagged_reference" --format '{{json .Manifest.Digest}}' |
+            jq --exit-status --raw-output 'select(type == "string" and test("^sha256:[0-9a-f]{64}$"))')"
+          image="${candidate_repository}@${registry_digest}"
+          docker pull "$image" >/dev/null
+          labels="$(docker image inspect "$image" --format '{{json .Config.Labels}}')"
+          manifest_sha256="$(jq --exit-status --raw-output --arg head "$head_sha" --arg run "$run_id" --arg attempt "$run_attempt" '
+            select(
               .["io.agent-workflow.candidate-source-commit"] == $head and
               .["io.agent-workflow.qualification-run-id"] == $run and
-              .["io.agent-workflow.qualification-run-attempt"] == $attempt and
-              .["io.agent-workflow.manifest-sha256"] == $manifest
-            ' <<<"$labels" >/dev/null; then
-              matches=$((matches + 1))
-              test "$matches" -eq 1 || { echo "qualified candidate registry identity is ambiguous" >&2; exit 1; }
-              container="$(docker create "$image")"
-              docker cp "$container:/qualified/." build/qualified
-              docker rm "$container" >/dev/null
-              selected_manifest="$manifest_sha256"
-              selected_digest="$registry_digest"
-            fi
-          done
-          test "$matches" -eq 1 || { echo "qualified candidate registry identity is missing" >&2; exit 1; }
+              .["io.agent-workflow.qualification-run-attempt"] == $attempt
+            ) |
+            .["io.agent-workflow.manifest-sha256"] |
+            select(type == "string" and test("^[0-9a-f]{64}$"))
+          ' <<<"$labels")"
+          rm -rf build/qualified
+          mkdir -p build/qualified
+          container="$(docker create "$image")"
+          docker cp "$container:/qualified/." build/qualified
+          docker rm "$container" >/dev/null
           actual_manifest="$(sha256sum build/qualified/workflow-release.json | awk '{print $1}')"
-          test "$actual_manifest" = "$selected_manifest" || { echo "qualified candidate manifest digest differs from registry identity" >&2; exit 1; }
-          echo "manifest_sha256=$selected_manifest" >> "$GITHUB_OUTPUT"
-          echo "registry_digest=$selected_digest" >> "$GITHUB_OUTPUT"
+          test "$actual_manifest" = "$manifest_sha256" || { echo "qualified candidate manifest digest differs from registry identity" >&2; exit 1; }
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+          echo "registry_digest=$registry_digest" >> "$GITHUB_OUTPUT"
       - name: Verify exact qualified release candidate
         id: candidate
         shell: pwsh

@@ -71,8 +71,9 @@ func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.
 		`($merged | fromdateiso8601)`,
 		`qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}`,
 		`merged_at: ${{ steps.admission.outputs.merged_at }}`,
-		`users/${configured_owner}/packages/container/${candidate_package}/versions?per_page=100`,
-		`prefix="q-${head_sha}-${run_attempt}-"`,
+		`candidate_tag="q-${head_sha}-${run_id}-${run_attempt}"`,
+		`tagged_reference="${candidate_repository}:${candidate_tag}"`,
+		`docker buildx imagetools inspect "$tagged_reference"`,
 		`image="${candidate_repository}@${registry_digest}"`,
 		`io.agent-workflow.candidate-source-commit`,
 		`io.agent-workflow.qualification-run-id`,
@@ -97,7 +98,7 @@ func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.
 	if strings.Contains(text, `-f status=completed`) || strings.Contains(text, `.workflow_runs[] | select(`+"\n"+`              .event == "pull_request" and .head_sha == $head and .conclusion == "success"`) {
 		t.Fatal("unified publisher selects qualification from mutable latest-attempt state")
 	}
-	for _, forbidden := range []string{"actions/runs/${run_id}/artifacts", "qualified-workflow-release-", "bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
+	for _, forbidden := range []string{"actions/runs/${run_id}/artifacts", "qualified-workflow-release-", "packages/container/${candidate_package}/versions", "bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("unified publisher can replace the qualified candidate through %q", forbidden)
 		}
@@ -157,8 +158,9 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
 		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
 		"Preserve exact qualified Workflow Release candidate",
-		`$tag = "q-$head-$attempt-$manifestDigest"`,
+		`$tag = "q-$head-$runID-$attempt"`,
 		`$repository = "$([string]$toolchain.worker.image_repository)-release-candidate"`,
+		`qualified candidate registry identity already exists`,
 		`io.agent-workflow.candidate-source-commit`,
 		`io.agent-workflow.qualification-run-id`,
 		`io.agent-workflow.qualification-run-attempt`,

@@ -254,8 +254,10 @@ jobs:
           $manifestDigest = (Get-FileHash -LiteralPath build/release/workflow-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
           $toolchain = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
           $repository = "$([string]$toolchain.worker.image_repository)-release-candidate"
-          $tag = "q-$head-$attempt-$manifestDigest"
+          $tag = "q-$head-$runID-$attempt"
           $reference = "${repository}:$tag"
+          docker buildx imagetools inspect $reference 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw 'qualified candidate registry identity already exists' }
           $context = 'build/release-container'
           New-Item -ItemType Directory -Force -Path $context | Out-Null
           Copy-Item -LiteralPath build/release/worker-sbom.spdx.json,build/release/workflow-release.json,build/release/workflow-windows-amd64.zip -Destination $context
