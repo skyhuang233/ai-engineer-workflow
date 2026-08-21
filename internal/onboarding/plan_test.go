@@ -42,6 +42,23 @@ func approvedPublication() PublicationPreflight {
 	return publicationPreflightFunc(func(context.Context, string, string, string, bool) error { return nil })
 }
 
+func addWorkflowContractProducer(t *testing.T, repo string) {
+	t.Helper()
+	files, _, _, err := repositorycontract.Render("single-context", nil, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(repo, ".github", "workflows", "workflow-contract.yml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, files[".github/workflows/workflow-contract.yml"], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", ".github/workflows/workflow-contract.yml")
+	git(t, repo, "commit", "-m", "seed workflow contract")
+}
+
 func TestPlanRequiresVerifiedRepositoryAbsenceBeforeApprovingCreation(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "new-repo")
 	git(t, "", "init", "-b", "main", repo)
@@ -53,6 +70,7 @@ func TestPlanRequiresVerifiedRepositoryAbsenceBeforeApprovingCreation(t *testing
 
 func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	repo := newRepo(t)
+	addWorkflowContractProducer(t, repo)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
 	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: approvedPublishedPolicy()})
 	if err != nil {
@@ -79,6 +97,15 @@ func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	}
 }
 
+func TestPlanBlocksPublishedOnboardingWithoutDefaultBranchCheckProducer(t *testing.T) {
+	repo := newRepo(t)
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: approvedPublishedPolicy()})
+	if err == nil || !strings.Contains(err.Error(), "default-branch workflow-contract check producer") {
+		t.Fatalf("published onboarding without a runnable check producer was accepted: %v", err)
+	}
+}
+
 func TestPlanBindsPublishedRepositoryNameAndVisibilityToDiscovery(t *testing.T) {
 	repo := newRepo(t)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
@@ -102,6 +129,7 @@ func TestPlanBindsPublishedRepositoryNameAndVisibilityToDiscovery(t *testing.T) 
 
 func TestPlanPublishedPolicyPreconditionRetainsVerifiedVisibility(t *testing.T) {
 	repo := newRepo(t)
+	addWorkflowContractProducer(t, repo)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
 	public := false
 	policy := policyDiscoveryFunc(func(context.Context, string, string) (RepositoryPolicy, error) {
@@ -206,8 +234,12 @@ func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *te
 		}
 	}
 	var snapshot []BaselineFile
-	if err := json.Unmarshal([]byte(baseline.Parameters["files_json"]), &snapshot); err != nil || len(snapshot) != 1 || snapshot[0].Path != "AGENTS.md" || snapshot[0].SHA256 == "" {
+	if err := json.Unmarshal([]byte(baseline.Parameters["files_json"]), &snapshot); err != nil || len(snapshot) != 2 || snapshot[0].Path != ".github/workflows/workflow-contract.yml" || snapshot[1].Path != "AGENTS.md" || snapshot[0].SHA256 == "" || snapshot[1].SHA256 == "" {
 		t.Fatalf("baseline snapshot = %#v, err=%v", snapshot, err)
+	}
+	var bootstrap map[string]string
+	if err := json.Unmarshal([]byte(baseline.Parameters["bootstrap_files_json"]), &bootstrap); err != nil || bootstrap[".github/workflows/workflow-contract.yml"] == "" {
+		t.Fatalf("baseline bootstrap = %#v, err=%v", bootstrap, err)
 	}
 	var encoded map[string]string
 	if err := json.Unmarshal([]byte(contract.Parameters["files_json"]), &encoded); err != nil {
@@ -255,6 +287,7 @@ func TestPlanApprovalSnapshotRejectsZeroBaselineDriftBeforeEffects(t *testing.T)
 
 func TestPlanUsesCanonicalHTTPSForSSHOriginAndBindsRemoteBase(t *testing.T) {
 	repo := newRepo(t)
+	addWorkflowContractProducer(t, repo)
 	git(t, repo, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
 	var resolvedURL string
@@ -296,6 +329,7 @@ func (f remoteHeadFunc) Resolve(ctx context.Context, origin string) (string, str
 
 func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t *testing.T) {
 	repo := newRepo(t)
+	addWorkflowContractProducer(t, repo)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
 	policy := policyDiscoveryFunc(func(_ context.Context, repository, branch string) (RepositoryPolicy, error) {
 		if repository != "owner/repo" || branch != "main" {
@@ -459,6 +493,7 @@ func TestPlanAlwaysReverifiesAdmissionForFeatureOnlyRepair(t *testing.T) {
 
 func TestPlanCreatesForwardRepairForManagedContractDrift(t *testing.T) {
 	repo := newRepo(t)
+	addWorkflowContractProducer(t, repo)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
 	state := onboardingStateFunc(func(context.Context, string, string, string, []Label) (OnboardingState, error) {
 		return OnboardingState{ContractSatisfied: false, AdmissionSatisfied: true}, nil

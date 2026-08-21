@@ -291,6 +291,13 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
     if ($LASTEXITCODE -ne 0) { throw "Cannot clone fixture repository $Repository" }
 }
 
+function Add-WorkflowContractProducer([string]$Target) {
+    $workflowDirectory = Join-Path $Target ".github\workflows"
+    New-Item -ItemType Directory -Force -Path $workflowDirectory | Out-Null
+    $source = Join-Path $PSScriptRoot "..\..\..\deploy\platform\repository-contract\.github\workflows\workflow-contract.yml"
+    Copy-Item -LiteralPath $source -Destination (Join-Path $workflowDirectory "workflow-contract.yml")
+}
+
     $env:USERPROFILE = $profileRoot; $env:HOME = $profileRoot
     $env:CODEX_HOME = Join-Path $profileRoot ".codex"
 	New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
@@ -309,7 +316,8 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
         param($target)
         git -C $target init -b main | Out-Null
         [IO.File]::WriteAllText((Join-Path $target "README.md"), "baseline`n")
-        git -C $target add README.md; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
+        Add-WorkflowContractProducer $target
+        git -C $target add README.md .github/workflows/workflow-contract.yml; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
 		$publishedDirtyRepository = "$GitHubOwner/workflow-setup-e2e-$runID-published-dirty"
 		gh repo create $publishedDirtyRepository --private --source $target --remote origin --push
 		if ($LASTEXITCODE -ne 0) { throw "Cannot create the published dirty fixture repository" }

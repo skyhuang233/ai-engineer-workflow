@@ -62,7 +62,10 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 	for _, required := range []string{
 		"actions: read",
 		`actions/workflows/worker-contract.yml/runs`,
-		`-f event=pull_request -f head_sha="$head_sha" -f status=completed`,
+		`-f event=pull_request -f head_sha="$head_sha" -f per_page=100`,
+		`actions/runs/${candidate_run_id}/attempts/${attempt}`,
+		`for ((attempt=latest_attempt; attempt>=1; attempt--))`,
+		`.status == "completed" and .conclusion == "success"`,
 		`any(.pull_requests[]?; .number == $pull)`,
 		`.updated_at | fromdateiso8601`,
 		`($merged | fromdateiso8601)`,
@@ -86,6 +89,9 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 		if !strings.Contains(text, required) {
 			t.Fatalf("unified publisher omits qualified-candidate contract %q", required)
 		}
+	}
+	if strings.Contains(text, `-f status=completed`) || strings.Contains(text, `.workflow_runs[] | select(`+"\n"+`              .event == "pull_request" and .head_sha == $head and .conclusion == "success"`) {
+		t.Fatal("unified publisher selects qualification from mutable latest-attempt state")
 	}
 	for _, forbidden := range []string{"bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
 		if strings.Contains(text, forbidden) {

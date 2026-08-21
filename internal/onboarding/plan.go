@@ -1,6 +1,7 @@
 package onboarding
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -111,13 +112,29 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 	encodedFiles, _ := json.Marshal(filePayload)
 	encodedBeforeFiles, _ := json.Marshal(beforePayload)
 	var zeroBaseline []BaselineFile
+	var initialBaseline []BaselineFile
+	bootstrapPayload := map[string]string{}
 	if !discovery.HasCommits {
 		zeroBaseline, err = BaselineSnapshot(ctx, discovery.Root)
 		if err != nil {
 			return setupcontract.Plan{}, err
 		}
+		initialBaseline = append([]BaselineFile(nil), zeroBaseline...)
+		workflowPath := ".github/workflows/workflow-contract.yml"
+		workflowBytes := files[workflowPath]
+		existingWorkflow, readErr := os.ReadFile(filepath.Join(discovery.Root, filepath.FromSlash(workflowPath)))
+		if errors.Is(readErr, os.ErrNotExist) {
+			sum := sha256.Sum256(workflowBytes)
+			initialBaseline = append(initialBaseline, BaselineFile{Path: workflowPath, SHA256: hex.EncodeToString(sum[:]), Mode: "100644"})
+			bootstrapPayload[workflowPath] = base64.StdEncoding.EncodeToString(workflowBytes)
+		} else if readErr != nil {
+			return setupcontract.Plan{}, readErr
+		} else if !bytes.Equal(existingWorkflow, workflowBytes) {
+			return setupcontract.Plan{}, errors.New("zero-commit repository has a conflicting workflow-contract check producer")
+		}
+		sort.Slice(initialBaseline, func(i, j int) bool { return initialBaseline[i].Path < initialBaseline[j].Path })
 	}
-	snapshotJSON, err := CaptureApprovalSnapshot(ctx, discovery, repositoryID, zeroBaseline)
+	snapshotJSON, err := captureApprovalSnapshot(ctx, discovery, repositoryID, zeroBaseline, initialBaseline)
 	if err != nil {
 		return setupcontract.Plan{}, err
 	}
@@ -185,6 +202,13 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 				return setupcontract.Plan{}, fmt.Errorf("discover current onboarding state: %w", err)
 			}
 		}
+		if !state.ContractSatisfied {
+			workflowPath := ".github/workflows/workflow-contract.yml"
+			producer, producerErr := gitBytes(ctx, discovery.Root, "show", "HEAD:"+workflowPath)
+			if producerErr != nil || !bytes.Equal(producer, files[workflowPath]) {
+				return setupcontract.Plan{}, errors.New("published repository lacks the exact default-branch workflow-contract check producer")
+			}
+		}
 	}
 	if !discovery.Published {
 		if options.Publication == nil {
@@ -202,8 +226,9 @@ func Plan(ctx context.Context, options PlanOptions) (setupcontract.Plan, error) 
 			if findings := ScanCredentialMaterial(discovery.Root, baselineFiles); len(findings) > 0 {
 				return setupcontract.Plan{}, errors.New("credential material blocks Initial Repository Baseline")
 			}
-			encoded, _ := json.Marshal(zeroBaseline)
-			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: discovery.Root, Action: "commit_and_push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "files_json": string(encoded), "repository": repositoryID, "source_url": "https://github.com/" + repositoryID + ".git"}})
+			encoded, _ := json.Marshal(initialBaseline)
+			encodedBootstrap, _ := json.Marshal(bootstrapPayload)
+			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: discovery.Root, Action: "commit_and_push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "files_json": string(encoded), "bootstrap_files_json": string(encodedBootstrap), "repository": repositoryID, "source_url": "https://github.com/" + repositoryID + ".git"}})
 		} else {
 			plan.Effects = append(plan.Effects, setupcontract.Effect{ID: "publish-history", Kind: "publish_history", Subject: repositoryID, Action: "push", Parameters: map[string]string{"branch": discovery.DefaultBranch, "head": discovery.Head, "new_repository": "true"}})
 		}

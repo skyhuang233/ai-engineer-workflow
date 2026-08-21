@@ -25,7 +25,7 @@ type Descriptor struct {
 
 var descriptors = []Descriptor{
 	{Kind: "create_repository", PlanKind: RepositoryOnboarding, Actions: []string{"create"}, Required: []string{"owner", "authenticated_login", "name", "private", "approval_absent_repository"}, Engine: StandardEffect},
-	{Kind: "initial_baseline", PlanKind: RepositoryOnboarding, Actions: []string{"commit_and_push"}, Required: []string{"branch", "files_json", "repository", "source_url"}, Engine: StandardEffect},
+	{Kind: "initial_baseline", PlanKind: RepositoryOnboarding, Actions: []string{"commit_and_push"}, Required: []string{"branch", "files_json", "repository", "source_url"}, Optional: []string{"bootstrap_files_json"}, Engine: StandardEffect},
 	{Kind: "publish_history", PlanKind: RepositoryOnboarding, Actions: []string{"push"}, Required: []string{"branch", "head"}, Optional: []string{"new_repository"}, Engine: StandardEffect},
 	{Kind: "github_label", PlanKind: RepositoryOnboarding, Actions: []string{"reconcile"}, Required: []string{"name", "color", "description"}, Engine: StandardEffect},
 	{Kind: "repository_features", PlanKind: RepositoryOnboarding, Actions: []string{"enable"}, Required: []string{"issues", "actions", "allowed_actions"}, Engine: StandardEffect},

@@ -299,7 +299,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			return errors.New("Actions policy is invalid")
 		}
 	}
-	for _, key := range []string{"files_json", "before_files_json", "required_checks_json", "labels_json"} {
+	for _, key := range []string{"files_json", "bootstrap_files_json", "before_files_json", "required_checks_json", "labels_json"} {
 		if value, exists := effect.Parameters[key]; exists && !json.Valid([]byte(value)) {
 			return fmt.Errorf("parameter %q must be valid JSON", key)
 		}

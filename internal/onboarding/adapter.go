@@ -2,9 +2,11 @@ package onboarding
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -370,7 +372,11 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 			return err
 		}
 		if _, err := gitOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD"); err != nil {
-			head, createErr := CreateInitialBaseline(ctx, effect.Subject, effect.Parameters["branch"], files, "Initial Repository Baseline\n\nOnboarding-Plan-SHA256: "+a.PlanDigest)
+			bootstrap, decodeErr := decodeBootstrapFiles(effect.Parameters["bootstrap_files_json"])
+			if decodeErr != nil {
+				return decodeErr
+			}
+			head, createErr := CreateInitialBaselineWithBootstrap(ctx, effect.Subject, effect.Parameters["branch"], files, bootstrap, "Initial Repository Baseline\n\nOnboarding-Plan-SHA256: "+a.PlanDigest)
 			if createErr != nil {
 				return createErr
 			}
@@ -411,6 +417,25 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 		return fmt.Errorf("Repository Onboarding effect %q requires its guarded Git primitive", effect.Kind)
 	}
 	return nil
+}
+
+func decodeBootstrapFiles(raw string) (map[string][]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	encoded := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &encoded); err != nil {
+		return nil, errors.New("invalid Initial Repository Baseline bootstrap files")
+	}
+	result := make(map[string][]byte, len(encoded))
+	for path, value := range encoded {
+		data, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || filepath.ToSlash(filepath.Clean(filepath.FromSlash(path))) != path || path == "." || filepath.IsAbs(path) || strings.HasPrefix(path, "../") {
+			return nil, errors.New("invalid Initial Repository Baseline bootstrap file")
+		}
+		result[path] = data
+	}
+	return result, nil
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
