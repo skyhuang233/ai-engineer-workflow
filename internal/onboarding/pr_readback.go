@@ -9,6 +9,7 @@ type PullReadback struct {
 	Found, Merged, Mergeable                             bool
 	Number                                               int64
 	Branch, Head, Base, BaseHead, Body, MergeHead, State string
+	MergedBy, MergedByType                               string
 	ChecksPassed, ReviewsClean, ContentMatches           bool
 }
 
@@ -24,7 +25,7 @@ const (
 // DecideOnboardingPull is deliberately pure. Remote callers must provide the
 // exact immutable digest-bound evidence; any absent or divergent identity is
 // a conflict rather than authority to update or merge a Pull Request.
-func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead string) (PullDecision, error) {
+func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead, owner string) (PullDecision, error) {
 	if !isFullSHA256(digest) || branch != "workflow/onboarding-"+digest[:12] || base == "" || !isGitObjectID(baseHead) {
 		return PullConflict, errors.New("approved Onboarding Pull identity is invalid")
 	}
@@ -40,6 +41,9 @@ func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead str
 	if value.Merged {
 		if !strings.EqualFold(value.State, "closed") || !isGitObjectID(value.MergeHead) {
 			return PullConflict, errors.New("merged Onboarding Pull Request lacks exact merge evidence")
+		}
+		if owner == "" || !strings.EqualFold(value.MergedBy, owner) || !strings.EqualFold(value.MergedByType, "User") {
+			return PullConflict, errors.New("Onboarding Pull Request was not merged by the admitted human repository owner")
 		}
 		return PullSatisfied, nil
 	}
@@ -57,6 +61,13 @@ func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead str
 	default:
 		return PullConflict, errors.New("Onboarding Pull Request has an unknown state")
 	}
+}
+
+func onboardingPullContentRef(value PullReadback, branch string) string {
+	if value.Merged && isGitObjectID(value.Head) {
+		return value.Head
+	}
+	return branch
 }
 
 func isGitObjectID(value string) bool {

@@ -102,7 +102,11 @@ func (r githubOnboardingRemote) OnboardingPull(ctx context.Context, repository, 
 	if err != nil || !found {
 		return onboarding.PullReadback{Found: found}, err
 	}
-	value := onboarding.PullReadback{Found: true, Number: pull.Number, Branch: pull.Head.Ref, Head: pull.Head.SHA, Base: pull.Base.Ref, BaseHead: pull.Base.SHA, Body: pull.Body, MergeHead: pull.MergeCommitSHA, State: pull.State, Merged: pull.MergedAt != "", Mergeable: pull.Mergeable != nil && *pull.Mergeable, ContentMatches: true}
+	pull, err = r.client.OnboardingPullRequest(ctx, repository, pull.Number)
+	if err != nil {
+		return onboarding.PullReadback{}, err
+	}
+	value := onboarding.PullReadback{Found: true, Number: pull.Number, Branch: pull.Head.Ref, Head: pull.Head.SHA, Base: pull.Base.Ref, BaseHead: pull.Base.SHA, Body: pull.Body, MergeHead: pull.MergeCommitSHA, State: pull.State, Merged: pull.MergedAt != "", MergedBy: pull.MergedBy.Login, MergedByType: pull.MergedBy.Type, Mergeable: pull.Mergeable != nil && *pull.Mergeable, ContentMatches: true}
 	reviews, err := r.client.OnboardingPullRequestReviews(ctx, repository, pull.Number)
 	if err != nil {
 		return onboarding.PullReadback{}, err

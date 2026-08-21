@@ -254,10 +254,7 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 		if decodeErr != nil {
 			return setupcontract.EffectFailed, "", decodeErr
 		}
-		contentRef := branch
-		if pull.Merged && isGitObjectID(pull.Head) {
-			contentRef = pull.Head
-		}
+		contentRef := onboardingPullContentRef(pull, branch)
 		if verifyErr := a.Remote.VerifyOnboardingContent(ctx, effect.Subject, contentRef, files); verifyErr != nil {
 			if errors.Is(verifyErr, ErrManagedContentNotFound) {
 				pull.ContentMatches = false
@@ -266,7 +263,7 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 			}
 		}
 	}
-	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead)
+	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead, a.Owner)
 	if err != nil || decision == PullConflict {
 		return setupcontract.EffectConflicting, "Onboarding Pull Request identity or content drifted from the exact approved digest", nil
 	}

@@ -48,7 +48,11 @@ type OnboardingPullRequest struct {
 	MergeCommitSHA string `json:"merge_commit_sha"`
 	Mergeable      *bool  `json:"mergeable"`
 	MergeableState string `json:"mergeable_state"`
-	Head           struct {
+	MergedBy       struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"merged_by"`
+	Head struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"head"`
