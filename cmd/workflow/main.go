@@ -431,7 +431,7 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	if err := database.ActivateWorkerReleaseFenced(context.Background(), store.WorkerRelease{
-		Version: manifest.Version, SourceCommit: manifest.SourceCommit,
+		Version: manifest.Version, SourceCommit: manifest.CandidateSourceCommit,
 		ImageReference: manifest.Worker.Image, ManifestJSON: string(manifestJSON),
 		VerifiedAt: report.GeneratedAt, ActivatedAt: report.GeneratedAt,
 	}, expectedActiveImage); err != nil {

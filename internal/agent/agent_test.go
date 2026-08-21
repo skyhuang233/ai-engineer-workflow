@@ -2763,7 +2763,7 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 func testWorkerReleaseManifest(t *testing.T, version, sourceCommit, image, codexVersion, githubCLIVersion, goVersion, noMistakesVersion string) string {
 	t.Helper()
 	manifest := workflowrelease.Manifest{
-		SchemaVersion: 1, Version: version, SourceCommit: sourceCommit, GitHubActionsRunID: 1,
+		SchemaVersion: 1, Version: version, CandidateSourceCommit: sourceCommit, QualificationRunID: 1,
 		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.Repeat("a", 64)},
 		Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
 			Codex:      workflowrelease.CodexTool{Version: codexVersion},

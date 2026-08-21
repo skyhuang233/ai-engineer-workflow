@@ -210,8 +210,8 @@ jobs:
         shell: pwsh
         run: |
           & scripts/assemble-workflow-release.ps1 `
-            -SourceCommit '${{ github.event.pull_request.head.sha }}' `
-            -GitHubActionsRunID '${{ github.run_id }}' `
+            -CandidateSourceCommit '${{ github.event.pull_request.head.sha }}' `
+            -QualificationRunID '${{ github.run_id }}' `
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
       - name: Preserve exact qualified Workflow Release candidate

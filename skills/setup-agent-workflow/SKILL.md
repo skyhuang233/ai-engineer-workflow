@@ -29,10 +29,12 @@ fail closed; never fall back to `platform-v*` or `worker-v*`.
 
 Download only `workflow-release.json` first and authenticate its bytes against
 the GitHub asset digest. Before downloading either other asset, run the
-PowerShell bootstrap verifier, require the Release tag to resolve directly to
-the manifest `source_commit`, and require its successful Actions run to have
-that same head SHA, event `push`, and the trusted publisher path
-`.github/workflows/publish-workflow.yml`. The verifier enforces schema 1 with
+PowerShell bootstrap verifier. Treat manifest `candidate_source_commit` and
+`qualification_run_id` as qualified-candidate provenance. Separately require
+the Release target and direct tag to identify an owner-created two-parent main
+merge containing that candidate, require the authoritative qualification to
+have completed before the merge, and require a successful `push` run of
+`.github/workflows/publish-workflow.yml` for the merge commit. The verifier enforces schema 1 with
 exact case-sensitive fields: unknown, duplicate, absent, mistyped, or invalid
 values fail. It does not execute downloaded code. Then download the Bundle and
 SBOM, verify their GitHub asset digests, and require those digests to equal the

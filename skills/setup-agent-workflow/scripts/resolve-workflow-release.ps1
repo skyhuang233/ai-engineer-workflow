@@ -68,6 +68,19 @@ function Assert-DownloadedDigest {
   return $actualHex
 }
 
+function Get-GitHubTimestamp {
+  param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Label)
+  if ($Value -is [DateTimeOffset]) {
+    return $Value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+  }
+  if ($Value -is [DateTime]) {
+    return ([DateTimeOffset]$Value).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+  }
+  $text = [string]$Value
+  if ($text -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') { throw "$Label timestamp is invalid" }
+  return $text
+}
+
 $resolvedDownload = [IO.Path]::GetFullPath($DownloadDirectory)
 New-Item -ItemType Directory -Force -Path $resolvedDownload | Out-Null
 if (@(Get-ChildItem -LiteralPath $resolvedDownload -Force).Count -ne 0) { throw 'Workflow Release download directory must be empty' }
@@ -115,14 +128,62 @@ $validator = Join-Path $PSScriptRoot 'verify-workflow-release-manifest.ps1'
 $validatedJSON = & $validator -ManifestPath $manifestPath -ExpectedSHA256 ([string]$manifestAsset.digest) -ExpectedSize ([long]$manifestAsset.size) -ExpectedTag ([string]$release.tag_name)
 if ($LASTEXITCODE -ne 0) { throw 'Workflow Release manifest bootstrap validation failed' }
 $validated = $validatedJSON | ConvertFrom-Json
-if ([string]$release.target_commitish -cne [string]$validated.source_commit) { throw 'Workflow Release target does not match its manifest source commit' }
+$mergeCommit = [string]$release.target_commitish
+if ($mergeCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Workflow Release target is not a full lowercase merge commit' }
 
 $tagRef = Invoke-GhJSON "repos/$repository/git/ref/tags/$([Uri]::EscapeDataString([string]$release.tag_name))"
-if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne [string]$validated.source_commit) { throw 'Workflow Release tag does not resolve to its manifest source commit' }
-$run = Invoke-GhJSON "repos/$repository/actions/runs/$($validated.github_actions_run_id)"
-if ([string]$run.path -cne [string]$policy.workflow_path -or [string]$run.head_sha -cne [string]$validated.source_commit -or [string]$run.event -cne 'push' -or [string]$run.status -cne 'completed' -or [string]$run.conclusion -cne 'success') {
-  throw 'Workflow Release source was not produced by the trusted successful publisher'
+if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne $mergeCommit) { throw 'Workflow Release tag does not resolve directly to its publisher merge commit' }
+
+$pullSummaries = @(Invoke-GhJSON "repos/$repository/commits/$mergeCommit/pulls")
+$matchingPulls = @($pullSummaries | Where-Object {
+  -not [string]::IsNullOrWhiteSpace([string]$_.merged_at) -and
+  [string]$_.merge_commit_sha -ceq $mergeCommit -and [string]$_.base.ref -ceq 'main'
+})
+if ($matchingPulls.Count -ne 1 -or [long]$matchingPulls[0].number -le 0) { throw 'Workflow Release publisher merge lacks one merged main Pull Request' }
+$pull = Invoke-GhJSON "repos/$repository/pulls/$([long]$matchingPulls[0].number)"
+$candidateCommit = [string]$validated.candidate_source_commit
+$owner = $repository.Split('/')[0]
+$expectedBranch = "release-$($validated.version)"
+$expectedHotfix = "hotfix-$($validated.version)"
+$mergedAt = Get-GitHubTimestamp $pull.merged_at 'Workflow Release owner merge'
+if ([string]$pull.merge_commit_sha -cne $mergeCommit -or [string]$pull.base.ref -cne 'main') { throw 'Workflow Release publisher target is not the Pull Request main merge' }
+if ([string]$pull.head.ref -cne $expectedBranch -and [string]$pull.head.ref -cne $expectedHotfix) { throw 'Workflow Release publisher branch does not match its version' }
+if ([string]$pull.head.sha -cne $candidateCommit) { throw 'Workflow Release owner merge does not contain the qualified candidate head' }
+if (-not [string]::Equals([string]$pull.merged_by.login, $owner, [StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals([string]$pull.merged_by.type, 'user', [StringComparison]::OrdinalIgnoreCase) -or
+    [string]$pull.merged_by.login -imatch '\[bot\]$') { throw 'Workflow Release publisher merge was not performed by the repository owner' }
+$integration = Invoke-GhJSON "repos/$repository/git/commits/$mergeCommit"
+$parents = @($integration.parents)
+if ($parents.Count -ne 2 -or @($parents | Where-Object { [string]$_.sha -ceq $candidateCommit }).Count -ne 1) {
+  throw 'Workflow Release publisher commit is not a two-parent merge containing the qualified candidate'
 }
+
+$qualificationWorkflow = Invoke-GhJSON "repos/$repository/actions/workflows/worker-contract.yml"
+$qualificationRun = Invoke-GhJSON "repos/$repository/actions/runs/$($validated.qualification_run_id)"
+if ([string]$qualificationWorkflow.path -cne '.github/workflows/worker-contract.yml' -or [string]$qualificationWorkflow.state -cne 'active' -or
+    [long]$qualificationRun.workflow_id -ne [long]$qualificationWorkflow.id -or [string]$qualificationRun.path -cne '.github/workflows/worker-contract.yml' -or
+    [string]$qualificationRun.head_sha -cne $candidateCommit -or [string]$qualificationRun.event -cne 'pull_request' -or
+    [string]$qualificationRun.status -cne 'completed' -or [string]$qualificationRun.conclusion -cne 'success' -or
+    @($qualificationRun.pull_requests | Where-Object { [long]$_.number -eq [long]$pull.number }).Count -eq 0) {
+  throw 'Qualified candidate was not produced by the authoritative successful qualification run for its Pull Request'
+}
+$qualificationCompletedAt = Get-GitHubTimestamp $qualificationRun.updated_at 'Workflow Release qualification completion'
+if ([DateTimeOffset]::Parse($qualificationCompletedAt, [Globalization.CultureInfo]::InvariantCulture) -gt [DateTimeOffset]::Parse($mergedAt, [Globalization.CultureInfo]::InvariantCulture)) {
+  throw 'Qualification did not complete before the owner merge'
+}
+
+$publisherWorkflowName = Split-Path -Leaf ([string]$policy.workflow_path)
+$publisherWorkflow = Invoke-GhJSON "repos/$repository/actions/workflows/$publisherWorkflowName"
+$publisherRuns = Invoke-GhJSON "repos/$repository/actions/workflows/$([long]$publisherWorkflow.id)/runs?event=push&head_sha=$mergeCommit&status=success&per_page=100"
+$trustedPublisherRuns = @($publisherRuns.workflow_runs | Where-Object {
+  [long]$_.workflow_id -eq [long]$publisherWorkflow.id -and [string]$_.path -ceq [string]$policy.workflow_path -and
+  [string]$_.head_sha -ceq $mergeCommit -and [string]$_.head_branch -ceq 'main' -and [string]$_.event -ceq 'push' -and
+  [string]$_.status -ceq 'completed' -and [string]$_.conclusion -ceq 'success'
+})
+if ([string]$publisherWorkflow.path -cne [string]$policy.workflow_path -or [string]$publisherWorkflow.state -cne 'active' -or $trustedPublisherRuns.Count -eq 0) {
+  throw 'Workflow Release merge was not consumed by the trusted successful publisher'
+}
+$publisherRun = $trustedPublisherRuns | Sort-Object -Property id -Descending | Select-Object -First 1
 
 $bundlePath = Download-ReleaseAsset ([string]$release.tag_name) 'workflow-windows-amd64.zip'
 $sbomPath = Download-ReleaseAsset ([string]$release.tag_name) 'worker-sbom.spdx.json'
@@ -135,7 +196,12 @@ if ($sbomMetadataDigest -cne [string]$validated.sbom_sha256) { throw 'Worker SBO
   schema_version = 1
   version = [string]$validated.version
   tag = [string]$release.tag_name
-  source_commit = [string]$validated.source_commit
+  source_commit = $candidateCommit
+  qualification_run_id = [long]$validated.qualification_run_id
+  qualification_completed_at = $qualificationCompletedAt
+  merged_at = $mergedAt
+  publisher_source_commit = $mergeCommit
+  publisher_run_id = [long]$publisherRun.id
   manifest_path = $manifestPath
   manifest_sha256 = [string]$validated.manifest_sha256
   bundle_path = $bundlePath

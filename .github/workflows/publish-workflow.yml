@@ -29,8 +29,11 @@ jobs:
     outputs:
       version: ${{ steps.admission.outputs.version }}
       tag: ${{ steps.admission.outputs.tag }}
-      source_commit: ${{ steps.admission.outputs.head_sha }}
+      candidate_source_commit: ${{ steps.admission.outputs.head_sha }}
+      merge_commit: ${{ github.sha }}
       qualification_run_id: ${{ steps.qualification.outputs.run_id }}
+      qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}
+      merged_at: ${{ steps.admission.outputs.merged_at }}
       manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
       worker_image: ${{ steps.candidate.outputs.worker_image }}
       allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}
@@ -58,6 +61,7 @@ jobs:
           pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}")"
           head_ref="$(jq --exit-status --raw-output '.head.ref' <<<"$pull")"
           head_sha="$(jq --exit-status --raw-output '.head.sha | select(test("^[0-9a-f]{40}$"))' <<<"$pull")"
+          merged_at="$(jq --exit-status --raw-output '.merged_at | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' <<<"$pull")"
           case "$head_ref" in
             "release-${version}"|"hotfix-${version}") ;;
             *) echo "publisher accepts only release-${version} or hotfix-${version}" >&2; exit 1 ;;
@@ -76,6 +80,7 @@ jobs:
           echo "tag=workflow-v${version}" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "pull_number=$pull_number" >> "$GITHUB_OUTPUT"
+          echo "merged_at=$merged_at" >> "$GITHUB_OUTPUT"
       - name: Resolve exact successful qualification
         id: qualification
         shell: bash
@@ -84,18 +89,22 @@ jobs:
         run: |
           head_sha="${{ steps.admission.outputs.head_sha }}"
           pull_number="${{ steps.admission.outputs.pull_number }}"
+          merged_at="${{ steps.admission.outputs.merged_at }}"
           runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/worker-contract.yml/runs" \
             -f event=pull_request -f head_sha="$head_sha" -f status=completed -f per_page=100)"
-          run="$(jq --exit-status --compact-output --arg head "$head_sha" --argjson pull "$pull_number" '
+          run="$(jq --exit-status --compact-output --arg head "$head_sha" --arg merged "$merged_at" --argjson pull "$pull_number" '
             [.workflow_runs[] | select(
               .event == "pull_request" and .head_sha == $head and .conclusion == "success" and
+              (.updated_at | type == "string") and (.updated_at | fromdateiso8601) <= ($merged | fromdateiso8601) and
               any(.pull_requests[]?; .number == $pull)
-            )] | sort_by(.id) | reverse | .[0] | {id, run_attempt}
+            )] | sort_by(.id) | reverse | .[0] | {id, run_attempt, updated_at}
           ' <<<"$runs")"
           run_id="$(jq --raw-output .id <<<"$run")"
           run_attempt="$(jq --raw-output .run_attempt <<<"$run")"
+          completed_at="$(jq --raw-output .updated_at <<<"$run")"
           [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || { echo "exact pull request head lacks a successful qualification" >&2; exit 1; }
           [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || { echo "qualification run attempt is invalid" >&2; exit 1; }
+          [[ "$completed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || { echo "qualification completion timestamp is invalid" >&2; exit 1; }
           artifact_name="qualified-workflow-release-${head_sha}-${run_attempt}"
           artifacts="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" -f per_page=100)"
           artifact="$(jq --exit-status --compact-output --arg name "$artifact_name" '
@@ -110,6 +119,7 @@ jobs:
           mkdir -p build/qualified
           unzip -q qualification.zip -d build/qualified
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "completed_at=$completed_at" >> "$GITHUB_OUTPUT"
       - name: Verify exact qualified release candidate
         id: candidate
         shell: pwsh
@@ -118,7 +128,7 @@ jobs:
             -CandidateDirectory build/qualified `
             -ExpectedVersion '${{ steps.admission.outputs.version }}' `
             -ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}' `
-            -ExpectedGitHubActionsRunID '${{ steps.qualification.outputs.run_id }}' | ConvertFrom-Json
+            -ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}' | ConvertFrom-Json
           "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
       - name: Preflight Workflow Release target
@@ -192,8 +202,8 @@ jobs:
           $candidate = & skills/setup-agent-workflow/scripts/resolve-workflow-candidate.ps1 `
             -CandidateDirectory build/release `
             -ExpectedVersion '${{ needs.qualified-candidate.outputs.version }}' `
-            -ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.source_commit }}' `
-            -ExpectedGitHubActionsRunID '${{ needs.qualified-candidate.outputs.qualification_run_id }}' | ConvertFrom-Json
+            -ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.candidate_source_commit }}' `
+            -ExpectedQualificationRunID '${{ needs.qualified-candidate.outputs.qualification_run_id }}' | ConvertFrom-Json
           if ([string]$candidate.manifest_sha256 -cne '${{ needs.qualified-candidate.outputs.manifest_sha256 }}') { throw 'transferred qualification manifest digest differs' }
           if ([string]$candidate.worker_image -cne '${{ needs.qualified-candidate.outputs.worker_image }}') { throw 'transferred qualification Worker digest differs' }
       - name: Resolve fresh, retry, or immutable state

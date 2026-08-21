@@ -43,8 +43,8 @@ func runAssemble(arguments []string) error {
 	setupExecutable := flags.String("setup-exe", "", "Windows amd64 workflow-setup.exe")
 	payload := flags.String("payload", "", "staged package payload root")
 	output := flags.String("output", "", "empty release output directory")
-	sourceCommit := flags.String("source-commit", "", "accepted source commit")
-	runID := flags.Int64("github-actions-run-id", 0, "publisher Actions run ID")
+	sourceCommit := flags.String("candidate-source-commit", "", "qualified candidate source commit")
+	runID := flags.Int64("qualification-run-id", 0, "qualification Actions run ID")
 	workerImage := flags.String("worker-image", "", "immutable Worker image reference")
 	sbom := flags.String("sbom", "", "generated SPDX JSON SBOM")
 	if err := flags.Parse(arguments); err != nil {
@@ -56,14 +56,14 @@ func runAssemble(arguments []string) error {
 	for name, value := range map[string]string{
 		"config": *configPath, "toolchain": *toolchainPath,
 		"workflow-exe": *workflowExecutable, "setup-exe": *setupExecutable, "payload": *payload,
-		"output": *output, "source-commit": *sourceCommit, "worker-image": *workerImage, "sbom": *sbom,
+		"output": *output, "candidate-source-commit": *sourceCommit, "worker-image": *workerImage, "sbom": *sbom,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("-%s is required", name)
 		}
 	}
 	if *runID <= 0 {
-		return errors.New("-github-actions-run-id must be positive")
+		return errors.New("-qualification-run-id must be positive")
 	}
 	config, err := workflowrelease.LoadConfig(*configPath)
 	if err != nil {
@@ -107,7 +107,7 @@ func runAssemble(arguments []string) error {
 		return fmt.Errorf("stage Worker SBOM: %w", err)
 	}
 	manifest, err := workflowrelease.CreateManifest(workflowrelease.ManifestOptions{
-		Config: config, SourceCommit: *sourceCommit, GitHubActionsRunID: *runID, BundlePath: bundlePath,
+		Config: config, CandidateSourceCommit: *sourceCommit, QualificationRunID: *runID, BundlePath: bundlePath,
 		WorkerImage: *workerImage, Tools: toolchain.Tools(), SBOMPath: sbomPath,
 	})
 	if err != nil {

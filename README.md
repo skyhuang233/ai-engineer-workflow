@@ -31,7 +31,8 @@ Go toolchain. It also rebuilds the pinned GitHub CLI release commit with the
 security-fixed `golang.org/x/mod` dependency and verifies the deterministic
 binary hash recorded in the manifest. The Workflow Release—not a separate
 no-mistakes Release—is the supply-chain boundary; Doctor verifies the final
-assets, direct source tag, publisher run, and immutable Worker digest.
+assets, candidate qualification, owner merge and direct tag, publisher run,
+and immutable Worker digest.
 
 Platform and Worker are released atomically under one product version. Legacy
 split-release artifacts and tags have been retired. Until the first owner-approved

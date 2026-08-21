@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory)][string]$CandidateDirectory,
   [Parameter(Mandatory)][string]$ExpectedVersion,
   [Parameter(Mandatory)][string]$ExpectedSourceCommit,
-  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedGitHubActionsRunID = 0
+  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedQualificationRunID = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,10 +42,10 @@ $validated = & $validator `
   -ExpectedSHA256 ('sha256:' + $manifestDigest) `
   -ExpectedSize (Get-Item -LiteralPath $manifestPath).Length `
   -ExpectedTag ('workflow-v' + $ExpectedVersion) | ConvertFrom-Json
-if ([string]$validated.source_commit -cne $ExpectedSourceCommit) {
+if ([string]$validated.candidate_source_commit -cne $ExpectedSourceCommit) {
   throw 'Workflow Release candidate manifest does not match the expected source commit'
 }
-if ($ExpectedGitHubActionsRunID -gt 0 -and [long]$validated.github_actions_run_id -ne $ExpectedGitHubActionsRunID) {
+if ($ExpectedQualificationRunID -gt 0 -and [long]$validated.qualification_run_id -ne $ExpectedQualificationRunID) {
   throw 'Workflow Release candidate manifest does not match the expected qualification run'
 }
 
@@ -67,7 +67,7 @@ $bundleVerifier = Join-Path $PSScriptRoot 'verify-windows-bundle.ps1'
 [pscustomobject]@{
   schema_version = 1
   version = [string]$validated.version
-  source_commit = [string]$validated.source_commit
+  source_commit = [string]$validated.candidate_source_commit
   manifest_path = $manifestPath
   manifest_sha256 = $manifestDigest
   bundle_path = $bundlePath

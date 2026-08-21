@@ -81,3 +81,15 @@ func TestReleaseIntegrationRequiresTwoParentsIncludingPullHead(t *testing.T) {
 		t.Fatal("accepted merge that omitted the exact pull request head")
 	}
 }
+
+func TestQualificationMustCompleteNoLaterThanMerge(t *testing.T) {
+	if !completedNoLaterThan("2026-08-21T01:00:00Z", "2026-08-21T02:00:00Z") {
+		t.Fatal("rejected qualification completed before merge")
+	}
+	if completedNoLaterThan("2026-08-21T03:00:00Z", "2026-08-21T02:00:00Z") {
+		t.Fatal("accepted post-merge qualification")
+	}
+	if completedNoLaterThan("invalid", "2026-08-21T02:00:00Z") {
+		t.Fatal("accepted invalid qualification completion time")
+	}
+}

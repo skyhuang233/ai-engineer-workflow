@@ -23,7 +23,7 @@ func DecodeToolProvenance(raw []byte) (ToolProvenance, error) {
 		return ToolProvenance{}, err
 	}
 	provenance := ToolProvenance{
-		Version: manifest.Version, SourceCommit: manifest.SourceCommit,
+		Version: manifest.Version, SourceCommit: manifest.CandidateSourceCommit,
 		ImageReference:    manifest.Worker.Image,
 		CodexVersion:      manifest.Worker.Tools.Codex.Version,
 		GitHubCLIVersion:  manifest.Worker.Tools.GitHubCLI.Version,

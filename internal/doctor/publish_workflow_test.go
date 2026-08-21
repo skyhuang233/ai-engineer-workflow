@@ -64,13 +64,18 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 		`actions/workflows/worker-contract.yml/runs`,
 		`-f event=pull_request -f head_sha="$head_sha" -f status=completed`,
 		`any(.pull_requests[]?; .number == $pull)`,
+		`.updated_at | fromdateiso8601`,
+		`($merged | fromdateiso8601)`,
+		`qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}`,
+		`merged_at: ${{ steps.admission.outputs.merged_at }}`,
 		`qualified-workflow-release-${head_sha}-${run_attempt}`,
 		`.expired == false`,
 		`(.digest | test("^sha256:[0-9a-f]{64}$"))`,
 		`actions/artifacts/${artifact_id}/zip`,
 		`test "$actual_digest" = "$artifact_digest"`,
 		`-ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}'`,
-		`-ExpectedGitHubActionsRunID '${{ steps.qualification.outputs.run_id }}'`,
+		`-ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}'`,
+		`-ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.candidate_source_commit }}'`,
 		`transferred qualification manifest digest differs`,
 		`transferred qualification Worker digest differs`,
 		"workflow-windows-amd64.zip", "workflow-release.json", "worker-sbom.spdx.json",
@@ -190,7 +195,7 @@ func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
 	}
 	assembler := readWorkflow(t, "scripts", "assemble-workflow-release.ps1")
 	for _, required := range []string{
-		"$SourceCommit", "$GitHubActionsRunID", "$WorkerImage", "$SBOMPath",
+		"$CandidateSourceCommit", "$QualificationRunID", "$WorkerImage", "$SBOMPath",
 		"go run ./cmd/workflow-release assemble",
 		"-workflow-version-exe $workflowVersionExecutable",
 		"Workflow Release manifest Bundle digest differs from assembled asset",

@@ -65,8 +65,8 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 		"-setup-exe", setupExecutable,
 		"-payload", payload,
 		"-output", outputDirectory,
-		"-source-commit", strings.Repeat("a", 40),
-		"-github-actions-run-id", "42",
+		"-candidate-source-commit", strings.Repeat("a", 40),
+		"-qualification-run-id", "42",
 		"-worker-image", image,
 		"-sbom", sbom,
 	}); err != nil {

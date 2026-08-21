@@ -84,7 +84,7 @@ func (e Engine) verifiedWorkerRelease(request Request) (*store.WorkerRelease, er
 	if err != nil {
 		return nil, err
 	}
-	if manifest.Version != request.TargetVersion || manifest.SourceCommit != verified.SourceCommit || manifest.Bundle.SHA256 != strings.TrimPrefix(request.BundleDigest, "sha256:") {
+	if manifest.Version != request.TargetVersion || manifest.CandidateSourceCommit != verified.SourceCommit || manifest.Bundle.SHA256 != strings.TrimPrefix(request.BundleDigest, "sha256:") {
 		return nil, errors.New("verified release manifest differs from the exact setup target")
 	}
 	compatibility, err := e.bundleCompatibility()
@@ -94,5 +94,5 @@ func (e Engine) verifiedWorkerRelease(request Request) (*store.WorkerRelease, er
 	if manifest.Worker.Image != compatibility.WorkerImage {
 		return nil, errors.New("verified release manifest Worker image differs from the verified Bundle")
 	}
-	return &store.WorkerRelease{Version: manifest.Version, SourceCommit: manifest.SourceCommit, ImageReference: manifest.Worker.Image, ManifestJSON: string(raw)}, nil
+	return &store.WorkerRelease{Version: manifest.Version, SourceCommit: manifest.CandidateSourceCommit, ImageReference: manifest.Worker.Image, ManifestJSON: string(raw)}, nil
 }
