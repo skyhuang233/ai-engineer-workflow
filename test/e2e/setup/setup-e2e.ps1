@@ -133,6 +133,21 @@ function Wait-ForWorkflowContractCheck([string]$Repository, [string]$Head) {
     }
 }
 
+function Assert-WorkflowContractProducer([string]$Repository, [string]$Ref) {
+    if ($Ref -cnotmatch '^[0-9a-f]{40}$') { throw "Merged onboarding workflow-contract producer ref is invalid" }
+    $contentRaw = gh api "repos/$Repository/contents/.github/workflows/workflow-contract.yml?ref=$Ref"
+    $contentExit = $LASTEXITCODE
+    if ($contentExit -ne 0) { throw "Merged onboarding workflow-contract producer cannot be read" }
+    $content = $contentRaw | ConvertFrom-Json
+    if ([string]$content.path -cne '.github/workflows/workflow-contract.yml' -or [string]$content.encoding -cne 'base64') { throw "Merged onboarding workflow-contract producer identity is invalid" }
+    $actual = [Convert]::FromBase64String(([string]$content.content -replace '\s', ''))
+    $source = Join-Path $PSScriptRoot "..\..\..\deploy\platform\repository-contract\.github\workflows\workflow-contract.yml"
+    $expected = [IO.File]::ReadAllBytes($source)
+    $actualDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($actual))
+    $expectedDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($expected))
+    if ($actualDigest -cne $expectedDigest) { throw "Merged onboarding workflow-contract producer differs from the qualified release" }
+}
+
 function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
     if ([string]$Gate.gate_kind -cne $ExpectedGate -or [string]$Gate.pull_request -cnotmatch '^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$' -or [string]$Gate.pull_head -cnotmatch '^[0-9a-f]{40}$' -or [string]$Gate.merge_method -cnotin @('merge','squash','rebase')) {
         throw "Owner merge gate lacks exact pull request identity"
@@ -152,8 +167,12 @@ function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
         $pull = $pullRaw | ConvertFrom-Json
         if ([string]$pull.state -cne 'open' -or [string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request changed before authorization" }
         if ($ExpectedGate -eq 'repository_onboarding' -and -not ([string]$pull.body).Contains([string]$Gate.onboarding_plan_digest)) { throw "Onboarding pull request does not bind the approved Plan Digest" }
-        Wait-ForWorkflowContractCheck $repository ([string]$Gate.pull_head)
-        Write-Host "::notice title=Owner merge required::$($Gate.pull_request) passed the exact GitHub Actions workflow-contract check at head $($Gate.pull_head). The repository owner must authorize its $($Gate.merge_method) merge."
+        if ($ExpectedGate -eq 'worker_delivery') {
+            Wait-ForWorkflowContractCheck $repository ([string]$Gate.pull_head)
+            Write-Host "::notice title=Owner merge required::$($Gate.pull_request) passed the exact GitHub Actions workflow-contract check at head $($Gate.pull_head). The repository owner must authorize its $($Gate.merge_method) merge."
+        } else {
+            Write-Host "::notice title=Owner merge required::$($Gate.pull_request) is the exact approved onboarding pull request. The repository owner must authorize its $($Gate.merge_method) merge before setup verifies the installed workflow producer."
+        }
         $deadline = [DateTime]::UtcNow.AddMinutes($OwnerMergeTimeoutMinutes)
         while ($true) {
             $pullRaw = gh api "repos/$repository/pulls/$number"
@@ -168,6 +187,9 @@ function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
             if ([string]$pull.state -cne 'open') { throw "Owner merge pull request closed without the required merge" }
             if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for the repository owner to authorize the exact pull request merge" }
             Start-Sleep -Seconds 15
+        }
+        if ($ExpectedGate -eq 'repository_onboarding') {
+            Assert-WorkflowContractProducer $repository ([string]$pull.merge_commit_sha)
         }
     } finally {
         if ($null -eq $savedToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $savedToken }
@@ -291,13 +313,6 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
     if ($LASTEXITCODE -ne 0) { throw "Cannot clone fixture repository $Repository" }
 }
 
-function Add-WorkflowContractProducer([string]$Target) {
-    $workflowDirectory = Join-Path $Target ".github\workflows"
-    New-Item -ItemType Directory -Force -Path $workflowDirectory | Out-Null
-    $source = Join-Path $PSScriptRoot "..\..\..\deploy\platform\repository-contract\.github\workflows\workflow-contract.yml"
-    Copy-Item -LiteralPath $source -Destination (Join-Path $workflowDirectory "workflow-contract.yml")
-}
-
     $env:USERPROFILE = $profileRoot; $env:HOME = $profileRoot
     $env:CODEX_HOME = Join-Path $profileRoot ".codex"
 	New-Item -ItemType Directory -Force -Path $env:CODEX_HOME | Out-Null
@@ -316,8 +331,7 @@ function Add-WorkflowContractProducer([string]$Target) {
         param($target)
         git -C $target init -b main | Out-Null
         [IO.File]::WriteAllText((Join-Path $target "README.md"), "baseline`n")
-        Add-WorkflowContractProducer $target
-        git -C $target add README.md .github/workflows/workflow-contract.yml; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
+        git -C $target add README.md; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
 		$publishedDirtyRepository = "$GitHubOwner/workflow-setup-e2e-$runID-published-dirty"
 		gh repo create $publishedDirtyRepository --private --source $target --remote origin --push
 		if ($LASTEXITCODE -ne 0) { throw "Cannot create the published dirty fixture repository" }

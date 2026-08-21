@@ -124,7 +124,7 @@ func (r githubOnboardingRemote) OnboardingPull(ctx context.Context, repository, 
 }
 func checksPassed(checks []workflowgithub.OnboardingCheck, required []onboarding.RequiredCheck) bool {
 	if len(required) == 0 {
-		return false
+		return true
 	}
 	seen := map[string]bool{}
 	for _, check := range checks {

@@ -309,7 +309,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			Context string `json:"context"`
 			AppID   int64  `json:"app_id"`
 		}
-		if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil {
+		if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || checks == nil {
 			return errors.New("repository contract required checks are invalid")
 		}
 		identities := map[string]int64{}
@@ -322,7 +322,7 @@ func validateEffect(planKind PlanKind, effect Effect) error {
 			}
 			identities[check.Context] = check.AppID
 		}
-		if identities[repositorycontract.RequiredCheckName] != repositorycontract.GitHubActionsAppID {
+		if appID, present := identities[repositorycontract.RequiredCheckName]; present && appID != repositorycontract.GitHubActionsAppID {
 			return errors.New("workflow-contract required check has an unapproved App identity")
 		}
 	}

@@ -303,8 +303,8 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 
 func requiredChecksForEffect(effect setupcontract.Effect) ([]RequiredCheck, error) {
 	var checks []RequiredCheck
-	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || len(checks) == 0 {
-		return nil, errors.New("Onboarding Pull Request lacks approved required checks")
+	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || checks == nil {
+		return nil, errors.New("Onboarding Pull Request approved required checks are invalid")
 	}
 	return CanonicalRequiredChecks(checks), nil
 }

@@ -97,12 +97,28 @@ func TestPlanPublishedRepositoryContainsExactContractEffects(t *testing.T) {
 	}
 }
 
-func TestPlanBlocksPublishedOnboardingWithoutDefaultBranchCheckProducer(t *testing.T) {
+func TestPlanAllowsPublishedOnboardingWithoutDefaultBranchCheckProducer(t *testing.T) {
 	repo := newRepo(t)
 	head := testGitOutput(t, repo, "rev-parse", "HEAD")
-	_, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: approvedPublishedPolicy()})
-	if err == nil || !strings.Contains(err.Error(), "default-branch workflow-contract check producer") {
-		t.Fatalf("published onboarding without a runnable check producer was accepted: %v", err)
+	plan, err := Plan(context.Background(), PlanOptions{RepositoryPath: repo, WorkflowHome: filepath.Join(t.TempDir(), "home"), Owner: "owner", AuthenticatedLogin: "owner", Remote: StaticRemoteHead{DefaultBranch: "main", Head: head}, PlatformReleaseDigest: repeatString("a", 64), Policy: approvedPublishedPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, effect := range plan.Effects {
+		if effect.Kind == "repository_contract_pr" {
+			found = true
+			if effect.Parameters["required_checks_json"] != `[]` {
+				t.Fatalf("onboarding checks = %s, want no not-yet-installed producer", effect.Parameters["required_checks_json"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("onboarding pull request effect missing")
+	}
+	raw, _ := json.Marshal(plan)
+	if _, _, _, err := setupcontract.ParsePlan(raw); err != nil {
+		t.Fatalf("published onboarding plan without a producer is not executable: %v", err)
 	}
 }
 
@@ -234,12 +250,11 @@ func TestPlanZeroCommitBindsBaselineContentAndPreservesExistingAgentsBytes(t *te
 		}
 	}
 	var snapshot []BaselineFile
-	if err := json.Unmarshal([]byte(baseline.Parameters["files_json"]), &snapshot); err != nil || len(snapshot) != 2 || snapshot[0].Path != ".github/workflows/workflow-contract.yml" || snapshot[1].Path != "AGENTS.md" || snapshot[0].SHA256 == "" || snapshot[1].SHA256 == "" {
+	if err := json.Unmarshal([]byte(baseline.Parameters["files_json"]), &snapshot); err != nil || len(snapshot) != 1 || snapshot[0].Path != "AGENTS.md" || snapshot[0].SHA256 == "" {
 		t.Fatalf("baseline snapshot = %#v, err=%v", snapshot, err)
 	}
-	var bootstrap map[string]string
-	if err := json.Unmarshal([]byte(baseline.Parameters["bootstrap_files_json"]), &bootstrap); err != nil || bootstrap[".github/workflows/workflow-contract.yml"] == "" {
-		t.Fatalf("baseline bootstrap = %#v, err=%v", bootstrap, err)
+	if _, present := baseline.Parameters["bootstrap_files_json"]; present {
+		t.Fatalf("baseline unexpectedly installs the onboarding workflow producer: %#v", baseline.Parameters)
 	}
 	var encoded map[string]string
 	if err := json.Unmarshal([]byte(contract.Parameters["files_json"]), &encoded); err != nil {
@@ -347,7 +362,7 @@ func TestPlanDeclaresFeatureEnablementAndAllRequiredChecksFromDiscoveredPolicy(t
 		case "repository_features":
 			features = effect.Parameters["allowed_actions"] == "selected"
 		case "repository_contract_pr":
-			contract = effect.Parameters["required_checks_json"] == `[{"context":"build","app_id":42},{"context":"workflow-contract","app_id":15368},{"context":"zeta","app_id":9}]`
+			contract = effect.Parameters["required_checks_json"] == `[{"context":"build","app_id":42},{"context":"zeta","app_id":9}]`
 		}
 	}
 	if !features || !contract {

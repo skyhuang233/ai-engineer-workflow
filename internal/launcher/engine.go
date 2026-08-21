@@ -107,7 +107,7 @@ type restartableLifecycle interface {
 func (e Engine) Inspect(ctx context.Context, request Request) (Result, error) {
 	_ = ctx
 	if request.Purpose == PurposeTargetState {
-		if _, err := e.verifiedWorkerRelease(request); err != nil {
+		if _, err := e.workerStateFromVerifiedWorkflowRelease(request); err != nil {
 			return blocked(err), nil
 		}
 	}
@@ -150,7 +150,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	if err := validateApplyRequest(request); err != nil {
 		return blocked(err), nil
 	}
-	verifiedRelease, err := e.verifiedWorkerRelease(request)
+	verifiedRelease, err := e.workerStateFromVerifiedWorkflowRelease(request)
 	if err != nil {
 		return blocked(err), nil
 	}

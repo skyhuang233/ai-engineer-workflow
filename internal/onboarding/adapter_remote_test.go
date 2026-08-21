@@ -401,7 +401,7 @@ func (w *fakeBranchWriter) Publish(context.Context, PreparedOnboardingBranch, st
 	return nil
 }
 
-func TestRepositoryAdapterCreatesExactUnmergedOnboardingPull(t *testing.T) {
+func TestRepositoryAdapterCreatesOnboardingPullWithoutPreinstalledChecks(t *testing.T) {
 	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	baseHead := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	head := "cccccccccccccccccccccccccccccccccccccccc"
@@ -410,7 +410,7 @@ func TestRepositoryAdapterCreatesExactUnmergedOnboardingPull(t *testing.T) {
 	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, BranchWriter: writer}
 	effect := setupcontract.Effect{Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{
 		"base_branch": "main", "base_head": baseHead, "source_url": "https://github.com/owner/repo.git",
-		"files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
+		"files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[]`,
 	}}
 	if err := adapter.Apply(context.Background(), effect); err != nil {
 		t.Fatal(err)

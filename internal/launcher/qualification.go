@@ -64,7 +64,7 @@ func validateVerifiedReleaseManifestRequest(request Request, required bool) erro
 	return nil
 }
 
-func (e Engine) verifiedWorkerRelease(request Request) (*store.WorkerRelease, error) {
+func (e Engine) workerStateFromVerifiedWorkflowRelease(request Request) (*store.WorkerRelease, error) {
 	if err := validateVerifiedReleaseManifestRequest(request, false); err != nil {
 		return nil, err
 	}

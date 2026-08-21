@@ -30,8 +30,8 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 		return err
 	}
 	var checks []RequiredCheck
-	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || len(checks) == 0 {
-		return errors.New("Onboarding Pull Request lacks approved required checks")
+	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || checks == nil {
+		return errors.New("Onboarding Pull Request approved required checks are invalid")
 	}
 	request := OnboardingPullRequest{Repository: effect.Subject, Branch: "workflow/onboarding-" + a.PlanDigest[:12], Base: base, BaseHead: baseHead, Digest: a.PlanDigest, Files: files, RequiredChecks: CanonicalRequiredChecks(checks)}
 	// A prior exact merge is a read-only retry: bind and verify it before

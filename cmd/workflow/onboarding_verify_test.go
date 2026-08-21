@@ -19,6 +19,12 @@ import (
 	"time"
 )
 
+func TestChecksPassedAllowsOnboardingWithoutPreinstalledChecks(t *testing.T) {
+	if !checksPassed(nil, nil) {
+		t.Fatal("onboarding without preinstalled checks was blocked")
+	}
+}
+
 func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
