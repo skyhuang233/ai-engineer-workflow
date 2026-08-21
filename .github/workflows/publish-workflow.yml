@@ -7,6 +7,7 @@ on:
 permissions:
   actions: read
   contents: write
+  packages: read
   pull-requests: read
 
 concurrency:
@@ -125,22 +126,72 @@ jobs:
           [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || { echo "exact pull request head lacks a successful qualification" >&2; exit 1; }
           [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || { echo "qualification run attempt is invalid" >&2; exit 1; }
           [[ "$completed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || { echo "qualification completion timestamp is invalid" >&2; exit 1; }
-          artifact_name="qualified-workflow-release-${head_sha}-${run_attempt}"
-          artifacts="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" -f per_page=100)"
-          artifact="$(jq --exit-status --compact-output --arg name "$artifact_name" '
-            [.artifacts[] | select(.name == $name and .expired == false and (.digest | test("^sha256:[0-9a-f]{64}$")))] |
-            if length == 1 then .[0] else error("qualification artifact is missing, ambiguous, expired, or lacks an immutable digest") end
-          ' <<<"$artifacts")"
-          artifact_id="$(jq --raw-output .id <<<"$artifact")"
-          artifact_digest="$(jq --raw-output .digest <<<"$artifact")"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > qualification.zip
-          actual_digest="sha256:$(sha256sum qualification.zip | awk '{print $1}')"
-          test "$actual_digest" = "$artifact_digest" || { echo "qualification artifact digest mismatch" >&2; exit 1; }
-          mkdir -p build/qualified
-          unzip -q qualification.zip -d build/qualified
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
           echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
           echo "completed_at=$completed_at" >> "$GITHUB_OUTPUT"
+      - name: Authenticate qualified candidate registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Restore exact qualified candidate from immutable registry digest
+        id: stored-candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          head_sha="${{ steps.admission.outputs.head_sha }}"
+          run_id="${{ steps.qualification.outputs.run_id }}"
+          run_attempt="${{ steps.qualification.outputs.run_attempt }}"
+          configured_owner="$(jq --exit-status --raw-output '.github.credential.owner' config/toolchain.json)"
+          candidate_repository="$(jq --exit-status --raw-output '.worker.image_repository' config/toolchain.json)-release-candidate"
+          repository_path="${candidate_repository#ghcr.io/}"
+          candidate_owner="${repository_path%%/*}"
+          candidate_package="${repository_path#*/}"
+          test "$repository_path" != "$candidate_repository" && test "$candidate_package" != "$repository_path"
+          test "${candidate_owner,,}" = "${configured_owner,,}"
+          [[ "$candidate_package" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+          prefix="q-${head_sha}-${run_attempt}-"
+          versions="$(gh api --paginate --slurp "users/${configured_owner}/packages/container/${candidate_package}/versions?per_page=100")"
+          mapfile -t candidates < <(jq --exit-status --raw-output --arg prefix "$prefix" '
+            [.[][] | select(.name | test("^sha256:[0-9a-f]{64}$")) as $version |
+              .metadata.container.tags[]? |
+              select(test("^" + $prefix + "[0-9a-f]{64}$")) |
+              [$version.name, .] | @tsv] | unique | .[]
+          ' <<<"$versions")
+          rm -rf build/qualified
+          mkdir -p build/qualified
+          matches=0
+          selected_manifest=""
+          selected_digest=""
+          for candidate in "${candidates[@]}"; do
+            registry_digest="${candidate%%$'\t'*}"
+            tag="${candidate#*$'\t'}"
+            manifest_sha256="${tag##*-}"
+            image="${candidate_repository}@${registry_digest}"
+            docker pull "$image" >/dev/null
+            labels="$(docker image inspect "$image" --format '{{json .Config.Labels}}')"
+            if jq --exit-status --arg head "$head_sha" --arg run "$run_id" --arg attempt "$run_attempt" --arg manifest "$manifest_sha256" '
+              .["io.agent-workflow.candidate-source-commit"] == $head and
+              .["io.agent-workflow.qualification-run-id"] == $run and
+              .["io.agent-workflow.qualification-run-attempt"] == $attempt and
+              .["io.agent-workflow.manifest-sha256"] == $manifest
+            ' <<<"$labels" >/dev/null; then
+              matches=$((matches + 1))
+              test "$matches" -eq 1 || { echo "qualified candidate registry identity is ambiguous" >&2; exit 1; }
+              container="$(docker create "$image")"
+              docker cp "$container:/qualified/." build/qualified
+              docker rm "$container" >/dev/null
+              selected_manifest="$manifest_sha256"
+              selected_digest="$registry_digest"
+            fi
+          done
+          test "$matches" -eq 1 || { echo "qualified candidate registry identity is missing" >&2; exit 1; }
+          actual_manifest="$(sha256sum build/qualified/workflow-release.json | awk '{print $1}')"
+          test "$actual_manifest" = "$selected_manifest" || { echo "qualified candidate manifest digest differs from registry identity" >&2; exit 1; }
+          echo "manifest_sha256=$selected_manifest" >> "$GITHUB_OUTPUT"
+          echo "registry_digest=$selected_digest" >> "$GITHUB_OUTPUT"
       - name: Verify exact qualified release candidate
         id: candidate
         shell: pwsh
@@ -151,6 +202,7 @@ jobs:
             -ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}' `
             -ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}' `
             -ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}' | ConvertFrom-Json
+          if ([string]$candidate.manifest_sha256 -cne '${{ steps.stored-candidate.outputs.manifest_sha256 }}') { throw 'qualified candidate manifest differs from immutable registry identity' }
           "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
       - name: Preflight Workflow Release target

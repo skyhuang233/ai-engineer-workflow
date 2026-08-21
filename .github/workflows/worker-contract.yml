@@ -195,7 +195,7 @@ jobs:
     environment: workflow-release-qualification
     permissions:
       contents: read
-      packages: read
+      packages: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -246,12 +246,34 @@ jobs:
             -PlatformVersion $version `
             -DifferentOwnerRepository '${{ vars.WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY }}'
       - name: Preserve exact qualified Workflow Release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: qualified-workflow-release-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
-          path: |
-            build/release/worker-sbom.spdx.json
-            build/release/workflow-release.json
-            build/release/workflow-windows-amd64.zip
-          if-no-files-found: error
-          retention-days: 90
+        shell: pwsh
+        run: |
+          $head = '${{ github.event.pull_request.head.sha }}'
+          $attempt = '${{ github.run_attempt }}'
+          $runID = '${{ github.run_id }}'
+          $manifestDigest = (Get-FileHash -LiteralPath build/release/workflow-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          $toolchain = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
+          $repository = "$([string]$toolchain.worker.image_repository)-release-candidate"
+          $tag = "q-$head-$attempt-$manifestDigest"
+          $reference = "${repository}:$tag"
+          $context = 'build/release-container'
+          New-Item -ItemType Directory -Force -Path $context | Out-Null
+          Copy-Item -LiteralPath build/release/worker-sbom.spdx.json,build/release/workflow-release.json,build/release/workflow-windows-amd64.zip -Destination $context
+          @'
+          FROM scratch
+          COPY worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip /qualified/
+          CMD ["/qualified/workflow-release.json"]
+          '@ | Set-Content -LiteralPath (Join-Path $context Dockerfile) -Encoding ascii
+          docker build `
+            --label "io.agent-workflow.candidate-source-commit=$head" `
+            --label "io.agent-workflow.qualification-run-id=$runID" `
+            --label "io.agent-workflow.qualification-run-attempt=$attempt" `
+            --label "io.agent-workflow.manifest-sha256=$manifestDigest" `
+            --tag $reference $context
+          if ($LASTEXITCODE -ne 0) { throw 'build qualified candidate container failed' }
+          docker push $reference
+          if ($LASTEXITCODE -ne 0) { throw 'push qualified candidate container failed' }
+          $digest = ([string](docker buildx imagetools inspect $reference --format '{{json .Manifest.Digest}}')).Trim().Trim('"')
+          if ($LASTEXITCODE -ne 0 -or $digest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw 'resolve qualified candidate container digest failed' }
+          docker buildx imagetools inspect "$repository@$digest" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'verify qualified candidate container digest failed' }

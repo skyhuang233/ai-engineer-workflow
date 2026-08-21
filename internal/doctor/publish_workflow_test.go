@@ -57,10 +57,10 @@ func TestUnifiedPublisherTestsTheAcceptedMergeBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.T) {
+func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
 	for _, required := range []string{
-		"actions: read",
+		"actions: read", "packages: read",
 		`actions/workflows/worker-contract.yml/runs`,
 		`-f event=pull_request -f head_sha="$head_sha" -f per_page=100`,
 		`actions/runs/${candidate_run_id}/attempts/${attempt}`,
@@ -71,11 +71,15 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 		`($merged | fromdateiso8601)`,
 		`qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}`,
 		`merged_at: ${{ steps.admission.outputs.merged_at }}`,
-		`qualified-workflow-release-${head_sha}-${run_attempt}`,
-		`.expired == false`,
-		`(.digest | test("^sha256:[0-9a-f]{64}$"))`,
-		`actions/artifacts/${artifact_id}/zip`,
-		`test "$actual_digest" = "$artifact_digest"`,
+		`users/${configured_owner}/packages/container/${candidate_package}/versions?per_page=100`,
+		`prefix="q-${head_sha}-${run_attempt}-"`,
+		`image="${candidate_repository}@${registry_digest}"`,
+		`io.agent-workflow.candidate-source-commit`,
+		`io.agent-workflow.qualification-run-id`,
+		`io.agent-workflow.qualification-run-attempt`,
+		`io.agent-workflow.manifest-sha256`,
+		`qualified candidate manifest digest differs from registry identity`,
+		`qualified candidate manifest differs from immutable registry identity`,
 		`-ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}'`,
 		`-ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}'`,
 		`-ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}'`,
@@ -93,7 +97,7 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 	if strings.Contains(text, `-f status=completed`) || strings.Contains(text, `.workflow_runs[] | select(`+"\n"+`              .event == "pull_request" and .head_sha == $head and .conclusion == "success"`) {
 		t.Fatal("unified publisher selects qualification from mutable latest-attempt state")
 	}
-	for _, forbidden := range []string{"bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
+	for _, forbidden := range []string{"actions/runs/${run_id}/artifacts", "qualified-workflow-release-", "bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("unified publisher can replace the qualified candidate through %q", forbidden)
 		}
@@ -153,7 +157,14 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
 		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
 		"Preserve exact qualified Workflow Release candidate",
-		"qualified-workflow-release-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}",
+		`$tag = "q-$head-$attempt-$manifestDigest"`,
+		`$repository = "$([string]$toolchain.worker.image_repository)-release-candidate"`,
+		`io.agent-workflow.candidate-source-commit`,
+		`io.agent-workflow.qualification-run-id`,
+		`io.agent-workflow.qualification-run-attempt`,
+		`io.agent-workflow.manifest-sha256`,
+		`docker push $reference`,
+		`docker buildx imagetools inspect "$repository@$digest"`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("candidate workflow omits %q", required)
@@ -191,6 +202,12 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 		!strings.Contains(text[qualificationScan:authenticate], "continue-on-error: true") ||
 		!strings.Contains(text[qualificationScan:authenticate], "fail-build: false") {
 		t.Fatal("qualification scan can block functional candidate publication")
+	}
+	adr := readWorkflow(t, "docs", "adr", "0001-publish-one-atomic-workflow-release.md")
+	for _, required := range []string{"Grype scan is", "advisory and non-blocking", "scanner failure do not prevent candidate preservation or publication"} {
+		if !strings.Contains(adr, required) {
+			t.Fatalf("release ADR omits advisory scan containment %q", required)
+		}
 	}
 }
 
