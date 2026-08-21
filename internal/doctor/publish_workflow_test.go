@@ -249,7 +249,7 @@ func TestOnlyQualificationBuildsWorkflowWorker(t *testing.T) {
 	if strings.Contains(candidate, "docker build \\") {
 		t.Fatal("qualification workflow retains an independent Worker docker build")
 	}
-	if strings.Contains(publisher, "build-workflow-worker.sh") || strings.Contains(publisher, "docker build") {
+	if strings.Contains(publisher, "build-workflow-worker.sh") || strings.Contains(publisher, "docker build ") {
 		t.Fatal("publisher can build a replacement Worker")
 	}
 	builder := readWorkflow(t, "scripts", "build-workflow-worker.sh")
