@@ -14,12 +14,14 @@ if ($env:WORKFLOW_SETUP_E2E -ne "1") { throw "Set WORKFLOW_SETUP_E2E=1 to author
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") { throw "Workflow Setup qualification requires Windows" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN)) { throw "WORKFLOW_SETUP_E2E_CLEANUP_TOKEN with repository listing and deletion capability is required" }
+if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_OWNER_TOKEN)) { throw "WORKFLOW_SETUP_E2E_OWNER_TOKEN with owner merge capability is required" }
 if (-not (Test-Path -LiteralPath $DriverScript -PathType Leaf)) { throw "DriverScript does not exist" }
-$qualificationMode = $env:WORKFLOW_SETUP_QUALIFICATION -eq "1"
-if ($qualificationMode) {
+$candidateQualification = $env:WORKFLOW_SETUP_QUALIFICATION -eq "1"
+if ($candidateQualification) {
     # Bind the local qualification checkout with git rev-parse HEAD before any skill executes.
     $EntrySkillSpec = [IO.Path]::GetFullPath($EntrySkillSpec)
-    if (-not (Test-Path -LiteralPath (Join-Path $EntrySkillSpec ".git") -PathType Container)) { throw "EntrySkillSpec must be a local qualification checkout" }
+    $insideWorkTree = [string](git -C $EntrySkillSpec rev-parse --is-inside-work-tree)
+    if ($LASTEXITCODE -ne 0 -or $insideWorkTree.Trim() -cne "true") { throw "EntrySkillSpec must be a local qualification checkout" }
     $entryHead = [string](git -C $EntrySkillSpec rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $entryHead.Trim() -cne $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT) { throw "local qualification checkout HEAD differs from the candidate source commit" }
 } elseif ($EntrySkillSpec -notmatch '#workflow-v[0-9A-Za-z._-]+$') {
@@ -38,7 +40,9 @@ $cleanupErrors = [Collections.Generic.List[string]]::new()
 $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
+$ownerToken = $env:WORKFLOW_SETUP_E2E_OWNER_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
+if ($ownerToken -ceq $setupToken) { throw "Owner merge credential must be separate from the Setup credential" }
 $patInputPath = Join-Path $qualificationRoot "setup-pat.stdin"
 $prior = @{
     USERPROFILE = $env:USERPROFILE; HOME = $env:HOME; CODEX_HOME = $env:CODEX_HOME
@@ -49,6 +53,17 @@ $prior = @{
 	WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC = $env:WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC
 	WORKFLOW_SETUP_E2E_PLATFORM_VERSION = $env:WORKFLOW_SETUP_E2E_PLATFORM_VERSION
 	WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = $cleanupToken
+	WORKFLOW_SETUP_E2E_OWNER_TOKEN = $ownerToken
+	WORKFLOW_SETUP_E2E_PHASE = $env:WORKFLOW_SETUP_E2E_PHASE
+	WORKFLOW_SETUP_E2E_APPROVED_DIGEST = $env:WORKFLOW_SETUP_E2E_APPROVED_DIGEST
+	WORKFLOW_SETUP_E2E_DELIVERY_PLAN = $env:WORKFLOW_SETUP_E2E_DELIVERY_PLAN
+	WORKFLOW_SETUP_E2E_TICKET = $env:WORKFLOW_SETUP_E2E_TICKET
+	WORKFLOW_SETUP_QUALIFICATION = $env:WORKFLOW_SETUP_QUALIFICATION
+	WORKFLOW_SETUP_CANDIDATE_DIRECTORY = $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY
+	WORKFLOW_SETUP_CANDIDATE_VERSION = $env:WORKFLOW_SETUP_CANDIDATE_VERSION
+	WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT = $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT
+	WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID = $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID
+	WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT = $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT
 }
 try {
 $env:GH_TOKEN = $cleanupToken
@@ -57,6 +72,7 @@ if ($LASTEXITCODE -ne 0) { throw "Cleanup credential cannot enumerate disposable
 $env:GH_TOKEN = $setupToken
 # The deletion credential is harness-only and must never enter Codex or a Worker.
 Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
+Remove-Item Env:WORKFLOW_SETUP_E2E_OWNER_TOKEN
 
 New-Item -ItemType Directory -Force -Path $profileRoot,$workflowHome,$evidenceRoot,$githubConfig | Out-Null
 [IO.File]::WriteAllText($patInputPath, $setupToken, (New-Object Text.UTF8Encoding($false)))
@@ -74,27 +90,75 @@ $doctorCodexHome = [string]$configCheck.details.CODEX_HOME
 if ([int]$codexDoctor.schemaVersion -ne 1 -or [string]$authCheck.status -ne "ok" -or [string]$configCheck.status -ne "ok" -or [string]$authCheck.details.'stored ChatGPT tokens' -ne "true" -or [string]$authCheck.details.'stored auth mode' -ne "chatgpt") { throw "codex doctor --json did not verify a supported ChatGPT login" }
 if (-not [IO.Path]::IsPathFullyQualified($sourceCodexAuth) -or -not [IO.Path]::IsPathFullyQualified($doctorCodexHome) -or -not [string]::Equals([IO.Path]::GetFullPath((Split-Path -Parent $sourceCodexAuth)), [IO.Path]::GetFullPath($doctorCodexHome), [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $sourceCodexAuth -PathType Leaf)) { throw "codex doctor --json returned an invalid authentication source boundary" }
 
-function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
-    $target = Join-Path $qualificationRoot ("workflow-setup-e2e-" + $runID + "-" + $Name)
-    New-Item -ItemType Directory -Force -Path $target | Out-Null
-    & $Prepare $target
-    $resultPath = Join-Path $evidenceRoot ($Name + ".json")
+function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [string]$ApprovedDigest = "", [long]$DeliveryPlan = 0, [long]$Ticket = 0) {
+    $resultPath = Join-Path $evidenceRoot ($Name + "-" + $Phase + ".json")
     $env:WORKFLOW_SETUP_E2E_SCENARIO = $Name
-    $env:WORKFLOW_SETUP_E2E_REPOSITORY_PATH = $target
+    $env:WORKFLOW_SETUP_E2E_REPOSITORY_PATH = $Target
     $env:WORKFLOW_SETUP_E2E_RESULT_PATH = $resultPath
+    $env:WORKFLOW_SETUP_E2E_PHASE = $Phase
+    $env:WORKFLOW_SETUP_E2E_APPROVED_DIGEST = $ApprovedDigest
+    $env:WORKFLOW_SETUP_E2E_DELIVERY_PLAN = $(if ($DeliveryPlan -gt 0) { [string]$DeliveryPlan } else { "" })
+    $env:WORKFLOW_SETUP_E2E_TICKET = $(if ($Ticket -gt 0) { [string]$Ticket } else { "" })
     $driverGitHubToken = $env:GH_TOKEN
     Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
     try { & $DriverScript } finally { $env:GH_TOKEN = $driverGitHubToken }
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw "Scenario '$Name' did not produce a result" }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw "Scenario '$Name' phase '$Phase' did not produce a result" }
     $raw = Get-Content -LiteralPath $resultPath -Raw
-    if ($raw.Contains($setupToken)) { throw "Scenario '$Name' leaked the PAT into evidence" }
+    if ($raw.Contains($setupToken) -or $raw.Contains($ownerToken)) { throw "Scenario '$Name' leaked a credential into evidence" }
     $result = $raw | ConvertFrom-Json
     foreach ($repository in @($result.temporary_repositories)) {
         if (-not ([string]$repository).StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Driver returned an unsafe cleanup repository '$repository'" }
         $repositories.Add([string]$repository)
     }
+    return $result
+}
+
+function Invoke-OwnerMerge($Gate, [string]$ExpectedGate) {
+    if ([string]$Gate.gate_kind -cne $ExpectedGate -or [string]$Gate.pull_request -cnotmatch '^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$' -or [string]$Gate.pull_head -cnotmatch '^[0-9a-f]{40}$' -or [string]$Gate.merge_method -cnotin @('merge','squash','rebase')) {
+        throw "Owner merge gate lacks exact pull request identity"
+    }
+    if ($ExpectedGate -eq 'repository_onboarding' -and [string]$Gate.onboarding_plan_digest -cnotmatch '^[0-9a-f]{64}$') { throw "Onboarding owner gate lacks the approved Plan Digest" }
+    $uri = [Uri]$Gate.pull_request
+    $parts = $uri.AbsolutePath.Trim('/').Split('/')
+    $repository = $parts[0] + '/' + $parts[1]
+    $number = [long]$parts[3]
+    if (-not $repository.StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Owner merge gate escaped the disposable repository boundary" }
+    $savedToken = $env:GH_TOKEN
+    try {
+        $env:GH_TOKEN = $ownerToken
+        $login = [string](gh api user --jq .login)
+        if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($login.Trim(), $GitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Owner merge credential does not belong to GitHubOwner" }
+        $pull = gh api "repos/$repository/pulls/$number" | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or [string]$pull.state -cne 'open' -or [string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request changed before authorization" }
+        if ($ExpectedGate -eq 'repository_onboarding' -and -not ([string]$pull.body).Contains([string]$Gate.onboarding_plan_digest)) { throw "Onboarding pull request does not bind the approved Plan Digest" }
+        gh pr checks ([string]$Gate.pull_request) --required --watch --fail-fast --interval 10
+        if ($LASTEXITCODE -ne 0) { throw "Owner merge pull request required checks have not passed" }
+        $methodFlag = '--' + [string]$Gate.merge_method
+        gh pr merge ([string]$Gate.pull_request) $methodFlag --match-head-commit ([string]$Gate.pull_head)
+        if ($LASTEXITCODE -ne 0) { throw "Owner-authorized pull request merge failed" }
+        $merged = gh api "repos/$repository/pulls/$number" | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$merged.merged_at) -or -not [string]::Equals([string]$merged.merged_by.login, $GitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Pull request was not merged by the repository owner" }
+    } finally {
+        if ($null -eq $savedToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $savedToken }
+    }
+}
+
+function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
+    $target = Join-Path $qualificationRoot ("workflow-setup-e2e-" + $runID + "-" + $Name)
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    & $Prepare $target
+    $result = Invoke-DriverPhase $Name $target 'initial'
     if ($Name -in @("clean-new-repository","unrelated-dirty-files","second-same-owner")) {
-        if (-not $result.platform_ready -or -not $result.repository_admitted) { throw "Scenario '$Name' did not reach both readiness gates" }
+        if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $false) { throw "Scenario '$Name' bypassed the repository owner merge gate" }
+        Invoke-OwnerMerge $result 'repository_onboarding'
+        $result = Invoke-DriverPhase $Name $target 'onboarding-resume' ([string]$result.onboarding_plan_digest)
+        if ($Name -eq 'clean-new-repository') {
+            if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $true -or [long]$result.delivery_plan -le 0 -or [long]$result.ticket -le 0) { throw "Scenario '$Name' did not reach the Worker pull request owner gate" }
+            Invoke-OwnerMerge $result 'worker_delivery'
+            $result = Invoke-DriverPhase $Name $target 'delivery-resume' '' ([long]$result.delivery_plan) ([long]$result.ticket)
+            if ($null -ne $result.gate_kind -or [string]$result.ticket_status -cne 'Delivered' -or [string]$result.plan_status -cne 'Completed') { throw "Scenario '$Name' did not reach Ticket Delivered and Plan Completed" }
+        }
+        if ($null -ne $result.gate_kind -or -not [string]::IsNullOrWhiteSpace([string]$result.blocker) -or -not $result.platform_ready -or -not $result.repository_admitted) { throw "Scenario '$Name' did not reach both readiness gates" }
 		if ($Name -eq "unrelated-dirty-files") {
 			$unrelatedPath = Join-Path $target "unrelated.txt"
 			if (-not (Test-Path -LiteralPath $unrelatedPath -PathType Leaf) -or [IO.File]::ReadAllText($unrelatedPath) -cne "preserve exactly`n") { throw "Published dirty scenario did not preserve unrelated.txt byte-for-byte" }

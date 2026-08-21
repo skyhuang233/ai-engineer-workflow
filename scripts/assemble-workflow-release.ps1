@@ -9,6 +9,10 @@ param(
     [long]$QualificationRunID,
 
     [Parameter(Mandatory = $true)]
+    [ValidateRange(1, [long]::MaxValue)]
+    [long]$QualificationRunAttempt,
+
+    [Parameter(Mandatory = $true)]
     [ValidatePattern('^ghcr\.io/skyhuang233/workflow-worker@sha256:[0-9a-f]{64}$')]
     [string]$WorkerImage,
 
@@ -72,7 +76,7 @@ try {
         -workflow-exe $workflowExecutable -workflow-version-exe $workflowVersionExecutable `
         -setup-exe $setupExecutable -payload $payloadRoot `
         -output $resolvedOutput -candidate-source-commit $CandidateSourceCommit `
-        -qualification-run-id $QualificationRunID -worker-image $WorkerImage -sbom $resolvedSBOM
+        -qualification-run-id $QualificationRunID -qualification-run-attempt $QualificationRunAttempt -worker-image $WorkerImage -sbom $resolvedSBOM
     if ($LASTEXITCODE -ne 0) { throw 'assemble Workflow Release failed' }
 } finally {
     Pop-Location
@@ -84,7 +88,7 @@ $stagedSBOMPath = Join-Path $resolvedOutput 'worker-sbom.spdx.json'
 $bundleDigest = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $sbomDigest = (Get-FileHash -LiteralPath $stagedSBOMPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ([string]$manifest.candidate_source_commit -cne $CandidateSourceCommit -or [long]$manifest.qualification_run_id -ne $QualificationRunID) {
+if ([string]$manifest.candidate_source_commit -cne $CandidateSourceCommit -or [long]$manifest.qualification_run_id -ne $QualificationRunID -or [long]$manifest.qualification_run_attempt -ne $QualificationRunAttempt) {
     throw 'Workflow Release manifest source identity differs from assembly inputs'
 }
 if ([string]$manifest.worker.image -cne $WorkerImage) {

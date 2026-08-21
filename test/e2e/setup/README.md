@@ -21,6 +21,7 @@ Run only against disposable repositories:
 $env:WORKFLOW_SETUP_E2E = "1"
 $env:WORKFLOW_SETUP_E2E_PAT = "<classic PAT>"
 $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = "<separate cleanup credential with list/delete capability>"
+$env:WORKFLOW_SETUP_E2E_OWNER_TOKEN = "<repository-owner credential used only by the harness for exact checked merges>"
 pwsh ./test/e2e/setup/setup-e2e.ps1 `
   -GitHubOwner <disposable-owner> `
   -DriverScript ./test/e2e/setup/codex-driver.ps1 `
@@ -42,8 +43,13 @@ created `workflow-setup-e2e-*` repositories independently of the agent's final
 response so cleanup remains possible after an interaction failure.
 
 The driver output must satisfy `driver-result.schema.json`. Positive scenarios
-must report both readiness gates; negative scenarios must report an exact
-blocker. The cleanup credential is removed from the environment before Codex starts;
+pause first at the exact Repository Onboarding pull request and, for the clean
+new-repository scenario, again at the exact Worker pull request. The harness
+verifies each approved digest, head revision, required-check result, and owner
+identity before merging with the isolated owner credential, then resumes the
+same Workflow Home. Qualification succeeds only after Repository Admission,
+Ticket Delivered, and Plan Completed. Negative scenarios must report an exact
+blocker. The cleanup and owner credentials are removed from the environment before Codex starts;
 only the harness uses it to list and delete newly created disposable repositories in a `finally` block.
 The Setup PAT needs only the product's `repo` and `workflow` scopes. Any
 repository or Docker cleanup failure fails qualification.

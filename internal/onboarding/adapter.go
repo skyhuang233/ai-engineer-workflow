@@ -21,7 +21,6 @@ type RepositoryRemote interface {
 	OnboardingPull(context.Context, string, string, string, []RequiredCheck) (PullReadback, error)
 	OnboardingBranch(context.Context, string, string) (RepositoryBranch, bool, error)
 	CreateOrUpdateOnboardingPull(context.Context, OnboardingPullRequest) (PullReadback, error)
-	MergeOnboardingPull(context.Context, string, int64, string, string) (string, error)
 	VerifyOnboardingContent(context.Context, string, string, map[string][]byte) error
 	CreateRepository(context.Context, string, string, string, bool) error
 	ReconcileLabel(context.Context, string, Label) error
@@ -45,15 +44,15 @@ var (
 
 // RepositoryBranch is a readback of a GitHub branch ref and its object ID.
 // The adapter deliberately carries both values: a default branch name alone is
-// not authority to apply or merge an immutable Onboarding Plan.
+// not authority to apply an immutable Onboarding Plan.
 type RepositoryBranch struct {
 	Name string
 	Head string
 }
 
 // OnboardingPullRequest contains only the immutable identity required to
-// create or re-read an Onboarding Pull Request. It intentionally has no merge
-// method: approved merge authority is a later, separately guarded transition.
+// create or re-read an Onboarding Pull Request. It intentionally cannot express
+// merge authority; only an owner-merged pull request can satisfy this effect.
 type OnboardingPullRequest struct {
 	Repository, Branch, Head, Base, BaseHead, Digest string
 	Files                                            map[string][]byte

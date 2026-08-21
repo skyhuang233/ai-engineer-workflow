@@ -25,8 +25,6 @@ type memoryRemote struct {
 	branch          RepositoryBranch
 	branchFound     bool
 	createdPull     OnboardingPullRequest
-	mergeCalls      int
-	mergeMethod     string
 	repositoryErr   error
 	labelErr        error
 	featuresErr     error
@@ -57,17 +55,6 @@ func (m *memoryRemote) CreateOrUpdateOnboardingPull(_ context.Context, request O
 	m.createdPull = request
 	m.pull = PullReadback{Found: true, Number: 7, State: "open", Branch: request.Branch, Head: request.Head, Base: request.Base, BaseHead: request.BaseHead, Body: "Approved Setup Plan SHA-256: " + request.Digest, Mergeable: true, ChecksPassed: false, ReviewsClean: true, ContentMatches: true}
 	return m.pull, nil
-}
-func (m *memoryRemote) MergeOnboardingPull(_ context.Context, _ string, number int64, expectedHead, method string) (string, error) {
-	if number != m.pull.Number || expectedHead != m.pull.Head {
-		return "", errors.New("merge identity differs")
-	}
-	m.mergeCalls++
-	m.mergeMethod = method
-	mergeHead := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	m.pull.Merged, m.pull.State, m.pull.MergeHead = true, "closed", mergeHead
-	m.defaultBranch.Head = mergeHead
-	return mergeHead, nil
 }
 func (m *memoryRemote) VerifyOnboardingContent(_ context.Context, _ string, ref string, _ map[string][]byte) error {
 	m.contentRef = ref
@@ -472,7 +459,7 @@ func TestRepositoryAdapterRejectsPullHeadDriftWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestRepositoryAdapterMergesExactPullThenRecordsAndVerifiesAdmission(t *testing.T) {
+func TestRepositoryAdapterBindsOnlyOwnerMergedPullThenRecordsAdmission(t *testing.T) {
 	ctx := context.Background()
 	digest := strings.Repeat("a", 64)
 	manifest := strings.Repeat("f", 64)
@@ -494,21 +481,22 @@ func TestRepositoryAdapterMergesExactPullThenRecordsAndVerifiesAdmission(t *test
 	if err := adapter.Apply(ctx, contract); err != nil {
 		t.Fatal(err)
 	}
-	if remote.mergeCalls != 1 || writer.published || remote.createdPull.Repository != "" {
-		t.Fatalf("merge authority was not exact: calls=%d published=%v create=%#v", remote.mergeCalls, writer.published, remote.createdPull)
-	}
-	if remote.mergeMethod != "squash" {
-		t.Fatalf("merge method=%q", remote.mergeMethod)
+	if writer.published || remote.createdPull.Repository != "" || remote.defaultBranch.Head != baseHead {
+		t.Fatalf("exact open pull was mutated: published=%v create=%#v default=%#v", writer.published, remote.createdPull, remote.defaultBranch)
 	}
 	status, _, err := adapter.Readback(ctx, contract)
-	if err != nil || status != setupcontract.EffectSatisfied {
-		t.Fatalf("merged pull readback = %s, %v", status, err)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("open pull readback = %s, %v", status, err)
 	}
+	mergeHead := strings.Repeat("e", 40)
+	remote.pull.Merged, remote.pull.State, remote.pull.MergeHead = true, "closed", mergeHead
+	remote.defaultBranch.Head = mergeHead
 	if err := adapter.Apply(ctx, contract); err != nil {
 		t.Fatal(err)
 	}
-	if remote.mergeCalls != 1 {
-		t.Fatalf("already merged exact PR was merged again: %d", remote.mergeCalls)
+	status, _, err = adapter.Readback(ctx, contract)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("owner-merged pull readback = %s, %v", status, err)
 	}
 	admission := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": manifest, "contract_version": "1"}}
 	if err := adapter.Apply(ctx, admission); err != nil {

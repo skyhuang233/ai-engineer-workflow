@@ -152,10 +152,6 @@ func (r githubOnboardingRemote) CreateOrUpdateOnboardingPull(ctx context.Context
 	}
 	return r.OnboardingPull(ctx, request.Repository, request.Branch, request.Base, request.RequiredChecks)
 }
-func (r githubOnboardingRemote) MergeOnboardingPull(ctx context.Context, repository string, number int64, head, method string) (string, error) {
-	value, err := r.client.MergeOnboardingPullRequest(ctx, repository, number, head, method)
-	return value.SHA, err
-}
 func (r githubOnboardingRemote) VerifyOnboardingContent(ctx context.Context, repository, branch string, files map[string][]byte) error {
 	for path, expected := range files {
 		actual, err := r.client.RepositoryFile(ctx, repository, path, branch)

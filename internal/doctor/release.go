@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -76,9 +76,16 @@ type workflowTagRef struct {
 	} `json:"object"`
 }
 
-func (r workflowTagRef) matchesDirectCommit(sourceCommit string) bool {
-	return r.Object.Type == "commit" && r.Object.SHA == sourceCommit
+type workflowTagObject struct {
+	Tag     string `json:"tag"`
+	Message string `json:"message"`
+	Object  struct {
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	} `json:"object"`
 }
+
+var publisherTagMessagePattern = regexp.MustCompile(`^Workflow publisher provenance\nrun_id=([1-9][0-9]*)\nrun_attempt=([1-9][0-9]*)$`)
 
 type releaseWorkflow struct {
 	ID    int64  `json:"id"`
@@ -97,6 +104,7 @@ type releaseWorkflowRun struct {
 	Path         string               `json:"path"`
 	UpdatedAt    string               `json:"updated_at"`
 	PullRequests []releasePullSummary `json:"pull_requests"`
+	RunAttempt   int64                `json:"run_attempt"`
 }
 
 func completedNoLaterThan(completedAt, mergedAt string) bool {
@@ -137,16 +145,21 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	}
 	tag := "workflow-v" + releaseConfig.Version
 	var release struct {
-		TargetCommitish string         `json:"target_commitish"`
-		Draft           bool           `json:"draft"`
-		Prerelease      bool           `json:"prerelease"`
-		Immutable       bool           `json:"immutable"`
-		Assets          []releaseAsset `json:"assets"`
+		TagName    string         `json:"tag_name"`
+		Body       string         `json:"body"`
+		Draft      bool           `json:"draft"`
+		Prerelease bool           `json:"prerelease"`
+		Immutable  bool           `json:"immutable"`
+		Assets     []releaseAsset `json:"assets"`
+		Author     struct {
+			Login string `json:"login"`
+			Type  string `json:"type"`
+		} `json:"author"`
 	}
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository+"/releases/tags/"+tag, nil, &release); err != nil {
 		return WorkflowReleaseManifest{}, nil, fmt.Errorf("read authoritative Workflow Release: %w", err)
 	}
-	if release.Draft || release.Prerelease || !release.Immutable {
+	if release.Draft || release.Prerelease || !release.Immutable || release.Author.Login != "github-actions[bot]" || release.Author.Type != "Bot" {
 		return WorkflowReleaseManifest{}, nil, errors.New("authoritative Workflow Release must be published, stable, and immutable")
 	}
 	assets, err := exactWorkflowAssets(release.Assets)
@@ -178,15 +191,34 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if err != nil {
 		return WorkflowReleaseManifest{}, nil, err
 	}
-	if manifest.Version != releaseConfig.Version || !shaPattern.MatchString(release.TargetCommitish) {
-		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag, configuration, and publisher target do not agree")
+	if manifest.Version != releaseConfig.Version || release.TagName != tag {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag and configuration do not agree")
 	}
 	var tagRef workflowTagRef
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository+"/git/ref/tags/"+tag, nil, &tagRef); err != nil {
 		return WorkflowReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release source tag: %w", err)
 	}
-	if !tagRef.matchesDirectCommit(release.TargetCommitish) {
-		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag must directly reference the publisher merge commit")
+	if tagRef.Object.Type != "tag" || !shaPattern.MatchString(tagRef.Object.SHA) {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag lacks annotated publisher provenance")
+	}
+	var tagObject workflowTagObject
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+f.WorkflowRepository+"/git/tags/"+tagRef.Object.SHA, nil, &tagObject); err != nil {
+		return WorkflowReleaseManifest{}, nil, fmt.Errorf("verify Workflow Release tag provenance: %w", err)
+	}
+	provenance := publisherTagMessagePattern.FindStringSubmatch(tagObject.Message)
+	if len(provenance) != 3 || tagObject.Tag != tag || tagObject.Object.Type != "commit" || !shaPattern.MatchString(tagObject.Object.SHA) {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release tag provenance is invalid")
+	}
+	var publisherRunID, publisherRunAttempt int64
+	if _, err := fmt.Sscan(provenance[1], &publisherRunID); err != nil {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release publisher run provenance is invalid")
+	}
+	if _, err := fmt.Sscan(provenance[2], &publisherRunAttempt); err != nil {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release publisher attempt provenance is invalid")
+	}
+	wantBody := fmt.Sprintf("Immutable atomic Agent Workflow release.\n\nPublisher Run: %d\nPublisher Attempt: %d", publisherRunID, publisherRunAttempt)
+	if release.Body != wantBody {
+		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release body differs from its annotated publisher provenance")
 	}
 	bundle, err := download(workflowrelease.BundleAssetName)
 	if err != nil {
@@ -208,7 +240,7 @@ func (f ReleaseFetcher) Fetch(ctx context.Context, config Config, token string) 
 	if manifest.Worker.Image != config.Worker.ImageRepository+"@sha256:"+strings.TrimPrefix(manifest.Worker.Image, config.Worker.ImageRepository+"@sha256:") {
 		return WorkflowReleaseManifest{}, nil, errors.New("Workflow Release image does not match the configured repository")
 	}
-	if err := verifyPublisher(ctx, client, f.WorkflowRepository, config, manifest, release.TargetCommitish); err != nil {
+	if err := verifyPublisher(ctx, client, f.WorkflowRepository, config, manifest, tagObject.Object.SHA, publisherRunID, publisherRunAttempt); err != nil {
 		return WorkflowReleaseManifest{}, nil, err
 	}
 	return manifest, manifestRaw, nil
@@ -243,7 +275,7 @@ func validateWorkerSBOM(raw []byte) error {
 	return nil
 }
 
-func verifyPublisher(ctx context.Context, client *githubapi.Client, repository string, config Config, manifest workflowrelease.Manifest, mergeCommit string) error {
+func verifyPublisher(ctx context.Context, client *githubapi.Client, repository string, config Config, manifest workflowrelease.Manifest, mergeCommit string, publisherRunID, publisherRunAttempt int64) error {
 	var summaries []releasePullSummary
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/commits/"+mergeCommit+"/pulls", nil, &summaries); err != nil {
 		return err
@@ -277,7 +309,7 @@ func verifyPublisher(ctx context.Context, client *githubapi.Client, repository s
 		return fmt.Errorf("verify qualification workflow: %w", err)
 	}
 	var qualificationRun releaseWorkflowRun
-	if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d", repository, manifest.QualificationRunID), nil, &qualificationRun); err != nil {
+	if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/attempts/%d", repository, manifest.QualificationRunID, manifest.QualificationRunAttempt), nil, &qualificationRun); err != nil {
 		return fmt.Errorf("verify qualification run: %w", err)
 	}
 	qualifiedPull := false
@@ -286,7 +318,7 @@ func verifyPublisher(ctx context.Context, client *githubapi.Client, repository s
 			qualifiedPull = true
 		}
 	}
-	if qualificationWorkflow.Path != ".github/workflows/worker-contract.yml" || qualificationWorkflow.State != "active" || qualificationRun.WorkflowID != qualificationWorkflow.ID || qualificationRun.Path != qualificationWorkflow.Path || qualificationRun.HeadSHA != manifest.CandidateSourceCommit || qualificationRun.Event != "pull_request" || qualificationRun.Status != "completed" || qualificationRun.Conclusion != "success" || !qualifiedPull {
+	if qualificationWorkflow.Path != ".github/workflows/worker-contract.yml" || qualificationWorkflow.State != "active" || qualificationRun.WorkflowID != qualificationWorkflow.ID || qualificationRun.Path != qualificationWorkflow.Path || qualificationRun.RunAttempt != manifest.QualificationRunAttempt || qualificationRun.HeadSHA != manifest.CandidateSourceCommit || qualificationRun.Event != "pull_request" || qualificationRun.Status != "completed" || qualificationRun.Conclusion != "success" || !qualifiedPull {
 		return errors.New("Workflow Release candidate lacks authoritative successful qualification provenance")
 	}
 	if !completedNoLaterThan(qualificationRun.UpdatedAt, pull.MergedAt) {
@@ -296,17 +328,12 @@ func verifyPublisher(ctx context.Context, client *githubapi.Client, repository s
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/actions/workflows/publish-workflow.yml", nil, &publisherWorkflow); err != nil {
 		return fmt.Errorf("verify Workflow publisher: %w", err)
 	}
-	var publisherRuns struct {
-		WorkflowRuns []releaseWorkflowRun `json:"workflow_runs"`
+	var publisherRun releaseWorkflowRun
+	if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d", repository, publisherRunID), nil, &publisherRun); err != nil {
+		return fmt.Errorf("verify Workflow publisher run: %w", err)
 	}
-	query := fmt.Sprintf("/repos/%s/actions/workflows/%d/runs?event=push&head_sha=%s&status=success&per_page=100", repository, publisherWorkflow.ID, url.QueryEscape(mergeCommit))
-	if err := client.RequestJSON(ctx, http.MethodGet, query, nil, &publisherRuns); err != nil {
-		return fmt.Errorf("verify Workflow publisher runs: %w", err)
+	if publisherWorkflow.Path == ".github/workflows/publish-workflow.yml" && publisherWorkflow.State == "active" && publisherRun.ID == publisherRunID && publisherRun.RunAttempt >= publisherRunAttempt && publisherRun.WorkflowID == publisherWorkflow.ID && publisherRun.Path == publisherWorkflow.Path && publisherRun.HeadSHA == mergeCommit && publisherRun.HeadBranch == "main" && publisherRun.Event == "push" && publisherRun.Status == "completed" && publisherRun.Conclusion == "success" {
+		return nil
 	}
-	for _, run := range publisherRuns.WorkflowRuns {
-		if publisherWorkflow.Path == ".github/workflows/publish-workflow.yml" && publisherWorkflow.State == "active" && run.WorkflowID == publisherWorkflow.ID && run.Path == publisherWorkflow.Path && run.HeadSHA == mergeCommit && run.HeadBranch == "main" && run.Event == "push" && run.Status == "completed" && run.Conclusion == "success" {
-			return nil
-		}
-	}
-	return errors.New("Workflow Release merge was not consumed by the successful fixed main publisher")
+	return errors.New("Workflow Release provenance is not its exact successful fixed main publisher run")
 }

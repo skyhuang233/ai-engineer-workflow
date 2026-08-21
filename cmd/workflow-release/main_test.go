@@ -67,6 +67,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 		"-output", outputDirectory,
 		"-candidate-source-commit", strings.Repeat("a", 40),
 		"-qualification-run-id", "42",
+		"-qualification-run-attempt", "3",
 		"-worker-image", image,
 		"-sbom", sbom,
 	}); err != nil {
@@ -94,7 +95,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Worker.Image != image || manifest.Version != config.Version || manifest.Worker.Tools.NoMistakes.Commit == "" {
+	if manifest.Worker.Image != image || manifest.Version != config.Version || manifest.QualificationRunAttempt != 3 || manifest.Worker.Tools.NoMistakes.Commit == "" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 }

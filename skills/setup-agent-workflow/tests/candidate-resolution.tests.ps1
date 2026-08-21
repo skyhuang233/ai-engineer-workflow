@@ -57,6 +57,7 @@ try {
     version = '0.0.1'
     candidate_source_commit = $sourceCommit
     qualification_run_id = 42
+    qualification_run_attempt = 3
     bundle = [ordered]@{name='workflow-windows-amd64.zip';sha256=$bundleDigest}
     worker = [ordered]@{
       image = $workerImage

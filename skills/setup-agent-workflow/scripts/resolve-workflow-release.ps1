@@ -90,7 +90,8 @@ $eligible = [Collections.Generic.List[object]]::new()
 foreach ($release in $releases) {
   $match = [regex]::Match([string]$release.tag_name, '^workflow-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')
   if (-not $match.Success) { continue }
-  if ([bool]$release.draft -or [bool]$release.prerelease -or -not [bool]$release.immutable -or [string]::IsNullOrWhiteSpace([string]$release.published_at)) { continue }
+  if ([bool]$release.draft -or [bool]$release.prerelease -or -not [bool]$release.immutable -or [string]::IsNullOrWhiteSpace([string]$release.published_at) -or
+      [string]$release.author.login -cne 'github-actions[bot]' -or [string]$release.author.type -cne 'Bot') { continue }
   $components = [Collections.Generic.List[int64]]::new()
   $validComponents = $true
   foreach ($index in 1..3) {
@@ -128,11 +129,18 @@ $validator = Join-Path $PSScriptRoot 'verify-workflow-release-manifest.ps1'
 $validatedJSON = & $validator -ManifestPath $manifestPath -ExpectedSHA256 ([string]$manifestAsset.digest) -ExpectedSize ([long]$manifestAsset.size) -ExpectedTag ([string]$release.tag_name)
 if ($LASTEXITCODE -ne 0) { throw 'Workflow Release manifest bootstrap validation failed' }
 $validated = $validatedJSON | ConvertFrom-Json
-$mergeCommit = [string]$release.target_commitish
-if ($mergeCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Workflow Release target is not a full lowercase merge commit' }
-
 $tagRef = Invoke-GhJSON "repos/$repository/git/ref/tags/$([Uri]::EscapeDataString([string]$release.tag_name))"
-if ([string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cne $mergeCommit) { throw 'Workflow Release tag does not resolve directly to its publisher merge commit' }
+if ([string]$tagRef.object.type -cne 'tag' -or [string]$tagRef.object.sha -cnotmatch '^[0-9a-f]{40}$') { throw 'Workflow Release tag lacks annotated publisher provenance' }
+$tagObject = Invoke-GhJSON "repos/$repository/git/tags/$([string]$tagRef.object.sha)"
+$provenanceMatch = [regex]::Match([string]$tagObject.message, '^Workflow publisher provenance\nrun_id=([1-9][0-9]*)\nrun_attempt=([1-9][0-9]*)$')
+if (-not $provenanceMatch.Success -or [string]$tagObject.tag -cne [string]$release.tag_name -or [string]$tagObject.object.type -cne 'commit' -or [string]$tagObject.object.sha -cnotmatch '^[0-9a-f]{40}$') {
+  throw 'Workflow Release tag provenance does not bind its publisher merge commit'
+}
+$mergeCommit = [string]$tagObject.object.sha
+$publisherRunID = [long]$provenanceMatch.Groups[1].Value
+$publisherRunAttempt = [long]$provenanceMatch.Groups[2].Value
+$expectedReleaseBody = "Immutable atomic Agent Workflow release.`n`nPublisher Run: $publisherRunID`nPublisher Attempt: $publisherRunAttempt"
+if ([string]$release.body -cne $expectedReleaseBody) { throw 'Workflow Release body differs from its annotated publisher provenance' }
 
 $pullSummaries = @(Invoke-GhJSON "repos/$repository/commits/$mergeCommit/pulls")
 $matchingPulls = @($pullSummaries | Where-Object {
@@ -159,9 +167,10 @@ if ($parents.Count -ne 2 -or @($parents | Where-Object { [string]$_.sha -ceq $ca
 }
 
 $qualificationWorkflow = Invoke-GhJSON "repos/$repository/actions/workflows/worker-contract.yml"
-$qualificationRun = Invoke-GhJSON "repos/$repository/actions/runs/$($validated.qualification_run_id)"
+$qualificationRun = Invoke-GhJSON "repos/$repository/actions/runs/$($validated.qualification_run_id)/attempts/$($validated.qualification_run_attempt)"
 if ([string]$qualificationWorkflow.path -cne '.github/workflows/worker-contract.yml' -or [string]$qualificationWorkflow.state -cne 'active' -or
     [long]$qualificationRun.workflow_id -ne [long]$qualificationWorkflow.id -or [string]$qualificationRun.path -cne '.github/workflows/worker-contract.yml' -or
+    [long]$qualificationRun.run_attempt -ne [long]$validated.qualification_run_attempt -or
     [string]$qualificationRun.head_sha -cne $candidateCommit -or [string]$qualificationRun.event -cne 'pull_request' -or
     [string]$qualificationRun.status -cne 'completed' -or [string]$qualificationRun.conclusion -cne 'success' -or
     @($qualificationRun.pull_requests | Where-Object { [long]$_.number -eq [long]$pull.number }).Count -eq 0) {
@@ -174,16 +183,14 @@ if ([DateTimeOffset]::Parse($qualificationCompletedAt, [Globalization.CultureInf
 
 $publisherWorkflowName = Split-Path -Leaf ([string]$policy.workflow_path)
 $publisherWorkflow = Invoke-GhJSON "repos/$repository/actions/workflows/$publisherWorkflowName"
-$publisherRuns = Invoke-GhJSON "repos/$repository/actions/workflows/$([long]$publisherWorkflow.id)/runs?event=push&head_sha=$mergeCommit&status=success&per_page=100"
-$trustedPublisherRuns = @($publisherRuns.workflow_runs | Where-Object {
-  [long]$_.workflow_id -eq [long]$publisherWorkflow.id -and [string]$_.path -ceq [string]$policy.workflow_path -and
-  [string]$_.head_sha -ceq $mergeCommit -and [string]$_.head_branch -ceq 'main' -and [string]$_.event -ceq 'push' -and
-  [string]$_.status -ceq 'completed' -and [string]$_.conclusion -ceq 'success'
-})
-if ([string]$publisherWorkflow.path -cne [string]$policy.workflow_path -or [string]$publisherWorkflow.state -cne 'active' -or $trustedPublisherRuns.Count -eq 0) {
-  throw 'Workflow Release merge was not consumed by the trusted successful publisher'
+$publisherRun = Invoke-GhJSON "repos/$repository/actions/runs/$publisherRunID"
+if ([string]$publisherWorkflow.path -cne [string]$policy.workflow_path -or [string]$publisherWorkflow.state -cne 'active' -or
+    [long]$publisherRun.id -ne $publisherRunID -or [long]$publisherRun.run_attempt -lt $publisherRunAttempt -or
+    [long]$publisherRun.workflow_id -ne [long]$publisherWorkflow.id -or [string]$publisherRun.path -cne [string]$policy.workflow_path -or
+    [string]$publisherRun.head_sha -cne $mergeCommit -or [string]$publisherRun.head_branch -cne 'main' -or [string]$publisherRun.event -cne 'push' -or
+    [string]$publisherRun.status -cne 'completed' -or [string]$publisherRun.conclusion -cne 'success') {
+  throw 'Workflow Release provenance is not its exact trusted successful publisher run'
 }
-$publisherRun = $trustedPublisherRuns | Sort-Object -Property id -Descending | Select-Object -First 1
 
 $bundlePath = Download-ReleaseAsset ([string]$release.tag_name) 'workflow-windows-amd64.zip'
 $sbomPath = Download-ReleaseAsset ([string]$release.tag_name) 'worker-sbom.spdx.json'
@@ -198,10 +205,12 @@ if ($sbomMetadataDigest -cne [string]$validated.sbom_sha256) { throw 'Worker SBO
   tag = [string]$release.tag_name
   source_commit = $candidateCommit
   qualification_run_id = [long]$validated.qualification_run_id
+  qualification_run_attempt = [long]$validated.qualification_run_attempt
   qualification_completed_at = $qualificationCompletedAt
   merged_at = $mergedAt
   publisher_source_commit = $mergeCommit
-  publisher_run_id = [long]$publisherRun.id
+  publisher_run_id = $publisherRunID
+  publisher_run_attempt = $publisherRunAttempt
   manifest_path = $manifestPath
   manifest_sha256 = [string]$validated.manifest_sha256
   bundle_path = $bundlePath

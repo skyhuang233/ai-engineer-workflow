@@ -30,8 +30,8 @@ fail closed; never fall back to `platform-v*` or `worker-v*`.
 Download only `workflow-release.json` first and authenticate its bytes against
 the GitHub asset digest. Before downloading either other asset, run the
 PowerShell bootstrap verifier. Treat manifest `candidate_source_commit` and
-`qualification_run_id` as qualified-candidate provenance. Separately require
-the Release target and direct tag to identify an owner-created two-parent main
+`qualification_run_id` and `qualification_run_attempt` as qualified-candidate provenance. Separately require
+the annotated Release tag to identify both an owner-created two-parent main
 merge containing that candidate, require the authoritative qualification to
 have completed before the merge, and require a successful `push` run of
 `.github/workflows/publish-workflow.yml` for the merge commit. The verifier enforces schema 1 with
@@ -49,7 +49,9 @@ Release-branch qualification has one explicit test-only acquisition boundary.
 When the qualification harness sets `WORKFLOW_SETUP_QUALIFICATION=1`, require
 absolute `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, exact
 `WORKFLOW_SETUP_CANDIDATE_VERSION`, and full lowercase
-`WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT` values. Resolve that directory only
+`WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`, positive
+`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID`, and positive
+`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT` values. Resolve that directory only
 through `scripts/resolve-workflow-candidate.ps1`, then continue with the same
 Bundle verification, consent, installation, readiness, and Repository
 Onboarding steps below. Never enter this path during ordinary setup, never
@@ -75,7 +77,9 @@ if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
   $release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
     -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `
     -ExpectedVersion $env:WORKFLOW_SETUP_CANDIDATE_VERSION `
-    -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT | ConvertFrom-Json
+    -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT `
+    -ExpectedQualificationRunID $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID `
+    -ExpectedQualificationRunAttempt $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT | ConvertFrom-Json
 } else {
   $release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
 }

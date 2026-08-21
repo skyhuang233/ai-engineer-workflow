@@ -75,6 +75,7 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 		`test "$actual_digest" = "$artifact_digest"`,
 		`-ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}'`,
 		`-ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}'`,
+		`-ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}'`,
 		`-ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.candidate_source_commit }}'`,
 		`transferred qualification manifest digest differs`,
 		`transferred qualification Worker digest differs`,
@@ -93,7 +94,7 @@ func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.
 	}
 	if strings.Count(text, "for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip") != 2 ||
 		strings.Count(text, `git/ref/tags/${tag}`) < 4 {
-		t.Fatal("fresh and idempotent publication do not both verify asset digests and the direct tag ref")
+		t.Fatal("fresh and idempotent publication do not both verify asset digests and the provenance tag ref")
 	}
 	for _, retired := range []string{"build_input_identity", "build-input.json", "no_mistakes_fork_release", "no_mistakes_upstream_commit"} {
 		if strings.Contains(text, retired) {
@@ -118,14 +119,18 @@ func TestUnifiedPublisherVerifiesQualificationBeforeRetryMutation(t *testing.T) 
 		t.Fatal("unified publisher can delete a release after acquiring the qualified candidate")
 	}
 	stage := strings.Index(text, "name: Stage exactly three assets")
-	if stage <= resolve || !strings.Contains(text[preflight:resolve], `.object.type == "commit" and .object.sha == $sha`) ||
-		!strings.Contains(text[resolve:stage], `.object.type == "commit" and .object.sha == $sha`) {
-		t.Fatal("unified publisher does not validate the direct Git tag before either candidate acquisition or release creation")
+	if stage <= resolve || !strings.Contains(text[preflight:resolve], `publisher tag lacks annotated provenance`) ||
+		!strings.Contains(text[resolve:stage], `publisher tag lost annotated provenance`) {
+		t.Fatal("unified publisher does not validate annotated tag provenance before either candidate acquisition or release creation")
 	}
 	for _, required := range []string{
-		`[ "$release_state" = "fresh" ] && [ "$tag_exists" = "true" ]`,
-		`allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}`,
-		`test "${{ needs.qualified-candidate.outputs.allow_existing_tag }}" = "true"`,
+		`tag_exists: ${{ steps.preflight.outputs.tag_exists }}`,
+		`publisher_run_attempt: ${{ steps.preflight.outputs.publisher_run_attempt }}`,
+		`.author.login == "github-actions[bot]" and .author.type == "Bot"`,
+		`test "$(jq -r .run_id <<<"$provenance")" = "$GITHUB_RUN_ID"`,
+		`gh release delete "$tag" --yes --cleanup-tag=false`,
+		`gh release create "$tag"`,
+		`--verify-tag`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("unified publisher does not reserve an existing tag exclusively for a verified retry: missing %q", required)
@@ -139,6 +144,8 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
+		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
+		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
 		"Preserve exact qualified Workflow Release candidate",
 		"qualified-workflow-release-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}",
 	} {
@@ -195,7 +202,7 @@ func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
 	}
 	assembler := readWorkflow(t, "scripts", "assemble-workflow-release.ps1")
 	for _, required := range []string{
-		"$CandidateSourceCommit", "$QualificationRunID", "$WorkerImage", "$SBOMPath",
+		"$CandidateSourceCommit", "$QualificationRunID", "$QualificationRunAttempt", "$WorkerImage", "$SBOMPath",
 		"go run ./cmd/workflow-release assemble",
 		"-workflow-version-exe $workflowVersionExecutable",
 		"Workflow Release manifest Bundle digest differs from assembled asset",

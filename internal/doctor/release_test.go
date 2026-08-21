@@ -47,22 +47,15 @@ func TestReleaseFetcherRejectsAnUnboundRepositoryBeforeNetwork(t *testing.T) {
 	}
 }
 
-func TestWorkflowTagRefRequiresDirectSourceCommit(t *testing.T) {
-	source := strings.Repeat("a", 40)
-	var valid workflowTagRef
-	valid.Object.Type = "commit"
-	valid.Object.SHA = source
-	if !valid.matchesDirectCommit(source) {
-		t.Fatal("rejected a direct tag ref to the manifest source commit")
+func TestPublisherTagMessageRequiresExactRunAndAttempt(t *testing.T) {
+	valid := publisherTagMessagePattern.FindStringSubmatch("Workflow publisher provenance\nrun_id=456\nrun_attempt=2")
+	if len(valid) != 3 || valid[1] != "456" || valid[2] != "2" {
+		t.Fatal("rejected exact publisher provenance")
 	}
-	valid.Object.Type = "tag"
-	if valid.matchesDirectCommit(source) {
-		t.Fatal("accepted an annotated tag object")
-	}
-	valid.Object.Type = "commit"
-	valid.Object.SHA = strings.Repeat("b", 40)
-	if valid.matchesDirectCommit(source) {
-		t.Fatal("accepted a tag ref to another source commit")
+	for _, invalid := range []string{"run_id=456", "Workflow publisher provenance\nrun_id=0\nrun_attempt=2", "Workflow publisher provenance\nrun_id=456\nrun_attempt=0\n"} {
+		if publisherTagMessagePattern.MatchString(invalid) {
+			t.Fatalf("accepted invalid publisher provenance %q", invalid)
+		}
 	}
 }
 

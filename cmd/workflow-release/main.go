@@ -45,6 +45,7 @@ func runAssemble(arguments []string) error {
 	output := flags.String("output", "", "empty release output directory")
 	sourceCommit := flags.String("candidate-source-commit", "", "qualified candidate source commit")
 	runID := flags.Int64("qualification-run-id", 0, "qualification Actions run ID")
+	runAttempt := flags.Int64("qualification-run-attempt", 0, "qualification Actions run attempt")
 	workerImage := flags.String("worker-image", "", "immutable Worker image reference")
 	sbom := flags.String("sbom", "", "generated SPDX JSON SBOM")
 	if err := flags.Parse(arguments); err != nil {
@@ -64,6 +65,9 @@ func runAssemble(arguments []string) error {
 	}
 	if *runID <= 0 {
 		return errors.New("-qualification-run-id must be positive")
+	}
+	if *runAttempt <= 0 {
+		return errors.New("-qualification-run-attempt must be positive")
 	}
 	config, err := workflowrelease.LoadConfig(*configPath)
 	if err != nil {
@@ -107,7 +111,7 @@ func runAssemble(arguments []string) error {
 		return fmt.Errorf("stage Worker SBOM: %w", err)
 	}
 	manifest, err := workflowrelease.CreateManifest(workflowrelease.ManifestOptions{
-		Config: config, CandidateSourceCommit: *sourceCommit, QualificationRunID: *runID, BundlePath: bundlePath,
+		Config: config, CandidateSourceCommit: *sourceCommit, QualificationRunID: *runID, QualificationRunAttempt: *runAttempt, BundlePath: bundlePath,
 		WorkerImage: *workerImage, Tools: toolchain.Tools(), SBOMPath: sbomPath,
 	})
 	if err != nil {

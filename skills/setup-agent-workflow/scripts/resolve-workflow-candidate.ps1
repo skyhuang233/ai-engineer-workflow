@@ -3,7 +3,8 @@ param(
   [Parameter(Mandatory)][string]$CandidateDirectory,
   [Parameter(Mandatory)][string]$ExpectedVersion,
   [Parameter(Mandatory)][string]$ExpectedSourceCommit,
-  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedQualificationRunID = 0
+  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedQualificationRunID = 0,
+  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedQualificationRunAttempt = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +49,9 @@ if ([string]$validated.candidate_source_commit -cne $ExpectedSourceCommit) {
 if ($ExpectedQualificationRunID -gt 0 -and [long]$validated.qualification_run_id -ne $ExpectedQualificationRunID) {
   throw 'Workflow Release candidate manifest does not match the expected qualification run'
 }
+if ($ExpectedQualificationRunAttempt -gt 0 -and [long]$validated.qualification_run_attempt -ne $ExpectedQualificationRunAttempt) {
+  throw 'Workflow Release candidate manifest does not match the expected qualification run attempt'
+}
 
 $bundleDigest = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $sbomDigest = (Get-FileHash -LiteralPath $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -68,6 +72,8 @@ $bundleVerifier = Join-Path $PSScriptRoot 'verify-windows-bundle.ps1'
   schema_version = 1
   version = [string]$validated.version
   source_commit = [string]$validated.candidate_source_commit
+  qualification_run_id = [long]$validated.qualification_run_id
+  qualification_run_attempt = [long]$validated.qualification_run_attempt
   manifest_path = $manifestPath
   manifest_sha256 = $manifestDigest
   bundle_path = $bundlePath

@@ -15,6 +15,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 	for _, required := range []string{
 		`WORKFLOW_SETUP_E2E`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_PAT_FILE`,
 		`WORKFLOW_SETUP_QUALIFICATION`, `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, `WORKFLOW_SETUP_CANDIDATE_VERSION`, `WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`,
+		`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID`, `WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT`, `WORKFLOW_SETUP_E2E_PHASE`,
 		`local qualification checkout`, `git rev-parse HEAD`, `#workflow-v`,
 		`Do not query, download, or require a published GitHub Release`,
 		`git init -b main`, `Do not reuse an earlier approved digest after any plan command failure`,
@@ -26,6 +27,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
+		`gate_kind="repository_onboarding"`, `gate_kind="worker_delivery"`, `Ticket #$ticket is projected as Delivered`, `Plan #$deliveryPlan is projected as Completed`,
 	} {
 		if !strings.Contains(driver, required) {
 			t.Fatalf("Codex DriverScript lacks required contract %q", required)
@@ -93,7 +95,7 @@ func TestDriverResultSchemaIsStrictAndComplete(t *testing.T) {
 	if schema.AdditionalProperties {
 		t.Fatal("driver result schema permits undeclared evidence")
 	}
-	for _, required := range []string{"scenario", "platform_ready", "repository_admitted", "temporary_repositories", "blocker"} {
+	for _, required := range []string{"scenario", "platform_ready", "repository_admitted", "temporary_repositories", "blocker", "gate_kind", "onboarding_plan_digest", "pull_request", "pull_head", "merge_method", "delivery_plan", "ticket", "ticket_status", "plan_status"} {
 		if _, ok := schema.Properties[required]; !ok || !contains(schema.Required, required) {
 			t.Fatalf("driver result schema lacks required property %q", required)
 		}
@@ -109,7 +111,7 @@ func TestDriverResultSchemaUsesCodexStructuredOutputsSubset(t *testing.T) {
 
 func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
-	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`, `#workflow-v`, `local qualification checkout`, `git rev-parse HEAD`} {
+	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `WORKFLOW_SETUP_E2E_OWNER_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_OWNER_TOKEN`, `Invoke-OwnerMerge`, `--match-head-commit`, `delivery-resume`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`, `#workflow-v`, `local qualification checkout`, `git rev-parse HEAD`, `rev-parse --is-inside-work-tree`} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("setup harness lacks %q", required)
 		}

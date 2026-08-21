@@ -191,7 +191,11 @@ jobs:
   release-dry-run:
     if: github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
     needs: [build-and-test, worker-contract]
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, workflow-qualification]
+    environment: workflow-release-qualification
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -212,8 +216,36 @@ jobs:
           & scripts/assemble-workflow-release.ps1 `
             -CandidateSourceCommit '${{ github.event.pull_request.head.sha }}' `
             -QualificationRunID '${{ github.run_id }}' `
+            -QualificationRunAttempt '${{ github.run_attempt }}' `
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
+      - name: Authenticate exact qualification Worker image
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Qualify exact candidate setup and full delivery operation
+        shell: pwsh
+        env:
+          WORKFLOW_SETUP_E2E: '1'
+          WORKFLOW_SETUP_QUALIFICATION: '1'
+          WORKFLOW_SETUP_E2E_PAT: ${{ secrets.WORKFLOW_SETUP_E2E_PAT }}
+          WORKFLOW_SETUP_E2E_CLEANUP_TOKEN: ${{ secrets.WORKFLOW_SETUP_E2E_CLEANUP_TOKEN }}
+          WORKFLOW_SETUP_E2E_OWNER_TOKEN: ${{ secrets.WORKFLOW_SETUP_E2E_OWNER_TOKEN }}
+          WORKFLOW_SETUP_CANDIDATE_DIRECTORY: ${{ github.workspace }}\build\release
+          WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
+          $env:WORKFLOW_SETUP_CANDIDATE_VERSION = $version
+          & test/e2e/setup/setup-e2e.ps1 `
+            -GitHubOwner '${{ vars.WORKFLOW_SETUP_E2E_GITHUB_OWNER }}' `
+            -DriverScript (Resolve-Path test/e2e/setup/codex-driver.ps1) `
+            -EntrySkillSpec (Resolve-Path .) `
+            -PlatformVersion $version `
+            -DifferentOwnerRepository '${{ vars.WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY }}'
       - name: Preserve exact qualified Workflow Release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

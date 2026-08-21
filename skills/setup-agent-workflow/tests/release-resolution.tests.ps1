@@ -22,7 +22,7 @@ try {
   $releasePage = @(
     @{tag_name='platform-v99.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
     @{tag_name='workflow-v0.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
-    @{tag_name='workflow-v0.0.1';target_commitish=('b' * 40);draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
+    @{tag_name='workflow-v0.0.1';target_commitish=('b' * 40);body="Immutable atomic Agent Workflow release.`n`nPublisher Run: 456`nPublisher Attempt: 2";author=@{login='github-actions[bot]';type='Bot'};draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
       @{name='workflow-windows-amd64.zip';state='uploaded';size=(Get-Item $global:workflowResolutionBundle).Length;digest=('sha256:'+$bundleDigest)},
       @{name='workflow-release.json';state='uploaded';size=(Get-Item $global:workflowResolutionFixture).Length;digest=('sha256:'+$manifestDigest)},
       @{name='worker-sbom.spdx.json';state='uploaded';size=(Get-Item $global:workflowResolutionSBOM).Length;digest=('sha256:'+$sbomDigest)}
@@ -38,14 +38,15 @@ try {
     if ($argv[0] -ceq 'api') {
       $endpoint = $argv[-1]
       if ($endpoint -like 'repos/*/releases?*') { Write-Output $global:workflowResolutionRelease; return }
-      if ($endpoint -like 'repos/*/git/ref/tags/*') { Write-Output '{"object":{"type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}'; return }
+      if ($endpoint -like 'repos/*/git/ref/tags/*') { Write-Output '{"object":{"type":"tag","sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}'; return }
+      if ($endpoint -like 'repos/*/git/tags/*') { Write-Output '{"tag":"workflow-v0.0.1","message":"Workflow publisher provenance\nrun_id=456\nrun_attempt=2","object":{"type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}'; return }
       if ($endpoint -like 'repos/*/commits/*/pulls') { Write-Output '[{"number":7,"merged_at":"2026-08-19T02:00:00Z","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base":{"ref":"main"}}]'; return }
       if ($endpoint -like 'repos/*/pulls/7') { Write-Output (@{number=7;merged_at='2026-08-19T02:00:00Z';merge_commit_sha=('b'*40);base=@{ref='main'};head=@{ref='release-0.0.1';sha=$global:workflowResolutionCandidateCommit};merged_by=@{login='skyhuang233';type='User'}} | ConvertTo-Json -Depth 5 -Compress); return }
       if ($endpoint -like 'repos/*/git/commits/*') { Write-Output '{"parents":[{"sha":"cccccccccccccccccccccccccccccccccccccccc"},{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}'; return }
       if ($endpoint -like 'repos/*/actions/workflows/worker-contract.yml') { Write-Output '{"id":2,"path":".github/workflows/worker-contract.yml","state":"active"}'; return }
-      if ($endpoint -like 'repos/*/actions/runs/123') { Write-Output (@{id=123;workflow_id=2;path='.github/workflows/worker-contract.yml';head_sha=('a'*40);event='pull_request';status='completed';conclusion='success';updated_at=$global:workflowResolutionQualificationCompletedAt;pull_requests=@(@{number=7})} | ConvertTo-Json -Depth 5 -Compress); return }
+      if ($endpoint -like 'repos/*/actions/runs/123/attempts/4') { Write-Output (@{id=123;run_attempt=4;workflow_id=2;path='.github/workflows/worker-contract.yml';head_sha=('a'*40);event='pull_request';status='completed';conclusion='success';updated_at=$global:workflowResolutionQualificationCompletedAt;pull_requests=@(@{number=7})} | ConvertTo-Json -Depth 5 -Compress); return }
       if ($endpoint -like 'repos/*/actions/workflows/publish-workflow.yml') { Write-Output '{"id":3,"path":".github/workflows/publish-workflow.yml","state":"active"}'; return }
-      if ($endpoint -like 'repos/*/actions/workflows/3/runs?*') { Write-Output '{"workflow_runs":[{"id":456,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"success"}]}'; return }
+      if ($endpoint -like 'repos/*/actions/runs/456') { Write-Output '{"id":456,"run_attempt":3,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"success"}'; return }
       throw "Unexpected mocked gh api endpoint: $endpoint"
     }
     if ($argv[0] -ceq 'release' -and $argv[1] -ceq 'download') {
@@ -72,15 +73,15 @@ try {
 
   $releaseObjects = @($global:workflowResolutionRelease | ConvertFrom-Json)
   $selected = @($releaseObjects | Where-Object tag_name -EQ 'workflow-v0.0.1')[0]
-  $selected.target_commitish = ('c' * 40)
+  $selected.body = 'manually published'
   $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
   $global:workflowResolutionCalls.Clear()
   $accepted = $true
   try { & $resolver -DownloadDirectory (Join-Path $scratch 'target-mismatch') *> $null } catch { $accepted = $false }
-  if ($accepted) { throw 'Resolver accepted a Release target different from its direct tag' }
+  if ($accepted) { throw 'Resolver accepted a Release without exact publisher provenance' }
   if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' }).Count -ne 1) { throw 'Resolver downloaded Bundle or SBOM before rejecting the Release target' }
 
-  $selected.target_commitish = ('b' * 40)
+  $selected.body = "Immutable atomic Agent Workflow release.`n`nPublisher Run: 456`nPublisher Attempt: 2"
   $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
   $global:workflowResolutionQualificationCompletedAt = '2026-08-19T03:00:00Z'
   $global:workflowResolutionCalls.Clear()

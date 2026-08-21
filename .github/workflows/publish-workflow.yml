@@ -32,11 +32,13 @@ jobs:
       candidate_source_commit: ${{ steps.admission.outputs.head_sha }}
       merge_commit: ${{ github.sha }}
       qualification_run_id: ${{ steps.qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ steps.qualification.outputs.run_attempt }}
       qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}
       merged_at: ${{ steps.admission.outputs.merged_at }}
       manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
       worker_image: ${{ steps.candidate.outputs.worker_image }}
-      allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}
+      tag_exists: ${{ steps.preflight.outputs.tag_exists }}
+      publisher_run_attempt: ${{ steps.preflight.outputs.publisher_run_attempt }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -119,6 +121,7 @@ jobs:
           mkdir -p build/qualified
           unzip -q qualification.zip -d build/qualified
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
           echo "completed_at=$completed_at" >> "$GITHUB_OUTPUT"
       - name: Verify exact qualified release candidate
         id: candidate
@@ -128,7 +131,8 @@ jobs:
             -CandidateDirectory build/qualified `
             -ExpectedVersion '${{ steps.admission.outputs.version }}' `
             -ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}' `
-            -ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}' | ConvertFrom-Json
+            -ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}' `
+            -ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}' | ConvertFrom-Json
           "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
       - name: Preflight Workflow Release target
@@ -138,43 +142,50 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.admission.outputs.tag }}"
+          notes="$(printf 'Immutable atomic Agent Workflow release.\n\nPublisher Run: %s\nPublisher Attempt: %s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")"
           release_state="fresh"
           if ! release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/tmp/release-error)"; then
             grep -q 'HTTP 404' /tmp/release-error || { cat /tmp/release-error >&2; exit 1; }
           else
-            test "$(jq -r .target_commitish <<<"$release")" = "$GITHUB_SHA" || { echo "version belongs to another source" >&2; exit 1; }
-            if jq -e '.draft == true and .immutable != true' <<<"$release" >/dev/null; then
+            jq -e --arg tag "$tag" '.tag_name == $tag' <<<"$release" >/dev/null || { echo "version belongs to another tag" >&2; exit 1; }
+            if jq -e '.draft == true and .immutable != true and .author.login == "github-actions[bot]" and .author.type == "Bot"' <<<"$release" >/dev/null; then
               release_state="retry"
-            elif jq -e '.immutable == true and .draft == false and .prerelease == false' <<<"$release" >/dev/null; then
+            elif jq -e '.immutable == true and .draft == false and .prerelease == false and .author.login == "github-actions[bot]" and .author.type == "Bot"' <<<"$release" >/dev/null; then
               release_state="immutable"
             else
-              echo "existing release is not retryable or an exact immutable result" >&2
+              echo "existing release is not owned by this exact publisher run attempt" >&2
               exit 1
             fi
           fi
           tag_exists="false"
+          publisher_run_attempt="$GITHUB_RUN_ATTEMPT"
           if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/tag-error)"; then
             grep -q 'HTTP 404' /tmp/tag-error || { cat /tmp/tag-error >&2; exit 1; }
           else
             tag_exists="true"
-            jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null || { echo "tag does not directly reference this source commit" >&2; exit 1; }
+            tag_object_sha="$(jq --exit-status --raw-output '.object.sha | select(test("^[0-9a-f]{40}$"))' <<<"$tag_ref")"
+            test "$(jq -r .object.type <<<"$tag_ref")" = "tag" || { echo "publisher tag lacks annotated provenance" >&2; exit 1; }
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")"
+            provenance="$(jq --exit-status --compact-output --arg tag "$tag" --arg sha "$GITHUB_SHA" '
+              select(.tag == $tag and .object.type == "commit" and .object.sha == $sha) |
+              .message | capture("^Workflow publisher provenance\\nrun_id=(?<run_id>[1-9][0-9]*)\\nrun_attempt=(?<run_attempt>[1-9][0-9]*)$")
+            ' <<<"$tag_object")" || { echo "publisher tag provenance is invalid" >&2; exit 1; }
+            test "$(jq -r .run_id <<<"$provenance")" = "$GITHUB_RUN_ID" || { echo "publisher tag belongs to another run" >&2; exit 1; }
+            publisher_run_attempt="$(jq -r .run_attempt <<<"$provenance")"
+            test "$publisher_run_attempt" -le "$GITHUB_RUN_ATTEMPT" || { echo "publisher tag attempt is from the future" >&2; exit 1; }
+            notes="$(printf 'Immutable atomic Agent Workflow release.\n\nPublisher Run: %s\nPublisher Attempt: %s' "$GITHUB_RUN_ID" "$publisher_run_attempt")"
+            if [ "$release_state" != "fresh" ]; then
+              jq -e --arg body "$notes" '.body == $body' <<<"$release" >/dev/null || { echo "release provenance differs from its publisher tag" >&2; exit 1; }
+            fi
           fi
-          if [ "$release_state" = "fresh" ] && [ "$tag_exists" = "true" ]; then
-            echo "fresh release target already has a tag" >&2
-            exit 1
-          elif [ "$release_state" = "immutable" ] && [ "$tag_exists" != "true" ]; then
-            echo "immutable release is missing its direct source tag" >&2
+          if [ "$release_state" = "immutable" ] && [ "$tag_exists" != "true" ]; then
+            echo "immutable release is missing its annotated provenance tag" >&2
             exit 1
           elif [ "$release_state" = "retry" ]; then
             gh release delete "$tag" --yes --cleanup-tag=false
-          elif [ "$release_state" = "immutable" ]; then
-            :
           fi
-          if [ "$release_state" = "retry" ] && [ "$tag_exists" = "true" ]; then
-            echo "allow_existing_tag=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "allow_existing_tag=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
+          echo "publisher_run_attempt=$publisher_run_attempt" >> "$GITHUB_OUTPUT"
       - name: Transfer exact qualified candidate to Windows publisher
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -203,7 +214,8 @@ jobs:
             -CandidateDirectory build/release `
             -ExpectedVersion '${{ needs.qualified-candidate.outputs.version }}' `
             -ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.candidate_source_commit }}' `
-            -ExpectedQualificationRunID '${{ needs.qualified-candidate.outputs.qualification_run_id }}' | ConvertFrom-Json
+            -ExpectedQualificationRunID '${{ needs.qualified-candidate.outputs.qualification_run_id }}' `
+            -ExpectedQualificationRunAttempt '${{ needs.qualified-candidate.outputs.qualification_run_attempt }}' | ConvertFrom-Json
           if ([string]$candidate.manifest_sha256 -cne '${{ needs.qualified-candidate.outputs.manifest_sha256 }}') { throw 'transferred qualification manifest digest differs' }
           if ([string]$candidate.worker_image -cne '${{ needs.qualified-candidate.outputs.worker_image }}') { throw 'transferred qualification Worker digest differs' }
       - name: Resolve fresh, retry, or immutable state
@@ -218,20 +230,27 @@ jobs:
             if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/tag-error)"; then
               grep -q 'HTTP 404' /tmp/tag-error || { cat /tmp/tag-error >&2; exit 1; }
             else
-              test "${{ needs.qualified-candidate.outputs.allow_existing_tag }}" = "true" || { echo "fresh release target acquired a tag after preflight" >&2; exit 1; }
-              jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null || { echo "tag changed after preflight" >&2; exit 1; }
+              test "${{ needs.qualified-candidate.outputs.tag_exists }}" = "true" || { echo "fresh release target acquired a tag after preflight" >&2; exit 1; }
+              test "$(jq -r .object.type <<<"$tag_ref")" = "tag" || { echo "publisher tag lost annotated provenance" >&2; exit 1; }
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$(jq -r .object.sha <<<"$tag_ref")")"
+              jq -e --arg tag "$tag" --arg sha "$GITHUB_SHA" --arg message "$(printf 'Workflow publisher provenance\nrun_id=%s\nrun_attempt=%s' "$GITHUB_RUN_ID" '${{ needs.qualified-candidate.outputs.publisher_run_attempt }}')" '
+                .tag == $tag and .object.type == "commit" and .object.sha == $sha and .message == $message
+              ' <<<"$tag_object" >/dev/null || { echo "publisher tag changed after preflight" >&2; exit 1; }
             fi
             echo "state=fresh" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          test "$(jq -r .target_commitish <<<"$release")" = "$GITHUB_SHA" || { echo "version belongs to another source" >&2; exit 1; }
-          if jq -e '.immutable == true and .draft == false and .prerelease == false' <<<"$release" >/dev/null; then
+          notes="$(printf 'Immutable atomic Agent Workflow release.\n\nPublisher Run: %s\nPublisher Attempt: %s' "$GITHUB_RUN_ID" '${{ needs.qualified-candidate.outputs.publisher_run_attempt }}')"
+          if jq -e '.immutable == true and .draft == false and .prerelease == false and .author.login == "github-actions[bot]" and .author.type == "Bot"' <<<"$release" >/dev/null; then
+            jq -e --arg tag "$tag" --arg body "$notes" '.tag_name == $tag and .body == $body' <<<"$release" >/dev/null
             jq -e '([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
             for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip; do
               digest="$(sha256sum "build/release/$name" | awk '{print $1}')"
               jq -e --arg name "$name" --arg digest "sha256:$digest" '[.assets[] | select(.name == $name and .digest == $digest)] | length == 1' <<<"$release" >/dev/null
             done
             tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
-            jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null
+            test "$(jq -r .object.type <<<"$tag_ref")" = "tag"
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$(jq -r .object.sha <<<"$tag_ref")")"
+            jq -e --arg tag "$tag" --arg sha "$GITHUB_SHA" --arg message "$(printf 'Workflow publisher provenance\nrun_id=%s\nrun_attempt=%s' "$GITHUB_RUN_ID" '${{ needs.qualified-candidate.outputs.publisher_run_attempt }}')" '.tag == $tag and .object.type == "commit" and .object.sha == $sha and .message == $message' <<<"$tag_object" >/dev/null
             echo "state=immutable" >> "$GITHUB_OUTPUT"
           else
             echo "release target changed after preflight" >&2; exit 1
@@ -242,7 +261,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ needs.qualified-candidate.outputs.tag }}" build/release/workflow-windows-amd64.zip build/release/workflow-release.json build/release/worker-sbom.spdx.json --draft --target "$GITHUB_SHA" --title "Workflow ${{ needs.qualified-candidate.outputs.version }}" --notes "Immutable atomic Agent Workflow release."
+          tag="${{ needs.qualified-candidate.outputs.tag }}"
+          publisher_attempt="${{ needs.qualified-candidate.outputs.publisher_run_attempt }}"
+          if [ "${{ needs.qualified-candidate.outputs.tag_exists }}" != "true" ]; then
+            message="$(printf 'Workflow publisher provenance\nrun_id=%s\nrun_attempt=%s' "$GITHUB_RUN_ID" "$publisher_attempt")"
+            tag_object="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" -f tag="$tag" -f message="$message" -f object="$GITHUB_SHA" -f type=commit)"
+            tag_object_sha="$(jq --exit-status --raw-output '.sha | select(test("^[0-9a-f]{40}$"))' <<<"$tag_object")"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/$tag" -f sha="$tag_object_sha" >/dev/null
+          fi
+          notes="$(printf 'Immutable atomic Agent Workflow release.\n\nPublisher Run: %s\nPublisher Attempt: %s' "$GITHUB_RUN_ID" "$publisher_attempt")"
+          gh release create "$tag" build/release/workflow-windows-amd64.zip build/release/workflow-release.json build/release/worker-sbom.spdx.json --draft --verify-tag --title "Workflow ${{ needs.qualified-candidate.outputs.version }}" --notes "$notes"
       - name: Publish and verify immutable result
         if: steps.release.outputs.state == 'fresh'
         shell: bash
@@ -251,10 +279,13 @@ jobs:
         run: |
           tag="${{ needs.qualified-candidate.outputs.tag }}"; gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          jq --exit-status --arg sha "$GITHUB_SHA" '.draft == false and .prerelease == false and .immutable == true and .target_commitish == $sha and ([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
+          notes="$(printf 'Immutable atomic Agent Workflow release.\n\nPublisher Run: %s\nPublisher Attempt: %s' "$GITHUB_RUN_ID" '${{ needs.qualified-candidate.outputs.publisher_run_attempt }}')"
+          jq --exit-status --arg tag "$tag" --arg body "$notes" '.draft == false and .prerelease == false and .immutable == true and .author.login == "github-actions[bot]" and .author.type == "Bot" and .tag_name == $tag and .body == $body and ([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
           for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip; do
             digest="$(sha256sum "build/release/$name" | awk '{print $1}')"
             jq -e --arg name "$name" --arg digest "sha256:$digest" '[.assets[] | select(.name == $name and .digest == $digest)] | length == 1' <<<"$release" >/dev/null
           done
           tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
-          jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null
+          test "$(jq -r .object.type <<<"$tag_ref")" = "tag"
+          tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$(jq -r .object.sha <<<"$tag_ref")")"
+          jq -e --arg tag "$tag" --arg sha "$GITHUB_SHA" --arg message "$(printf 'Workflow publisher provenance\nrun_id=%s\nrun_attempt=%s' "$GITHUB_RUN_ID" '${{ needs.qualified-candidate.outputs.publisher_run_attempt }}')" '.tag == $tag and .object.type == "commit" and .object.sha == $sha and .message == $message' <<<"$tag_object" >/dev/null

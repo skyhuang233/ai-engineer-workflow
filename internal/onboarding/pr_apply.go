@@ -90,11 +90,6 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 	if pull.Found && pull.Head != request.Head {
 		return errors.New("existing Onboarding Pull Request head differs from the deterministic approved commit")
 	}
-	// An existing exact PR receives merge authority only after a fresh full
-	// readiness readback. Creating a PR never immediately grants that authority.
-	if pull.Found && strings.EqualFold(pull.State, "open") && pull.Mergeable && pull.ChecksPassed && pull.ReviewsClean {
-		return a.mergeExactOnboardingPull(ctx, effect, request)
-	}
 	if !pull.Found || strings.EqualFold(pull.State, "closed") {
 		remoteBranch, found, readErr := a.Remote.OnboardingBranch(ctx, effect.Subject, request.Branch)
 		if readErr != nil {
@@ -118,46 +113,6 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 		return errors.New("created Onboarding Pull Request is not an exact unmerged approved state")
 	}
 	return nil
-}
-
-func (a *RepositoryAdapter) mergeExactOnboardingPull(ctx context.Context, effect setupcontract.Effect, request OnboardingPullRequest) error {
-	base, err := a.Remote.DefaultBranchHead(ctx, request.Repository)
-	if err != nil {
-		return err
-	}
-	if base.Name != request.Base || base.Head != request.BaseHead {
-		return errors.New("GitHub default branch advanced before approved onboarding merge")
-	}
-	pull, err := a.Remote.OnboardingPull(ctx, request.Repository, request.Branch, request.Base, request.RequiredChecks)
-	if err != nil {
-		return err
-	}
-	decision, decisionErr := DecideOnboardingPull(pull, request.Digest, request.Branch, request.Base, request.BaseHead)
-	if decisionErr != nil || decision != PullDrift || pull.Number <= 0 || pull.Head != request.Head || !strings.EqualFold(pull.State, "open") || !pull.Mergeable || !pull.ChecksPassed || !pull.ReviewsClean {
-		return errors.New("Onboarding Pull Request changed or lacks exact approved merge evidence")
-	}
-	method := effect.Parameters["merge_method"]
-	if method != "merge" && method != "squash" && method != "rebase" {
-		return errors.New("Onboarding Pull Request merge method is not approved")
-	}
-	mergeHead, err := a.Remote.MergeOnboardingPull(ctx, request.Repository, pull.Number, request.Head, method)
-	if err != nil {
-		return err
-	}
-	if !isGitObjectID(mergeHead) {
-		return errors.New("GitHub merge response lacks an exact default-branch object ID")
-	}
-	merged, err := a.Remote.OnboardingPull(ctx, request.Repository, request.Branch, request.Base, request.RequiredChecks)
-	if err != nil {
-		return err
-	}
-	if a.Remote.VerifyOnboardingContent(ctx, request.Repository, request.Branch, request.Files) != nil {
-		merged.ContentMatches = false
-	}
-	if merged.MergeHead != mergeHead {
-		return errors.New("Onboarding Pull Request merge response differs from its readback")
-	}
-	return a.bindMergedOnboardingPull(ctx, effect, request, merged)
 }
 
 func (a *RepositoryAdapter) bindMergedOnboardingPull(ctx context.Context, effect setupcontract.Effect, request OnboardingPullRequest, pull PullReadback) error {
