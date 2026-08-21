@@ -109,6 +109,30 @@ function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [str
     return $result
 }
 
+function Wait-ForWorkflowContractCheck([string]$Repository, [string]$Head) {
+    $deadline = [DateTime]::UtcNow.AddMinutes($OwnerMergeTimeoutMinutes)
+    while ($true) {
+        $checksRaw = gh api "repos/$Repository/commits/$Head/check-runs?check_name=workflow-contract&filter=latest&per_page=100"
+        $checksExit = $LASTEXITCODE
+        if ($checksExit -ne 0) { throw "Owner merge workflow-contract check cannot be read" }
+        $checks = $checksRaw | ConvertFrom-Json
+        $trusted = @($checks.check_runs | Where-Object {
+            [string]$_.name -ceq 'workflow-contract' -and
+            [string]$_.head_sha -ceq $Head -and
+            [long]$_.app.id -eq 15368
+        })
+        if ($trusted.Count -gt 1) { throw "Owner merge head has ambiguous GitHub Actions workflow-contract checks" }
+        if ($trusted.Count -eq 1) {
+            if ([string]$trusted[0].status -ceq 'completed') {
+                if ([string]$trusted[0].conclusion -cne 'success') { throw "Owner merge workflow-contract check did not succeed" }
+                return
+            }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for the exact GitHub Actions workflow-contract check" }
+        Start-Sleep -Seconds 10
+    }
+}
+
 function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
     if ([string]$Gate.gate_kind -cne $ExpectedGate -or [string]$Gate.pull_request -cnotmatch '^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$' -or [string]$Gate.pull_head -cnotmatch '^[0-9a-f]{40}$' -or [string]$Gate.merge_method -cnotin @('merge','squash','rebase')) {
         throw "Owner merge gate lacks exact pull request identity"
@@ -128,9 +152,8 @@ function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
         $pull = $pullRaw | ConvertFrom-Json
         if ([string]$pull.state -cne 'open' -or [string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request changed before authorization" }
         if ($ExpectedGate -eq 'repository_onboarding' -and -not ([string]$pull.body).Contains([string]$Gate.onboarding_plan_digest)) { throw "Onboarding pull request does not bind the approved Plan Digest" }
-        gh pr checks ([string]$Gate.pull_request) --required --watch --fail-fast --interval 10
-        if ($LASTEXITCODE -ne 0) { throw "Owner merge pull request required checks have not passed" }
-        Write-Host "::notice title=Owner merge required::$($Gate.pull_request) passed required checks at head $($Gate.pull_head). The repository owner must authorize its $($Gate.merge_method) merge."
+        Wait-ForWorkflowContractCheck $repository ([string]$Gate.pull_head)
+        Write-Host "::notice title=Owner merge required::$($Gate.pull_request) passed the exact GitHub Actions workflow-contract check at head $($Gate.pull_head). The repository owner must authorize its $($Gate.merge_method) merge."
         $deadline = [DateTime]::UtcNow.AddMinutes($OwnerMergeTimeoutMinutes)
         while ($true) {
             $pullRaw = gh api "repos/$repository/pulls/$number"

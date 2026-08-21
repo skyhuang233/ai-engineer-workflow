@@ -16,6 +16,7 @@ try {
   $global:workflowResolutionFixture = Join-Path $scratch 'workflow-release.json'
   $global:workflowResolutionQualificationCompletedAt = '2026-08-19T01:00:00Z'
   $global:workflowResolutionCandidateCommit = 'a' * 40
+  $global:workflowResolutionSuccessfulPublisherAttempt = 3
   $manifestJSON = [IO.File]::ReadAllText($fixture).Replace(('b' * 64), $bundleDigest).Replace(('3' * 64), $sbomDigest)
   [IO.File]::WriteAllText($global:workflowResolutionFixture, $manifestJSON, [Text.UTF8Encoding]::new($false))
   $manifestDigest = (Get-FileHash -LiteralPath $global:workflowResolutionFixture -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -46,7 +47,13 @@ try {
       if ($endpoint -like 'repos/*/actions/workflows/worker-contract.yml') { Write-Output '{"id":2,"path":".github/workflows/worker-contract.yml","state":"active"}'; return }
       if ($endpoint -like 'repos/*/actions/runs/123/attempts/4') { Write-Output (@{id=123;run_attempt=4;workflow_id=2;path='.github/workflows/worker-contract.yml';head_sha=('a'*40);event='pull_request';status='completed';conclusion='success';updated_at=$global:workflowResolutionQualificationCompletedAt;pull_requests=@(@{number=7})} | ConvertTo-Json -Depth 5 -Compress); return }
       if ($endpoint -like 'repos/*/actions/workflows/publish-workflow.yml') { Write-Output '{"id":3,"path":".github/workflows/publish-workflow.yml","state":"active"}'; return }
-      if ($endpoint -like 'repos/*/actions/runs/456') { Write-Output '{"id":456,"run_attempt":3,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"success"}'; return }
+      if ($endpoint -like 'repos/*/actions/runs/456/attempts/*') {
+        $attempt = [long]($endpoint.Split('/')[-1])
+        $conclusion = $(if ($attempt -eq $global:workflowResolutionSuccessfulPublisherAttempt) { 'success' } else { 'failure' })
+        Write-Output (@{id=456;run_attempt=$attempt;workflow_id=3;path='.github/workflows/publish-workflow.yml';head_sha=('b'*40);head_branch='main';event='push';status='completed';conclusion=$conclusion} | ConvertTo-Json -Compress)
+        return
+      }
+      if ($endpoint -like 'repos/*/actions/runs/456') { Write-Output '{"id":456,"run_attempt":4,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"failure"}'; return }
       throw "Unexpected mocked gh api endpoint: $endpoint"
     }
     if ($argv[0] -ceq 'release' -and $argv[1] -ceq 'download') {
@@ -68,6 +75,7 @@ try {
   $result = & $resolver -DownloadDirectory $download | ConvertFrom-Json
   if ([string]$result.tag -cne 'workflow-v0.0.1') { throw 'Resolver did not select the highest eligible semantic version' }
   if ([string]$result.manifest_sha256 -cne $manifestDigest) { throw 'Resolver did not preserve the verified manifest digest' }
+  if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'api repos/*/actions/runs/456/attempts/3' }).Count -ne 1) { throw 'Resolver did not accept the historical successful publisher retry attempt' }
   $downloads = @($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' })
   if ($downloads.Count -ne 3 -or $downloads[0] -notlike '*--pattern workflow-release.json*') { throw 'Resolver did not authenticate the manifest before downloading other assets' }
 
@@ -110,6 +118,6 @@ try {
   Write-Output 'Workflow Release resolution ordering and exact-asset tests passed.'
 } finally {
   Remove-Item Function:\global:gh -ErrorAction SilentlyContinue
-  Remove-Variable workflowResolutionFixture,workflowResolutionBundle,workflowResolutionSBOM,workflowResolutionRelease,workflowResolutionCalls,workflowResolutionQualificationCompletedAt,workflowResolutionCandidateCommit -Scope Global -ErrorAction SilentlyContinue
+  Remove-Variable workflowResolutionFixture,workflowResolutionBundle,workflowResolutionSBOM,workflowResolutionRelease,workflowResolutionCalls,workflowResolutionQualificationCompletedAt,workflowResolutionCandidateCommit,workflowResolutionSuccessfulPublisherAttempt -Scope Global -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $scratch -Recurse -Force
 }

@@ -328,12 +328,28 @@ func verifyPublisher(ctx context.Context, client *githubapi.Client, repository s
 	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/actions/workflows/publish-workflow.yml", nil, &publisherWorkflow); err != nil {
 		return fmt.Errorf("verify Workflow publisher: %w", err)
 	}
-	var publisherRun releaseWorkflowRun
-	if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d", repository, publisherRunID), nil, &publisherRun); err != nil {
+	if publisherWorkflow.Path != ".github/workflows/publish-workflow.yml" || publisherWorkflow.State != "active" {
+		return errors.New("Workflow Release provenance is not its exact successful fixed main publisher run")
+	}
+	return verifySuccessfulPublisherAttempt(ctx, client, repository, publisherWorkflow, mergeCommit, publisherRunID, publisherRunAttempt)
+}
+
+func verifySuccessfulPublisherAttempt(ctx context.Context, client *githubapi.Client, repository string, workflow releaseWorkflow, mergeCommit string, publisherRunID, publisherRunAttempt int64) error {
+	var latest releaseWorkflowRun
+	if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d", repository, publisherRunID), nil, &latest); err != nil {
 		return fmt.Errorf("verify Workflow publisher run: %w", err)
 	}
-	if publisherWorkflow.Path == ".github/workflows/publish-workflow.yml" && publisherWorkflow.State == "active" && publisherRun.ID == publisherRunID && publisherRun.RunAttempt >= publisherRunAttempt && publisherRun.WorkflowID == publisherWorkflow.ID && publisherRun.Path == publisherWorkflow.Path && publisherRun.HeadSHA == mergeCommit && publisherRun.HeadBranch == "main" && publisherRun.Event == "push" && publisherRun.Status == "completed" && publisherRun.Conclusion == "success" {
-		return nil
+	if latest.ID != publisherRunID || latest.RunAttempt < publisherRunAttempt {
+		return errors.New("Workflow Release provenance is not its exact successful fixed main publisher run")
+	}
+	for attempt := publisherRunAttempt; attempt <= latest.RunAttempt; attempt++ {
+		var run releaseWorkflowRun
+		if err := client.RequestJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/actions/runs/%d/attempts/%d", repository, publisherRunID, attempt), nil, &run); err != nil {
+			return fmt.Errorf("verify Workflow publisher run attempt %d: %w", attempt, err)
+		}
+		if run.ID == publisherRunID && run.RunAttempt == attempt && run.WorkflowID == workflow.ID && run.Path == workflow.Path && run.HeadSHA == mergeCommit && run.HeadBranch == "main" && run.Event == "push" && run.Status == "completed" && run.Conclusion == "success" {
+			return nil
+		}
 	}
 	return errors.New("Workflow Release provenance is not its exact successful fixed main publisher run")
 }

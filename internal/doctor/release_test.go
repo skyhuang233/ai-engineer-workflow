@@ -2,9 +2,13 @@ package doctor
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
@@ -84,5 +88,32 @@ func TestQualificationMustCompleteNoLaterThanMerge(t *testing.T) {
 	}
 	if completedNoLaterThan("invalid", "2026-08-21T02:00:00Z") {
 		t.Fatal("accepted invalid qualification completion time")
+	}
+}
+
+func TestPublisherVerificationAcceptsHistoricalSuccessfulRetry(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/owner/repo/actions/runs/456":
+			_, _ = fmt.Fprint(w, `{"id":456,"run_attempt":4,"conclusion":"failure"}`)
+		case "/repos/owner/repo/actions/runs/456/attempts/2":
+			_, _ = fmt.Fprint(w, `{"id":456,"run_attempt":2,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"failure"}`)
+		case "/repos/owner/repo/actions/runs/456/attempts/3":
+			_, _ = fmt.Fprint(w, `{"id":456,"run_attempt":3,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"success"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := &workflowgithub.Client{BaseURL: server.URL, HTTP: server.Client()}
+	workflow := releaseWorkflow{ID: 3, Path: ".github/workflows/publish-workflow.yml", State: "active"}
+	if err := verifySuccessfulPublisherAttempt(context.Background(), client, "owner/repo", workflow, strings.Repeat("b", 40), 456, 2); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/repos/owner/repo/actions/runs/456", "/repos/owner/repo/actions/runs/456/attempts/2", "/repos/owner/repo/actions/runs/456/attempts/3"}
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("publisher verification requests %v, want %v", requests, want)
 	}
 }

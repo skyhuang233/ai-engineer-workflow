@@ -183,14 +183,23 @@ if ([DateTimeOffset]::Parse($qualificationCompletedAt, [Globalization.CultureInf
 
 $publisherWorkflowName = Split-Path -Leaf ([string]$policy.workflow_path)
 $publisherWorkflow = Invoke-GhJSON "repos/$repository/actions/workflows/$publisherWorkflowName"
-$publisherRun = Invoke-GhJSON "repos/$repository/actions/runs/$publisherRunID"
+$latestPublisherRun = Invoke-GhJSON "repos/$repository/actions/runs/$publisherRunID"
 if ([string]$publisherWorkflow.path -cne [string]$policy.workflow_path -or [string]$publisherWorkflow.state -cne 'active' -or
-    [long]$publisherRun.id -ne $publisherRunID -or [long]$publisherRun.run_attempt -lt $publisherRunAttempt -or
-    [long]$publisherRun.workflow_id -ne [long]$publisherWorkflow.id -or [string]$publisherRun.path -cne [string]$policy.workflow_path -or
-    [string]$publisherRun.head_sha -cne $mergeCommit -or [string]$publisherRun.head_branch -cne 'main' -or [string]$publisherRun.event -cne 'push' -or
-    [string]$publisherRun.status -cne 'completed' -or [string]$publisherRun.conclusion -cne 'success') {
+    [long]$latestPublisherRun.id -ne $publisherRunID -or [long]$latestPublisherRun.run_attempt -lt $publisherRunAttempt) {
   throw 'Workflow Release provenance is not its exact trusted successful publisher run'
 }
+$successfulPublisherRun = $null
+for ($attempt = $publisherRunAttempt; $attempt -le [long]$latestPublisherRun.run_attempt; $attempt++) {
+  $publisherRun = Invoke-GhJSON "repos/$repository/actions/runs/$publisherRunID/attempts/$attempt"
+  if ([long]$publisherRun.id -eq $publisherRunID -and [long]$publisherRun.run_attempt -eq $attempt -and
+      [long]$publisherRun.workflow_id -eq [long]$publisherWorkflow.id -and [string]$publisherRun.path -ceq [string]$policy.workflow_path -and
+      [string]$publisherRun.head_sha -ceq $mergeCommit -and [string]$publisherRun.head_branch -ceq 'main' -and [string]$publisherRun.event -ceq 'push' -and
+      [string]$publisherRun.status -ceq 'completed' -and [string]$publisherRun.conclusion -ceq 'success') {
+    $successfulPublisherRun = $publisherRun
+    break
+  }
+}
+if ($null -eq $successfulPublisherRun) { throw 'Workflow Release provenance is not its exact trusted successful publisher run' }
 
 $bundlePath = Download-ReleaseAsset ([string]$release.tag_name) 'workflow-windows-amd64.zip'
 $sbomPath = Download-ReleaseAsset ([string]$release.tag_name) 'worker-sbom.spdx.json'
