@@ -214,3 +214,13 @@ jobs:
             -GitHubActionsRunID '${{ github.run_id }}' `
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
+      - name: Preserve exact qualified Workflow Release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qualified-workflow-release-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          path: |
+            build/release/worker-sbom.spdx.json
+            build/release/workflow-release.json
+            build/release/workflow-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 90

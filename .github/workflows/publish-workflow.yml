@@ -5,8 +5,8 @@ on:
     branches: [main]
 
 permissions:
+  actions: read
   contents: write
-  packages: write
   pull-requests: read
 
 concurrency:
@@ -23,14 +23,16 @@ jobs:
       - name: Vet the accepted main merge
         run: go vet ./...
 
-  worker:
+  qualified-candidate:
     needs: accepted-merge
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.admission.outputs.version }}
       tag: ${{ steps.admission.outputs.tag }}
-      image_repository: ${{ steps.pins.outputs.worker_image_repository }}
-      image_digest: ${{ steps.pushed.outputs.digest }}
+      source_commit: ${{ steps.admission.outputs.head_sha }}
+      qualification_run_id: ${{ steps.qualification.outputs.run_id }}
+      manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
+      worker_image: ${{ steps.candidate.outputs.worker_image }}
       allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -72,6 +74,53 @@ jobs:
           ' <<<"$integration" >/dev/null || { echo "publisher requires a two-parent merge containing the exact pull request head" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=workflow-v${version}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "pull_number=$pull_number" >> "$GITHUB_OUTPUT"
+      - name: Resolve exact successful qualification
+        id: qualification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          head_sha="${{ steps.admission.outputs.head_sha }}"
+          pull_number="${{ steps.admission.outputs.pull_number }}"
+          runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/worker-contract.yml/runs" \
+            -f event=pull_request -f head_sha="$head_sha" -f status=completed -f per_page=100)"
+          run="$(jq --exit-status --compact-output --arg head "$head_sha" --argjson pull "$pull_number" '
+            [.workflow_runs[] | select(
+              .event == "pull_request" and .head_sha == $head and .conclusion == "success" and
+              any(.pull_requests[]?; .number == $pull)
+            )] | sort_by(.id) | reverse | .[0] | {id, run_attempt}
+          ' <<<"$runs")"
+          run_id="$(jq --raw-output .id <<<"$run")"
+          run_attempt="$(jq --raw-output .run_attempt <<<"$run")"
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || { echo "exact pull request head lacks a successful qualification" >&2; exit 1; }
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || { echo "qualification run attempt is invalid" >&2; exit 1; }
+          artifact_name="qualified-workflow-release-${head_sha}-${run_attempt}"
+          artifacts="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" -f per_page=100)"
+          artifact="$(jq --exit-status --compact-output --arg name "$artifact_name" '
+            [.artifacts[] | select(.name == $name and .expired == false and (.digest | test("^sha256:[0-9a-f]{64}$")))] |
+            if length == 1 then .[0] else error("qualification artifact is missing, ambiguous, expired, or lacks an immutable digest") end
+          ' <<<"$artifacts")"
+          artifact_id="$(jq --raw-output .id <<<"$artifact")"
+          artifact_digest="$(jq --raw-output .digest <<<"$artifact")"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > qualification.zip
+          actual_digest="sha256:$(sha256sum qualification.zip | awk '{print $1}')"
+          test "$actual_digest" = "$artifact_digest" || { echo "qualification artifact digest mismatch" >&2; exit 1; }
+          mkdir -p build/qualified
+          unzip -q qualification.zip -d build/qualified
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+      - name: Verify exact qualified release candidate
+        id: candidate
+        shell: pwsh
+        run: |
+          $candidate = & skills/setup-agent-workflow/scripts/resolve-workflow-candidate.ps1 `
+            -CandidateDirectory build/qualified `
+            -ExpectedVersion '${{ steps.admission.outputs.version }}' `
+            -ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}' `
+            -ExpectedGitHubActionsRunID '${{ steps.qualification.outputs.run_id }}' | ConvertFrom-Json
+          "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
+          "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
       - name: Preflight Workflow Release target
         id: preflight
         shell: bash
@@ -109,66 +158,25 @@ jobs:
           elif [ "$release_state" = "retry" ]; then
             gh release delete "$tag" --yes --cleanup-tag=false
           elif [ "$release_state" = "immutable" ]; then
-            : # Build the fresh candidate so the immutable result can be compared exactly.
+            :
           fi
           if [ "$release_state" = "retry" ] && [ "$tag_exists" = "true" ]; then
             echo "allow_existing_tag=true" >> "$GITHUB_OUTPUT"
           else
             echo "allow_existing_tag=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Read Worker pins
-        id: pins
-        shell: bash
-        run: |
-          jq --exit-status '.worker.version? | not' config/toolchain.json >/dev/null
-          for key in codex.version github_cli.version github_cli.linux_amd64_sha256 go.version go.linux_amd64_sha256 no_mistakes.version no_mistakes.repository no_mistakes.commit worker.image_repository; do
-            echo "${key//./_}=$(jq --exit-status --raw-output ".${key}" config/toolchain.json)" >> "$GITHUB_OUTPUT"
-          done
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build release candidate locally
-        id: image
-        shell: bash
-        run: |
-          staging="${{ steps.pins.outputs.worker_image_repository }}:build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          bash scripts/build-workflow-worker.sh "$staging"
-          echo "staging=$staging" >> "$GITHUB_OUTPUT"
-      - name: Generate Worker SBOM before push
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
-        with:
-          image: ${{ steps.image.outputs.staging }}
-          format: spdx-json
-          output-file: worker-sbom.spdx.json
-          upload-artifact: false
-      - name: Scan Worker before push
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
-        with:
-          sbom: worker-sbom.spdx.json
-          fail-build: true
-          severity-cutoff: high
-          only-fixed: true
-          output-format: table
-      - name: Push only the scan-passing image
-        id: pushed
-        shell: bash
-        run: |
-          docker push "${{ steps.image.outputs.staging }}"
-          digest="$(docker buildx imagetools inspect "${{ steps.image.outputs.staging }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - name: Transfer verified Worker inputs to Windows publisher
+      - name: Transfer exact qualified candidate to Windows publisher
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: workflow-release-inputs
-          path: worker-sbom.spdx.json
+          name: workflow-release-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/qualified/worker-sbom.spdx.json
+            build/qualified/workflow-release.json
+            build/qualified/workflow-windows-amd64.zip
           if-no-files-found: error
 
   publish:
-    needs: worker
+    needs: qualified-candidate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -176,28 +184,31 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: workflow-release-inputs
-          path: build/release-inputs
-      - name: Assemble the atomic Workflow Release
+          name: workflow-release-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/release
+      - name: Reverify exact qualified release candidate
         shell: pwsh
         run: |
-          & scripts/assemble-workflow-release.ps1 `
-            -SourceCommit $env:GITHUB_SHA -GitHubActionsRunID $env:GITHUB_RUN_ID `
-            -WorkerImage '${{ needs.worker.outputs.image_repository }}@${{ needs.worker.outputs.image_digest }}' `
-            -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
+          $candidate = & skills/setup-agent-workflow/scripts/resolve-workflow-candidate.ps1 `
+            -CandidateDirectory build/release `
+            -ExpectedVersion '${{ needs.qualified-candidate.outputs.version }}' `
+            -ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.source_commit }}' `
+            -ExpectedGitHubActionsRunID '${{ needs.qualified-candidate.outputs.qualification_run_id }}' | ConvertFrom-Json
+          if ([string]$candidate.manifest_sha256 -cne '${{ needs.qualified-candidate.outputs.manifest_sha256 }}') { throw 'transferred qualification manifest digest differs' }
+          if ([string]$candidate.worker_image -cne '${{ needs.qualified-candidate.outputs.worker_image }}') { throw 'transferred qualification Worker digest differs' }
       - name: Resolve fresh, retry, or immutable state
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ needs.worker.outputs.tag }}"
+          tag="${{ needs.qualified-candidate.outputs.tag }}"
           if ! release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/tmp/release-error)"; then
             grep -q 'HTTP 404' /tmp/release-error || { cat /tmp/release-error >&2; exit 1; }
             if ! tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/tmp/tag-error)"; then
               grep -q 'HTTP 404' /tmp/tag-error || { cat /tmp/tag-error >&2; exit 1; }
             else
-              test "${{ needs.worker.outputs.allow_existing_tag }}" = "true" || { echo "fresh release target acquired a tag after preflight" >&2; exit 1; }
+              test "${{ needs.qualified-candidate.outputs.allow_existing_tag }}" = "true" || { echo "fresh release target acquired a tag after preflight" >&2; exit 1; }
               jq -e --arg sha "$GITHUB_SHA" '.object.type == "commit" and .object.sha == $sha' <<<"$tag_ref" >/dev/null || { echo "tag changed after preflight" >&2; exit 1; }
             fi
             echo "state=fresh" >> "$GITHUB_OUTPUT"; exit 0
@@ -221,14 +232,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ needs.worker.outputs.tag }}" build/release/workflow-windows-amd64.zip build/release/workflow-release.json build/release/worker-sbom.spdx.json --draft --target "$GITHUB_SHA" --title "Workflow ${{ needs.worker.outputs.version }}" --notes "Immutable atomic Agent Workflow release."
+          gh release create "${{ needs.qualified-candidate.outputs.tag }}" build/release/workflow-windows-amd64.zip build/release/workflow-release.json build/release/worker-sbom.spdx.json --draft --target "$GITHUB_SHA" --title "Workflow ${{ needs.qualified-candidate.outputs.version }}" --notes "Immutable atomic Agent Workflow release."
       - name: Publish and verify immutable result
         if: steps.release.outputs.state == 'fresh'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ needs.worker.outputs.tag }}"; gh release edit "$tag" --draft=false
+          tag="${{ needs.qualified-candidate.outputs.tag }}"; gh release edit "$tag" --draft=false
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
           jq --exit-status --arg sha "$GITHUB_SHA" '.draft == false and .prerelease == false and .immutable == true and .target_commitish == $sha and ([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)' <<<"$release" >/dev/null
           for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip; do

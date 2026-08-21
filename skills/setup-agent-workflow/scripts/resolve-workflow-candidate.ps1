@@ -2,7 +2,8 @@
 param(
   [Parameter(Mandatory)][string]$CandidateDirectory,
   [Parameter(Mandatory)][string]$ExpectedVersion,
-  [Parameter(Mandatory)][string]$ExpectedSourceCommit
+  [Parameter(Mandatory)][string]$ExpectedSourceCommit,
+  [ValidateRange(0, [long]::MaxValue)][long]$ExpectedGitHubActionsRunID = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,6 +45,9 @@ $validated = & $validator `
 if ([string]$validated.source_commit -cne $ExpectedSourceCommit) {
   throw 'Workflow Release candidate manifest does not match the expected source commit'
 }
+if ($ExpectedGitHubActionsRunID -gt 0 -and [long]$validated.github_actions_run_id -ne $ExpectedGitHubActionsRunID) {
+  throw 'Workflow Release candidate manifest does not match the expected qualification run'
+}
 
 $bundleDigest = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $sbomDigest = (Get-FileHash -LiteralPath $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -53,6 +57,12 @@ if ($bundleDigest -cne [string]$validated.bundle_sha256) {
 if ($sbomDigest -cne [string]$validated.sbom_sha256) {
   throw 'Candidate Worker SBOM SHA-256 differs from its Workflow Release manifest'
 }
+$bundleVerifier = Join-Path $PSScriptRoot 'verify-windows-bundle.ps1'
+[void](& $bundleVerifier `
+  -BundlePath $bundlePath `
+  -ExpectedSHA256 $bundleDigest `
+  -ExpectedVersion ([string]$validated.version) `
+  -ExpectedWorkerImage ([string]$validated.worker_image) | ConvertFrom-Json)
 
 [pscustomobject]@{
   schema_version = 1

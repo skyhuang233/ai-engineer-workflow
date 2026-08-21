@@ -41,37 +41,49 @@ func TestUnifiedPublisherAdmitsOnlyOwnerMergedVersionBranches(t *testing.T) {
 func TestUnifiedPublisherTestsTheAcceptedMergeBeforeMutation(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
 	acceptedMerge := strings.Index(text, "  accepted-merge:")
-	worker := strings.Index(text, "  worker:")
-	if acceptedMerge < 0 || worker <= acceptedMerge {
-		t.Fatal("unified publisher omits the accepted-merge gate before the Worker build")
+	candidate := strings.Index(text, "  qualified-candidate:")
+	if acceptedMerge < 0 || candidate <= acceptedMerge {
+		t.Fatal("unified publisher omits the accepted-merge gate before candidate resolution")
 	}
-	gate := text[acceptedMerge:worker]
+	gate := text[acceptedMerge:candidate]
 	for _, required := range []string{"runs-on: windows-latest", "go test -p 1 ./...", "go vet ./..."} {
 		if !strings.Contains(gate, required) {
 			t.Fatalf("accepted-merge gate omits %q", required)
 		}
 	}
-	workerBlock := text[worker:]
-	if !strings.Contains(workerBlock, "needs: accepted-merge") {
-		t.Fatal("Worker mutation does not wait for the accepted-merge gate")
+	candidateBlock := text[candidate:]
+	if !strings.Contains(candidateBlock, "needs: accepted-merge") {
+		t.Fatal("candidate resolution does not wait for the accepted-merge gate")
 	}
 }
 
-func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testing.T) {
+func TestUnifiedPublisherConsumesExactImmutableQualificationArtifact(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	scan := strings.Index(text, "name: Scan Worker before push")
-	push := strings.Index(text, "name: Push only the scan-passing image")
-	if scan < 0 || push <= scan {
-		t.Fatal("Worker image is not scanned before its first push")
-	}
 	for _, required := range []string{
+		"actions: read",
+		`actions/workflows/worker-contract.yml/runs`,
+		`-f event=pull_request -f head_sha="$head_sha" -f status=completed`,
+		`any(.pull_requests[]?; .number == $pull)`,
+		`qualified-workflow-release-${head_sha}-${run_attempt}`,
+		`.expired == false`,
+		`(.digest | test("^sha256:[0-9a-f]{64}$"))`,
+		`actions/artifacts/${artifact_id}/zip`,
+		`test "$actual_digest" = "$artifact_digest"`,
+		`-ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}'`,
+		`-ExpectedGitHubActionsRunID '${{ steps.qualification.outputs.run_id }}'`,
+		`transferred qualification manifest digest differs`,
+		`transferred qualification Worker digest differs`,
 		"workflow-windows-amd64.zip", "workflow-release.json", "worker-sbom.spdx.json",
-		"severity-cutoff: high", "only-fixed: true", "immutable == true",
-		"build-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+		"immutable == true",
 		`([.assets[].name] | sort) == (["worker-sbom.spdx.json","workflow-release.json","workflow-windows-amd64.zip"] | sort)`,
 	} {
 		if !strings.Contains(text, required) {
-			t.Fatalf("unified publisher omits atomic release contract %q", required)
+			t.Fatalf("unified publisher omits qualified-candidate contract %q", required)
+		}
+	}
+	for _, forbidden := range []string{"bash scripts/build-workflow-worker.sh", "docker push", "scripts/assemble-workflow-release.ps1", "anchore/scan-action"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("unified publisher can replace the qualified candidate through %q", forbidden)
 		}
 	}
 	if strings.Count(text, "for name in worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip") != 2 ||
@@ -85,31 +97,30 @@ func TestUnifiedPublisherScansBeforePushAndPublishesExactlyThreeAssets(t *testin
 	}
 }
 
-func TestUnifiedPublisherResolvesRetryBeforeBuildingWorker(t *testing.T) {
+func TestUnifiedPublisherVerifiesQualificationBeforeRetryMutation(t *testing.T) {
 	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	qualification := strings.Index(text, "name: Resolve exact successful qualification")
 	preflight := strings.Index(text, "name: Preflight Workflow Release target")
-	build := strings.Index(text, "name: Build release candidate locally")
-	push := strings.Index(text, "name: Push only the scan-passing image")
 	resolve := strings.Index(text, "name: Resolve fresh, retry, or immutable state")
-	if preflight < 0 || build <= preflight || push <= build || resolve <= push {
-		t.Fatal("unified publisher does not preflight release retry state before building and pushing the Worker")
+	if qualification < 0 || preflight <= qualification || resolve <= preflight {
+		t.Fatal("unified publisher does not verify qualification before mutating retry state")
 	}
 	deleteDraft := strings.Index(text, `gh release delete "$tag" --yes --cleanup-tag=false`)
-	if deleteDraft < preflight || deleteDraft >= build {
+	if deleteDraft < preflight || deleteDraft >= resolve {
 		t.Fatal("unified publisher does not delete a same-source retry draft during preflight")
 	}
 	if strings.Contains(text[resolve:], `gh release delete "$tag"`) {
-		t.Fatal("unified publisher can delete a release after pushing the Worker")
+		t.Fatal("unified publisher can delete a release after acquiring the qualified candidate")
 	}
 	stage := strings.Index(text, "name: Stage exactly three assets")
-	if stage <= resolve || !strings.Contains(text[preflight:build], `.object.type == "commit" and .object.sha == $sha`) ||
+	if stage <= resolve || !strings.Contains(text[preflight:resolve], `.object.type == "commit" and .object.sha == $sha`) ||
 		!strings.Contains(text[resolve:stage], `.object.type == "commit" and .object.sha == $sha`) {
-		t.Fatal("unified publisher does not validate the direct Git tag before either building or creating a release")
+		t.Fatal("unified publisher does not validate the direct Git tag before either candidate acquisition or release creation")
 	}
 	for _, required := range []string{
 		`[ "$release_state" = "fresh" ] && [ "$tag_exists" = "true" ]`,
 		`allow_existing_tag: ${{ steps.preflight.outputs.allow_existing_tag }}`,
-		`test "${{ needs.worker.outputs.allow_existing_tag }}" = "true"`,
+		`test "${{ needs.qualified-candidate.outputs.allow_existing_tag }}" = "true"`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("unified publisher does not reserve an existing tag exclusively for a verified retry: missing %q", required)
@@ -123,6 +134,8 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
+		"Preserve exact qualified Workflow Release candidate",
+		"qualified-workflow-release-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("candidate workflow omits %q", required)
@@ -161,25 +174,19 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 		!strings.Contains(text[qualificationScan:authenticate], "fail-build: false") {
 		t.Fatal("qualification scan can block functional candidate publication")
 	}
-	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	scan := strings.Index(publisher, "name: Scan Worker before push")
-	push := strings.Index(publisher, "name: Push only the scan-passing image")
-	if scan < 0 || push <= scan || !strings.Contains(publisher[scan:push], "fail-build: true") ||
-		strings.Contains(publisher[scan:push], "continue-on-error: true") {
-		t.Fatal("formal publisher no longer blocks image publication on its vulnerability scan")
-	}
 }
 
-func TestCandidateAndPublisherUseSharedWorkflowReleaseAssembler(t *testing.T) {
+func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
 	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	for name, text := range map[string]string{"candidate": candidate, "publisher": publisher} {
-		if strings.Count(text, "& scripts/assemble-workflow-release.ps1") != 1 {
-			t.Fatalf("%s workflow does not use exactly one shared assembler", name)
-		}
-		if strings.Contains(text, "go run ./cmd/workflow-release assemble") {
-			t.Fatalf("%s workflow retains an independent release assembler", name)
-		}
+	if strings.Count(candidate, "& scripts/assemble-workflow-release.ps1") != 1 {
+		t.Fatal("qualification workflow does not use exactly one shared assembler")
+	}
+	if strings.Contains(candidate, "go run ./cmd/workflow-release assemble") {
+		t.Fatal("qualification workflow retains an independent release assembler")
+	}
+	if strings.Contains(publisher, "assemble-workflow-release.ps1") || strings.Contains(publisher, "go run ./cmd/workflow-release assemble") {
+		t.Fatal("publisher can assemble replacement release bytes")
 	}
 	assembler := readWorkflow(t, "scripts", "assemble-workflow-release.ps1")
 	for _, required := range []string{
@@ -196,16 +203,17 @@ func TestCandidateAndPublisherUseSharedWorkflowReleaseAssembler(t *testing.T) {
 	}
 }
 
-func TestCandidateAndPublisherUseSharedWorkerBuilder(t *testing.T) {
+func TestOnlyQualificationBuildsWorkflowWorker(t *testing.T) {
 	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	for name, text := range map[string]string{"candidate": candidate, "publisher": publisher} {
-		if strings.Count(text, "bash scripts/build-workflow-worker.sh") != 1 {
-			t.Fatalf("%s workflow does not use exactly one shared Worker builder", name)
-		}
-		if strings.Contains(text, "docker build \\") {
-			t.Fatalf("%s workflow retains an independent Worker docker build", name)
-		}
+	if strings.Count(candidate, "bash scripts/build-workflow-worker.sh") != 1 {
+		t.Fatal("qualification workflow does not use exactly one shared Worker builder")
+	}
+	if strings.Contains(candidate, "docker build \\") {
+		t.Fatal("qualification workflow retains an independent Worker docker build")
+	}
+	if strings.Contains(publisher, "build-workflow-worker.sh") || strings.Contains(publisher, "docker build") {
+		t.Fatal("publisher can build a replacement Worker")
 	}
 	builder := readWorkflow(t, "scripts", "build-workflow-worker.sh")
 	for _, required := range []string{

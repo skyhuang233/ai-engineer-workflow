@@ -75,7 +75,7 @@ try {
   $manifestPath = Join-Path $candidateDirectory 'workflow-release.json'
   $manifest | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
 
-  $resolved = & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit | ConvertFrom-Json
+  $resolved = & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit -ExpectedGitHubActionsRunID 42 | ConvertFrom-Json
   $manifestDigest = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
   if ([string]$resolved.manifest_sha256 -cne $manifestDigest -or [string]$resolved.bundle_sha256 -cne $bundleDigest) {
     throw 'Candidate resolver returned incorrect evidence'
@@ -95,12 +95,23 @@ try {
   }
 
   $acceptedWrongSource = $true
-  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit ('b' * 40) *> $null } catch { $acceptedWrongSource = $false }
+  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit ('b' * 40) -ExpectedGitHubActionsRunID 42 *> $null } catch { $acceptedWrongSource = $false }
   if ($acceptedWrongSource) { throw 'Candidate resolver accepted the wrong source commit' }
+
+  $acceptedWrongRun = $true
+  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit -ExpectedGitHubActionsRunID 43 *> $null } catch { $acceptedWrongRun = $false }
+  if ($acceptedWrongRun) { throw 'Candidate resolver accepted the wrong qualification run' }
+
+  $originalManifest = [IO.File]::ReadAllText($manifestPath)
+  [IO.File]::WriteAllText($manifestPath, $originalManifest.Replace($workerImage, 'ghcr.io/skyhuang233/workflow-worker@sha256:' + ('9' * 64)))
+  $acceptedWrongWorker = $true
+  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit -ExpectedGitHubActionsRunID 42 *> $null } catch { $acceptedWrongWorker = $false }
+  if ($acceptedWrongWorker) { throw 'Candidate resolver accepted a Worker digest that differs from the Bundle' }
+  [IO.File]::WriteAllText($manifestPath, $originalManifest)
 
   [IO.File]::AppendAllText($bundlePath, 'tampered')
   $acceptedTamper = $true
-  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit *> $null } catch { $acceptedTamper = $false }
+  try { & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit -ExpectedGitHubActionsRunID 42 *> $null } catch { $acceptedTamper = $false }
   if ($acceptedTamper) { throw 'Candidate resolver accepted a tampered Bundle' }
 
   Write-Output 'Workflow Release candidate acquisition tests passed.'
