@@ -156,6 +156,8 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
+		"-GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER",
+		"-DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY",
 		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
 		"Preserve exact qualified Workflow Release candidate",
 		`$tag = "q-$head-$runID-$attempt"`,
@@ -170,6 +172,14 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("candidate workflow omits %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"secrets.WORKFLOW_SETUP_E2E_PAT", "secrets.WORKFLOW_SETUP_E2E_CLEANUP_TOKEN",
+		"vars.WORKFLOW_SETUP_E2E_GITHUB_OWNER", "vars.WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("candidate workflow overwrites qualification-runner input with unconfigured GitHub value %q", forbidden)
 		}
 	}
 }
