@@ -36,7 +36,7 @@ func TestVerifiedReleaseManifestSeedsActiveWorkerRelease(t *testing.T) {
 			bundleDigest := strings.Repeat("b", 64)
 			image := "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)
 			manifest := workflowrelease.Manifest{
-				SchemaVersion: 1, Version: "0.0.1", CandidateSourceCommit: sourceCommit, QualificationRunID: 1,
+				SchemaVersion: 1, Version: "0.0.1", CandidateSourceCommit: sourceCommit, QualificationRunID: 1, QualificationRunAttempt: 1,
 				Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: bundleDigest},
 				Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
 					Codex:      workflowrelease.CodexTool{Version: "0.148.0"},
@@ -1337,7 +1337,7 @@ func requiredCapabilities(t *testing.T, engine Engine, request Request) []Capabi
 func writeTestVerifiedReleaseManifest(t *testing.T, directory, version, bundleDigest string) *VerifiedReleaseManifest {
 	t.Helper()
 	manifest := workflowrelease.Manifest{
-		SchemaVersion: 1, Version: version, CandidateSourceCommit: strings.Repeat("c", 40), QualificationRunID: 1,
+		SchemaVersion: 1, Version: version, CandidateSourceCommit: strings.Repeat("c", 40), QualificationRunID: 1, QualificationRunAttempt: 1,
 		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.TrimPrefix(bundleDigest, "sha256:")},
 		Worker: workflowrelease.Worker{Image: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64), Tools: workflowrelease.Tools{
 			Codex: workflowrelease.CodexTool{Version: "0.148.0"}, GitHubCLI: workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},

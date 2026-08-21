@@ -111,10 +111,13 @@ func TestDriverResultSchemaUsesCodexStructuredOutputsSubset(t *testing.T) {
 
 func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
-	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `WORKFLOW_SETUP_E2E_OWNER_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_OWNER_TOKEN`, `Invoke-OwnerMerge`, `--match-head-commit`, `delivery-resume`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`, `#workflow-v`, `local qualification checkout`, `git rev-parse HEAD`, `rev-parse --is-inside-work-tree`} {
+	for _, required := range []string{`codex doctor --json`, `stored ChatGPT tokens`, `stored auth mode`, `auth file`, "sourceCodexAuth", `Copy-Item -LiteralPath $sourceCodexAuth`, `WORKFLOW_SETUP_E2E_GITHUB_OWNER`, `WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC`, `WORKFLOW_SETUP_E2E_PLATFORM_VERSION`, `WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN`, `Wait-ForOwnerMerge`, `Owner merge required`, `Assert-ControlPlaneCompletion`, `<!-- workflow:status:start -->`, `delivery-resume`, `Initialize-PublishedFixture`, `DifferentOwnerRepository`, `ClassicPATRejectedRepository`, `#workflow-v`, `local qualification checkout`, `git rev-parse HEAD`, `rev-parse --is-inside-work-tree`} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("setup harness lacks %q", required)
 		}
+	}
+	if strings.Contains(harness, "gh pr merge") || strings.Contains(harness, "WORKFLOW_SETUP_E2E_OWNER_TOKEN") {
+		t.Fatal("setup harness retains agent-reachable merge authority")
 	}
 	if runtime.GOOS != "windows" && strings.Contains(harness, "Windows qualification") {
 		// The driver contract is intentionally Windows-only; static validation is

@@ -232,7 +232,6 @@ jobs:
           WORKFLOW_SETUP_QUALIFICATION: '1'
           WORKFLOW_SETUP_E2E_PAT: ${{ secrets.WORKFLOW_SETUP_E2E_PAT }}
           WORKFLOW_SETUP_E2E_CLEANUP_TOKEN: ${{ secrets.WORKFLOW_SETUP_E2E_CLEANUP_TOKEN }}
-          WORKFLOW_SETUP_E2E_OWNER_TOKEN: ${{ secrets.WORKFLOW_SETUP_E2E_OWNER_TOKEN }}
           WORKFLOW_SETUP_CANDIDATE_DIRECTORY: ${{ github.workspace }}\build\release
           WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
           WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID: ${{ github.run_id }}

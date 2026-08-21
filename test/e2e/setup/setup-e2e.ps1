@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $true)][string]$PlatformVersion,
     [ValidateSet("standard", "organization-policy")][string]$QualificationMode = "standard",
     [string]$DifferentOwnerRepository,
-    [string]$ClassicPATRejectedRepository
+    [string]$ClassicPATRejectedRepository,
+    [ValidateRange(1, 120)][int]$OwnerMergeTimeoutMinutes = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,7 +15,6 @@ if ($env:WORKFLOW_SETUP_E2E -ne "1") { throw "Set WORKFLOW_SETUP_E2E=1 to author
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") { throw "Workflow Setup qualification requires Windows" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_PAT)) { throw "WORKFLOW_SETUP_E2E_PAT is required" }
 if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN)) { throw "WORKFLOW_SETUP_E2E_CLEANUP_TOKEN with repository listing and deletion capability is required" }
-if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_SETUP_E2E_OWNER_TOKEN)) { throw "WORKFLOW_SETUP_E2E_OWNER_TOKEN with owner merge capability is required" }
 if (-not (Test-Path -LiteralPath $DriverScript -PathType Leaf)) { throw "DriverScript does not exist" }
 $candidateQualification = $env:WORKFLOW_SETUP_QUALIFICATION -eq "1"
 if ($candidateQualification) {
@@ -40,9 +40,7 @@ $cleanupErrors = [Collections.Generic.List[string]]::new()
 $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
-$ownerToken = $env:WORKFLOW_SETUP_E2E_OWNER_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
-if ($ownerToken -ceq $setupToken) { throw "Owner merge credential must be separate from the Setup credential" }
 $patInputPath = Join-Path $qualificationRoot "setup-pat.stdin"
 $prior = @{
     USERPROFILE = $env:USERPROFILE; HOME = $env:HOME; CODEX_HOME = $env:CODEX_HOME
@@ -53,7 +51,6 @@ $prior = @{
 	WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC = $env:WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC
 	WORKFLOW_SETUP_E2E_PLATFORM_VERSION = $env:WORKFLOW_SETUP_E2E_PLATFORM_VERSION
 	WORKFLOW_SETUP_E2E_CLEANUP_TOKEN = $cleanupToken
-	WORKFLOW_SETUP_E2E_OWNER_TOKEN = $ownerToken
 	WORKFLOW_SETUP_E2E_PHASE = $env:WORKFLOW_SETUP_E2E_PHASE
 	WORKFLOW_SETUP_E2E_APPROVED_DIGEST = $env:WORKFLOW_SETUP_E2E_APPROVED_DIGEST
 	WORKFLOW_SETUP_E2E_DELIVERY_PLAN = $env:WORKFLOW_SETUP_E2E_DELIVERY_PLAN
@@ -72,7 +69,6 @@ if ($LASTEXITCODE -ne 0) { throw "Cleanup credential cannot enumerate disposable
 $env:GH_TOKEN = $setupToken
 # The deletion credential is harness-only and must never enter Codex or a Worker.
 Remove-Item Env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
-Remove-Item Env:WORKFLOW_SETUP_E2E_OWNER_TOKEN
 
 New-Item -ItemType Directory -Force -Path $profileRoot,$workflowHome,$evidenceRoot,$githubConfig | Out-Null
 [IO.File]::WriteAllText($patInputPath, $setupToken, (New-Object Text.UTF8Encoding($false)))
@@ -104,7 +100,7 @@ function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [str
     try { & $DriverScript } finally { $env:GH_TOKEN = $driverGitHubToken }
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw "Scenario '$Name' phase '$Phase' did not produce a result" }
     $raw = Get-Content -LiteralPath $resultPath -Raw
-    if ($raw.Contains($setupToken) -or $raw.Contains($ownerToken)) { throw "Scenario '$Name' leaked a credential into evidence" }
+    if ($raw.Contains($setupToken)) { throw "Scenario '$Name' leaked a credential into evidence" }
     $result = $raw | ConvertFrom-Json
     foreach ($repository in @($result.temporary_repositories)) {
         if (-not ([string]$repository).StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Driver returned an unsafe cleanup repository '$repository'" }
@@ -113,7 +109,7 @@ function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [str
     return $result
 }
 
-function Invoke-OwnerMerge($Gate, [string]$ExpectedGate) {
+function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
     if ([string]$Gate.gate_kind -cne $ExpectedGate -or [string]$Gate.pull_request -cnotmatch '^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$' -or [string]$Gate.pull_head -cnotmatch '^[0-9a-f]{40}$' -or [string]$Gate.merge_method -cnotin @('merge','squash','rebase')) {
         throw "Owner merge gate lacks exact pull request identity"
     }
@@ -125,19 +121,65 @@ function Invoke-OwnerMerge($Gate, [string]$ExpectedGate) {
     if (-not $repository.StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Owner merge gate escaped the disposable repository boundary" }
     $savedToken = $env:GH_TOKEN
     try {
-        $env:GH_TOKEN = $ownerToken
-        $login = [string](gh api user --jq .login)
-        if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($login.Trim(), $GitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Owner merge credential does not belong to GitHubOwner" }
-        $pull = gh api "repos/$repository/pulls/$number" | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or [string]$pull.state -cne 'open' -or [string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request changed before authorization" }
+        $env:GH_TOKEN = $setupToken
+        $pullRaw = gh api "repos/$repository/pulls/$number"
+        $pullExit = $LASTEXITCODE
+        if ($pullExit -ne 0) { throw "Owner merge pull request cannot be read" }
+        $pull = $pullRaw | ConvertFrom-Json
+        if ([string]$pull.state -cne 'open' -or [string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request changed before authorization" }
         if ($ExpectedGate -eq 'repository_onboarding' -and -not ([string]$pull.body).Contains([string]$Gate.onboarding_plan_digest)) { throw "Onboarding pull request does not bind the approved Plan Digest" }
         gh pr checks ([string]$Gate.pull_request) --required --watch --fail-fast --interval 10
         if ($LASTEXITCODE -ne 0) { throw "Owner merge pull request required checks have not passed" }
-        $methodFlag = '--' + [string]$Gate.merge_method
-        gh pr merge ([string]$Gate.pull_request) $methodFlag --match-head-commit ([string]$Gate.pull_head)
-        if ($LASTEXITCODE -ne 0) { throw "Owner-authorized pull request merge failed" }
-        $merged = gh api "repos/$repository/pulls/$number" | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$merged.merged_at) -or -not [string]::Equals([string]$merged.merged_by.login, $GitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Pull request was not merged by the repository owner" }
+        Write-Host "::notice title=Owner merge required::$($Gate.pull_request) passed required checks at head $($Gate.pull_head). The repository owner must authorize its $($Gate.merge_method) merge."
+        $deadline = [DateTime]::UtcNow.AddMinutes($OwnerMergeTimeoutMinutes)
+        while ($true) {
+            $pullRaw = gh api "repos/$repository/pulls/$number"
+            $pullExit = $LASTEXITCODE
+            if ($pullExit -ne 0) { throw "Owner merge pull request cannot be read while awaiting authorization" }
+            $pull = $pullRaw | ConvertFrom-Json
+            if ([string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request head changed while awaiting authorization" }
+            if (-not [string]::IsNullOrWhiteSpace([string]$pull.merged_at)) {
+                if (-not [string]::Equals([string]$pull.merged_by.login, $GitHubOwner, [StringComparison]::OrdinalIgnoreCase)) { throw "Pull request was not merged by the repository owner" }
+                break
+            }
+            if ([string]$pull.state -cne 'open') { throw "Owner merge pull request closed without the required merge" }
+            if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for the repository owner to authorize the exact pull request merge" }
+            Start-Sleep -Seconds 15
+        }
+    } finally {
+        if ($null -eq $savedToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $savedToken }
+    }
+}
+
+function Assert-ControlPlaneCompletion([string]$Target, [long]$DeliveryPlan, [long]$Ticket) {
+    $origin = [string](git -C $Target remote get-url origin)
+    $originExit = $LASTEXITCODE
+    if ($originExit -ne 0 -or $origin.Trim() -cnotmatch '^https://github\.com/(?<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$') { throw "Completed delivery repository lacks a canonical GitHub origin" }
+    $repository = $Matches.repository
+    if ($repository.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) { $repository = $repository.Substring(0, $repository.Length - 4) }
+    if (-not $repository.StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Completed delivery escaped the disposable repository boundary" }
+    $savedToken = $env:GH_TOKEN
+    try {
+        $env:GH_TOKEN = $setupToken
+        $planRaw = gh api "repos/$repository/issues/$DeliveryPlan"
+        $planExit = $LASTEXITCODE
+        if ($planExit -ne 0) { throw "Cannot read the exact Delivery Plan projection" }
+        $planIssue = $planRaw | ConvertFrom-Json
+        $ticketRaw = gh api "repos/$repository/issues/$Ticket"
+        $ticketExit = $LASTEXITCODE
+        if ($ticketExit -ne 0) { throw "Cannot read the exact Ticket" }
+        $ticketIssue = $ticketRaw | ConvertFrom-Json
+        if ([long]$planIssue.number -ne $DeliveryPlan -or [long]$ticketIssue.number -ne $Ticket -or $null -ne $planIssue.pull_request -or $null -ne $ticketIssue.pull_request) { throw "Delivery completion evidence does not identify the exact Plan and Ticket issues" }
+        $body = [string]$planIssue.body
+        $startMarker = '<!-- workflow:status:start -->'
+        $endMarker = '<!-- workflow:status:end -->'
+        $starts = [regex]::Matches($body, [regex]::Escape($startMarker))
+        $ends = [regex]::Matches($body, [regex]::Escape($endMarker))
+        if ($starts.Count -ne 1 -or $ends.Count -ne 1 -or $ends[0].Index -le $starts[0].Index) { throw "Delivery Plan lacks one authoritative Control Plane projection" }
+        $projection = $body.Substring($starts[0].Index, $ends[0].Index + $endMarker.Length - $starts[0].Index)
+        if (-not $projection.Contains('- state: `Completed`')) { throw "Control Plane projection does not report Plan Completed" }
+        $ticketPattern = '(?m)^\|\s*#' + $Ticket + '\s+.*?\|\s*Delivered\s*\|'
+        if ($projection -cnotmatch $ticketPattern) { throw "Control Plane projection does not report the exact Ticket Delivered" }
     } finally {
         if ($null -eq $savedToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $savedToken }
     }
@@ -150,13 +192,16 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     $result = Invoke-DriverPhase $Name $target 'initial'
     if ($Name -in @("clean-new-repository","unrelated-dirty-files","second-same-owner")) {
         if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $false) { throw "Scenario '$Name' bypassed the repository owner merge gate" }
-        Invoke-OwnerMerge $result 'repository_onboarding'
+        Wait-ForOwnerMerge $result 'repository_onboarding'
         $result = Invoke-DriverPhase $Name $target 'onboarding-resume' ([string]$result.onboarding_plan_digest)
         if ($Name -eq 'clean-new-repository') {
             if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $true -or [long]$result.delivery_plan -le 0 -or [long]$result.ticket -le 0) { throw "Scenario '$Name' did not reach the Worker pull request owner gate" }
-            Invoke-OwnerMerge $result 'worker_delivery'
-            $result = Invoke-DriverPhase $Name $target 'delivery-resume' '' ([long]$result.delivery_plan) ([long]$result.ticket)
+            $deliveryPlan = [long]$result.delivery_plan
+            $ticket = [long]$result.ticket
+            Wait-ForOwnerMerge $result 'worker_delivery'
+            $result = Invoke-DriverPhase $Name $target 'delivery-resume' '' $deliveryPlan $ticket
             if ($null -ne $result.gate_kind -or [string]$result.ticket_status -cne 'Delivered' -or [string]$result.plan_status -cne 'Completed') { throw "Scenario '$Name' did not reach Ticket Delivered and Plan Completed" }
+            Assert-ControlPlaneCompletion $target $deliveryPlan $ticket
         }
         if ($null -ne $result.gate_kind -or -not [string]::IsNullOrWhiteSpace([string]$result.blocker) -or -not $result.platform_ready -or -not $result.repository_admitted) { throw "Scenario '$Name' did not reach both readiness gates" }
 		if ($Name -eq "unrelated-dirty-files") {

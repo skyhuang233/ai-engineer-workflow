@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/skyhuang233/workflow/internal/credential"
@@ -169,19 +168,9 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 }
 
 func requireApprovedOnboardingRepositoryPath(requested, approved string) error {
-	requestedPath, err := filepath.Abs(requested)
+	samePath, err := workflowhome.SameFilesystemPath(requested, approved)
 	if err != nil {
 		return err
-	}
-	approvedPath, err := filepath.Abs(approved)
-	if err != nil {
-		return err
-	}
-	requestedPath = filepath.Clean(requestedPath)
-	approvedPath = filepath.Clean(approvedPath)
-	samePath := requestedPath == approvedPath
-	if runtime.GOOS == "windows" {
-		samePath = strings.EqualFold(requestedPath, approvedPath)
 	}
 	if !samePath {
 		return errors.New("onboarding repository path differs from the approved Onboarding Plan")
