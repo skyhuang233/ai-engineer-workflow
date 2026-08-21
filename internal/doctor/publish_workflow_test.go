@@ -18,6 +18,9 @@ func TestUnifiedPublisherAdmitsOnlyOwnerMergedVersionBranches(t *testing.T) {
 		`.merged_by.type`,
 		`endswith("[bot]")`,
 		`.base.ref == "main"`,
+		`.head.sha | select(test("^[0-9a-f]{40}$"))`,
+		`(.parents | length) == 2`,
+		`any(.parents[]; .sha == $head)`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("unified publisher omits admission contract %q", required)

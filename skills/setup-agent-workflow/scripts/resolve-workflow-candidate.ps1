@@ -56,7 +56,6 @@ if ($sbomDigest -cne [string]$validated.sbom_sha256) {
 
 [pscustomobject]@{
   schema_version = 1
-  qualification_candidate = $true
   version = [string]$validated.version
   source_commit = [string]$validated.source_commit
   manifest_path = $manifestPath

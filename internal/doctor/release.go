@@ -44,11 +44,27 @@ type releasePull struct {
 	} `json:"base"`
 	Head struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"head"`
 	MergedBy struct {
 		Login string `json:"login"`
 		Type  string `json:"type"`
 	} `json:"merged_by"`
+}
+
+type releaseCommitParent struct {
+	SHA string `json:"sha"`
+}
+
+type releaseIntegrationCommit struct {
+	Parents []releaseCommitParent `json:"parents"`
+}
+
+func (c releaseIntegrationCommit) containsExactPullHead(headSHA string) bool {
+	if len(c.Parents) != 2 || headSHA == "" {
+		return false
+	}
+	return c.Parents[0].SHA == headSHA || c.Parents[1].SHA == headSHA
 }
 
 type workflowTagRef struct {
@@ -240,6 +256,13 @@ func verifyPublisher(ctx context.Context, client *githubapi.Client, repository s
 	branch := pull.Head.Ref == "release-"+manifest.Version || pull.Head.Ref == "hotfix-"+manifest.Version
 	if pull.MergedAt == "" || pull.MergeCommitSHA != manifest.SourceCommit || pull.Base.Ref != "main" || !branch || !strings.EqualFold(pull.MergedBy.Login, config.GitHub.Credential.Owner) || !strings.EqualFold(pull.MergedBy.Type, "user") || strings.HasSuffix(strings.ToLower(pull.MergedBy.Login), "[bot]") {
 		return errors.New("Workflow Release source lacks an admitted owner merge")
+	}
+	var integration releaseIntegrationCommit
+	if err := client.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/git/commits/"+manifest.SourceCommit, nil, &integration); err != nil {
+		return fmt.Errorf("verify Workflow Release integration commit: %w", err)
+	}
+	if !integration.containsExactPullHead(pull.Head.SHA) {
+		return errors.New("Workflow Release source is not a two-parent merge containing the exact pull request head")
 	}
 	return nil
 }

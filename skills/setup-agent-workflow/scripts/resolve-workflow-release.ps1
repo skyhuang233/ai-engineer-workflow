@@ -137,6 +137,7 @@ if ($sbomMetadataDigest -cne [string]$validated.sbom_sha256) { throw 'Worker SBO
   tag = [string]$release.tag_name
   source_commit = [string]$validated.source_commit
   manifest_path = $manifestPath
+  manifest_sha256 = [string]$validated.manifest_sha256
   bundle_path = $bundlePath
   bundle_sha256 = $bundleMetadataDigest
   sbom_path = $sbomPath

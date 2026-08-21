@@ -58,6 +58,7 @@ try {
   $download = Join-Path $scratch 'success'
   $result = & $resolver -DownloadDirectory $download | ConvertFrom-Json
   if ([string]$result.tag -cne 'workflow-v0.0.1') { throw 'Resolver did not select the highest eligible semantic version' }
+  if ([string]$result.manifest_sha256 -cne $manifestDigest) { throw 'Resolver did not preserve the verified manifest digest' }
   $downloads = @($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' })
   if ($downloads.Count -ne 3 -or $downloads[0] -notlike '*--pattern workflow-release.json*') { throw 'Resolver did not authenticate the manifest before downloading other assets' }
 

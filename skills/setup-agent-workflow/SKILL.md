@@ -92,13 +92,10 @@ $preparedBundle = & "$skillRoot\scripts\extract-verified-windows-bundle.ps1" `
 $version = [string]$preparedBundle.version
 $bundleDigest = [string]$preparedBundle.bundle_digest
 $verifiedExtractedBundle = [string]$preparedBundle.extracted_bundle
-$qualificationCandidate = $null
-if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
-  $qualificationCandidate = @{
-    manifest_path=[string]$release.manifest_path
-    manifest_sha256=[string]$release.manifest_sha256
-    source_commit=[string]$release.source_commit
-  }
+$verifiedReleaseManifest = @{
+  manifest_path=[string]$release.manifest_path
+  manifest_sha256=[string]$release.manifest_sha256
+  source_commit=[string]$release.source_commit
 }
 $launcher = Join-Path $verifiedExtractedBundle 'setup\workflow-setup.exe'
 ```
@@ -170,8 +167,7 @@ $state = $verify | & $dispatcher setup verify | ConvertFrom-Json
 # Explicit upgrade only:
 $preflight = @{schema_version=1;operation='inspect';purpose='active_work_preflight';workflow_home=$workflowHome} | ConvertTo-Json -Compress
 $preflight | & $dispatcher setup inspect | ConvertFrom-Json
-$targetRequest = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner}
-if ($null -ne $qualificationCandidate) { $targetRequest.qualification_candidate = $qualificationCandidate }
+$targetRequest = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner;verified_release_manifest=$verifiedReleaseManifest}
 $target = $targetRequest | ConvertTo-Json -Depth 16 -Compress
 $inspection = $target | & $launcher | ConvertFrom-Json
 # Do not invent or submit an empty consent surface. A fresh/changed target
@@ -191,7 +187,7 @@ if ($inspection.status -eq 'consent_required') {
 } else {
   throw "Unexpected target_state status: $($inspection.status)"
 }
-if ($null -ne $qualificationCandidate) { $applyRequest.qualification_candidate = $qualificationCandidate }
+$applyRequest.verified_release_manifest = $verifiedReleaseManifest
 $apply = $applyRequest | ConvertTo-Json -Depth 16 -Compress
 $apply | & $launcher | ConvertFrom-Json
 # Repository authority is only the active versioned CLI, never the launcher:

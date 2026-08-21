@@ -107,7 +107,7 @@ type restartableLifecycle interface {
 func (e Engine) Inspect(ctx context.Context, request Request) (Result, error) {
 	_ = ctx
 	if request.Purpose == PurposeTargetState {
-		if _, err := e.qualificationWorkerRelease(request); err != nil {
+		if _, err := e.verifiedWorkerRelease(request); err != nil {
 			return blocked(err), nil
 		}
 	}
@@ -150,7 +150,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	if err := validateApplyRequest(request); err != nil {
 		return blocked(err), nil
 	}
-	qualificationRelease, err := e.qualificationWorkerRelease(request)
+	verifiedRelease, err := e.verifiedWorkerRelease(request)
 	if err != nil {
 		return blocked(err), nil
 	}
@@ -391,7 +391,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		}
 	}
 	if resumeActiveRepair {
-		return e.repairActiveGeneration(ctx, request, active, consent, qualificationRelease, now)
+		return e.repairActiveGeneration(ctx, request, active, consent, verifiedRelease, now)
 	}
 
 	clearOldFence := func() {
@@ -443,10 +443,10 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		}
 		return e.failAttempt(request.WorkflowHome, attempt, err)
 	}
-	if qualificationRelease != nil {
-		qualificationRelease.VerifiedAt = now
-		qualificationRelease.ActivatedAt = now
-		if releaseErr := candidate.ActivateWorkerRelease(ctx, *qualificationRelease); releaseErr != nil {
+	if verifiedRelease != nil {
+		verifiedRelease.VerifiedAt = now
+		verifiedRelease.ActivatedAt = now
+		if releaseErr := candidate.ActivateWorkerRelease(ctx, *verifiedRelease); releaseErr != nil {
 			_ = candidate.Close()
 			if freshCandidate {
 				return e.failFreshAttempt(request.WorkflowHome, attempt, releaseErr)
@@ -537,7 +537,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 // active.json names a repair_required candidate, that generation and its
 // SQLite file are the durable forward-repair subject.  Copying the active
 // database back over itself is both non-idempotent and unsafe on Windows.
-func (e Engine) repairActiveGeneration(ctx context.Context, request Request, active Active, consent Consent, qualificationRelease *store.WorkerRelease, now time.Time) (Result, error) {
+func (e Engine) repairActiveGeneration(ctx context.Context, request Request, active Active, consent Consent, verifiedRelease *store.WorkerRelease, now time.Time) (Result, error) {
 	attempt, err := readAttempt(request.WorkflowHome, active.AttemptID)
 	if err != nil {
 		return result("repair_required", map[string]any{"active": active, "error": "active repair Attempt is unavailable"}), nil
@@ -552,10 +552,10 @@ func (e Engine) repairActiveGeneration(ctx context.Context, request Request, act
 	if err != nil {
 		return result("repair_required", map[string]any{"active": active, "error": err.Error()}), nil
 	}
-	if qualificationRelease != nil {
-		qualificationRelease.VerifiedAt = now
-		qualificationRelease.ActivatedAt = now
-		if err := candidate.ActivateWorkerRelease(ctx, *qualificationRelease); err != nil {
+	if verifiedRelease != nil {
+		verifiedRelease.VerifiedAt = now
+		verifiedRelease.ActivatedAt = now
+		if err := candidate.ActivateWorkerRelease(ctx, *verifiedRelease); err != nil {
 			_ = candidate.Close()
 			return result("repair_required", map[string]any{"active": active, "error": err.Error()}), nil
 		}

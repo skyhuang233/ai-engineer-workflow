@@ -54,8 +54,9 @@ jobs:
           pull_number="$(jq --raw-output --arg sha "$GITHUB_SHA" '[.[] | select(.merged_at != null and .merge_commit_sha == $sha and .base.ref == "main")] | if length == 1 then .[0].number else empty end' <<<"$pulls")"
           test -n "$pull_number" || { echo "main commit lacks one merged pull request" >&2; exit 1; }
           pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pull_number}")"
-          head="$(jq --exit-status --raw-output '.head.ref' <<<"$pull")"
-          case "$head" in
+          head_ref="$(jq --exit-status --raw-output '.head.ref' <<<"$pull")"
+          head_sha="$(jq --exit-status --raw-output '.head.sha | select(test("^[0-9a-f]{40}$"))' <<<"$pull")"
+          case "$head_ref" in
             "release-${version}"|"hotfix-${version}") ;;
             *) echo "publisher accepts only release-${version} or hotfix-${version}" >&2; exit 1 ;;
           esac
@@ -65,6 +66,10 @@ jobs:
             ((.merged_by.type // "") | ascii_downcase) == "user" and
             (((.merged_by.login // "") | ascii_downcase | endswith("[bot]")) | not)
           ' <<<"$pull" >/dev/null
+          integration="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${GITHUB_SHA}")"
+          jq --exit-status --arg head "$head_sha" '
+            (.parents | length) == 2 and any(.parents[]; .sha == $head)
+          ' <<<"$integration" >/dev/null || { echo "publisher requires a two-parent merge containing the exact pull request head" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=workflow-v${version}" >> "$GITHUB_OUTPUT"
       - name: Preflight Workflow Release target

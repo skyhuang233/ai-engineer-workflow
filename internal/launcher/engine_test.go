@@ -21,61 +21,79 @@ import (
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
-func TestQualificationApplySeedsActiveWorkerReleaseInFreshGeneration(t *testing.T) {
-	home := filepath.Join(t.TempDir(), "home")
-	bundle := t.TempDir()
-	writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
-	candidateDirectory := t.TempDir()
-	sourceCommit := strings.Repeat("c", 40)
-	bundleDigest := strings.Repeat("b", 64)
-	image := "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)
-	manifest := workflowrelease.Manifest{
-		SchemaVersion: 1, Version: "0.0.1", SourceCommit: sourceCommit, GitHubActionsRunID: 1,
-		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: bundleDigest},
-		Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
-			Codex:      workflowrelease.CodexTool{Version: "0.148.0"},
-			GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},
-			Go:         workflowrelease.ArchiveTool{Version: "1.26.6", LinuxAMD64SHA256: strings.Repeat("e", 64)},
-			NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("f", 40)},
-		}},
-		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
-	}
-	raw, err := manifest.Canonical()
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestPath := filepath.Join(candidateDirectory, workflowrelease.ManifestAssetName)
-	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	manifestDigest := sha256.Sum256(raw)
-	t.Setenv(setupQualificationEnvironment, "1")
-	t.Setenv(candidateDirectoryEnvironment, candidateDirectory)
-	t.Setenv(candidateVersionEnvironment, manifest.Version)
-	t.Setenv(candidateSourceCommitEnvironment, sourceCommit)
-	engine := Engine{BundleRoot: bundle}
-	request := Request{
-		SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: manifest.Version,
-		BundleDigest: "sha256:" + bundleDigest, GitHubOwner: "owner",
-		QualificationCandidate: &QualificationCandidate{ManifestPath: manifestPath, ManifestSHA256: hex.EncodeToString(manifestDigest[:]), SourceCommit: sourceCommit},
-	}
-	request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
-	result, err := engine.Apply(context.Background(), request)
-	if err != nil || result.Status != "ready" {
-		t.Fatalf("qualification apply = %#v, %v", result, err)
-	}
-	active, err := ReadActive(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	database, err := store.OpenForRuntime(context.Background(), filepath.Join(home, "platform", "generations", active.Generation, "workflow.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	release, err := database.ActiveWorkerRelease(context.Background())
-	if err != nil || release.Version != manifest.Version || release.SourceCommit != sourceCommit || release.ImageReference != image || release.ManifestJSON != string(raw) {
-		t.Fatalf("active qualification Worker Release = %#v, %v", release, err)
+func TestVerifiedReleaseManifestSeedsActiveWorkerRelease(t *testing.T) {
+	for _, qualification := range []bool{false, true} {
+		name := "published"
+		if qualification {
+			name = "qualification"
+		}
+		t.Run(name, func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), "home")
+			bundle := t.TempDir()
+			writeTestBundle(t, bundle, map[string]string{"platform/workflow.exe": "cli", "setup/workflow-setup.exe": "setup", "skills/agent-workflow/SKILL.md": "skill", "repository-contract/repository.json": "contract"})
+			manifestDirectory := t.TempDir()
+			sourceCommit := strings.Repeat("c", 40)
+			bundleDigest := strings.Repeat("b", 64)
+			image := "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)
+			manifest := workflowrelease.Manifest{
+				SchemaVersion: 1, Version: "0.0.1", SourceCommit: sourceCommit, GitHubActionsRunID: 1,
+				Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: bundleDigest},
+				Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
+					Codex:      workflowrelease.CodexTool{Version: "0.148.0"},
+					GitHubCLI:  workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},
+					Go:         workflowrelease.ArchiveTool{Version: "1.26.6", LinuxAMD64SHA256: strings.Repeat("e", 64)},
+					NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("f", 40)},
+				}},
+				SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+			}
+			raw, err := manifest.Canonical()
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(manifestDirectory, workflowrelease.ManifestAssetName)
+			if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			manifestDigest := sha256.Sum256(raw)
+			if qualification {
+				t.Setenv(setupQualificationEnvironment, "1")
+				t.Setenv(candidateDirectoryEnvironment, manifestDirectory)
+				t.Setenv(candidateVersionEnvironment, manifest.Version)
+				t.Setenv(candidateSourceCommitEnvironment, sourceCommit)
+			}
+			engine := Engine{BundleRoot: bundle}
+			request := Request{
+				SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: manifest.Version,
+				BundleDigest: "sha256:" + bundleDigest, GitHubOwner: "owner",
+				VerifiedReleaseManifest: &VerifiedReleaseManifest{ManifestPath: manifestPath, ManifestSHA256: hex.EncodeToString(manifestDigest[:]), SourceCommit: sourceCommit},
+			}
+			request.AcceptedCapabilities = requiredCapabilities(t, engine, request)
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err = DecodeRequest(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := engine.Apply(context.Background(), request)
+			if err != nil || result.Status != "ready" {
+				t.Fatalf("apply = %#v, %v", result, err)
+			}
+			active, err := ReadActive(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			database, err := store.OpenForRuntime(context.Background(), filepath.Join(home, "platform", "generations", active.Generation, "workflow.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			release, err := database.ActiveWorkerRelease(context.Background())
+			if err != nil || release.Version != manifest.Version || release.SourceCommit != sourceCommit || release.ImageReference != image || release.ManifestJSON != string(raw) {
+				t.Fatalf("active Worker Release = %#v, %v", release, err)
+			}
+		})
 	}
 }
 
@@ -122,7 +140,8 @@ func TestSetupSkillFreshInspectAcceptanceBuildsExactLauncherApply(t *testing.T) 
 	home := filepath.Join(t.TempDir(), "fresh-home")
 	digest := "sha256:" + strings.Repeat("a", 64)
 	engine := Engine{BundleRoot: bundle}
-	inspect := Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner"}
+	verified := writeTestVerifiedReleaseManifest(t, t.TempDir(), "0.0.1", digest)
+	inspect := Request{SchemaVersion: ProtocolVersion, Operation: Inspect, Purpose: PurposeTargetState, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner", VerifiedReleaseManifest: verified}
 	inspection, err := engine.Inspect(context.Background(), inspect)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +167,7 @@ func TestSetupSkillFreshInspectAcceptanceBuildsExactLauncherApply(t *testing.T) 
 	}
 	// Model the user's acceptance: the returned capability array is forwarded
 	// untouched into the strict request decoder and then into the real apply.
-	apply := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner", AcceptedCapabilities: displayed.Evidence.RequiredCapabilities}
+	apply := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner", AcceptedCapabilities: displayed.Evidence.RequiredCapabilities, VerifiedReleaseManifest: verified}
 	rawApply, err := json.Marshal(apply)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +204,7 @@ func TestSetupSkillFreshInspectAcceptanceBuildsExactLauncherApply(t *testing.T) 
 	if displayed.Evidence.ConsentID == "" || len(displayed.Evidence.RequiredCapabilities) != 0 {
 		t.Fatalf("reusable inspect JSON=%s", rawReusable)
 	}
-	reuseApply := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner", ConsentID: displayed.Evidence.ConsentID}
+	reuseApply := Request{SchemaVersion: ProtocolVersion, Operation: Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: digest, GitHubOwner: "owner", ConsentID: displayed.Evidence.ConsentID, VerifiedReleaseManifest: verified}
 	rawReuse, err := json.Marshal(reuseApply)
 	if err != nil {
 		t.Fatal(err)
@@ -1313,6 +1332,29 @@ func requiredCapabilities(t *testing.T, engine Engine, request Request) []Capabi
 		t.Fatal(err)
 	}
 	return capabilities
+}
+
+func writeTestVerifiedReleaseManifest(t *testing.T, directory, version, bundleDigest string) *VerifiedReleaseManifest {
+	t.Helper()
+	manifest := workflowrelease.Manifest{
+		SchemaVersion: 1, Version: version, SourceCommit: strings.Repeat("c", 40), GitHubActionsRunID: 1,
+		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.TrimPrefix(bundleDigest, "sha256:")},
+		Worker: workflowrelease.Worker{Image: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64), Tools: workflowrelease.Tools{
+			Codex: workflowrelease.CodexTool{Version: "0.148.0"}, GitHubCLI: workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},
+			Go: workflowrelease.ArchiveTool{Version: "1.26.6", LinuxAMD64SHA256: strings.Repeat("e", 64)}, NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("f", 40)},
+		}},
+		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+	}
+	raw, err := manifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, workflowrelease.ManifestAssetName)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(raw)
+	return &VerifiedReleaseManifest{ManifestPath: path, ManifestSHA256: hex.EncodeToString(digest[:]), SourceCommit: manifest.SourceCommit}
 }
 
 func writeTestBundleVersion(t *testing.T, root, version string, files map[string]string) {

@@ -77,7 +77,7 @@ try {
 
   $resolved = & $resolver -CandidateDirectory $candidateDirectory -ExpectedVersion '0.0.1' -ExpectedSourceCommit $sourceCommit | ConvertFrom-Json
   $manifestDigest = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
-  if (-not [bool]$resolved.qualification_candidate -or [string]$resolved.manifest_sha256 -cne $manifestDigest -or [string]$resolved.bundle_sha256 -cne $bundleDigest) {
+  if ([string]$resolved.manifest_sha256 -cne $manifestDigest -or [string]$resolved.bundle_sha256 -cne $bundleDigest) {
     throw 'Candidate resolver returned incorrect evidence'
   }
   $verified = & $verifier -BundlePath $resolved.bundle_path -ExpectedSHA256 $resolved.bundle_sha256 -ExpectedVersion $resolved.version -ExpectedWorkerImage $resolved.worker_image | ConvertFrom-Json

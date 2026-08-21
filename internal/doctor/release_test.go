@@ -65,3 +65,19 @@ func TestWorkflowTagRefRequiresDirectSourceCommit(t *testing.T) {
 		t.Fatal("accepted a tag ref to another source commit")
 	}
 }
+
+func TestReleaseIntegrationRequiresTwoParentsIncludingPullHead(t *testing.T) {
+	head := strings.Repeat("b", 40)
+	commit := releaseIntegrationCommit{Parents: []releaseCommitParent{{SHA: strings.Repeat("a", 40)}, {SHA: head}}}
+	if !commit.containsExactPullHead(head) {
+		t.Fatal("rejected valid no-ff integration commit")
+	}
+	commit.Parents = commit.Parents[:1]
+	if commit.containsExactPullHead(head) {
+		t.Fatal("accepted one-parent squash or rebase result")
+	}
+	commit.Parents = append(commit.Parents, releaseCommitParent{SHA: strings.Repeat("c", 40)})
+	if commit.containsExactPullHead(head) {
+		t.Fatal("accepted merge that omitted the exact pull request head")
+	}
+}
