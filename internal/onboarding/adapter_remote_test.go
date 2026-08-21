@@ -101,11 +101,11 @@ func TestRepositoryAdapterReadbackBindsOnlyExactMergedPull(t *testing.T) {
 	mergeHead := "cccccccccccccccccccccccccccccccccccccccc"
 	branch := "workflow/onboarding-" + digest[:12]
 	remote := &memoryRemote{
-		pull:          PullReadback{Found: true, Merged: true, State: "closed", Branch: branch, Head: "dddddddddddddddddddddddddddddddddddddddd", Base: "main", BaseHead: baseHead, Body: "Approved Setup Plan SHA-256: " + digest, MergeHead: mergeHead, MergedBy: "owner", MergedByType: "User", ChecksPassed: true, ReviewsClean: true, ContentMatches: true},
+		pull:          PullReadback{Found: true, Merged: true, State: "closed", Branch: branch, Head: "dddddddddddddddddddddddddddddddddddddddd", Base: "main", BaseHead: baseHead, Body: "Approved Setup Plan SHA-256: " + digest, MergeHead: mergeHead, MergedBy: "alice", MergedByType: "User", ChecksPassed: true, ReviewsClean: true, ContentMatches: true},
 		defaultBranch: RepositoryBranch{Name: "main", Head: mergeHead},
 	}
-	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", PlanDigest: digest}
-	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "manifest_digest": "manifest", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
+	adapter := RepositoryAdapter{Remote: remote, Owner: "acme", AuthenticatedLogin: "alice", PlanDigest: digest}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "acme/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "manifest_digest": "manifest", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("exact merged PR = %s, %v", status, err)
@@ -476,7 +476,7 @@ func TestRepositoryAdapterBindsOnlyOwnerMergedPullThenRecordsAdmission(t *testin
 	}
 	defer database.Close()
 	writer := &fakeBranchWriter{prepared: PreparedOnboardingBranch{Branch: branch, Head: head}}
-	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, Store: database, BranchWriter: writer}
+	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", AuthenticatedLogin: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, Store: database, BranchWriter: writer}
 	contract := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "source_url": "https://github.com/owner/repo.git", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`, "manifest_digest": manifest, "merge_method": "squash"}}
 	if err := adapter.Apply(ctx, contract); err != nil {
 		t.Fatal(err)

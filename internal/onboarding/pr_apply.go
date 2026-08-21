@@ -43,7 +43,7 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 	if prior.Found && a.Remote.VerifyOnboardingContent(ctx, effect.Subject, onboardingPullContentRef(prior, request.Branch), request.Files) != nil {
 		prior.ContentMatches = false
 	}
-	priorDecision, priorErr := DecideOnboardingPull(prior, a.PlanDigest, request.Branch, base, baseHead, a.Owner)
+	priorDecision, priorErr := DecideOnboardingPull(prior, a.PlanDigest, request.Branch, base, baseHead, a.AuthenticatedLogin)
 	if priorErr != nil || priorDecision == PullConflict {
 		return errors.New("existing Onboarding Pull Request differs from the approved identity or managed content")
 	}
@@ -80,7 +80,7 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 	if pull.Found && a.Remote.VerifyOnboardingContent(ctx, effect.Subject, onboardingPullContentRef(pull, request.Branch), request.Files) != nil {
 		pull.ContentMatches = false
 	}
-	decision, decisionErr := DecideOnboardingPull(pull, a.PlanDigest, request.Branch, base, baseHead, a.Owner)
+	decision, decisionErr := DecideOnboardingPull(pull, a.PlanDigest, request.Branch, base, baseHead, a.AuthenticatedLogin)
 	if decisionErr != nil || decision == PullConflict {
 		return errors.New("existing Onboarding Pull Request differs from the approved identity or managed content")
 	}
@@ -108,7 +108,7 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 			return err
 		}
 	}
-	decision, decisionErr = DecideOnboardingPull(pull, a.PlanDigest, request.Branch, base, baseHead, a.Owner)
+	decision, decisionErr = DecideOnboardingPull(pull, a.PlanDigest, request.Branch, base, baseHead, a.AuthenticatedLogin)
 	if decisionErr != nil || decision != PullDrift || pull.Head != request.Head || !strings.EqualFold(pull.State, "open") {
 		return errors.New("created Onboarding Pull Request is not an exact unmerged approved state")
 	}
@@ -116,7 +116,7 @@ func (a *RepositoryAdapter) applyOnboardingPull(ctx context.Context, effect setu
 }
 
 func (a *RepositoryAdapter) bindMergedOnboardingPull(ctx context.Context, effect setupcontract.Effect, request OnboardingPullRequest, pull PullReadback) error {
-	decision, err := DecideOnboardingPull(pull, request.Digest, request.Branch, request.Base, request.BaseHead, a.Owner)
+	decision, err := DecideOnboardingPull(pull, request.Digest, request.Branch, request.Base, request.BaseHead, a.AuthenticatedLogin)
 	if err != nil || decision != PullSatisfied {
 		return errors.New("Onboarding Pull Request is not an exact merged approved state")
 	}

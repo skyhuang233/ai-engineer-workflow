@@ -116,7 +116,7 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 			return err
 		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, AuthenticatedLogin: session.login, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		result, err := (onboarding.Executor{Store: database, Adapter: adapter}).Apply(ctx, raw, *approvedDigest, strings.TrimPrefix(active.BundleDigest, "sha256:"))
 		if err != nil {
 			return err
@@ -141,7 +141,7 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 			return err
 		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, AuthenticatedLogin: session.login, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		for _, effect := range plan.Effects {
 			status, _, readErr := adapter.Readback(ctx, effect)
 			if readErr != nil || status != setupcontract.EffectSatisfied {

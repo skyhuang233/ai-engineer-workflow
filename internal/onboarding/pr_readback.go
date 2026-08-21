@@ -25,7 +25,7 @@ const (
 // DecideOnboardingPull is deliberately pure. Remote callers must provide the
 // exact immutable digest-bound evidence; any absent or divergent identity is
 // a conflict rather than authority to update or merge a Pull Request.
-func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead, owner string) (PullDecision, error) {
+func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead, authenticatedLogin string) (PullDecision, error) {
 	if !isFullSHA256(digest) || branch != "workflow/onboarding-"+digest[:12] || base == "" || !isGitObjectID(baseHead) {
 		return PullConflict, errors.New("approved Onboarding Pull identity is invalid")
 	}
@@ -42,7 +42,7 @@ func DecideOnboardingPull(value PullReadback, digest, branch, base, baseHead, ow
 		if !strings.EqualFold(value.State, "closed") || !isGitObjectID(value.MergeHead) {
 			return PullConflict, errors.New("merged Onboarding Pull Request lacks exact merge evidence")
 		}
-		if owner == "" || !strings.EqualFold(value.MergedBy, owner) || !strings.EqualFold(value.MergedByType, "User") {
+		if authenticatedLogin == "" || !strings.EqualFold(value.MergedBy, authenticatedLogin) || !strings.EqualFold(value.MergedByType, "User") {
 			return PullConflict, errors.New("Onboarding Pull Request was not merged by the admitted human repository owner")
 		}
 		return PullSatisfied, nil

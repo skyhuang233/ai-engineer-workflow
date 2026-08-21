@@ -79,16 +79,17 @@ type OnboardingBranchWriter interface {
 }
 
 type RepositoryAdapter struct {
-	Remote         RepositoryRemote
-	Credential     GitCredential
-	Owner          string
-	PlanDigest     string
-	Store          *store.Store
-	MergeHeads     map[string]string
-	Created        map[string]bool
-	BaselineHead   map[string]string
-	RepositoryPath string
-	BranchWriter   OnboardingBranchWriter
+	Remote             RepositoryRemote
+	Credential         GitCredential
+	Owner              string
+	AuthenticatedLogin string
+	PlanDigest         string
+	Store              *store.Store
+	MergeHeads         map[string]string
+	Created            map[string]bool
+	BaselineHead       map[string]string
+	RepositoryPath     string
+	BranchWriter       OnboardingBranchWriter
 }
 
 func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -263,7 +264,7 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 			}
 		}
 	}
-	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead, a.Owner)
+	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead, a.AuthenticatedLogin)
 	if err != nil || decision == PullConflict {
 		return setupcontract.EffectConflicting, "Onboarding Pull Request identity or content drifted from the exact approved digest", nil
 	}
