@@ -140,12 +140,11 @@ function Assert-WorkflowContractProducer([string]$Repository, [string]$Ref) {
     if ($contentExit -ne 0) { throw "Merged onboarding workflow-contract producer cannot be read" }
     $content = $contentRaw | ConvertFrom-Json
     if ([string]$content.path -cne '.github/workflows/workflow-contract.yml' -or [string]$content.encoding -cne 'base64') { throw "Merged onboarding workflow-contract producer identity is invalid" }
-    $actual = [Convert]::FromBase64String(([string]$content.content -replace '\s', ''))
-    $source = Join-Path $PSScriptRoot "..\..\..\deploy\platform\repository-contract\.github\workflows\workflow-contract.yml"
-    $expected = [IO.File]::ReadAllBytes($source)
-    $actualDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($actual))
-    $expectedDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($expected))
-    if ($actualDigest -cne $expectedDigest) { throw "Merged onboarding workflow-contract producer differs from the qualified release" }
+    $producerPath = 'deploy/platform/repository-contract/.github/workflows/workflow-contract.yml'
+    $expectedBlob = [string](git -C $PSScriptRoot rev-parse "HEAD:$producerPath")
+    $blobExit = $LASTEXITCODE
+    if ($blobExit -ne 0 -or $expectedBlob.Trim() -cnotmatch '^[0-9a-f]{40}$') { throw "Qualified workflow-contract producer identity cannot be resolved" }
+    if ([string]$content.sha -cne $expectedBlob.Trim()) { throw "Merged onboarding workflow-contract producer differs from the qualified release" }
 }
 
 function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {

@@ -145,6 +145,24 @@ func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
 	}
 }
 
+func TestHarnessComparesMergedProducerToQualifiedGitBlob(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	for _, required := range []string{
+		`$producerPath = 'deploy/platform/repository-contract/.github/workflows/workflow-contract.yml'`,
+		`git -C $PSScriptRoot rev-parse "HEAD:$producerPath"`,
+		`[string]$content.sha -cne $expectedBlob.Trim()`,
+	} {
+		if !strings.Contains(harness, required) {
+			t.Fatalf("setup harness does not compare the merged producer to the qualified Git blob: missing %q", required)
+		}
+	}
+	for _, checkoutByteComparison := range []string{"ReadAllBytes($source)", "$actualDigest", "$expectedDigest"} {
+		if strings.Contains(harness, checkoutByteComparison) {
+			t.Fatalf("setup harness compares checkout-transformed producer bytes via %q", checkoutByteComparison)
+		}
+	}
+}
+
 func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
 	for _, required := range []string{"$qualificationError = $null", "$qualificationError = $_.Exception", "$failures.Add(\"Qualification failed:", "$failures.Add(\"Cleanup failed:", "foreach ($repository in $repositories)", "docker ps -aq", "foreach ($name in $prior.Keys)", "Remove-Item -LiteralPath $resolvedRoot"} {
