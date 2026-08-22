@@ -219,14 +219,31 @@ function Assert-ControlPlaneCompletion([string]$Target, [long]$DeliveryPlan, [lo
         $env:GH_TOKEN = $setupToken
         $planRaw = gh api "repos/$repository/issues/$DeliveryPlan"
         $planExit = $LASTEXITCODE
-        if ($planExit -ne 0) { throw "Cannot read the exact Delivery Plan projection" }
+        if ($planExit -ne 0) { throw "Cannot read the exact Delivery Plan" }
         $planIssue = $planRaw | ConvertFrom-Json
         $ticketRaw = gh api "repos/$repository/issues/$Ticket"
         $ticketExit = $LASTEXITCODE
         if ($ticketExit -ne 0) { throw "Cannot read the exact Ticket" }
         $ticketIssue = $ticketRaw | ConvertFrom-Json
         if ([long]$planIssue.number -ne $DeliveryPlan -or [long]$ticketIssue.number -ne $Ticket -or $null -ne $planIssue.pull_request -or $null -ne $ticketIssue.pull_request) { throw "Delivery completion evidence does not identify the exact Plan and Ticket issues" }
-        $body = [string]$planIssue.body
+        $comments = [Collections.Generic.List[object]]::new()
+        for ($page = 1; ; $page++) {
+            $commentsRaw = gh api "repos/$repository/issues/$DeliveryPlan/comments?per_page=100&page=$page"
+            $commentsExit = $LASTEXITCODE
+            if ($commentsExit -ne 0) { throw "Cannot read the exact Delivery Plan projection comments" }
+            $commentPage = @($commentsRaw | ConvertFrom-Json)
+            foreach ($comment in $commentPage) { $comments.Add($comment) }
+            if ($commentPage.Count -lt 100) { break }
+        }
+        $controlPlaneMarker = '<!-- workflow:control-plane -->'
+        $projectionComments = @($comments | Where-Object {
+            [string]::Equals([string]$_.user.login, $GitHubOwner, [StringComparison]::OrdinalIgnoreCase) -and
+            [string]$_.user.type -cne 'Bot' -and
+            -not ([string]$_.user.login).EndsWith('[bot]', [StringComparison]::OrdinalIgnoreCase) -and
+            ([string]$_.body).Contains($controlPlaneMarker)
+        })
+        if ($projectionComments.Count -ne 1) { throw "Delivery Plan lacks one owner-authored Control Plane projection comment" }
+        $body = [string]$projectionComments[0].body
         $startMarker = '<!-- workflow:status:start -->'
         $endMarker = '<!-- workflow:status:end -->'
         $starts = [regex]::Matches($body, [regex]::Escape($startMarker))

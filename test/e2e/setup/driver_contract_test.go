@@ -154,6 +154,24 @@ func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 	}
 }
 
+func TestHarnessReadsOwnerControlPlaneProjectionFromPaginatedComments(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	for _, required := range []string{
+		`issues/$DeliveryPlan/comments?per_page=100&page=$page`,
+		`<!-- workflow:control-plane -->`,
+		`[string]$_.user.login`,
+		`$projectionComments.Count -ne 1`,
+		`$body = [string]$projectionComments[0].body`,
+	} {
+		if !strings.Contains(harness, required) {
+			t.Fatalf("setup harness does not read the authoritative projection comment: missing %q", required)
+		}
+	}
+	if strings.Contains(harness, `$body = [string]$planIssue.body`) {
+		t.Fatal("setup harness still reads the Control Plane projection from the Plan issue body")
+	}
+}
+
 func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
 	lines := strings.Split(strings.ReplaceAll(read(t, "setup-e2e.ps1"), "\r\n", "\n"), "\n")
 	for command, assignment := range map[string]string{
