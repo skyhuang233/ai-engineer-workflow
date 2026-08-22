@@ -251,7 +251,8 @@ jobs:
             -DriverScript (Resolve-Path test/e2e/setup/codex-driver.ps1) `
             -EntrySkillSpec (Resolve-Path .) `
             -PlatformVersion $version `
-            -DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY
+            -DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY `
+            -OwnerMergeTimeoutMinutes 120
       - name: Preserve exact qualified Workflow Release candidate
         shell: pwsh
         run: |

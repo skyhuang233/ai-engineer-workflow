@@ -158,6 +158,7 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
 		"-GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER",
 		"-DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY",
+		"-OwnerMergeTimeoutMinutes 120",
 		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
 		`$maximumAttempts = 3`,
 		`Start-Sleep -Seconds (5 * $attempt)`,
