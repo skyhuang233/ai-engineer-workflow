@@ -9,6 +9,13 @@ declared plans. The repository-owned `codex-driver.ps1` is the reference
 exact `#workflow-v...` release tag, runs `codex exec` with the strict result schema, approves only the
 displayed setup-plan digests, and records disposable repositories for cleanup.
 
+Release qualification takes its disposable owner, different-owner fixture,
+Setup PAT, and cleanup token from `WORKFLOW_SETUP_E2E_GITHUB_OWNER`,
+`WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY`, `WORKFLOW_SETUP_E2E_PAT`, and
+`WORKFLOW_SETUP_E2E_CLEANUP_TOKEN` in the owner-started ephemeral runner's
+process environment. The workflow does not replace those inputs with repository
+variables or secrets.
+
 The driver receives an isolated user profile, Codex home, Workflow Home, target
 repository path, scenario name, and evidence path through environment variables.
 It must write the final structured setup response to that evidence path. The
