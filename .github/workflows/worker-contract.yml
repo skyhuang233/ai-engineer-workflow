@@ -226,8 +226,11 @@ jobs:
         run: |
           $maximumAttempts = 3
           for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
-            $env:GHCR_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin
-            if ($LASTEXITCODE -eq 0) { break }
+            $loginDiagnostic = @($env:GHCR_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin 2>&1)
+            $loginExitCode = $LASTEXITCODE
+            $loginDiagnostic | ForEach-Object { Write-Host $_ }
+            if ($loginExitCode -eq 0) { break }
+            if (($loginDiagnostic | Out-String) -cnotmatch '(?i)\bEOF\b') { throw 'authenticate exact qualification Worker image failed' }
             if ($attempt -eq $maximumAttempts) { throw 'authenticate exact qualification Worker image failed' }
             Start-Sleep -Seconds (5 * $attempt)
           }
