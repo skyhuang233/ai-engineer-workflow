@@ -235,7 +235,10 @@ function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
     & $Prepare $target
     $result = Invoke-DriverPhase $Name $target 'initial'
     if ($Name -in @("clean-new-repository","unrelated-dirty-files","second-same-owner")) {
-        if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $false) { throw "Scenario '$Name' bypassed the repository owner merge gate" }
+        if ($result.platform_ready -ne $true -or $result.repository_admitted -ne $false) {
+            $driverEvidence = "blocker='$([string]$result.blocker)', gate_kind='$([string]$result.gate_kind)', pull_request='$([string]$result.pull_request)'"
+            throw "Scenario '$Name' bypassed the repository owner merge gate ($driverEvidence)"
+        }
         Wait-ForOwnerMerge $result 'repository_onboarding'
         $result = Invoke-DriverPhase $Name $target 'onboarding-resume' ([string]$result.onboarding_plan_digest)
         if ($Name -eq 'clean-new-repository') {

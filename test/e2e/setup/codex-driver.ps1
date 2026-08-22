@@ -83,6 +83,7 @@ try {
         'initial' {
 @"
 Run the complete Setup Skill flow from candidate acquisition through the exact Repository Onboarding owner merge gate. For a positive scenario, stop at that gate and return gate_kind="repository_onboarding", the exact onboarding_plan_digest, pull_request URL, pull_head SHA, and approved merge_method. Do not merge the pull request. Set every delivery field to null.
+Do not return from a positive scenario until either that exact gate is reached or the Setup Skill reports a non-repairable blocker. A command error is not by itself a blocker: follow the skill's same-attempt repair rules first. Never delete, archive, rename, or transfer a scenario repository and never close its Pull Requests; the qualification harness alone owns disposable-resource cleanup, including after a blocker.
 "@
         }
         'onboarding-resume' {
@@ -113,7 +114,7 @@ Positive scenarios clean-new-repository, unrelated-dirty-files, and second-same-
 
 Return only the JSON object required by the supplied output schema. Include every disposable repository created or discovered during this scenario in temporary_repositories. Use null blocker on success; otherwise provide the exact blocker. Always populate every schema field, using null only when that field does not apply to the current phase.
 "@
-    $prompt | & codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ephemeral --ignore-user-config --json --output-schema $schemaPath --output-last-message $agentResultPath -C $repositoryPath - 2>&1 | Set-Content -LiteralPath $eventsPath -Encoding utf8
+    $prompt | & codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ephemeral --ignore-user-config -c 'model_reasoning_effort="high"' --json --output-schema $schemaPath --output-last-message $agentResultPath -C $repositoryPath - 2>&1 | Set-Content -LiteralPath $eventsPath -Encoding utf8
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $agentResultPath -PathType Leaf)) { throw "Codex setup interaction failed" }
     $events = Get-Content -LiteralPath $eventsPath -Raw
     if ($events.Contains($setupToken)) { throw "Codex event stream leaked the setup PAT" }

@@ -26,6 +26,7 @@ func TestRepositoryOwnedCodexDriverImplementsQualificationContract(t *testing.T)
 		`Do not call gh repo create or push the repository directly`, `PAT verification must complete before any GitHub mutation`,
 		`$setup-agent-workflow`, `codex exec`, `--output-schema`, `--output-last-message`,
 		`--dangerously-bypass-approvals-and-sandbox`, `npx --yes skills@latest add`, `temporary_repositories`,
+		`model_reasoning_effort="high"`, `qualification harness alone owns disposable-resource cleanup`,
 		`Get-DisposableRepositories`, `result leaked the setup PAT`,
 		`gate_kind="repository_onboarding"`, `gate_kind="worker_delivery"`, `Ticket #$ticket is projected as Delivered`, `Plan #$deliveryPlan is projected as Completed`,
 	} {
@@ -165,7 +166,7 @@ func TestHarnessComparesMergedProducerToQualifiedGitBlob(t *testing.T) {
 
 func TestHarnessPreservesQualificationFailureAndRunsEveryCleanup(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
-	for _, required := range []string{"$qualificationError = $null", "$qualificationError = $_.Exception", "$failures.Add(\"Qualification failed:", "$failures.Add(\"Cleanup failed:", "foreach ($repository in $repositories)", "docker ps -aq", "foreach ($name in $prior.Keys)", "Remove-Item -LiteralPath $resolvedRoot"} {
+	for _, required := range []string{"$qualificationError = $null", "$qualificationError = $_.Exception", "$failures.Add(\"Qualification failed:", "$failures.Add(\"Cleanup failed:", "$driverEvidence", "blocker='$([string]$result.blocker)'", "foreach ($repository in $repositories)", "docker ps -aq", "foreach ($name in $prior.Keys)", "Remove-Item -LiteralPath $resolvedRoot"} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("setup harness does not preserve primary failure while completing cleanup: missing %q", required)
 		}
