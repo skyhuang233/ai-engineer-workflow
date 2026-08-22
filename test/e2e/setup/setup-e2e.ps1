@@ -114,7 +114,12 @@ function Wait-ForWorkflowContractCheck([string]$Repository, [string]$Head) {
     while ($true) {
         $checksRaw = gh api "repos/$Repository/commits/$Head/check-runs?check_name=workflow-contract&filter=latest&per_page=100"
         $checksExit = $LASTEXITCODE
-        if ($checksExit -ne 0) { throw "Owner merge workflow-contract check cannot be read" }
+        if ($checksExit -ne 0) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for the exact GitHub Actions workflow-contract check after transient GitHub API failures" }
+            Write-Warning "GitHub API read failed while awaiting the workflow-contract check; retrying within the owner merge timeout"
+            Start-Sleep -Seconds 10
+            continue
+        }
         $checks = $checksRaw | ConvertFrom-Json
         $trusted = @($checks.check_runs | Where-Object {
             [string]$_.name -ceq 'workflow-contract' -and
@@ -176,7 +181,12 @@ function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
         while ($true) {
             $pullRaw = gh api "repos/$repository/pulls/$number"
             $pullExit = $LASTEXITCODE
-            if ($pullExit -ne 0) { throw "Owner merge pull request cannot be read while awaiting authorization" }
+            if ($pullExit -ne 0) {
+                if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for the repository owner because the exact pull request could not be read" }
+                Write-Warning "GitHub API read failed while awaiting owner authorization; retrying within the owner merge timeout"
+                Start-Sleep -Seconds 15
+                continue
+            }
             $pull = $pullRaw | ConvertFrom-Json
             if ([string]$pull.head.sha -cne [string]$Gate.pull_head) { throw "Owner merge pull request head changed while awaiting authorization" }
             if (-not [string]::IsNullOrWhiteSpace([string]$pull.merged_at)) {
@@ -366,6 +376,15 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
     $qualificationError = $_.Exception
 } finally {
 	$scenarioToken = $env:GH_TOKEN
+    Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+    $workflowExecutable = Join-Path $workflowHome "bin\workflow.exe"
+    if (Test-Path -LiteralPath $workflowExecutable -PathType Leaf) {
+        try {
+            & $workflowExecutable stop --workflow-home $workflowHome --timeout 30s | Out-Null
+            $controlPlaneStopExit = $LASTEXITCODE
+            if ($controlPlaneStopExit -ne 0) { $cleanupErrors.Add("Cannot stop the Control Plane before cleanup (exit $controlPlaneStopExit)") }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
+    }
 	$env:GH_TOKEN = $cleanupToken
     $cleanupAfter = @()
     try {

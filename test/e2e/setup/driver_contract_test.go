@@ -129,10 +129,11 @@ func TestHarnessCopiesExistingCodexAuthIntoDisposableProfile(t *testing.T) {
 func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
 	lines := strings.Split(strings.ReplaceAll(read(t, "setup-e2e.ps1"), "\r\n", "\n"), "\n")
 	for command, assignment := range map[string]string{
-		"gh repo list":   "$listExit = $LASTEXITCODE",
-		"gh repo delete": "$deleteExit = $LASTEXITCODE",
-		"docker ps -aq":  "$dockerListExit = $LASTEXITCODE",
-		"docker rm -f":   "$dockerRemoveExit = $LASTEXITCODE",
+		"workflowExecutable stop": "$controlPlaneStopExit = $LASTEXITCODE",
+		"gh repo list":            "$listExit = $LASTEXITCODE",
+		"gh repo delete":          "$deleteExit = $LASTEXITCODE",
+		"docker ps -aq":           "$dockerListExit = $LASTEXITCODE",
+		"docker rm -f":            "$dockerRemoveExit = $LASTEXITCODE",
 	} {
 		found := false
 		for index, line := range lines {
@@ -143,6 +144,28 @@ func TestHarnessCapturesNativeCleanupExitCodesImmediately(t *testing.T) {
 		if !found {
 			t.Fatalf("%s does not immediately preserve its native exit code in %s", command, assignment)
 		}
+	}
+}
+
+func TestHarnessRetriesTransientGitHubReadsWithinOwnerDeadline(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	for _, required := range []string{
+		"workflow-contract check; retrying within the owner merge timeout",
+		"owner authorization; retrying within the owner merge timeout",
+		"continue",
+	} {
+		if !strings.Contains(harness, required) {
+			t.Fatalf("setup harness does not tolerate transient GitHub reads: missing %q", required)
+		}
+	}
+}
+
+func TestHarnessStopsControlPlaneBeforeRemovingQualificationRoot(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	stop := strings.LastIndex(harness, `& $workflowExecutable stop --workflow-home $workflowHome --timeout 30s`)
+	remove := strings.LastIndex(harness, "Remove-Item -LiteralPath $resolvedRoot")
+	if stop < 0 || remove < 0 || stop > remove {
+		t.Fatal("setup harness does not stop the Control Plane before removing qualification files")
 	}
 }
 
