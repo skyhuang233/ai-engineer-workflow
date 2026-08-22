@@ -160,6 +160,25 @@ func TestHarnessRetriesTransientGitHubReadsWithinOwnerDeadline(t *testing.T) {
 	}
 }
 
+func TestQualificationRepositoryDiscoveryIsScopedToCurrentRun(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	driver := read(t, "codex-driver.ps1")
+	for name, content := range map[string]string{"harness": harness, "driver": driver} {
+		if !strings.Contains(content, `workflow-setup-e2e-$runID-`) {
+			t.Fatalf("%s does not scope disposable repository discovery to the current qualification run", name)
+		}
+	}
+	for _, required := range []string{
+		`$runRepositoryPrefix = "$GitHubOwner/workflow-setup-e2e-$runID-"`,
+		`StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)`,
+		`StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)`,
+	} {
+		if !strings.Contains(harness+"\n"+driver, required) {
+			t.Fatalf("qualification repository fencing is missing %q", required)
+		}
+	}
+}
+
 func TestHarnessStopsControlPlaneBeforeRemovingQualificationRoot(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
 	stop := strings.LastIndex(harness, `& $workflowExecutable stop --workflow-home $workflowHome --timeout 30s`)

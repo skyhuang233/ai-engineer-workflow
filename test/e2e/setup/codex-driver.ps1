@@ -57,7 +57,7 @@ $installedSkill = Join-Path $env:USERPROFILE ".agents\skills\setup-agent-workflo
 
 function Get-DisposableRepositories {
     if ($scenario -eq "organization-rejects-classic-pat") { return @() }
-    $prefix = "workflow-setup-e2e-"
+    $prefix = "$owner/workflow-setup-e2e-$runID-"
     $priorGitHubToken = $env:GH_TOKEN
     try {
         $env:GH_TOKEN = $setupToken
@@ -66,7 +66,7 @@ function Get-DisposableRepositories {
     } finally {
         if ($null -eq $priorGitHubToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $priorGitHubToken }
     }
-    return @($raw | Where-Object { ([string]$_).StartsWith("$owner/$prefix") })
+    return @($raw | Where-Object { ([string]$_).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
 }
 
 $before = @(Get-DisposableRepositories)

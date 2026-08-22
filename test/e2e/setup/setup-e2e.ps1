@@ -39,6 +39,7 @@ $repositories = [Collections.Generic.List[string]]::new()
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
+$runRepositoryPrefix = "$GitHubOwner/workflow-setup-e2e-$runID-"
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
 $patInputPath = Join-Path $qualificationRoot "setup-pat.stdin"
@@ -64,7 +65,7 @@ $prior = @{
 }
 try {
 $env:GH_TOKEN = $cleanupToken
-$cleanupBaseline = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
+$cleanupBaseline = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase) })
 if ($LASTEXITCODE -ne 0) { throw "Cleanup credential cannot enumerate disposable repositories" }
 $env:GH_TOKEN = $setupToken
 # The deletion credential is harness-only and must never enter Codex or a Worker.
@@ -103,7 +104,7 @@ function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [str
     if ($raw.Contains($setupToken)) { throw "Scenario '$Name' leaked a credential into evidence" }
     $result = $raw | ConvertFrom-Json
     foreach ($repository in @($result.temporary_repositories)) {
-        if (-not ([string]$repository).StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Driver returned an unsafe cleanup repository '$repository'" }
+        if (-not ([string]$repository).StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Driver returned a cleanup repository outside this qualification run '$repository'" }
         $repositories.Add([string]$repository)
     }
     return $result
@@ -161,7 +162,7 @@ function Wait-ForOwnerMerge($Gate, [string]$ExpectedGate) {
     $parts = $uri.AbsolutePath.Trim('/').Split('/')
     $repository = $parts[0] + '/' + $parts[1]
     $number = [long]$parts[3]
-    if (-not $repository.StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Owner merge gate escaped the disposable repository boundary" }
+    if (-not $repository.StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Owner merge gate escaped this qualification run's repository boundary" }
     $savedToken = $env:GH_TOKEN
     try {
         $env:GH_TOKEN = $setupToken
@@ -211,7 +212,7 @@ function Assert-ControlPlaneCompletion([string]$Target, [long]$DeliveryPlan, [lo
     if ($originExit -ne 0 -or $origin.Trim() -cnotmatch '^https://github\.com/(?<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$') { throw "Completed delivery repository lacks a canonical GitHub origin" }
     $repository = $Matches.repository
     if ($repository.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) { $repository = $repository.Substring(0, $repository.Length - 4) }
-    if (-not $repository.StartsWith("$GitHubOwner/workflow-setup-e2e-")) { throw "Completed delivery escaped the disposable repository boundary" }
+    if (-not $repository.StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Completed delivery escaped this qualification run's repository boundary" }
     $savedToken = $env:GH_TOKEN
     try {
         $env:GH_TOKEN = $setupToken
@@ -388,7 +389,7 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
 	$env:GH_TOKEN = $cleanupToken
     $cleanupAfter = @()
     try {
-        $cleanupAfter = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith("$GitHubOwner/workflow-setup-e2e-") })
+        $cleanupAfter = @(gh repo list $GitHubOwner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner" | Where-Object { ([string]$_).StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase) })
         $listExit = $LASTEXITCODE
         if ($listExit -ne 0) { $cleanupErrors.Add("Cleanup credential cannot enumerate repositories after qualification (exit $listExit)") }
     } catch { $cleanupErrors.Add($_.Exception.Message) }
