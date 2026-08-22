@@ -325,10 +325,9 @@ func TestBackupDrillRequiresCurrentCandidateDeliverySource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sharedRoot := t.TempDir()
-	workspaceRoot := filepath.Join(sharedRoot, "repository-workspaces")
+	workspaceRoot := t.TempDir()
 	workspace := filepath.Join(workspaceRoot, claim.SessionID)
-	deliverySource := filepath.Join(sharedRoot, ".delivery-sources", claim.SessionID, "round-0.git")
+	deliverySource := filepath.Join(workspaceRoot, ".delivery-sources", claim.SessionID, "round-0.git")
 	if err := os.MkdirAll(deliverySource, 0o700); err != nil {
 		t.Fatal(err)
 	}

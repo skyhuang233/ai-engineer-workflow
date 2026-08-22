@@ -448,55 +448,6 @@ func TestReclaimSupersededDeliverySourcesKeepsAcceptedRevision(t *testing.T) {
 	}
 }
 
-func TestEnsureDeliverySourceStagesOutsideLongWindowsSessionPath(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("requires Git for Windows path handling")
-	}
-	ctx := context.Background()
-	root := t.TempDir()
-	source := filepath.Join(root, "source")
-	if err := runGit(ctx, "", "init", "-b", "main", source); err != nil {
-		t.Fatal(err)
-	}
-	configureDeliverySourceTestIdentity(t, ctx, source)
-	writeDeliverySourceCommit(t, ctx, source, "first")
-
-	padding := 190 - len(root)
-	if padding < 1 {
-		padding = 1
-	}
-	manager := WorkspaceManager{
-		RootDir:            filepath.Join(root, strings.Repeat("w", padding)),
-		DeliverySourceRoot: filepath.Join(root, ".delivery-sources"),
-	}
-	sessionID := "ts-" + strings.Repeat("a", 32)
-	revisionRoundID := "rr-" + strings.Repeat("b", 32)
-	destination, err := manager.deliverySourcePath(sessionID, revisionRoundID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyDestination := filepath.Join(manager.RootDir, ".delivery-sources", sessionID, revisionRoundID+".git")
-	legacyObjectPath := filepath.Join(legacyDestination, "objects", "aa", strings.Repeat("b", 38))
-	if len(legacyObjectPath) <= 260 {
-		t.Fatalf("test legacy Delivery Source object path length = %d, want > 260", len(legacyObjectPath))
-	}
-	objectPath := filepath.Join(destination, "objects", "aa", strings.Repeat("b", 38))
-	if len(objectPath) > 260 {
-		t.Fatalf("configured Delivery Source object path length = %d, want <= 260", len(objectPath))
-	}
-
-	got, err := manager.ensureDeliverySource(ctx, sessionID, revisionRoundID, source)
-	if err != nil {
-		t.Fatalf("ensure Delivery Source at long Windows path: %v", err)
-	}
-	if got != destination {
-		t.Fatalf("Delivery Source path = %q, want %q", got, destination)
-	}
-	if err := validateDeliverySource(ctx, got); err != nil {
-		t.Fatalf("validate long-path Delivery Source: %v", err)
-	}
-}
-
 func TestDeliverySourceReadableFromLinuxDockerOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("requires a Windows host")

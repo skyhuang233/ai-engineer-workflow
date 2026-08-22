@@ -9,12 +9,12 @@
     "repository_admitted": { "type": "boolean" },
     "temporary_repositories": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/workflow-setup-e2e-[A-Za-z0-9_.-]+$" }
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/wf-e2e-[0-9a-f]{12}-[a-z0-9-]+$" }
     },
     "blocker": { "type": ["string", "null"] },
     "gate_kind": { "type": ["string", "null"], "enum": ["repository_onboarding", "worker_delivery", null] },
     "onboarding_plan_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
-    "pull_request": { "type": ["string", "null"], "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/workflow-setup-e2e-[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$" },
+    "pull_request": { "type": ["string", "null"], "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/wf-e2e-[0-9a-f]{12}-[a-z0-9-]+/pull/[1-9][0-9]*$" },
     "pull_head": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "merge_method": { "type": ["string", "null"], "enum": ["merge", "squash", "rebase", null] },
     "delivery_plan": { "type": ["integer", "null"], "minimum": 1 },

@@ -20,7 +20,6 @@ import (
 
 type WorkspaceManager struct {
 	RootDir               string
-	DeliverySourceRoot    string
 	CodexStateRoot        string
 	CodexAuthFile         string
 	RefreshDeliverySource func(context.Context, string) (string, error)
@@ -450,18 +449,11 @@ func (m WorkspaceManager) deliverySourceSessionPath(sessionID string) (string, e
 	if err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve workspace root: %w", err))
 	}
-	deliveryRoot := strings.TrimSpace(m.DeliverySourceRoot)
-	boundary := workspaceRoot
-	if deliveryRoot == "" {
-		deliveryRoot = filepath.Join(workspaceRoot, ".delivery-sources")
-	} else {
-		boundary = filepath.Dir(workspaceRoot)
-	}
-	root, err := canonicalPath(deliveryRoot)
+	root, err := canonicalPath(filepath.Join(workspaceRoot, ".delivery-sources"))
 	if err != nil {
 		return "", deliverySourceInfrastructureError(fmt.Errorf("resolve Delivery Source root: %w", err))
 	}
-	if _, err := managedPath(boundary, root); err != nil {
+	if _, err := managedPath(workspaceRoot, root); err != nil {
 		return "", deliverySourceIntegrityError(err)
 	}
 	path, err := canonicalPath(filepath.Join(root, sessionID))
@@ -520,14 +512,7 @@ func (m WorkspaceManager) ensureDeliverySource(ctx context.Context, sessionID, r
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", deliverySourceInfrastructureError(err)
 	}
-	// Git for Windows still creates fetched loose objects through relative
-	// ./objects paths. Staging beneath the session directory can therefore
-	// exceed MAX_PATH before the completed repository is made persistent, even
-	// with core.longpaths enabled. Build at the shallower managed workspace root
-	// and atomically move the validated bare repository into the session path.
-	// Production configures a shared Delivery Source root that deliberately
-	// omits the repository slug, keeping both staging and final Git paths short.
-	temporaryPath, err := os.MkdirTemp(filepath.Dir(root), ".delivery-source-")
+	temporaryPath, err := os.MkdirTemp(root, ".delivery-")
 	if err != nil {
 		return "", deliverySourceInfrastructureError(err)
 	}

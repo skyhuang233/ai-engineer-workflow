@@ -22,7 +22,6 @@ import (
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
-	"github.com/skyhuang233/workflow/internal/deliverysource"
 	"github.com/skyhuang233/workflow/internal/doctor"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
@@ -485,7 +484,7 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, DeliverySourceRoot: deliverysource.SharedRoot(*workspaceRoot), CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
@@ -696,7 +695,7 @@ func runPollGitHub(args []string) {
 	}
 	provider := &verifiedGitHubPATSource{Database: db, Config: config}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, DeliverySourceRoot: deliverysource.SharedRoot(*workspaceRoot), CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot, ControlPlaneID: controlPlaneContainerID(*databasePath)}

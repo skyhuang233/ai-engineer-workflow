@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -107,6 +108,33 @@ func TestDriverResultSchemaUsesCodexStructuredOutputsSubset(t *testing.T) {
 	schema := read(t, "driver-result.schema.json")
 	if strings.Contains(schema, `"uniqueItems"`) {
 		t.Fatal("driver result schema uses unsupported Codex Structured Outputs keyword uniqueItems")
+	}
+}
+
+func TestDriverResultSchemaAcceptsOnlyCurrentRunShortRepositoryNames(t *testing.T) {
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(read(t, "driver-result.schema.json")), &schema); err != nil {
+		t.Fatal(err)
+	}
+	properties := schema["properties"].(map[string]any)
+	repositoryPattern := properties["temporary_repositories"].(map[string]any)["items"].(map[string]any)["pattern"].(string)
+	pullRequestPattern := properties["pull_request"].(map[string]any)["pattern"].(string)
+
+	repository := regexp.MustCompile(repositoryPattern)
+	pullRequest := regexp.MustCompile(pullRequestPattern)
+	if !repository.MatchString("skyhuang233/wf-e2e-a1b2c3d4e5f6-clean") {
+		t.Fatal("driver result schema rejects the current short repository name")
+	}
+	if !pullRequest.MatchString("https://github.com/skyhuang233/wf-e2e-a1b2c3d4e5f6-clean/pull/1") {
+		t.Fatal("driver result schema rejects a pull request from the current short repository")
+	}
+	for _, retired := range []string{
+		"skyhuang233/workflow-setup-e2e-a1b2c3d4e5f6-clean",
+		"skyhuang233/wf-e2e-a1b2c3d4e5-clean",
+	} {
+		if repository.MatchString(retired) {
+			t.Fatalf("driver result schema accepts retired or unscoped repository name %q", retired)
+		}
 	}
 }
 

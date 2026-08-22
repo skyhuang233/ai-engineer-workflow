@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/skyhuang233/workflow/internal/deliverysource"
 	"modernc.org/sqlite"
 )
 
@@ -290,7 +289,7 @@ WHERE s.state = ? AND candidate.delivery_source_digest != ''`, SessionRunning)
 			rows.Close()
 			return backupReferences{}, errors.New("current Candidate has no workspace path for Delivery Source provenance")
 		}
-		references.deliverySources = append(references.deliverySources, referenceForPath(deliverysource.RevisionPathForWorkspace(workspace, sessionID, fmt.Sprintf("round-%d", recoveryEpoch))))
+		references.deliverySources = append(references.deliverySources, referenceForPath(filepath.Join(filepath.Dir(workspace), ".delivery-sources", sessionID, fmt.Sprintf("round-%d.git", recoveryEpoch))))
 	}
 	if err := rows.Close(); err != nil {
 		return backupReferences{}, err
