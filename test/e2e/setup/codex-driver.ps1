@@ -91,6 +91,7 @@ Do not return from a positive scenario until either that exact gate is reached o
             $approvedDigest = Require-Environment "WORKFLOW_SETUP_E2E_APPROVED_DIGEST"
 @"
 The repository owner has merged the exact Onboarding Pull Request for approved digest $approvedDigest. Do not reinstall, reacquire, replan, or repeat Setup. Resume the stored immutable Onboarding Plan by calling onboarding apply with digest $approvedDigest and no stdin, then verify Repository Admission with the same digest. For scenario clean-new-repository only, use the installed `$agent-workflow skill to publish, approve, activate, and runtime-bind one Delivery Plan with one executable ticket that adds a file named workflow-release-qualification.txt containing the exact line `workflow-v$platformVersion qualified`. Wait for its Worker pull request and required checks, then stop for the owner with gate_kind="worker_delivery", its exact pull_request, pull_head, merge_method, delivery_plan issue number, and ticket issue number. Do not merge it. For every other positive scenario, finish with both readiness gates and gate_kind null.
+Do not return from this positive phase until either that exact Worker owner gate is reached or the agent-workflow skill reports a non-repairable blocker. A command error is not by itself a blocker: follow the skill's same-attempt repair rules first.
 "@
         }
         'delivery-resume' {

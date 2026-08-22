@@ -106,7 +106,7 @@ function Invoke-DriverPhase([string]$Name, [string]$Target, [string]$Phase, [str
     $result = $raw | ConvertFrom-Json
     foreach ($repository in @($result.temporary_repositories)) {
         if (-not ([string]$repository).StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Driver returned a cleanup repository outside this qualification run '$repository'" }
-        $repositories.Add([string]$repository)
+        if ($repository -notin $repositories) { $repositories.Add([string]$repository) }
     }
     return $result
 }

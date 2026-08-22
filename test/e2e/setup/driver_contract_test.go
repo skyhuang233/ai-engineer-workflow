@@ -206,6 +206,28 @@ func TestHarnessRetriesTransientGitHubReadsWithinOwnerDeadline(t *testing.T) {
 	}
 }
 
+func TestPositiveCodexPhasesDoNotReturnBeforeTheirExactOwnerGate(t *testing.T) {
+	driver := read(t, "codex-driver.ps1")
+	for _, required := range []string{
+		"Do not return from a positive scenario until either that exact gate is reached or the Setup Skill reports a non-repairable blocker.",
+		"Do not return from this positive phase until either that exact Worker owner gate is reached or the agent-workflow skill reports a non-repairable blocker.",
+	} {
+		if !strings.Contains(driver, required) {
+			t.Fatalf("positive Codex phases must enforce %q", required)
+		}
+	}
+	if strings.Count(driver, "A command error is not by itself a blocker:") != 2 {
+		t.Fatal("initial and onboarding-resume phases must both repair command errors before returning")
+	}
+}
+
+func TestHarnessRecordsEachDisposableRepositoryOnce(t *testing.T) {
+	harness := read(t, "setup-e2e.ps1")
+	if strings.Count(harness, "if ($repository -notin $repositories)") != 2 {
+		t.Fatal("setup harness does not deduplicate repositories from repeated driver phases before cleanup")
+	}
+}
+
 func TestQualificationRepositoryDiscoveryIsScopedToCurrentRun(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
 	driver := read(t, "codex-driver.ps1")
