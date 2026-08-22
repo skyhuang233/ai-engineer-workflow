@@ -164,12 +164,14 @@ func TestQualificationRepositoryDiscoveryIsScopedToCurrentRun(t *testing.T) {
 	harness := read(t, "setup-e2e.ps1")
 	driver := read(t, "codex-driver.ps1")
 	for name, content := range map[string]string{"harness": harness, "driver": driver} {
-		if !strings.Contains(content, `workflow-setup-e2e-$runID-`) {
+		if !strings.Contains(content, `$runID.Substring(0, 12)`) || !strings.Contains(content, `wf-e2e-$runRepositoryID-`) {
 			t.Fatalf("%s does not scope disposable repository discovery to the current qualification run", name)
 		}
 	}
 	for _, required := range []string{
-		`$runRepositoryPrefix = "$GitHubOwner/workflow-setup-e2e-$runID-"`,
+		`$runRepositoryPrefix = "$GitHubOwner/wf-e2e-$runRepositoryID-"`,
+		`"clean-new-repository" { "clean" }`,
+		`"wf-e2e-" + $runRepositoryID + "-" + $repositorySuffix`,
 		`StartsWith($runRepositoryPrefix, [StringComparison]::OrdinalIgnoreCase)`,
 		`StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)`,
 	} {

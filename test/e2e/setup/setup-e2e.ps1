@@ -39,7 +39,8 @@ $repositories = [Collections.Generic.List[string]]::new()
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $qualificationError = $null
 $runID = [Guid]::NewGuid().ToString("N")
-$runRepositoryPrefix = "$GitHubOwner/workflow-setup-e2e-$runID-"
+$runRepositoryID = $runID.Substring(0, 12)
+$runRepositoryPrefix = "$GitHubOwner/wf-e2e-$runRepositoryID-"
 $cleanupToken = $env:WORKFLOW_SETUP_E2E_CLEANUP_TOKEN
 $setupToken = $env:WORKFLOW_SETUP_E2E_PAT
 $patInputPath = Join-Path $qualificationRoot "setup-pat.stdin"
@@ -241,7 +242,17 @@ function Assert-ControlPlaneCompletion([string]$Target, [long]$DeliveryPlan, [lo
 }
 
 function Invoke-Scenario([string]$Name, [scriptblock]$Prepare) {
-    $target = Join-Path $qualificationRoot ("workflow-setup-e2e-" + $runID + "-" + $Name)
+    $repositorySuffix = switch ($Name) {
+        "clean-new-repository" { "clean" }
+        "unrelated-dirty-files" { "dirty" }
+        "managed-path-drift" { "drift" }
+        "non-github-origin" { "non-gh" }
+        "second-same-owner" { "second" }
+        "different-owner" { "other" }
+        "organization-rejects-classic-pat" { "org-pat" }
+        default { throw "Unknown qualification scenario '$Name'" }
+    }
+    $target = Join-Path $qualificationRoot ("wf-e2e-" + $runRepositoryID + "-" + $repositorySuffix)
     New-Item -ItemType Directory -Force -Path $target | Out-Null
     & $Prepare $target
     $result = Invoke-DriverPhase $Name $target 'initial'
@@ -345,7 +356,7 @@ function Initialize-PublishedFixture([string]$Target, [string]$Repository) {
         git -C $target init -b main | Out-Null
         [IO.File]::WriteAllText((Join-Path $target "README.md"), "baseline`n")
         git -C $target add README.md; git -C $target -c user.name=e2e -c user.email=e2e@localhost commit -m baseline | Out-Null
-		$publishedDirtyRepository = "$GitHubOwner/workflow-setup-e2e-$runID-published-dirty"
+		$publishedDirtyRepository = "${runRepositoryPrefix}published"
 		gh repo create $publishedDirtyRepository --private --source $target --remote origin --push
 		if ($LASTEXITCODE -ne 0) { throw "Cannot create the published dirty fixture repository" }
 		$repositories.Add($publishedDirtyRepository)
