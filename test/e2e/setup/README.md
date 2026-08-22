@@ -45,8 +45,11 @@ operator's source from the redacted machine-readable `codex doctor --json`
 report, verifies its ChatGPT mode and `CODEX_HOME` boundary, and copies it into
 the disposable profile; the driver never captures or reports its contents. The
 test-only `WORKFLOW_CODEX_AUTH_FILE` override is not needed. It also discovers newly
-created `workflow-setup-e2e-*` repositories independently of the agent's final
-response so cleanup remains possible after an interaction failure.
+created `wf-e2e-<12-hex-run-id>-*` repositories independently of the agent's
+final response so cleanup remains possible after an interaction failure. This
+release qualification intentionally covers only these short repository names;
+long repository names and the Windows 260-character path boundary are outside
+its scope.
 
 The driver output must satisfy `driver-result.schema.json`. Positive scenarios
 pause first at the exact Repository Onboarding pull request and, for the clean
