@@ -220,11 +220,17 @@ jobs:
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
       - name: Authenticate exact qualification Worker image
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $maximumAttempts = 3
+          for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+            $env:GHCR_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $maximumAttempts) { throw 'authenticate exact qualification Worker image failed' }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
       - name: Qualify exact candidate setup and full delivery operation
         shell: pwsh
         env:
@@ -277,3 +283,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $digest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw 'resolve qualified candidate container digest failed' }
           docker buildx imagetools inspect "$repository@$digest" | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'verify qualified candidate container digest failed' }
+      - name: Remove qualification registry credentials
+        if: always()
+        shell: pwsh
+        run: docker logout ghcr.io
