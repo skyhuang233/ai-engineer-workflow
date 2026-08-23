@@ -1,4 +1,0 @@
-interface:
-  display_name: "Agent Workflow"
-  short_description: "Operate plans, tickets, inbox, and delivery"
-  default_prompt: "Use $agent-workflow to operate this repository's admitted delivery workflow."

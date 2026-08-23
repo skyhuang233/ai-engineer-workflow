@@ -1,6 +1,0 @@
-interface:
-  display_name: "Setup Agent Workflow"
-  short_description: "Prepare this Windows host and repository for Agent Workflow"
-  default_prompt: "Run $setup-agent-workflow in the current repository and guide me through the two approved setup plans."
-policy:
-  allow_implicit_invocation: false
