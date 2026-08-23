@@ -299,6 +299,7 @@ jobs:
           $qualifiedSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
           $allowedQualificationOnlyChanges = @(
             '.github/workflows/worker-contract.yml',
+            'docs/adr/0002-accept-a-release-blackout-for-the-version-reset.md',
             'internal/doctor/publish_workflow_test.go'
           )
           $qualificationOnlyChanges = @(git diff --name-only $qualifiedSource HEAD)
