@@ -24,6 +24,7 @@ const (
 	StateActive         = "active"
 	StateCompleted      = "completed"
 	LatestSchemaVersion = 63
+	sqliteBusyTimeout   = 5 * time.Second
 )
 
 var (
@@ -327,6 +328,7 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 
 func (s *Store) configure(ctx context.Context) error {
 	for _, statement := range []string{
+		fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeout.Milliseconds()),
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = FULL",
 		"PRAGMA foreign_keys = ON",
