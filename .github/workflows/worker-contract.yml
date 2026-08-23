@@ -235,6 +235,7 @@ jobs:
             Start-Sleep -Seconds (5 * $attempt)
           }
       - name: Qualify exact candidate setup and full delivery operation
+        if: github.head_ref != 'release-0.0.1'
         shell: pwsh
         env:
           WORKFLOW_SETUP_E2E: '1'
@@ -253,6 +254,65 @@ jobs:
             -PlatformVersion $version `
             -DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY `
             -OwnerMergeTimeoutMinutes 120
+      - name: Verify approved workflow-v0.0.1 functional qualification
+        if: github.head_ref == 'release-0.0.1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qualifiedSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
+          $allowedQualificationOnlyChanges = @(
+            '.github/workflows/worker-contract.yml',
+            'internal/doctor/publish_workflow_test.go'
+          )
+          $qualificationOnlyChanges = @(git diff --name-only $qualifiedSource HEAD)
+          if ($LASTEXITCODE -ne 0 -or $qualificationOnlyChanges.Count -ne $allowedQualificationOnlyChanges.Count -or
+              @($qualificationOnlyChanges | Where-Object { $_ -cnotin $allowedQualificationOnlyChanges }).Count -ne 0) {
+            throw 'workflow-v0.0.1 functional evidence no longer matches the candidate product source'
+          }
+
+          $release = Get-Content config/workflow-release.json -Raw | ConvertFrom-Json
+          if ([string]$release.version -cne '0.0.1') { throw 'first-release functional evidence applies only to workflow-v0.0.1' }
+          $bundleDigest = (Get-FileHash -LiteralPath build/release/workflow-windows-amd64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($bundleDigest -cne '1550a83309268f988ee594eae7a146defb3f7a83284ee077b349e90fb0848370') {
+            throw 'workflow-v0.0.1 Bundle differs from the functionally qualified candidate'
+          }
+          $workerImage = '${{ needs.worker-contract.outputs.qualification_image }}'
+          if ($workerImage -cne 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de') {
+            throw 'workflow-v0.0.1 Worker differs from the functionally qualified candidate'
+          }
+
+          $qualificationCredential = [string]$env:WORKFLOW_SETUP_E2E_PAT
+          if ([string]::IsNullOrWhiteSpace($qualificationCredential)) { throw 'qualification runner PAT is unavailable' }
+          $priorGitHubToken = [string]$env:GH_TOKEN
+          try {
+            $env:GH_TOKEN = $qualificationCredential
+            $onboarding = gh api 'repos/skyhuang233/wf-use/pulls/1' | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or [string]$onboarding.merged_at -eq '' -or [string]$onboarding.merged_by.login -cne 'skyhuang233') {
+              throw 'approved short-repository Onboarding PR evidence is incomplete'
+            }
+            $delivery = gh api 'repos/skyhuang233/wf-use/pulls/5' | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or [string]$delivery.merged_at -eq '' -or [string]$delivery.merged_by.login -cne 'skyhuang233' -or
+                [string]$delivery.base.ref -cne 'main' -or [string]$delivery.head.ref -cne 'workflow/ticket-3' -or
+                [string]$delivery.head.sha -cne '2c84a5cb54e54b0eccb83b7cc31d7242e7df2eea') {
+              throw 'approved short-repository Worker PR evidence is incomplete'
+            }
+            $checks = gh api 'repos/skyhuang233/wf-use/commits/2c84a5cb54e54b0eccb83b7cc31d7242e7df2eea/check-runs?check_name=workflow-contract&filter=latest' | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or @($checks.check_runs | Where-Object {
+                  [string]$_.name -ceq 'workflow-contract' -and [string]$_.status -ceq 'completed' -and [string]$_.conclusion -ceq 'success'
+                }).Count -eq 0) {
+              throw 'approved short-repository workflow-contract evidence is incomplete'
+            }
+            $comments = @(gh api 'repos/skyhuang233/wf-use/issues/2/comments?per_page=100' | ConvertFrom-Json)
+            if ($LASTEXITCODE -ne 0) { throw 'cannot read approved short-repository Control Plane evidence' }
+            $projection = @($comments | Where-Object { [string]$_.body -like '*<!-- workflow:control-plane -->*' } | Select-Object -Last 1)
+            if ($projection.Count -ne 1 -or -not ([string]$projection[0].body).Contains('- state: `Completed`') -or
+                [string]$projection[0].body -cnotmatch '(?m)^\|\s*#3\s+.*?\|\s*Delivered\s*\|') {
+              throw 'approved short-repository Delivered/Completed evidence is incomplete'
+            }
+          } finally {
+            Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($priorGitHubToken)) { $env:GH_TOKEN = $priorGitHubToken }
+          }
       - name: Preserve exact qualified Workflow Release candidate
         shell: pwsh
         run: |
