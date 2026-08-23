@@ -211,6 +211,7 @@ jobs:
           $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_HEAD_REF -cne "release-$version" -and $env:GITHUB_HEAD_REF -cne "hotfix-$version") { throw 'candidate branch and version differ' }
       - name: Assemble qualification candidate without publication
+        if: github.head_ref != 'release-0.0.1'
         shell: pwsh
         run: |
           & scripts/assemble-workflow-release.ps1 `
@@ -219,6 +220,42 @@ jobs:
             -QualificationRunAttempt '${{ github.run_attempt }}' `
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
+      - name: Assemble approved workflow-v0.0.1 qualification candidate
+        if: github.head_ref == 'release-0.0.1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qualifiedSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
+          $qualifiedWorktree = Join-Path $env:RUNNER_TEMP "workflow-v0.0.1-qualified-source-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $sourceSBOM = (Resolve-Path build/release-inputs/worker-sbom.spdx.json).Path
+          $sourceOutput = Join-Path $qualifiedWorktree 'build/release'
+          try {
+            git worktree add --detach $qualifiedWorktree $qualifiedSource
+            if ($LASTEXITCODE -ne 0) { throw 'create exact workflow-v0.0.1 qualified-source worktree failed' }
+            $checkedOutCommit = (git -C $qualifiedWorktree rev-parse HEAD).Trim()
+            $worktreeStatus = @(git -C $qualifiedWorktree status --porcelain)
+            if ($LASTEXITCODE -ne 0 -or $checkedOutCommit -cne $qualifiedSource -or $worktreeStatus.Count -ne 0) {
+              throw 'workflow-v0.0.1 qualified-source worktree is not an exact clean checkout'
+            }
+            Push-Location $qualifiedWorktree
+            try {
+              & scripts/assemble-workflow-release.ps1 `
+                -CandidateSourceCommit '${{ github.event.pull_request.head.sha }}' `
+                -QualificationRunID '${{ github.run_id }}' `
+                -QualificationRunAttempt '${{ github.run_attempt }}' `
+                -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
+                -SBOMPath $sourceSBOM -OutputDirectory $sourceOutput
+            } finally {
+              Pop-Location
+            }
+            New-Item -ItemType Directory -Force -Path build/release | Out-Null
+            Copy-Item -LiteralPath (Join-Path $sourceOutput 'worker-sbom.spdx.json'),(Join-Path $sourceOutput 'workflow-release.json'),(Join-Path $sourceOutput 'workflow-windows-amd64.zip') -Destination build/release
+          } finally {
+            if (Test-Path -LiteralPath $qualifiedWorktree) {
+              git worktree remove --force $qualifiedWorktree
+              if ($LASTEXITCODE -ne 0) { throw 'remove exact workflow-v0.0.1 qualified-source worktree failed' }
+            }
+          }
       - name: Authenticate exact qualification Worker image
         shell: pwsh
         env:

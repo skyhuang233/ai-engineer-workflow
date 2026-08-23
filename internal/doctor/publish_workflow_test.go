@@ -155,6 +155,11 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
+		"Assemble approved workflow-v0.0.1 qualification candidate",
+		"b35d239f4fe7e4ed55cb800942b2a36cf7468058",
+		"git worktree add --detach $qualifiedWorktree $qualifiedSource",
+		"workflow-v0.0.1 qualified-source worktree is not an exact clean checkout",
+		"git worktree remove --force $qualifiedWorktree",
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
 		"if: github.head_ref != 'release-0.0.1'",
 		"-GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER",
@@ -240,8 +245,8 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
 	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	if strings.Count(candidate, "& scripts/assemble-workflow-release.ps1") != 1 {
-		t.Fatal("qualification workflow does not use exactly one shared assembler")
+	if strings.Count(candidate, "& scripts/assemble-workflow-release.ps1") != 2 {
+		t.Fatal("qualification workflow does not route both mutually exclusive paths through the shared assembler")
 	}
 	if strings.Contains(candidate, "go run ./cmd/workflow-release assemble") {
 		t.Fatal("qualification workflow retains an independent release assembler")
