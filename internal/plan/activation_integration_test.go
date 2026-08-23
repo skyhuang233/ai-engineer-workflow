@@ -118,6 +118,7 @@ func TestActivationPreservesCompletedProjection(t *testing.T) {
 	if completed.State != store.StateCompleted || !contains(projector.body, "`Completed`") {
 		t.Fatalf("completed activation = %#v, body = %q", completed, projector.body)
 	}
+	t.Logf("Plan state=%s after its delivered Ticket was projected; projection contains Completed=%t", completed.State, contains(projector.body, "`Completed`"))
 }
 
 func TestActivationCompletesAnInitiallyDeliveredPlan(t *testing.T) {

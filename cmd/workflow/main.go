@@ -28,11 +28,11 @@ import (
 	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
 	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/plan"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/scheduler"
 	"github.com/skyhuang233/workflow/internal/startup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
@@ -40,7 +40,7 @@ const (
 	doctorVerificationTimeout = 10 * time.Minute
 )
 
-// Version is "dev" for source builds. Immutable Platform Release builds set
+// Version is "dev" for source builds. Immutable Workflow Release builds set
 // this exact variable with -ldflags "-X main.Version=<manifest-version>".
 var Version = "dev"
 
@@ -218,7 +218,7 @@ func validateWorkflowBuildVersion() error {
 	if Version == "dev" {
 		return nil
 	}
-	if err := platformrelease.ValidatePlatformVersion(Version); err != nil {
+	if err := workflowbundle.ValidateVersion(Version); err != nil {
 		return fmt.Errorf("invalid published Workflow CLI version: %w", err)
 	}
 	return nil
@@ -383,10 +383,10 @@ func runDoctor(args []string) {
 				Contains: []string{"resume", "--json", "--output-schema", "--ephemeral"},
 			}},
 		},
-		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Image, AuthFile: *codexAuthFile},
+		doctor.WorkerCodexSessionCheck{Executor: doctor.OSExecutor{}, Image: manifest.Worker.Image, AuthFile: *codexAuthFile},
 		doctor.SQLiteCheck{Path: *databasePath},
 		doctor.DockerCheck{Manifest: manifest},
-		doctor.WorkerRegistryCheck{Image: manifest.Image},
+		doctor.WorkerRegistryCheck{Image: manifest.Worker.Image},
 	}
 	patVerification, readErr := database.GitHubPATVerification(context.Background())
 	if readErr != nil {
@@ -426,18 +426,18 @@ func runDoctor(args []string) {
 		os.Exit(1)
 	}
 	if currentManifest != manifest || string(currentManifestJSON) != string(manifestJSON) {
-		fmt.Fprintln(os.Stderr, "Worker Release changed during doctor verification")
+		fmt.Fprintln(os.Stderr, "Workflow Release changed during doctor verification")
 		os.Exit(1)
 	}
 	if err := database.ActivateWorkerReleaseFenced(context.Background(), store.WorkerRelease{
-		Version: manifest.WorkerVersion, SourceCommit: manifest.SourceCommit,
-		ImageReference: manifest.Image, ManifestJSON: string(manifestJSON),
+		Version: manifest.Version, SourceCommit: manifest.CandidateSourceCommit,
+		ImageReference: manifest.Worker.Image, ManifestJSON: string(manifestJSON),
 		VerifiedAt: report.GeneratedAt, ActivatedAt: report.GeneratedAt,
 	}, expectedActiveImage); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("activated Worker image %s for new Worker Runs\n", manifest.Image)
+	fmt.Printf("activated Worker image %s for new Worker Runs\n", manifest.Worker.Image)
 }
 
 func runTicket(args []string) {

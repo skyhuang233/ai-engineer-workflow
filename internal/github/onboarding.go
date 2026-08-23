@@ -48,7 +48,11 @@ type OnboardingPullRequest struct {
 	MergeCommitSHA string `json:"merge_commit_sha"`
 	Mergeable      *bool  `json:"mergeable"`
 	MergeableState string `json:"mergeable_state"`
-	Head           struct {
+	MergedBy       struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"merged_by"`
+	Head struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"head"`
@@ -60,12 +64,6 @@ type OnboardingPullRequest struct {
 type PullRequestReview struct {
 	State string `json:"state"`
 }
-type MergeResult struct {
-	Merged  bool   `json:"merged"`
-	SHA     string `json:"sha"`
-	Message string `json:"message"`
-}
-
 type ActionsPermissions struct {
 	Enabled        bool   `json:"enabled"`
 	AllowedActions string `json:"allowed_actions"`
@@ -452,28 +450,6 @@ func (c *Client) OnboardingPullRequestReviews(ctx context.Context, repository st
 	}
 	err := c.RequestJSON(ctx, http.MethodGet, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10)+"/reviews?per_page=100", nil, &result)
 	return result, err
-}
-func (c *Client) MergeOnboardingPullRequest(ctx context.Context, repository string, number int64, expectedHead, method string) (MergeResult, error) {
-	var result MergeResult
-	if err := c.validateOnboardingMutationRepository(repository); err != nil {
-		return result, err
-	}
-	if !fullCommitID(expectedHead) {
-		return result, errors.New("expected pull request head must be a full commit")
-	}
-	switch method {
-	case "merge", "squash", "rebase":
-	default:
-		return result, errors.New("unsupported merge method")
-	}
-	body := map[string]string{"sha": expectedHead, "merge_method": method}
-	if err := c.RequestJSON(ctx, http.MethodPut, "/repos/"+repository+"/pulls/"+strconv.FormatInt(number, 10)+"/merge", body, &result); err != nil {
-		return result, err
-	}
-	if !result.Merged {
-		return result, fmt.Errorf("GitHub did not merge onboarding pull request: %s", result.Message)
-	}
-	return result, nil
 }
 func (c *Client) DeleteBranch(ctx context.Context, repository, branch string) error {
 	if err := c.validateOnboardingMutationRepository(repository); err != nil {

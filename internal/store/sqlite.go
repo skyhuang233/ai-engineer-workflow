@@ -23,7 +23,8 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 63
+	LatestSchemaVersion = 63
+	sqliteBusyTimeout   = 5 * time.Second
 )
 
 var (
@@ -110,9 +111,9 @@ func OpenReadOnly(ctx context.Context, dsn string) (*Store, error) {
 		store.Close()
 		return nil, fmt.Errorf("inspect workflow database schema read-only: %w", err)
 	}
-	if version != latestSchemaVersion {
+	if version != LatestSchemaVersion {
 		store.Close()
-		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, LatestSchemaVersion)
 	}
 	return store, nil
 }
@@ -140,12 +141,12 @@ func OpenActivated(ctx context.Context, dsn string) (*Store, error) {
 		return nil, err
 	}
 	version, err := store.schemaVersion(ctx)
-	if err != nil || version != latestSchemaVersion {
+	if err != nil || version != LatestSchemaVersion {
 		_ = store.Close()
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+		return nil, fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, LatestSchemaVersion)
 	}
 	return store, nil
 }
@@ -190,8 +191,8 @@ func verifyActivatedSchema(ctx context.Context, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("inspect activated workflow database schema: %w", err)
 	}
-	if version != latestSchemaVersion {
-		return fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	if version != LatestSchemaVersion {
+		return fmt.Errorf("%w: found schema %d, require schema %d; run workflow-setup repair", ErrSchemaUpgradeRequired, version, LatestSchemaVersion)
 	}
 	return nil
 }
@@ -223,8 +224,8 @@ func verifyMaintenanceSchema(ctx context.Context, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("inspect Launcher maintenance schema: %w", err)
 	}
-	if version > latestSchemaVersion {
-		return fmt.Errorf("%w: found future schema %d, target supports through %d", ErrSchemaUpgradeRequired, version, latestSchemaVersion)
+	if version > LatestSchemaVersion {
+		return fmt.Errorf("%w: found future schema %d, target supports through %d", ErrSchemaUpgradeRequired, version, LatestSchemaVersion)
 	}
 	for table, columns := range map[string][]string{
 		"worker_runs":                 {"run_id", "lease_generation", "state"},
@@ -327,6 +328,7 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 
 func (s *Store) configure(ctx context.Context) error {
 	for _, statement := range []string{
+		fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeout.Milliseconds()),
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = FULL",
 		"PRAGMA foreign_keys = ON",
@@ -343,7 +345,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if applied < latestSchemaVersion {
+	if applied < LatestSchemaVersion {
 		if err := s.backupDatabase(ctx); err != nil {
 			return err
 		}

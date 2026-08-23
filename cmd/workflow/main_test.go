@@ -52,7 +52,7 @@ func TestVerifiedTokenSourceReadsOwnerBoundClassicPAT(t *testing.T) {
 	if err := db.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "user", UserID: 7, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: "owner", PlaintextRelativePath: `state\credentials\github.pat`}}}
+	config := doctor.Config{SchemaVersion: 7, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: "owner", PlaintextRelativePath: `state\credentials\github.pat`}}}
 	got, err := (&verifiedGitHubPATSource{Database: db, Config: config}).Token(ctx)
 	if err != nil || got != token {
 		t.Fatalf("Token = %q, %v", got, err)
@@ -85,7 +85,7 @@ func TestVerifiedClassicPATUsesExplicitCustomWorkflowHomeCredential(t *testing.T
 	if err := db.RecordGitHubPATVerification(ctx, store.GitHubPATVerification{FingerprintSHA256: credential.Fingerprint(token), Login: "user", UserID: 7, Owner: "owner", Scopes: []string{"repo", "workflow"}, CredentialPath: layout.CredentialFile, Status: "verified", VerifiedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	config := doctor.Config{SchemaVersion: 6, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: "owner", PlaintextRelativePath: `state\credentials\github.pat`}}}
+	config := doctor.Config{SchemaVersion: 7, GitHub: doctor.GitHubPin{Credential: doctor.GitHubCredentialPin{Kind: "classic-pat", Owner: "owner", PlaintextRelativePath: `state\credentials\github.pat`}}}
 	got, err := verifiedClassicPAT(ctx, db, config, layout.CredentialFile)
 	if err != nil || got != token {
 		t.Fatalf("custom Workflow Home token = %q, %v", got, err)

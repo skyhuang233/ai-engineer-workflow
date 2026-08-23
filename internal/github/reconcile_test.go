@@ -209,6 +209,7 @@ func TestReconcileTicketPersistsMergeRevisionAndUnlocksDependentFrontier(t *test
 	if current, err := db.CurrentClaim(ctx, version.ID, 2); err != nil || current.RunID != downstream.RunID {
 		t.Fatalf("downstream dispatch = %#v, %v; want %#v", current, err, downstream)
 	}
+	t.Logf("owner-merged PR #7 delivered Ticket 1; merge_commit=%s; dependent Ticket %d became dispatchable", stored.MergeCommit, downstream.TicketID)
 }
 
 func TestMergedParallelCandidateInvalidatesOtherMergeReadyCandidate(t *testing.T) {

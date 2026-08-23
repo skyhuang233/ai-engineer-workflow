@@ -19,6 +19,12 @@ import (
 	"time"
 )
 
+func TestChecksPassedAllowsOnboardingWithoutPreinstalledChecks(t *testing.T) {
+	if !checksPassed(nil, nil) {
+		t.Fatal("onboarding without preinstalled checks was blocked")
+	}
+}
+
 func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
@@ -50,7 +56,11 @@ func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	if err = db.RecordSetupPlan(ctx, store.SetupPlanRecord{PlanID: "p", Kind: string(plan.Kind), SchemaVersion: 1, Target: plan.Target.RepositoryPath, DigestSHA256: digest, CanonicalJSON: string(canon), Projection: "owner/repo", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if err = db.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifest, Eligible: true, VerifiedAt: time.Now()}); err != nil {
+	admittedAt := time.Now()
+	if err = db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx,
+		store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifest, Eligible: true, VerifiedAt: admittedAt},
+		store.RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: plan.Target.RepositoryPath, GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: admittedAt},
+	); err != nil {
 		t.Fatal(err)
 	}
 	contentReads := 0
@@ -75,6 +85,22 @@ func TestOnboardingVerifyRechecksExactAdmittedContract(t *testing.T) {
 	os.MkdirAll(filepath.Join(home, "platform"), 0700)
 	os.WriteFile(filepath.Join(home, "platform", "active.json"), data, 0600)
 	var out bytes.Buffer
+	wrongRepositoryPath := t.TempDir()
+	if err = onboardingCommand([]string{"apply", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("apply did not resume the stored approved Onboarding Plan before checking its repository path: %v", err)
+	}
+	if err = onboardingCommand([]string{"apply", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(canon), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("apply accepted repository path outside the approved Onboarding Plan: %v", err)
+	}
+	if contentReads != 0 {
+		t.Fatal("repository path mismatch reached remote apply effects")
+	}
+	if err = onboardingCommand([]string{"verify", "--workflow-home", home, "--repo", wrongRepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err == nil || !strings.Contains(err.Error(), "differs from the approved Onboarding Plan") {
+		t.Fatalf("verify accepted repository path outside the approved Onboarding Plan: %v", err)
+	}
+	if contentReads != 0 {
+		t.Fatal("repository path mismatch reached remote contract readback")
+	}
 	if err = onboardingCommand([]string{"verify", "--workflow-home", home, "--repo", plan.Target.RepositoryPath, "--github-api", server.URL, "--onboarding-plan-digest", digest}, bytes.NewReader(nil), &out); err != nil {
 		t.Fatal(err)
 	}

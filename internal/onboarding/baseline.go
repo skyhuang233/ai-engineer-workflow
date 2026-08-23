@@ -346,6 +346,10 @@ func ScanCredentialMaterial(repository string, files []string) []string {
 }
 
 func CreateInitialBaseline(ctx context.Context, repository, branch string, approvedFiles []BaselineFile, message string) (string, error) {
+	return CreateInitialBaselineWithBootstrap(ctx, repository, branch, approvedFiles, nil, message)
+}
+
+func CreateInitialBaselineWithBootstrap(ctx context.Context, repository, branch string, approvedFiles []BaselineFile, bootstrap map[string][]byte, message string) (string, error) {
 	if _, err := baselineGitOutput(ctx, repository, "rev-parse", "--verify", "HEAD"); err == nil {
 		return "", errors.New("Initial Repository Baseline requires zero commits")
 	}
@@ -356,16 +360,40 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	approved := append([]BaselineFile(nil), approvedFiles...)
 	sort.Slice(approved, func(i, j int) bool { return approved[i].Path < approved[j].Path })
 	approvedPaths := make([]string, 0, len(approved))
+	workspacePaths := make([]string, 0, len(approved))
+	approvedBootstrap := 0
 	for _, file := range approved {
 		approvedPaths = append(approvedPaths, file.Path)
+		data, generated := bootstrap[file.Path]
+		if generated {
+			approvedBootstrap++
+			if file.Mode != "100644" {
+				return "", fmt.Errorf("Initial Repository Baseline bootstrap mode is invalid: %s", file.Path)
+			}
+			sum := sha256.Sum256(data)
+			if hex.EncodeToString(sum[:]) != file.SHA256 {
+				return "", fmt.Errorf("Initial Repository Baseline bootstrap content differs: %s", file.Path)
+			}
+		} else {
+			workspacePaths = append(workspacePaths, file.Path)
+		}
 	}
-	if strings.Join(current, "\x00") != strings.Join(approvedPaths, "\x00") {
+	if approvedBootstrap != len(bootstrap) {
+		return "", errors.New("Initial Repository Baseline bootstrap files differ from the approved plan")
+	}
+	if strings.Join(current, "\x00") != strings.Join(workspacePaths, "\x00") {
 		return "", errors.New("Initial Repository Baseline file list drifted from the approved plan")
 	}
-	if err := verifyBaselineSnapshot(ctx, repository, approved); err != nil {
+	workspaceApproved := make([]BaselineFile, 0, len(workspacePaths))
+	for _, file := range approved {
+		if _, generated := bootstrap[file.Path]; !generated {
+			workspaceApproved = append(workspaceApproved, file)
+		}
+	}
+	if err := verifyBaselineSnapshot(ctx, repository, workspaceApproved); err != nil {
 		return "", err
 	}
-	if findings := ScanCredentialMaterial(repository, approvedPaths); len(findings) > 0 {
+	if findings := ScanCredentialMaterial(repository, workspacePaths); len(findings) > 0 {
 		return "", fmt.Errorf("credential material blocks baseline: %s", strings.Join(findings, ", "))
 	}
 	gitDir, err := baselineGitOutput(ctx, repository, "rev-parse", "--git-dir")
@@ -411,9 +439,12 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	}
 	if len(approvedPaths) > 0 {
 		for _, file := range approved {
-			data, err := baselineWorkingBytes(repository, file.Path)
-			if err != nil {
-				return "", err
+			data, generated := bootstrap[file.Path]
+			if !generated {
+				data, err = baselineWorkingBytes(repository, file.Path)
+				if err != nil {
+					return "", err
+				}
 			}
 			sum := sha256.Sum256(data)
 			if hex.EncodeToString(sum[:]) != file.SHA256 {
@@ -481,6 +512,15 @@ func CreateInitialBaseline(ctx context.Context, repository, branch string, appro
 	}
 	if _, err := baselineGitOutput(ctx, repository, "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
 		return "", err
+	}
+	for relative, data := range bootstrap {
+		target := filepath.Join(repository, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(target, data, 0o600); err != nil {
+			return "", err
+		}
 	}
 	return commit, nil
 }

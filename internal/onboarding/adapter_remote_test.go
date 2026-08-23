@@ -2,10 +2,13 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyhuang233/workflow/internal/setupcontract"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -16,13 +19,12 @@ type memoryRemote struct {
 	issues, actions bool
 	allowed         string
 	variable        string
+	contentRef      string
 	pull            PullReadback
 	defaultBranch   RepositoryBranch
 	branch          RepositoryBranch
 	branchFound     bool
 	createdPull     OnboardingPullRequest
-	mergeCalls      int
-	mergeMethod     string
 	repositoryErr   error
 	labelErr        error
 	featuresErr     error
@@ -54,18 +56,8 @@ func (m *memoryRemote) CreateOrUpdateOnboardingPull(_ context.Context, request O
 	m.pull = PullReadback{Found: true, Number: 7, State: "open", Branch: request.Branch, Head: request.Head, Base: request.Base, BaseHead: request.BaseHead, Body: "Approved Setup Plan SHA-256: " + request.Digest, Mergeable: true, ChecksPassed: false, ReviewsClean: true, ContentMatches: true}
 	return m.pull, nil
 }
-func (m *memoryRemote) MergeOnboardingPull(_ context.Context, _ string, number int64, expectedHead, method string) (string, error) {
-	if number != m.pull.Number || expectedHead != m.pull.Head {
-		return "", errors.New("merge identity differs")
-	}
-	m.mergeCalls++
-	m.mergeMethod = method
-	mergeHead := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	m.pull.Merged, m.pull.State, m.pull.MergeHead = true, "closed", mergeHead
-	m.defaultBranch.Head = mergeHead
-	return mergeHead, nil
-}
-func (m *memoryRemote) VerifyOnboardingContent(context.Context, string, string, map[string][]byte) error {
+func (m *memoryRemote) VerifyOnboardingContent(_ context.Context, _ string, ref string, _ map[string][]byte) error {
+	m.contentRef = ref
 	return nil
 }
 func (m *memoryRemote) CreateRepository(context.Context, string, string, string, bool) error {
@@ -109,14 +101,17 @@ func TestRepositoryAdapterReadbackBindsOnlyExactMergedPull(t *testing.T) {
 	mergeHead := "cccccccccccccccccccccccccccccccccccccccc"
 	branch := "workflow/onboarding-" + digest[:12]
 	remote := &memoryRemote{
-		pull:          PullReadback{Found: true, Merged: true, State: "closed", Branch: branch, Head: "dddddddddddddddddddddddddddddddddddddddd", Base: "main", BaseHead: baseHead, Body: "Approved Setup Plan SHA-256: " + digest, MergeHead: mergeHead, ChecksPassed: true, ReviewsClean: true, ContentMatches: true},
+		pull:          PullReadback{Found: true, Merged: true, State: "closed", Branch: branch, Head: "dddddddddddddddddddddddddddddddddddddddd", Base: "main", BaseHead: baseHead, Body: "Approved Setup Plan SHA-256: " + digest, MergeHead: mergeHead, MergedBy: "alice", MergedByType: "User", ChecksPassed: true, ReviewsClean: true, ContentMatches: true},
 		defaultBranch: RepositoryBranch{Name: "main", Head: mergeHead},
 	}
-	adapter := RepositoryAdapter{Remote: remote, PlanDigest: digest}
-	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "manifest_digest": "manifest", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
+	adapter := RepositoryAdapter{Remote: remote, Owner: "acme", AuthenticatedLogin: "alice", PlanDigest: digest}
+	effect := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "acme/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "manifest_digest": "manifest", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`}}
 	status, _, err := adapter.Readback(context.Background(), effect)
 	if err != nil || status != setupcontract.EffectSatisfied {
 		t.Fatalf("exact merged PR = %s, %v", status, err)
+	}
+	if remote.contentRef != remote.pull.Head {
+		t.Fatalf("merged PR content ref = %q, want immutable head %q", remote.contentRef, remote.pull.Head)
 	}
 	remote.pull.BaseHead = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	status, _, err = adapter.Readback(context.Background(), effect)
@@ -140,6 +135,66 @@ func TestRepositoryAdapterReadbackRejectsDefaultBaseAdvanceBeforeMerge(t *testin
 		t.Fatalf("advanced base = %s, %v", status, err)
 	}
 }
+
+func TestRepositoryAdapterFastForwardsZeroCommitBaselineFromEffectEvidence(t *testing.T) {
+	repository := newRepo(t)
+	preMerge := testGitOutput(t, repository, "rev-parse", "HEAD")
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	git(t, "", "clone", "--bare", repository, bare)
+	advance := filepath.Join(t.TempDir(), "advance")
+	git(t, "", "clone", bare, advance)
+	git(t, advance, "config", "user.name", "Test")
+	git(t, advance, "config", "user.email", "test@example.com")
+	git(t, advance, "commit", "--allow-empty", "-m", "approved onboarding merge")
+	mergeHead := testGitOutput(t, advance, "rev-parse", "HEAD")
+	git(t, advance, "push", "origin", "main")
+	installCapturedGitForPushTest(t, "https://github.com/owner/repo.git", bare)
+
+	remote := &memoryRemote{defaultBranch: RepositoryBranch{Name: "main", Head: mergeHead}}
+	adapter := RepositoryAdapter{
+		Remote: remote, PlanDigest: strings.Repeat("a", 64),
+		MergeHeads:   map[string]string{"repository-contract-pr": mergeHead},
+		BaselineHead: map[string]string{"initial-baseline": preMerge},
+	}
+	effect := setupcontract.Effect{Kind: "local_fast_forward", Subject: repository, Parameters: map[string]string{
+		"repository": "owner/repo", "branch": "main", "pre_merge_head": "", "pre_merge_head_effect_id": "initial-baseline", "merge_head_effect_id": "repository-contract-pr",
+	}}
+	if err := adapter.Apply(context.Background(), effect); err != nil {
+		t.Fatalf("zero-commit baseline fast-forward: %v", err)
+	}
+	if head := testGitOutput(t, repository, "rev-parse", "HEAD"); head != mergeHead {
+		t.Fatalf("local HEAD = %s, want approved merge %s", head, mergeHead)
+	}
+}
+
+func TestRepositoryAdapterReadbackKeepsInitialBaselineSatisfiedAfterFastForward(t *testing.T) {
+	repository := newRepo(t)
+	baselineHead := testGitOutput(t, repository, "rev-parse", "HEAD")
+	files, err := BaselineSnapshot(context.Background(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "AGENTS.md"), []byte("managed\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "add", "AGENTS.md")
+	git(t, repository, "commit", "-m", "approved onboarding merge")
+
+	adapter := RepositoryAdapter{Remote: &memoryRemote{}, PlanDigest: strings.Repeat("a", 64)}
+	effect := setupcontract.Effect{ID: "initial-baseline", Kind: "initial_baseline", Subject: repository, Parameters: map[string]string{"files_json": string(encoded)}}
+	status, _, err := adapter.Readback(context.Background(), effect)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("fast-forwarded Initial Repository Baseline readback = %s, %v", status, err)
+	}
+	if got := adapter.BaselineHead[effect.ID]; got != baselineHead {
+		t.Fatalf("Initial Repository Baseline evidence = %q, want root commit %q", got, baselineHead)
+	}
+}
+
 func (m *memoryRemote) ReconcileLabel(_ context.Context, _ string, value Label) error {
 	m.labelCalls++
 	m.label = value
@@ -278,7 +333,8 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	defer database.Close()
 	effect := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": strings.Repeat("b", 64), "contract_version": "1"}}
 	remote := &memoryRemote{contractErr: errors.New("remote contract unavailable")}
-	adapter := RepositoryAdapter{Remote: remote, Store: database, PlanDigest: strings.Repeat("a", 64)}
+	repositoryPath := filepath.Join(t.TempDir(), "repo")
+	adapter := RepositoryAdapter{Remote: remote, Store: database, PlanDigest: strings.Repeat("a", 64), RepositoryPath: repositoryPath}
 	if err := adapter.Apply(context.Background(), effect); err == nil {
 		t.Fatal("admission was recorded without a live contract")
 	}
@@ -292,6 +348,41 @@ func TestRepositoryAdmissionRecordsEligibilityOnlyAfterLiveContractVerification(
 	record, err := database.RepositoryAdmission(context.Background(), effect.Subject)
 	if err != nil || !record.Eligible {
 		t.Fatalf("live verification did not record eligible admission: %#v,%v", record, err)
+	}
+	runtime, err := database.RepositoryRuntimeConfiguration(context.Background(), effect.Subject)
+	if err != nil {
+		t.Fatalf("clean Repository Admission did not seed runtime configuration: %v", err)
+	}
+	if runtime.Repository != effect.Subject || runtime.DefaultBranch != "main" || runtime.SourcePath != repositoryPath || runtime.RootIssueNumber != 0 {
+		t.Fatalf("runtime configuration seed = %#v", runtime)
+	}
+	t.Logf("Repository Admitted after live verification; initial runtime seed repository=%s branch=%s source=%q root=%d", runtime.Repository, runtime.DefaultBranch, runtime.SourcePath, runtime.RootIssueNumber)
+}
+
+func TestRepositoryAdmissionReadbackRetriesMissingRuntimeSeed(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	digest := strings.Repeat("a", 64)
+	manifestDigest := strings.Repeat("b", 64)
+	if err := database.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: digest, ContractVersion: "1", ManifestDigestSHA256: manifestDigest, Eligible: true, VerifiedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	effect := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": manifestDigest, "contract_version": "1"}}
+	adapter := RepositoryAdapter{Remote: &memoryRemote{}, Store: database, PlanDigest: digest, RepositoryPath: filepath.Join(t.TempDir(), "repo")}
+	status, _, err := adapter.Readback(ctx, effect)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("partial admission readback = %s, %v", status, err)
+	}
+	if err := adapter.Apply(ctx, effect); err != nil {
+		t.Fatalf("retry partial admission: %v", err)
+	}
+	if _, err := database.RepositoryRuntimeConfiguration(ctx, effect.Subject); err != nil {
+		t.Fatalf("retry did not repair runtime seed: %v", err)
 	}
 }
 
@@ -310,7 +401,7 @@ func (w *fakeBranchWriter) Publish(context.Context, PreparedOnboardingBranch, st
 	return nil
 }
 
-func TestRepositoryAdapterCreatesExactUnmergedOnboardingPull(t *testing.T) {
+func TestRepositoryAdapterCreatesOnboardingPullWithoutPreinstalledChecks(t *testing.T) {
 	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	baseHead := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	head := "cccccccccccccccccccccccccccccccccccccccc"
@@ -319,7 +410,7 @@ func TestRepositoryAdapterCreatesExactUnmergedOnboardingPull(t *testing.T) {
 	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, BranchWriter: writer}
 	effect := setupcontract.Effect{Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{
 		"base_branch": "main", "base_head": baseHead, "source_url": "https://github.com/owner/repo.git",
-		"files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`,
+		"files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[]`,
 	}}
 	if err := adapter.Apply(context.Background(), effect); err != nil {
 		t.Fatal(err)
@@ -368,7 +459,7 @@ func TestRepositoryAdapterRejectsPullHeadDriftWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestRepositoryAdapterMergesExactPullThenRecordsAndVerifiesAdmission(t *testing.T) {
+func TestRepositoryAdapterBindsOnlyOwnerMergedPullThenRecordsAdmission(t *testing.T) {
 	ctx := context.Background()
 	digest := strings.Repeat("a", 64)
 	manifest := strings.Repeat("f", 64)
@@ -385,26 +476,31 @@ func TestRepositoryAdapterMergesExactPullThenRecordsAndVerifiesAdmission(t *test
 	}
 	defer database.Close()
 	writer := &fakeBranchWriter{prepared: PreparedOnboardingBranch{Branch: branch, Head: head}}
-	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, Store: database, BranchWriter: writer}
+	adapter := RepositoryAdapter{Remote: remote, Owner: "owner", AuthenticatedLogin: "owner", Credential: GitCredential{Token: "pat"}, PlanDigest: digest, Store: database, BranchWriter: writer}
 	contract := setupcontract.Effect{ID: "repository-contract-pr", Kind: "repository_contract_pr", Subject: "owner/repo", Parameters: map[string]string{"base_branch": "main", "base_head": baseHead, "source_url": "https://github.com/owner/repo.git", "files_json": `{"AGENTS.md":"bWFuYWdlZAo="}`, "required_checks_json": `[{"context":"workflow-contract","app_id":15368}]`, "manifest_digest": manifest, "merge_method": "squash"}}
 	if err := adapter.Apply(ctx, contract); err != nil {
 		t.Fatal(err)
 	}
-	if remote.mergeCalls != 1 || writer.published || remote.createdPull.Repository != "" {
-		t.Fatalf("merge authority was not exact: calls=%d published=%v create=%#v", remote.mergeCalls, writer.published, remote.createdPull)
-	}
-	if remote.mergeMethod != "squash" {
-		t.Fatalf("merge method=%q", remote.mergeMethod)
+	if writer.published || remote.createdPull.Repository != "" || remote.defaultBranch.Head != baseHead {
+		t.Fatalf("exact open pull was mutated: published=%v create=%#v default=%#v", writer.published, remote.createdPull, remote.defaultBranch)
 	}
 	status, _, err := adapter.Readback(ctx, contract)
-	if err != nil || status != setupcontract.EffectSatisfied {
-		t.Fatalf("merged pull readback = %s, %v", status, err)
+	if err != nil || status != setupcontract.EffectRequired {
+		t.Fatalf("open pull readback = %s, %v", status, err)
 	}
+	mergeHead := strings.Repeat("e", 40)
+	remote.pull.Merged, remote.pull.State, remote.pull.MergeHead = true, "closed", mergeHead
+	remote.pull.MergedBy, remote.pull.MergedByType = "owner", "User"
+	remote.defaultBranch.Head = mergeHead
 	if err := adapter.Apply(ctx, contract); err != nil {
 		t.Fatal(err)
 	}
-	if remote.mergeCalls != 1 {
-		t.Fatalf("already merged exact PR was merged again: %d", remote.mergeCalls)
+	if remote.contentRef != head {
+		t.Fatalf("merged PR content ref = %q, want immutable head %q", remote.contentRef, head)
+	}
+	status, _, err = adapter.Readback(ctx, contract)
+	if err != nil || status != setupcontract.EffectSatisfied {
+		t.Fatalf("owner-merged pull readback = %s, %v", status, err)
 	}
 	admission := setupcontract.Effect{Kind: "repository_admission", Subject: "owner/repo", Parameters: map[string]string{"default_branch": "main", "manifest_digest": manifest, "contract_version": "1"}}
 	if err := adapter.Apply(ctx, admission); err != nil {

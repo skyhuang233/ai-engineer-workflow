@@ -113,7 +113,7 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metadata.SchemaVersion != latestSchemaVersion || metadata.ChecksumSHA256 == "" || !metadata.LastDrill.Succeeded || len(metadata.WorkspaceReferences) != 2 || len(metadata.ArtifactReferences) != 1 || !metadata.WorkspaceReferences[0].Available || metadata.WorkspaceReferences[0].ChecksumSHA256 == "" || !metadata.ArtifactReferences[0].Available || metadata.ArtifactReferences[0].ChecksumSHA256 == "" {
+	if metadata.SchemaVersion != LatestSchemaVersion || metadata.ChecksumSHA256 == "" || !metadata.LastDrill.Succeeded || len(metadata.WorkspaceReferences) != 2 || len(metadata.ArtifactReferences) != 1 || !metadata.WorkspaceReferences[0].Available || metadata.WorkspaceReferences[0].ChecksumSHA256 == "" || !metadata.ArtifactReferences[0].Available || metadata.ArtifactReferences[0].ChecksumSHA256 == "" {
 		t.Fatalf("backup metadata = %#v", metadata)
 	}
 	workspaceHash := sha256.New()
@@ -293,8 +293,8 @@ func TestRestoreBackupMigratesLegacySchemaWithoutDeliverySourceProvenance(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != latestSchemaVersion {
-		t.Fatalf("restored schema version = %d, want %d", version, latestSchemaVersion)
+	if version != LatestSchemaVersion {
+		t.Fatalf("restored schema version = %d, want %d", version, LatestSchemaVersion)
 	}
 	if !hasColumn(t, ctx, restored.db, "candidate_revisions", "delivery_source_digest") {
 		t.Fatal("restored Delivery Source column is missing")

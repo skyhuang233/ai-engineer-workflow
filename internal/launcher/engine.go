@@ -17,8 +17,8 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
 	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 )
 
 const (
@@ -106,6 +106,11 @@ type restartableLifecycle interface {
 
 func (e Engine) Inspect(ctx context.Context, request Request) (Result, error) {
 	_ = ctx
+	if request.Purpose == PurposeTargetState {
+		if _, err := e.workerStateFromVerifiedWorkflowRelease(request); err != nil {
+			return blocked(err), nil
+		}
+	}
 	if request.Purpose == PurposeActiveWorkPreflight {
 		active, err := ReadActive(request.WorkflowHome)
 		if err != nil {
@@ -143,6 +148,10 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 	// installation. Validate both the protocol shape and the concrete consent
 	// target before creating either the Home or its in-Home installation lock.
 	if err := validateApplyRequest(request); err != nil {
+		return blocked(err), nil
+	}
+	verifiedRelease, err := e.workerStateFromVerifiedWorkflowRelease(request)
+	if err != nil {
 		return blocked(err), nil
 	}
 	recoveryConsent, recoveryAttempt, recoveringFresh, recoveryErr := e.freshRecoveryForApply(ctx, request)
@@ -382,7 +391,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 		}
 	}
 	if resumeActiveRepair {
-		return e.repairActiveGeneration(ctx, request, active, consent)
+		return e.repairActiveGeneration(ctx, request, active, consent, verifiedRelease, now)
 	}
 
 	clearOldFence := func() {
@@ -433,6 +442,17 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 			return e.failFreshAttempt(request.WorkflowHome, attempt, err)
 		}
 		return e.failAttempt(request.WorkflowHome, attempt, err)
+	}
+	if verifiedRelease != nil {
+		verifiedRelease.VerifiedAt = now
+		verifiedRelease.ActivatedAt = now
+		if releaseErr := candidate.ActivateWorkerRelease(ctx, *verifiedRelease); releaseErr != nil {
+			_ = candidate.Close()
+			if freshCandidate {
+				return e.failFreshAttempt(request.WorkflowHome, attempt, releaseErr)
+			}
+			return e.failAttempt(request.WorkflowHome, attempt, releaseErr)
+		}
 	}
 	if request.PAT != "" {
 		target, targetErr := canonicalPATCapability(request.WorkflowHome, consent.Capabilities)
@@ -517,7 +537,7 @@ func (e Engine) Apply(ctx context.Context, request Request) (Result, error) {
 // active.json names a repair_required candidate, that generation and its
 // SQLite file are the durable forward-repair subject.  Copying the active
 // database back over itself is both non-idempotent and unsafe on Windows.
-func (e Engine) repairActiveGeneration(ctx context.Context, request Request, active Active, consent Consent) (Result, error) {
+func (e Engine) repairActiveGeneration(ctx context.Context, request Request, active Active, consent Consent, verifiedRelease *store.WorkerRelease, now time.Time) (Result, error) {
 	attempt, err := readAttempt(request.WorkflowHome, active.AttemptID)
 	if err != nil {
 		return result("repair_required", map[string]any{"active": active, "error": "active repair Attempt is unavailable"}), nil
@@ -531,6 +551,14 @@ func (e Engine) repairActiveGeneration(ctx context.Context, request Request, act
 	candidate, err := store.Open(ctx, filepath.Join(request.WorkflowHome, "platform", "generations", active.Generation, "workflow.db"))
 	if err != nil {
 		return result("repair_required", map[string]any{"active": active, "error": err.Error()}), nil
+	}
+	if verifiedRelease != nil {
+		verifiedRelease.VerifiedAt = now
+		verifiedRelease.ActivatedAt = now
+		if err := candidate.ActivateWorkerRelease(ctx, *verifiedRelease); err != nil {
+			_ = candidate.Close()
+			return result("repair_required", map[string]any{"active": active, "error": err.Error()}), nil
+		}
 	}
 	if request.PAT != "" {
 		if err := e.verifyAndRecordPAT(ctx, candidate, request, consent); err != nil {
@@ -610,7 +638,7 @@ func (e Engine) verifyGeneration(home string, active Active) error {
 	if err != nil {
 		return fmt.Errorf("active generation lacks platform-release.json: %w", err)
 	}
-	var manifest platformrelease.BundleManifest
+	var manifest workflowbundle.BundleManifest
 	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
 		return fmt.Errorf("decode active generation manifest: %w", err)
 	}

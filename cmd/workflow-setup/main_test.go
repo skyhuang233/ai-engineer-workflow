@@ -17,8 +17,9 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/launcher"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
 type packagedLifecycle struct{}
@@ -37,6 +38,46 @@ func (packagedLifecycle) Prepare(context.Context, launcher.Request, launcher.Con
 func (packagedLifecycle) Stop(context.Context, string, launcher.Active) error  { return nil }
 func (packagedLifecycle) Start(context.Context, string, launcher.Active) error { return nil }
 func (packagedLifecycle) Ready(context.Context, string, launcher.Active) error { return nil }
+
+func TestDispatcherForwardsOrdinaryCommandStandardInput(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	generation := strings.Repeat("a", 64)
+	versioned := filepath.Join(home, "platform", "generations", generation, "workflow.exe")
+	if err := os.MkdirAll(filepath.Dir(versioned), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helperSource := filepath.Join(root, "stdin-echo.go")
+	if err := os.WriteFile(helperSource, []byte(`package main
+import ("io"; "os")
+func main() { _, _ = io.Copy(os.Stdout, os.Stdin) }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", versioned, helperSource)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build stdin helper: %v\n%s", err, output)
+	}
+	active := launcher.Active{SchemaVersion: 1, Generation: generation, Version: "0.0.1", BundleDigest: "sha256:" + generation, AttemptID: "attempt", ConsentID: "consent", Readiness: "ready"}
+	raw, err := json.Marshal(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "platform"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "platform", "active.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"exact":"onboarding-plan"}`)
+	var output bytes.Buffer
+	if err := dispatch([]string{"echo", "--workflow-home", home}, bytes.NewReader(input), &output); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), input) {
+		t.Fatalf("ordinary command stdin = %q, want %q", output.Bytes(), input)
+	}
+}
 
 func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *testing.T) {
 	root := t.TempDir()
@@ -65,8 +106,8 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 		}
 	}
 	bundle := filepath.Join(root, "workflow-windows-amd64.zip")
-	manifest := platformrelease.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: platformrelease.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
-	if err := platformrelease.AssembleBundle(platformrelease.BundleAssembleOptions{Output: bundle, SetupExecutable: launcherSource, WorkflowExecutable: workflowSource, PayloadDirectory: payload, Manifest: manifest}); err != nil {
+	manifest := workflowbundle.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: workflowbundle.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
+	if err := workflowbundle.AssembleBundle(workflowbundle.BundleAssembleOptions{Output: bundle, SetupExecutable: launcherSource, WorkflowExecutable: workflowSource, PayloadDirectory: payload, Manifest: manifest}); err != nil {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(root, "extracted")
@@ -78,8 +119,27 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 	}
 	digest := sha256.Sum256(digestBytes)
 	bundleDigest := "sha256:" + hex.EncodeToString(digest[:])
+	releaseManifest := workflowrelease.Manifest{
+		SchemaVersion: 1, Version: "0.0.1", CandidateSourceCommit: strings.Repeat("c", 40), QualificationRunID: 1, QualificationRunAttempt: 1,
+		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.TrimPrefix(bundleDigest, "sha256:")},
+		Worker: workflowrelease.Worker{Image: manifest.Compatibility.WorkerImage, Tools: workflowrelease.Tools{
+			Codex: workflowrelease.CodexTool{Version: "0.148.0"}, GitHubCLI: workflowrelease.ArchiveTool{Version: "2.97.0", LinuxAMD64SHA256: strings.Repeat("d", 64)},
+			Go: workflowrelease.ArchiveTool{Version: "1.26.6", LinuxAMD64SHA256: strings.Repeat("e", 64)}, NoMistakes: workflowrelease.NoMistakesTool{Version: "v1.41.2", Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("f", 40)},
+		}},
+		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+	}
+	releaseRaw, err := releaseManifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasePath := filepath.Join(root, workflowrelease.ManifestAssetName)
+	if err := os.WriteFile(releasePath, releaseRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	releaseDigest := sha256.Sum256(releaseRaw)
+	verifiedRelease := &launcher.VerifiedReleaseManifest{ManifestPath: releasePath, ManifestSHA256: hex.EncodeToString(releaseDigest[:]), SourceCommit: releaseManifest.CandidateSourceCommit}
 	engine := launcher.Engine{BundleRoot: extracted, Lifecycle: packagedLifecycle{}, DependencyInspector: packagedLifecycle{}}
-	inspectRequest := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Inspect, WorkflowHome: home, Purpose: launcher.PurposeTargetState, TargetVersion: "0.0.1", BundleDigest: bundleDigest, GitHubOwner: "owner"}
+	inspectRequest := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Inspect, WorkflowHome: home, Purpose: launcher.PurposeTargetState, TargetVersion: "0.0.1", BundleDigest: bundleDigest, GitHubOwner: "owner", VerifiedReleaseManifest: verifiedRelease}
 	inspection, err := engine.Inspect(context.Background(), inspectRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +148,7 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 	if inspection.Status != "consent_required" || !ok || len(capabilities) == 0 {
 		t.Fatalf("packaged inspect=%#v", inspection)
 	}
-	request := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: bundleDigest, GitHubOwner: "owner", AcceptedCapabilities: capabilities}
+	request := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Apply, WorkflowHome: home, TargetVersion: "0.0.1", BundleDigest: bundleDigest, GitHubOwner: "owner", AcceptedCapabilities: capabilities, VerifiedReleaseManifest: verifiedRelease}
 	if result, err := engine.Apply(context.Background(), request); err != nil || result.Status != "ready" {
 		t.Fatalf("fresh apply=%#v, %v", result, err)
 	}
@@ -101,7 +161,7 @@ func TestPackagedGenerationLauncherSurvivesBundleCleanupThroughDispatcher(t *tes
 	}
 	serveHealthyControlPlane(t, home, active)
 
-	inspect := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Inspect, WorkflowHome: home, Purpose: launcher.PurposeTargetState, TargetVersion: active.Version, BundleDigest: active.BundleDigest, GitHubOwner: "owner"}
+	inspect := launcher.Request{SchemaVersion: launcher.ProtocolVersion, Operation: launcher.Inspect, WorkflowHome: home, Purpose: launcher.PurposeTargetState, TargetVersion: active.Version, BundleDigest: active.BundleDigest, GitHubOwner: "owner", VerifiedReleaseManifest: verifiedRelease}
 	inspectResult := runDispatcherSetup(t, home, "inspect", inspect)
 	// This synthetic packaged setup did not actually install the Bundle's
 	// Docker version. Dispatcher inspect must therefore surface replacement
