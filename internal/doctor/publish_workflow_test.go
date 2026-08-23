@@ -158,14 +158,13 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"branches: [develop, main]", "go test -p 1 ./...", "go vet ./...",
 		"release-dry-run:", `github.base_ref == 'main'`,
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
-		"Assemble approved workflow-v0.0.1 qualification candidate",
+		"Restore approved workflow-v0.0.1 qualification candidate",
 		"b35d239f4fe7e4ed55cb800942b2a36cf7468058",
-		"Download approved workflow-v0.0.1 Worker SBOM",
-		"run-id: 32615246977",
-		"github-token: ${{ secrets.GITHUB_TOKEN }}",
-		"git worktree add --detach $qualifiedWorktree $qualifiedSource",
-		"workflow-v0.0.1 qualified-source worktree is not an exact clean checkout",
-		"git worktree remove --force $qualifiedWorktree",
+		"q-$qualifiedSource-$qualifiedRunID-$qualifiedRunAttempt",
+		"docker pull $reference",
+		"docker create $reference",
+		"docker cp \"${container}:/qualified/.\" build/release",
+		"approved workflow-v0.0.1 candidate registry identity differs from its qualification evidence",
 		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
 		"if: github.head_ref != 'release-0.0.1'",
 		"-GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER",
@@ -179,10 +178,9 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"$qualificationOnlyChanges.Count -ne $allowedQualificationOnlyChanges.Count",
 		"workflow-v0.0.1 Bundle differs from the functionally qualified candidate",
 		"workflow-v0.0.1 Worker differs from the functionally qualified candidate",
-		"-CandidateSourceCommit $qualifiedSource",
-		"-QualificationRunID 32615246977",
-		"-QualificationRunAttempt 1",
-		"-WorkerImage 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de'",
+		"$qualifiedRunID = '32615246977'",
+		"$qualifiedRunAttempt = '1'",
+		"$env:GHCR_TOKEN | docker login ghcr.io",
 		"$manifestSource = $head",
 		"$manifestRunID = $runID",
 		"$manifestRunAttempt = $attempt",
@@ -280,8 +278,12 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
 	candidate := readWorkflow(t, ".github", "workflows", "worker-contract.yml")
 	publisher := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
-	if strings.Count(candidate, "& scripts/assemble-workflow-release.ps1") != 2 {
-		t.Fatal("qualification workflow does not route both mutually exclusive paths through the shared assembler")
+	if strings.Count(candidate, "& scripts/assemble-workflow-release.ps1") != 1 {
+		t.Fatal("qualification workflow does not assemble new release candidates exactly once")
+	}
+	if !strings.Contains(candidate, "Restore approved workflow-v0.0.1 qualification candidate") ||
+		!strings.Contains(candidate, `docker cp "${container}:/qualified/." build/release`) {
+		t.Fatal("first-release qualification does not restore the exact approved candidate")
 	}
 	if strings.Contains(candidate, "go run ./cmd/workflow-release assemble") {
 		t.Fatal("qualification workflow retains an independent release assembler")

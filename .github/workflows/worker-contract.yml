@@ -208,14 +208,6 @@ jobs:
         with:
           name: candidate-worker-sbom
           path: build/release-inputs
-      - name: Download approved workflow-v0.0.1 Worker SBOM
-        if: github.head_ref == 'release-0.0.1'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: candidate-worker-sbom
-          path: build/release-inputs
-          run-id: 32615246977
-          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify candidate branch version
         shell: pwsh
         run: |
@@ -231,40 +223,39 @@ jobs:
             -QualificationRunAttempt '${{ github.run_attempt }}' `
             -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
             -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
-      - name: Assemble approved workflow-v0.0.1 qualification candidate
+      - name: Restore approved workflow-v0.0.1 qualification candidate
         if: github.head_ref == 'release-0.0.1'
         shell: pwsh
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $qualifiedSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
-          $qualifiedWorktree = Join-Path $env:RUNNER_TEMP "workflow-v0.0.1-qualified-source-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $sourceSBOM = (Resolve-Path build/release-inputs/worker-sbom.spdx.json).Path
-          $sourceOutput = Join-Path $qualifiedWorktree 'build/release'
+          $qualifiedRunID = '32615246977'
+          $qualifiedRunAttempt = '1'
+          $toolchain = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
+          $repository = "$([string]$toolchain.worker.image_repository)-release-candidate"
+          $reference = "${repository}:q-$qualifiedSource-$qualifiedRunID-$qualifiedRunAttempt"
+          $container = ''
           try {
-            git worktree add --detach $qualifiedWorktree $qualifiedSource
-            if ($LASTEXITCODE -ne 0) { throw 'create exact workflow-v0.0.1 qualified-source worktree failed' }
-            $checkedOutCommit = (git -C $qualifiedWorktree rev-parse HEAD).Trim()
-            $worktreeStatus = @(git -C $qualifiedWorktree status --porcelain)
-            if ($LASTEXITCODE -ne 0 -or $checkedOutCommit -cne $qualifiedSource -or $worktreeStatus.Count -ne 0) {
-              throw 'workflow-v0.0.1 qualified-source worktree is not an exact clean checkout'
-            }
-            Push-Location $qualifiedWorktree
-            try {
-              & scripts/assemble-workflow-release.ps1 `
-                -CandidateSourceCommit $qualifiedSource `
-                -QualificationRunID 32615246977 `
-                -QualificationRunAttempt 1 `
-                -WorkerImage 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de' `
-                -SBOMPath $sourceSBOM -OutputDirectory $sourceOutput
-            } finally {
-              Pop-Location
+            $env:GHCR_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin
+            if ($LASTEXITCODE -ne 0) { throw 'authenticate approved workflow-v0.0.1 candidate registry failed' }
+            docker pull $reference
+            if ($LASTEXITCODE -ne 0) { throw 'restore approved workflow-v0.0.1 candidate failed' }
+            $labels = docker image inspect $reference --format '{{json .Config.Labels}}' | ConvertFrom-Json
+            if ([string]$labels.'io.agent-workflow.candidate-source-commit' -cne $qualifiedSource -or
+                [string]$labels.'io.agent-workflow.qualification-run-id' -cne $qualifiedRunID -or
+                [string]$labels.'io.agent-workflow.qualification-run-attempt' -cne $qualifiedRunAttempt) {
+              throw 'approved workflow-v0.0.1 candidate registry identity differs from its qualification evidence'
             }
             New-Item -ItemType Directory -Force -Path build/release | Out-Null
-            Copy-Item -LiteralPath (Join-Path $sourceOutput 'worker-sbom.spdx.json'),(Join-Path $sourceOutput 'workflow-release.json'),(Join-Path $sourceOutput 'workflow-windows-amd64.zip') -Destination build/release
+            $container = (docker create $reference).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($container)) { throw 'create approved workflow-v0.0.1 candidate container failed' }
+            docker cp "${container}:/qualified/." build/release
+            if ($LASTEXITCODE -ne 0) { throw 'extract approved workflow-v0.0.1 candidate failed' }
           } finally {
-            if (Test-Path -LiteralPath $qualifiedWorktree) {
-              git worktree remove --force $qualifiedWorktree
-              if ($LASTEXITCODE -ne 0) { throw 'remove exact workflow-v0.0.1 qualified-source worktree failed' }
+            if (-not [string]::IsNullOrWhiteSpace($container)) {
+              docker rm $container | Out-Null
             }
           }
       - name: Authenticate exact qualification Worker image
