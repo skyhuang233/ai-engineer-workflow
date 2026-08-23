@@ -97,15 +97,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           head_sha="${{ steps.admission.outputs.head_sha }}"
-          pull_number="${{ steps.admission.outputs.pull_number }}"
           merged_at="${{ steps.admission.outputs.merged_at }}"
           runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/worker-contract.yml/runs" \
             -f event=pull_request -f head_sha="$head_sha" -f per_page=100)"
           run=""
-          mapfile -t candidate_run_ids < <(jq --exit-status --raw-output --arg head "$head_sha" --argjson pull "$pull_number" '
+          mapfile -t candidate_run_ids < <(jq --exit-status --raw-output --arg head "$head_sha" '
             [.workflow_runs[] | select(
               .event == "pull_request" and .head_sha == $head and
-              any(.pull_requests[]?; .number == $pull) and
               (.id | type == "number") and (.run_attempt | type == "number")
             )] | sort_by(.id) | reverse | .[].id
           ' <<<"$runs")
@@ -114,11 +112,10 @@ jobs:
             [[ "$latest_attempt" =~ ^[1-9][0-9]*$ ]] || { echo "qualification run attempt is invalid" >&2; exit 1; }
             for ((attempt=latest_attempt; attempt>=1; attempt--)); do
               attempt_run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run_id}/attempts/${attempt}")"
-              if jq --exit-status --arg head "$head_sha" --arg merged "$merged_at" --argjson pull "$pull_number" --argjson run "$candidate_run_id" --argjson attempt "$attempt" '
+              if jq --exit-status --arg head "$head_sha" --arg merged "$merged_at" --argjson run "$candidate_run_id" --argjson attempt "$attempt" '
                 .id == $run and .run_attempt == $attempt and .event == "pull_request" and .head_sha == $head and
                 .status == "completed" and .conclusion == "success" and
-                (.updated_at | type == "string") and (.updated_at | fromdateiso8601) <= ($merged | fromdateiso8601) and
-                any(.pull_requests[]?; .number == $pull)
+                (.updated_at | type == "string") and (.updated_at | fromdateiso8601) <= ($merged | fromdateiso8601)
               ' <<<"$attempt_run" >/dev/null; then
                 run="$(jq --compact-output '{id, run_attempt, updated_at}' <<<"$attempt_run")"
                 break 2

@@ -74,7 +74,6 @@ func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.
 		`actions/runs/${candidate_run_id}/attempts/${attempt}`,
 		`for ((attempt=latest_attempt; attempt>=1; attempt--))`,
 		`.status == "completed" and .conclusion == "success"`,
-		`any(.pull_requests[]?; .number == $pull)`,
 		`.updated_at | fromdateiso8601`,
 		`($merged | fromdateiso8601)`,
 		`qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}`,
@@ -105,6 +104,9 @@ func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.
 		if !strings.Contains(text, required) {
 			t.Fatalf("unified publisher omits qualified-candidate contract %q", required)
 		}
+	}
+	if strings.Contains(text, `.pull_requests[]?`) {
+		t.Fatal("unified publisher relies on GitHub's transient workflow-run pull_requests projection after merge")
 	}
 	if strings.Contains(text, `-f status=completed`) || strings.Contains(text, `.workflow_runs[] | select(`+"\n"+`              .event == "pull_request" and .head_sha == $head and .conclusion == "success"`) {
 		t.Fatal("unified publisher selects qualification from mutable latest-attempt state")
