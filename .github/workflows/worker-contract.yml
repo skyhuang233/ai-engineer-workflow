@@ -194,6 +194,7 @@ jobs:
     runs-on: [self-hosted, Windows, X64, workflow-qualification]
     environment: workflow-release-qualification
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
@@ -201,10 +202,20 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download candidate Worker SBOM
+        if: github.head_ref != 'release-0.0.1'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: candidate-worker-sbom
           path: build/release-inputs
+      - name: Download approved workflow-v0.0.1 Worker SBOM
+        if: github.head_ref == 'release-0.0.1'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-worker-sbom
+          path: build/release-inputs
+          run-id: 32615246977
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify candidate branch version
         shell: pwsh
         run: |
@@ -240,10 +251,10 @@ jobs:
             Push-Location $qualifiedWorktree
             try {
               & scripts/assemble-workflow-release.ps1 `
-                -CandidateSourceCommit '${{ github.event.pull_request.head.sha }}' `
-                -QualificationRunID '${{ github.run_id }}' `
-                -QualificationRunAttempt '${{ github.run_attempt }}' `
-                -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
+                -CandidateSourceCommit $qualifiedSource `
+                -QualificationRunID 32615246977 `
+                -QualificationRunAttempt 1 `
+                -WorkerImage 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de' `
                 -SBOMPath $sourceSBOM -OutputDirectory $sourceOutput
             } finally {
               Pop-Location
@@ -299,6 +310,7 @@ jobs:
           $qualifiedSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
           $allowedQualificationOnlyChanges = @(
             '.github/workflows/worker-contract.yml',
+            '.github/workflows/publish-workflow.yml',
             'docs/adr/0002-accept-a-release-blackout-for-the-version-reset.md',
             'internal/doctor/publish_workflow_test.go'
           )
@@ -314,7 +326,7 @@ jobs:
           if ($bundleDigest -cne '1550a83309268f988ee594eae7a146defb3f7a83284ee077b349e90fb0848370') {
             throw 'workflow-v0.0.1 Bundle differs from the functionally qualified candidate'
           }
-          $workerImage = '${{ needs.worker-contract.outputs.qualification_image }}'
+          $workerImage = [string](Get-Content build/release/workflow-release.json -Raw | ConvertFrom-Json).worker.image
           if ($workerImage -cne 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de') {
             throw 'workflow-v0.0.1 Worker differs from the functionally qualified candidate'
           }
@@ -357,6 +369,14 @@ jobs:
           $head = '${{ github.event.pull_request.head.sha }}'
           $attempt = '${{ github.run_attempt }}'
           $runID = '${{ github.run_id }}'
+          $manifestSource = $head
+          $manifestRunID = $runID
+          $manifestRunAttempt = $attempt
+          if ($env:GITHUB_HEAD_REF -ceq 'release-0.0.1') {
+            $manifestSource = 'b35d239f4fe7e4ed55cb800942b2a36cf7468058'
+            $manifestRunID = '32615246977'
+            $manifestRunAttempt = '1'
+          }
           $manifestDigest = (Get-FileHash -LiteralPath build/release/workflow-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
           $toolchain = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
           $repository = "$([string]$toolchain.worker.image_repository)-release-candidate"
@@ -373,9 +393,9 @@ jobs:
           CMD ["/qualified/workflow-release.json"]
           '@ | Set-Content -LiteralPath (Join-Path $context Dockerfile) -Encoding ascii
           docker build `
-            --label "io.agent-workflow.candidate-source-commit=$head" `
-            --label "io.agent-workflow.qualification-run-id=$runID" `
-            --label "io.agent-workflow.qualification-run-attempt=$attempt" `
+            --label "io.agent-workflow.candidate-source-commit=$manifestSource" `
+            --label "io.agent-workflow.qualification-run-id=$manifestRunID" `
+            --label "io.agent-workflow.qualification-run-attempt=$manifestRunAttempt" `
             --label "io.agent-workflow.manifest-sha256=$manifestDigest" `
             --tag $reference $context
           if ($LASTEXITCODE -ne 0) { throw 'build qualified candidate container failed' }

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "contract_version": "1",
+  "issue_tracker": "github-issues",
+  "domain_layout": "single-context",
+  "required_check": "workflow-contract"
+}

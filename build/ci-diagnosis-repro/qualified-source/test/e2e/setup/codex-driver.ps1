@@ -1,0 +1,154 @@
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = "Stop"
+
+function Require-Environment([string]$Name) {
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "$Name is required by the setup DriverScript contract" }
+    return $value
+}
+
+if ($env:WORKFLOW_SETUP_E2E -ne "1") { throw "Set WORKFLOW_SETUP_E2E=1 before running the Codex setup driver" }
+$scenario = Require-Environment "WORKFLOW_SETUP_E2E_SCENARIO"
+$repositoryPath = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_E2E_REPOSITORY_PATH"))
+$resultPath = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_E2E_RESULT_PATH"))
+$owner = Require-Environment "WORKFLOW_SETUP_E2E_GITHUB_OWNER"
+$entrySkillSpec = Require-Environment "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC"
+$platformVersion = Require-Environment "WORKFLOW_SETUP_E2E_PLATFORM_VERSION"
+$runID = Require-Environment "WORKFLOW_SETUP_E2E_RUN_ID"
+$runRepositoryID = $runID.Substring(0, 12)
+$phase = Require-Environment "WORKFLOW_SETUP_E2E_PHASE"
+if ($phase -cnotin @('initial','onboarding-resume','delivery-resume')) { throw "WORKFLOW_SETUP_E2E_PHASE is invalid" }
+$patInputPath = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_E2E_PAT_FILE"))
+if (-not (Test-Path -LiteralPath $patInputPath -PathType Leaf)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is unavailable" }
+$setupToken = [IO.File]::ReadAllText($patInputPath).Trim()
+if ([string]::IsNullOrWhiteSpace($setupToken)) { throw "WORKFLOW_SETUP_E2E_PAT_FILE is empty" }
+if (-not (Test-Path -LiteralPath $repositoryPath -PathType Container)) { throw "Scenario repository does not exist" }
+$qualificationMode = $env:WORKFLOW_SETUP_QUALIFICATION -ceq "1"
+if (-not $qualificationMode -and $entrySkillSpec -notmatch '#workflow-v[0-9A-Za-z._-]+$') { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must use the skills CLI #workflow-v Git ref syntax" }
+
+$qualificationInstruction = ""
+if ($qualificationMode) {
+    $candidateDirectory = [IO.Path]::GetFullPath((Require-Environment "WORKFLOW_SETUP_CANDIDATE_DIRECTORY"))
+    $candidateVersion = Require-Environment "WORKFLOW_SETUP_CANDIDATE_VERSION"
+    $candidateSourceCommit = Require-Environment "WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT"
+    $candidateQualificationRunID = Require-Environment "WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID"
+    $candidateQualificationRunAttempt = Require-Environment "WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT"
+    if (-not (Test-Path -LiteralPath $candidateDirectory -PathType Container)) { throw "WORKFLOW_SETUP_CANDIDATE_DIRECTORY is unavailable" }
+    if ($candidateVersion -cne $platformVersion) { throw "Workflow qualification candidate version differs from the requested Platform version" }
+    if ($candidateSourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw "Workflow qualification candidate source commit is invalid" }
+    $entrySkillSpec = [IO.Path]::GetFullPath($entrySkillSpec)
+    $insideWorkTree = [string](git -C $entrySkillSpec rev-parse --is-inside-work-tree)
+    if ($LASTEXITCODE -ne 0 -or $insideWorkTree.Trim() -cne "true") { throw "WORKFLOW_SETUP_E2E_ENTRY_SKILL_SPEC must be a local qualification checkout" }
+    $entryHead = [string](git -C $entrySkillSpec rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0 -or $entryHead.Trim() -cne $candidateSourceCommit) { throw "local qualification checkout HEAD differs from WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT" }
+    $entrySkillStatus = [string](git -C $entrySkillSpec status --porcelain=v1 -- skills/setup-agent-workflow)
+    if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($entrySkillStatus)) { throw "local qualification checkout has uncommitted Setup Skill changes" }
+    $qualificationInstruction = @"
+This is release-branch qualification with WORKFLOW_SETUP_QUALIFICATION=1. The Setup Skill was installed from the exact local qualification checkout whose git rev-parse HEAD equals WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT. Immediately use the installed skill's explicit test-only candidate acquisition boundary with the exact WORKFLOW_SETUP_CANDIDATE_DIRECTORY, WORKFLOW_SETUP_CANDIDATE_VERSION, WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT, WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID, and WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT values already present in the process environment. Do not query, download, or require a published GitHub Release. Do not fall back from the candidate path to published acquisition.
+"@
+}
+
+$driverRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$schemaPath = Join-Path $driverRoot "driver-result.schema.json"
+$agentResultPath = Join-Path ([IO.Path]::GetTempPath()) ("workflow-codex-result-" + $runID + "-" + $scenario + ".json")
+$eventsPath = Join-Path ([IO.Path]::GetTempPath()) ("workflow-codex-events-" + $runID + "-" + $scenario + ".jsonl")
+$installedSkill = Join-Path $env:USERPROFILE ".agents\skills\setup-agent-workflow"
+
+function Get-DisposableRepositories {
+    if ($scenario -eq "organization-rejects-classic-pat") { return @() }
+    $prefix = "$owner/wf-e2e-$runRepositoryID-"
+    $priorGitHubToken = $env:GH_TOKEN
+    try {
+        $env:GH_TOKEN = $setupToken
+        $raw = gh repo list $owner --limit 1000 --json nameWithOwner --jq ".[].nameWithOwner"
+        if ($LASTEXITCODE -ne 0) { throw "cannot enumerate disposable repositories for cleanup fencing" }
+    } finally {
+        if ($null -eq $priorGitHubToken) { Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue } else { $env:GH_TOKEN = $priorGitHubToken }
+    }
+    return @($raw | Where-Object { ([string]$_).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+$before = @(Get-DisposableRepositories)
+try {
+    if ($phase -eq 'initial') {
+        if (Test-Path -LiteralPath $installedSkill) { Remove-Item -LiteralPath $installedSkill -Recurse -Force }
+        & npx --yes skills@latest add $entrySkillSpec --skill setup-agent-workflow --agent codex -g -y
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $installedSkill "SKILL.md") -PathType Leaf)) { throw "README npx skill installation failed" }
+    } elseif (-not (Test-Path -LiteralPath (Join-Path $installedSkill "SKILL.md") -PathType Leaf)) {
+        throw "resumed qualification lost the exact installed Setup Skill"
+    }
+
+    $phaseInstruction = switch ($phase) {
+        'initial' {
+@"
+Run the complete Setup Skill flow from candidate acquisition through the exact Repository Onboarding owner merge gate. For a positive scenario, stop at that gate and return gate_kind="repository_onboarding", the exact onboarding_plan_digest, pull_request URL, pull_head SHA, and approved merge_method. Do not merge the pull request. Set every delivery field to null.
+Do not return from a positive scenario until either that exact gate is reached or the Setup Skill reports a non-repairable blocker. A command error is not by itself a blocker: follow the skill's same-attempt repair rules first. Never delete, archive, rename, or transfer a scenario repository and never close its Pull Requests; the qualification harness alone owns disposable-resource cleanup, including after a blocker.
+"@
+        }
+        'onboarding-resume' {
+            $approvedDigest = Require-Environment "WORKFLOW_SETUP_E2E_APPROVED_DIGEST"
+@"
+The repository owner has merged the exact Onboarding Pull Request for approved digest $approvedDigest. Do not reinstall, reacquire, replan, or repeat Setup. Resume the stored immutable Onboarding Plan by calling onboarding apply with digest $approvedDigest and no stdin, then verify Repository Admission with the same digest. For scenario clean-new-repository only, use the installed `$agent-workflow skill to publish, approve, activate, and runtime-bind one Delivery Plan with one executable ticket that adds a file named workflow-release-qualification.txt containing the exact line `workflow-v$platformVersion qualified`. Wait for its Worker pull request and required checks, then stop for the owner with gate_kind="worker_delivery", its exact pull_request, pull_head, merge_method, delivery_plan issue number, and ticket issue number. Do not merge it. For every other positive scenario, finish with both readiness gates and gate_kind null.
+Do not return from this positive phase until either that exact Worker owner gate is reached or the agent-workflow skill reports a non-repairable blocker. A command error is not by itself a blocker: follow the skill's same-attempt repair rules first.
+"@
+        }
+        'delivery-resume' {
+            $deliveryPlan = Require-Environment "WORKFLOW_SETUP_E2E_DELIVERY_PLAN"
+            $ticket = Require-Environment "WORKFLOW_SETUP_E2E_TICKET"
+@"
+The repository owner has merged the exact Worker Pull Request for Delivery Plan #$deliveryPlan and Ticket #$ticket. Do not create, amend, or activate another Plan and do not mutate GitHub directly. Use the installed `$agent-workflow skill and the running Control Plane to reconcile that exact merged revision until Ticket #$ticket is projected as Delivered and Plan #$deliveryPlan is projected as Completed. Return ticket_status="Delivered", plan_status="Completed", both readiness gates true, and gate_kind null.
+"@
+        }
+    }
+
+    $prompt = @"
+Manually invoke `$setup-agent-workflow for the repository at: $repositoryPath
+
+This is the authorized, disposable setup qualification scenario "$scenario" under GitHub owner "$owner".
+Select exact Workflow Release version "$platformVersion"; do not fall back to a different stable release.
+$qualificationInstruction
+$phaseInstruction
+Follow the installed skill exactly. If the directory is not a Git repository, answer yes to its Git initialization question and run exactly `git init -b main`; never use the machine's implicit default branch. Use pwsh for every other Setup script and Launcher command; the sole powershell.exe exception is the native PAT verification command. Do not create helper scripts inside the target repository; use and clean a temporary directory outside it if needed. PAT verification must complete before any GitHub mutation. Do not call gh repo create or push the repository directly; only the approved workflow onboarding apply may create or publish it. For every plan_required response, inspect the complete projection and approve only the exact displayed digest, then continue applying and verifying it. Pipe exactly `$plan.onboarding_plan | ConvertTo-Json -Depth 100 -Compress` as the one JSON object on stdin for the first onboarding apply; do not join or reconstruct native output. Do not reuse an earlier approved digest after any plan command failure: regenerate, display, and approve the complete current Plan again. If onboarding apply returns incomplete with preceding effects satisfied and only repository-contract-pr required, treat it as the owner merge gate: return its exact Plan Digest and Pull Request in blocker with platform_ready=true and repository_admitted=false. Do not regenerate or reapply an Onboarding Plan before that Pull Request is merged. After the owner confirms the merge, do not generate a new Plan or mutate the local branch directly; resume the exact stored Plan by calling onboarding apply with its preserved approved Digest and no stdin, then verify with that same Digest. When a classic PAT is required, never read, echo, print, place it in an argument, or copy it into an environment variable. Verify it by piping `Get-Content -LiteralPath `$env:WORKFLOW_SETUP_E2E_PAT_FILE -Raw` to the installed skill's documented `powershell.exe -NoProfile -NonInteractive -File` command for `verify-github-pat.ps1`; never invoke that script through PowerShell's call operator. Do not approve effects outside the scenario repository, isolated Workflow Home, current-user Codex skills/PATH, Docker Desktop dependency, and repositories named $owner/wf-e2e-*.
+
+Positive scenarios clean-new-repository, unrelated-dirty-files, and second-same-owner must follow the phase-specific owner-controlled pause/resume protocol. Negative scenarios must stop at the exact expected blocker without weakening or bypassing the contract. Preserve unrelated dirty files byte-for-byte.
+
+Return only the JSON object required by the supplied output schema. Include every disposable repository created or discovered during this scenario in temporary_repositories. Use null blocker on success; otherwise provide the exact blocker. Always populate every schema field, using null only when that field does not apply to the current phase.
+"@
+    $prompt | & codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ephemeral --ignore-user-config -c 'model_reasoning_effort="high"' --json --output-schema $schemaPath --output-last-message $agentResultPath -C $repositoryPath - 2>&1 | Set-Content -LiteralPath $eventsPath -Encoding utf8
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $agentResultPath -PathType Leaf)) { throw "Codex setup interaction failed" }
+    $events = Get-Content -LiteralPath $eventsPath -Raw
+    if ($events.Contains($setupToken)) { throw "Codex event stream leaked the setup PAT" }
+    $raw = Get-Content -LiteralPath $agentResultPath -Raw
+    if ($raw.Contains($setupToken)) { throw "Codex result leaked the setup PAT" }
+    $result = $raw | ConvertFrom-Json
+    if ([string]$result.scenario -ne $scenario) { throw "Codex result scenario does not match DriverScript input" }
+    $after = @(Get-DisposableRepositories)
+    $created = @($after | Where-Object { $_ -notin $before })
+    $reported = @($result.temporary_repositories) + $created | Sort-Object -Unique
+    $result.temporary_repositories = @($reported)
+    $result | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $resultPath -Encoding utf8
+} catch {
+    $after = @(Get-DisposableRepositories)
+    $created = @($after | Where-Object { $_ -notin $before })
+    @{
+        scenario = $scenario
+        platform_ready = $false
+        repository_admitted = $false
+        temporary_repositories = @($created)
+        blocker = $_.Exception.Message
+        gate_kind = $null
+        onboarding_plan_digest = $null
+        pull_request = $null
+        pull_head = $null
+        merge_method = $null
+        delivery_plan = $null
+        ticket = $null
+        ticket_status = $null
+        plan_status = $null
+    } | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $resultPath -Encoding utf8
+	$global:LASTEXITCODE = 0
+} finally {
+    Remove-Item -LiteralPath $agentResultPath,$eventsPath -Force -ErrorAction SilentlyContinue
+}

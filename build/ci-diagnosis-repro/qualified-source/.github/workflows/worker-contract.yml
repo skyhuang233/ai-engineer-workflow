@@ -1,0 +1,293 @@
+name: worker-contract
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "deploy/worker/**"
+      - "config/toolchain.json"
+      - "config/workflow-release.json"
+      - "scripts/assemble-workflow-release.ps1"
+      - "scripts/build-workflow-worker.sh"
+      - ".github/workflows/worker-contract.yml"
+      - ".github/workflows/publish-workflow.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    env:
+      TEMP: 'C:\t'
+      TMP: 'C:\t'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Prepare short Windows test paths
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+      - name: Test Control Plane
+        # Windows PowerShell integration probes carry intentional 10-15 second
+        # child-process deadlines. Serialize packages so unrelated compile- and
+        # agent-heavy packages cannot starve those probes on the shared runner.
+        run: go test -p 1 ./...
+      - name: Vet Control Plane
+        run: go vet ./...
+
+  worker-contract:
+    # Linux is the Worker container runtime, not a supported Control Plane host.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      qualification_image: ${{ steps.qualification-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Detect Worker image input changes
+        id: worker-changes
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$BASE_REF" = main ] && { [[ "$HEAD_REF" == release-* ]] || [[ "$HEAD_REF" == hotfix-* ]]; }; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            cmd/delivery-source-digest internal/deliverysource deploy/worker config/toolchain.json go.mod go.sum \
+            .github/workflows/publish-workflow.yml; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Read accepted tool versions
+        if: steps.worker-changes.outputs.required == 'true'
+        id: pins
+        shell: bash
+        run: |
+          echo "codex_version=$(jq -r .codex.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_version=$(jq -r .github_cli.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "github_cli_sha256=$(jq -r .github_cli.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(jq -r .go.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "go_sha256=$(jq -r .go.linux_amd64_sha256 config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_version=$(jq -r .no_mistakes.version config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_repository=$(jq -r .no_mistakes.repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "no_mistakes_commit=$(jq -r .no_mistakes.commit config/toolchain.json)" >> "$GITHUB_OUTPUT"
+          echo "worker_image_repository=$(jq -r .worker.image_repository config/toolchain.json)" >> "$GITHUB_OUTPUT"
+      - name: Build without publishing
+        id: image
+        if: steps.worker-changes.outputs.required == 'true'
+        shell: bash
+        run: |
+          candidate="${{ steps.pins.outputs.worker_image_repository }}:qualification-${{ github.event.pull_request.head.sha }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bash scripts/build-workflow-worker.sh "$candidate"
+          echo "reference=$candidate" >> "$GITHUB_OUTPUT"
+      - name: Verify Worker contract
+        if: steps.worker-changes.outputs.required == 'true'
+        shell: bash
+        run: |
+          candidate="${{ steps.image.outputs.reference }}"
+          codex_output="$(docker run --rm "$candidate" codex --version)"
+          if [[ "$codex_output" =~ ^codex-cli[[:space:]]+([^[:space:]]+)$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.codex_version }}"
+          else
+            echo "Codex emitted an unrecognized version string: $codex_output" >&2
+            exit 1
+          fi
+          github_cli_output="$(docker run --rm "$candidate" gh --version | head -n 1)"
+          if [[ "$github_cli_output" =~ ^gh[[:space:]]version[[:space:]]([^[:space:]]+)([[:space:]].*)?$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.github_cli_version }}"
+          else
+            echo "GitHub CLI emitted an unrecognized version string: $github_cli_output" >&2
+            exit 1
+          fi
+          no_mistakes_output="$(docker run --rm "$candidate" no-mistakes --version)"
+          go_output="$(docker run --rm "$candidate" go version)"
+          docker run --rm "$candidate" sh -ceu 'command -v delivery-source-digest >/dev/null'
+          test "$go_output" = "go version go${{ steps.pins.outputs.go_version }} linux/amd64"
+          if [[ "$no_mistakes_output" =~ ^no-mistakes[[:space:]]version[[:space:]]+([^[:space:]]+)[[:space:]]+\(([0-9a-f]{7,40})\)([[:space:]].*)?$ ]]; then
+            test "${BASH_REMATCH[1]}" = "${{ steps.pins.outputs.no_mistakes_version }}"
+            reported_no_mistakes_commit="${BASH_REMATCH[2]}"
+          else
+            echo "no-mistakes emitted an unrecognized version string: $no_mistakes_output" >&2
+            exit 1
+          fi
+          docker run --rm "$candidate" sh -ceu \
+            'no-mistakes daemon start; daemon_status="$(no-mistakes daemon status)"; printf "%s\n" "$daemon_status"; case "$daemon_status" in *"daemon running"*) ;; *) echo "no-mistakes daemon is not running" >&2; exit 1 ;; esac'
+          worker_container="$(docker create "$candidate")"
+          trap 'docker rm --force "$worker_container" >/dev/null' EXIT
+          worker_binary="$RUNNER_TEMP/no-mistakes"
+          docker cp "$worker_container:/usr/local/bin/no-mistakes" "$worker_binary"
+          mapfile -t embedded_no_mistakes_commits < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.revision=\([0-9a-f]\{40\}\)$/\1/p')
+          test "${#embedded_no_mistakes_commits[@]}" -eq 1
+          embedded_no_mistakes_commit="${embedded_no_mistakes_commits[0]}"
+          test "$embedded_no_mistakes_commit" = "${{ steps.pins.outputs.no_mistakes_commit }}"
+          mapfile -t embedded_no_mistakes_modified < <(go version -m "$worker_binary" | sed -n 's/^[[:space:]]*build[[:space:]]*vcs\.modified=\(true\|false\)$/\1/p')
+          test "${#embedded_no_mistakes_modified[@]}" -eq 1
+          test "${embedded_no_mistakes_modified[0]}" = false
+          test "$reported_no_mistakes_commit" = "${embedded_no_mistakes_commit:0:${#reported_no_mistakes_commit}}"
+      - name: Generate candidate Worker SBOM
+        if: steps.worker-changes.outputs.required == 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ steps.image.outputs.reference }}
+          format: spdx-json
+          output-file: worker-sbom.spdx.json
+          upload-artifact: false
+      - name: Scan candidate Worker dependencies
+        if: steps.worker-changes.outputs.required == 'true' && !(github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-')))
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+      - name: Scan qualification Worker dependencies without blocking functional qualification
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        with:
+          sbom: worker-sbom.spdx.json
+          fail-build: false
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+      - name: Authenticate qualification Worker registry
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish qualification Worker image by immutable digest
+        id: qualification-image
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        shell: bash
+        run: |
+          candidate="${{ steps.image.outputs.reference }}"
+          docker push "$candidate"
+          digest="$(docker buildx imagetools inspect "$candidate" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image="${{ steps.pins.outputs.worker_image_repository }}@$digest"
+          docker buildx imagetools inspect "$image" >/dev/null
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - name: Transfer scanned SBOM to the release dry run
+        if: steps.worker-changes.outputs.required == 'true' && github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-worker-sbom
+          path: worker-sbom.spdx.json
+          if-no-files-found: error
+
+  release-dry-run:
+    if: github.base_ref == 'main' && (startsWith(github.head_ref, 'release-') || startsWith(github.head_ref, 'hotfix-'))
+    needs: [build-and-test, worker-contract]
+    runs-on: [self-hosted, Windows, X64, workflow-qualification]
+    environment: workflow-release-qualification
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-worker-sbom
+          path: build/release-inputs
+      - name: Verify candidate branch version
+        shell: pwsh
+        run: |
+          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_HEAD_REF -cne "release-$version" -and $env:GITHUB_HEAD_REF -cne "hotfix-$version") { throw 'candidate branch and version differ' }
+      - name: Assemble qualification candidate without publication
+        shell: pwsh
+        run: |
+          & scripts/assemble-workflow-release.ps1 `
+            -CandidateSourceCommit '${{ github.event.pull_request.head.sha }}' `
+            -QualificationRunID '${{ github.run_id }}' `
+            -QualificationRunAttempt '${{ github.run_attempt }}' `
+            -WorkerImage '${{ needs.worker-contract.outputs.qualification_image }}' `
+            -SBOMPath build/release-inputs/worker-sbom.spdx.json -OutputDirectory build/release
+      - name: Authenticate exact qualification Worker image
+        shell: pwsh
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $maximumAttempts = 3
+          for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+            $loginDiagnostic = @($env:GHCR_TOKEN | docker login ghcr.io --username '${{ github.actor }}' --password-stdin 2>&1)
+            $loginExitCode = $LASTEXITCODE
+            $loginDiagnostic | ForEach-Object { Write-Host $_ }
+            if ($loginExitCode -eq 0) { break }
+            if (($loginDiagnostic | Out-String) -cnotmatch '(?i)\bEOF\b') { throw 'authenticate exact qualification Worker image failed' }
+            if ($attempt -eq $maximumAttempts) { throw 'authenticate exact qualification Worker image failed' }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+      - name: Qualify exact candidate setup and full delivery operation
+        shell: pwsh
+        env:
+          WORKFLOW_SETUP_E2E: '1'
+          WORKFLOW_SETUP_QUALIFICATION: '1'
+          WORKFLOW_SETUP_CANDIDATE_DIRECTORY: ${{ github.workspace }}\build\release
+          WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $version = [string](Get-Content config/workflow-release.json -Raw | ConvertFrom-Json).version
+          $env:WORKFLOW_SETUP_CANDIDATE_VERSION = $version
+          & test/e2e/setup/setup-e2e.ps1 `
+            -GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER `
+            -DriverScript (Resolve-Path test/e2e/setup/codex-driver.ps1) `
+            -EntrySkillSpec (Resolve-Path .) `
+            -PlatformVersion $version `
+            -DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY `
+            -OwnerMergeTimeoutMinutes 120
+      - name: Preserve exact qualified Workflow Release candidate
+        shell: pwsh
+        run: |
+          $head = '${{ github.event.pull_request.head.sha }}'
+          $attempt = '${{ github.run_attempt }}'
+          $runID = '${{ github.run_id }}'
+          $manifestDigest = (Get-FileHash -LiteralPath build/release/workflow-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          $toolchain = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
+          $repository = "$([string]$toolchain.worker.image_repository)-release-candidate"
+          $tag = "q-$head-$runID-$attempt"
+          $reference = "${repository}:$tag"
+          docker buildx imagetools inspect $reference 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw 'qualified candidate registry identity already exists' }
+          $context = 'build/release-container'
+          New-Item -ItemType Directory -Force -Path $context | Out-Null
+          Copy-Item -LiteralPath build/release/worker-sbom.spdx.json,build/release/workflow-release.json,build/release/workflow-windows-amd64.zip -Destination $context
+          @'
+          FROM scratch
+          COPY worker-sbom.spdx.json workflow-release.json workflow-windows-amd64.zip /qualified/
+          CMD ["/qualified/workflow-release.json"]
+          '@ | Set-Content -LiteralPath (Join-Path $context Dockerfile) -Encoding ascii
+          docker build `
+            --label "io.agent-workflow.candidate-source-commit=$head" `
+            --label "io.agent-workflow.qualification-run-id=$runID" `
+            --label "io.agent-workflow.qualification-run-attempt=$attempt" `
+            --label "io.agent-workflow.manifest-sha256=$manifestDigest" `
+            --tag $reference $context
+          if ($LASTEXITCODE -ne 0) { throw 'build qualified candidate container failed' }
+          docker push $reference
+          if ($LASTEXITCODE -ne 0) { throw 'push qualified candidate container failed' }
+          $digest = ([string](docker buildx imagetools inspect $reference --format '{{json .Manifest.Digest}}')).Trim().Trim('"')
+          if ($LASTEXITCODE -ne 0 -or $digest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw 'resolve qualified candidate container digest failed' }
+          docker buildx imagetools inspect "$repository@$digest" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'verify qualified candidate container digest failed' }
+      - name: Remove qualification registry credentials
+        if: always()
+        shell: pwsh
+        run: docker logout ghcr.io

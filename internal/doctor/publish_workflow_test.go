@@ -81,9 +81,12 @@ func TestUnifiedPublisherConsumesExactRegistryPreservedQualification(t *testing.
 		`io.agent-workflow.manifest-sha256`,
 		`qualified candidate manifest digest differs from registry identity`,
 		`qualified candidate manifest differs from immutable registry identity`,
-		`-ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}'`,
-		`-ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}'`,
-		`-ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}'`,
+		`EXPECTED_SOURCE_COMMIT: ${{ steps.stored-candidate.outputs.expected_source }}`,
+		`EXPECTED_QUALIFICATION_RUN_ID: ${{ steps.stored-candidate.outputs.expected_run_id }}`,
+		`EXPECTED_QUALIFICATION_RUN_ATTEMPT: ${{ steps.stored-candidate.outputs.expected_run_attempt }}`,
+		`-ExpectedSourceCommit $env:EXPECTED_SOURCE_COMMIT`,
+		`-ExpectedQualificationRunID $env:EXPECTED_QUALIFICATION_RUN_ID`,
+		`-ExpectedQualificationRunAttempt $env:EXPECTED_QUALIFICATION_RUN_ATTEMPT`,
 		`-ExpectedSourceCommit '${{ needs.qualified-candidate.outputs.candidate_source_commit }}'`,
 		`transferred qualification manifest digest differs`,
 		`transferred qualification Worker digest differs`,
@@ -157,6 +160,9 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"Assemble qualification candidate without publication", "scripts/assemble-workflow-release.ps1",
 		"Assemble approved workflow-v0.0.1 qualification candidate",
 		"b35d239f4fe7e4ed55cb800942b2a36cf7468058",
+		"Download approved workflow-v0.0.1 Worker SBOM",
+		"run-id: 32615246977",
+		"github-token: ${{ secrets.GITHUB_TOKEN }}",
 		"git worktree add --detach $qualifiedWorktree $qualifiedSource",
 		"workflow-v0.0.1 qualified-source worktree is not an exact clean checkout",
 		"git worktree remove --force $qualifiedWorktree",
@@ -168,10 +174,18 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"Verify approved workflow-v0.0.1 functional qualification",
 		"if: github.head_ref == 'release-0.0.1'",
 		"$allowedQualificationOnlyChanges = @(",
+		"'.github/workflows/publish-workflow.yml'",
 		"'docs/adr/0002-accept-a-release-blackout-for-the-version-reset.md'",
 		"$qualificationOnlyChanges.Count -ne $allowedQualificationOnlyChanges.Count",
 		"workflow-v0.0.1 Bundle differs from the functionally qualified candidate",
 		"workflow-v0.0.1 Worker differs from the functionally qualified candidate",
+		"-CandidateSourceCommit $qualifiedSource",
+		"-QualificationRunID 32615246977",
+		"-QualificationRunAttempt 1",
+		"-WorkerImage 'ghcr.io/skyhuang233/workflow-worker@sha256:7252ed834d6bbc9def5ffe97ca8d6cf5e7bc207c11c28a0128ac1733c2b8a8de'",
+		"$manifestSource = $head",
+		"$manifestRunID = $runID",
+		"$manifestRunAttempt = $attempt",
 		"repos/skyhuang233/wf-use/pulls/1",
 		"repos/skyhuang233/wf-use/pulls/5",
 		"repos/skyhuang233/wf-use/issues/2/comments?per_page=100",
@@ -202,6 +216,24 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 	} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("candidate workflow overwrites qualification-runner input with unconfigured GitHub value %q", forbidden)
+		}
+	}
+}
+
+func TestFirstReleasePublisherRetainsApprovedCandidateIdentity(t *testing.T) {
+	text := readWorkflow(t, ".github", "workflows", "publish-workflow.yml")
+	for _, required := range []string{
+		`if [ "${{ steps.admission.outputs.version }}" = '0.0.1' ]; then`,
+		"expected_source='b35d239f4fe7e4ed55cb800942b2a36cf7468058'",
+		"expected_run_id='32615246977'",
+		"expected_run_attempt='1'",
+		"--arg source \"$expected_source\" --arg run \"$expected_run_id\" --arg attempt \"$expected_run_attempt\"",
+		"-ExpectedSourceCommit $env:EXPECTED_SOURCE_COMMIT",
+		"-ExpectedQualificationRunID $env:EXPECTED_QUALIFICATION_RUN_ID",
+		"-ExpectedQualificationRunAttempt $env:EXPECTED_QUALIFICATION_RUN_ATTEMPT",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("first-release publisher omits approved candidate identity %q", required)
 		}
 	}
 }

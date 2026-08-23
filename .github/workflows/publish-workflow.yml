@@ -142,6 +142,14 @@ jobs:
           head_sha="${{ steps.admission.outputs.head_sha }}"
           run_id="${{ steps.qualification.outputs.run_id }}"
           run_attempt="${{ steps.qualification.outputs.run_attempt }}"
+          expected_source="$head_sha"
+          expected_run_id="$run_id"
+          expected_run_attempt="$run_attempt"
+          if [ "${{ steps.admission.outputs.version }}" = '0.0.1' ]; then
+            expected_source='b35d239f4fe7e4ed55cb800942b2a36cf7468058'
+            expected_run_id='32615246977'
+            expected_run_attempt='1'
+          fi
           configured_owner="$(jq --exit-status --raw-output '.github.credential.owner' config/toolchain.json)"
           candidate_repository="$(jq --exit-status --raw-output '.worker.image_repository' config/toolchain.json)-release-candidate"
           repository_path="${candidate_repository#ghcr.io/}"
@@ -157,9 +165,9 @@ jobs:
           image="${candidate_repository}@${registry_digest}"
           docker pull "$image" >/dev/null
           labels="$(docker image inspect "$image" --format '{{json .Config.Labels}}')"
-          manifest_sha256="$(jq --exit-status --raw-output --arg head "$head_sha" --arg run "$run_id" --arg attempt "$run_attempt" '
+          manifest_sha256="$(jq --exit-status --raw-output --arg source "$expected_source" --arg run "$expected_run_id" --arg attempt "$expected_run_attempt" '
             select(
-              .["io.agent-workflow.candidate-source-commit"] == $head and
+              .["io.agent-workflow.candidate-source-commit"] == $source and
               .["io.agent-workflow.qualification-run-id"] == $run and
               .["io.agent-workflow.qualification-run-attempt"] == $attempt
             ) |
@@ -175,16 +183,23 @@ jobs:
           test "$actual_manifest" = "$manifest_sha256" || { echo "qualified candidate manifest digest differs from registry identity" >&2; exit 1; }
           echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
           echo "registry_digest=$registry_digest" >> "$GITHUB_OUTPUT"
+          echo "expected_source=$expected_source" >> "$GITHUB_OUTPUT"
+          echo "expected_run_id=$expected_run_id" >> "$GITHUB_OUTPUT"
+          echo "expected_run_attempt=$expected_run_attempt" >> "$GITHUB_OUTPUT"
       - name: Verify exact qualified release candidate
         id: candidate
         shell: pwsh
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ steps.stored-candidate.outputs.expected_source }}
+          EXPECTED_QUALIFICATION_RUN_ID: ${{ steps.stored-candidate.outputs.expected_run_id }}
+          EXPECTED_QUALIFICATION_RUN_ATTEMPT: ${{ steps.stored-candidate.outputs.expected_run_attempt }}
         run: |
           $candidate = & skills/setup-agent-workflow/scripts/resolve-workflow-candidate.ps1 `
             -CandidateDirectory build/qualified `
             -ExpectedVersion '${{ steps.admission.outputs.version }}' `
-            -ExpectedSourceCommit '${{ steps.admission.outputs.head_sha }}' `
-            -ExpectedQualificationRunID '${{ steps.qualification.outputs.run_id }}' `
-            -ExpectedQualificationRunAttempt '${{ steps.qualification.outputs.run_attempt }}' | ConvertFrom-Json
+            -ExpectedSourceCommit $env:EXPECTED_SOURCE_COMMIT `
+            -ExpectedQualificationRunID $env:EXPECTED_QUALIFICATION_RUN_ID `
+            -ExpectedQualificationRunAttempt $env:EXPECTED_QUALIFICATION_RUN_ATTEMPT | ConvertFrom-Json
           if ([string]$candidate.manifest_sha256 -cne '${{ steps.stored-candidate.outputs.manifest_sha256 }}') { throw 'qualified candidate manifest differs from immutable registry identity' }
           "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
