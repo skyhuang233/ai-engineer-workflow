@@ -17,8 +17,14 @@ concurrency:
 jobs:
   accepted-merge:
     runs-on: windows-latest
+    env:
+      TEMP: 'C:\t'
+      TMP: 'C:\t'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Prepare short Windows test paths
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Test the accepted main merge
         run: go test -p 1 ./...
       - name: Vet the accepted main merge

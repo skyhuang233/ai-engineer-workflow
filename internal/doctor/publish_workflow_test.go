@@ -46,7 +46,15 @@ func TestUnifiedPublisherTestsTheAcceptedMergeBeforeMutation(t *testing.T) {
 		t.Fatal("unified publisher omits the accepted-merge gate before candidate resolution")
 	}
 	gate := text[acceptedMerge:candidate]
-	for _, required := range []string{"runs-on: windows-latest", "go test -p 1 ./...", "go vet ./..."} {
+	for _, required := range []string{
+		"runs-on: windows-latest",
+		`TEMP: 'C:\t'`,
+		`TMP: 'C:\t'`,
+		"Prepare short Windows test paths",
+		"New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null",
+		"go test -p 1 ./...",
+		"go vet ./...",
+	} {
 		if !strings.Contains(gate, required) {
 			t.Fatalf("accepted-merge gate omits %q", required)
 		}
