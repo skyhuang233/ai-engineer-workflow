@@ -1,4 +1,4 @@
-package platformrelease
+package workflowbundle
 
 import (
 	"archive/zip"

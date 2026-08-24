@@ -11,8 +11,22 @@ tools are recorded in its manifest, and no-mistakes is pinned by repository,
 full commit, and version, then compiled from a clean checkout with the pinned Go
 toolchain. The design intentionally has no second no-mistakes Release lifecycle
 and no canonical Git-tree/blob build identity. Publication remains gated on the
-final Worker SBOM and Grype scan, and consumers use only the final immutable
-Worker digest carried by the Workflow Release.
+final Worker SBOM, and consumers use only the final immutable Worker digest
+carried by the Workflow Release. The high-severity, only-fixed Grype scan is
+advisory and non-blocking for functional release qualification: findings or a
+scanner failure do not prevent candidate preservation or publication. This is
+an explicit containment while security review is out of scope, not evidence
+that the candidate passed a vulnerability gate.
+
+After functional qualification, the exact Bundle, manifest, and SBOM are
+stored together in a scratch OCI image. Its discovery tag is keyed by the full
+candidate head, qualification run ID, and attempt and is never reused, while
+image labels also bind those values and the manifest SHA-256. The publisher
+resolves that deterministic tag through the authenticated registry, pulls the
+package version by immutable registry digest, rechecks every binding, and then
+reverifies the three candidate files. A rerun creates a new attempt-bound
+identity and cannot hide the candidate accepted by an earlier successful
+attempt.
 
 The GitHub CLI remains a `version` plus exact Linux amd64 binary-hash pin in the
 manifest. When its latest upstream release artifact cannot pass the required

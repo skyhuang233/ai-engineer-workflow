@@ -18,7 +18,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/hostsetup"
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
 )
 
@@ -35,7 +35,7 @@ type ControlPlaneAdapter interface {
 }
 
 type BundleLifecycle struct {
-	Compatibility platformrelease.Compatibility
+	Compatibility workflowbundle.Compatibility
 	Dependencies  DependencyAdapter
 	ControlPlane  ControlPlaneAdapter
 }
@@ -45,7 +45,7 @@ func NewBundleLifecycle(bundleRoot string) (*BundleLifecycle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read Bundle manifest: %w", err)
 	}
-	var manifest platformrelease.BundleManifest
+	var manifest workflowbundle.BundleManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, fmt.Errorf("decode Bundle manifest: %w", err)
 	}

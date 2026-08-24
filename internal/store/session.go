@@ -13,8 +13,8 @@ import (
 
 	candidateoutput "github.com/skyhuang233/workflow/internal/candidate"
 	"github.com/skyhuang233/workflow/internal/plan"
-	"github.com/skyhuang233/workflow/internal/workerrelease"
 	"github.com/skyhuang233/workflow/internal/workerrun"
+	"github.com/skyhuang233/workflow/internal/workerruntime"
 )
 
 var ErrSessionConflict = errors.New("ticket session identity conflict")
@@ -943,8 +943,8 @@ WHERE r.run_id = ? AND r.lease_generation = ? AND r.run_kind = ?`, claim.RunID, 
 		return "", nil, false, ErrInvalidClaim
 	}
 	if !validWorkerToolVersions(toolVersions) {
-		provenance, err := workerrelease.DecodeToolProvenance([]byte(manifestJSON))
-		if err != nil {
+		provenance, err := workerruntime.DecodeToolProvenance([]byte(manifestJSON))
+		if err != nil || provenance.ImageReference != imageDigest {
 			return "", nil, false, ErrInvalidClaim
 		}
 		manifestTools, _ := provenance.ToolVersions()

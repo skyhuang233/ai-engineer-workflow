@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 )
 
 type fixedDockerInspector struct {
@@ -308,7 +308,7 @@ func rewriteWorkerImage(t *testing.T, bundle, image string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var manifest platformrelease.BundleManifest
+	var manifest workflowbundle.BundleManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatal(err)
 	}

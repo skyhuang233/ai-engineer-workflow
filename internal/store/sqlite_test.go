@@ -296,6 +296,63 @@ func TestOpenForRuntimeSkipsMigrationDiscoveryAndHoldsRestoreBarrier(t *testing.
 	}
 }
 
+func TestOpenActivatedRuntimeWriteWaitsForShortSQLiteContention(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	seed, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeStore, err := OpenActivated(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+
+	blocker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	blocker.SetMaxOpenConns(1)
+	connection, err := blocker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_, releaseErr := connection.ExecContext(context.Background(), "ROLLBACK")
+		released <- releaseErr
+	}()
+
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	writeErr := runtimeStore.RecordRepositoryAdmission(writeCtx, RepositoryAdmission{
+		Repository:                 "owner/repo",
+		OnboardingPlanDigestSHA256: strings.Repeat("a", 64),
+		ContractVersion:            "1",
+		ManifestDigestSHA256:       strings.Repeat("b", 64),
+		Eligible:                   true,
+		VerifiedAt:                 time.Now().UTC(),
+	})
+	releaseErr := <-released
+	if releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	if writeErr != nil {
+		t.Fatalf("runtime write failed during short SQLite contention: %v", writeErr)
+	}
+}
+
 func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	ctx := context.Background()
@@ -355,8 +412,8 @@ func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != latestSchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, latestSchemaVersion)
+	if version != LatestSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, LatestSchemaVersion)
 	}
 }
 

@@ -166,7 +166,9 @@ func managedBlockConflict(ctx context.Context, root string, hasCommits bool) err
 	}
 	workingBlock, wOK := extractManagedBlock(string(working))
 	baseBlock, bOK := extractManagedBlock(string(base))
-	if wOK != (bOK) || workingBlock != baseBlock {
+	workingBlock = strings.ReplaceAll(workingBlock, "\r\n", "\n")
+	baseBlock = strings.ReplaceAll(baseBlock, "\r\n", "\n")
+	if wOK != bOK || workingBlock != baseBlock {
 		return errors.New("local AGENTS.md change overlaps the Workflow-managed block")
 	}
 	return nil

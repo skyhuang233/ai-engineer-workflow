@@ -24,13 +24,14 @@ var (
 )
 
 type Manifest struct {
-	SchemaVersion      int    `json:"schema_version"`
-	Version            string `json:"version"`
-	SourceCommit       string `json:"source_commit"`
-	GitHubActionsRunID int64  `json:"github_actions_run_id"`
-	Bundle             Bundle `json:"bundle"`
-	Worker             Worker `json:"worker"`
-	SBOM               SBOM   `json:"sbom"`
+	SchemaVersion           int    `json:"schema_version"`
+	Version                 string `json:"version"`
+	CandidateSourceCommit   string `json:"candidate_source_commit"`
+	QualificationRunID      int64  `json:"qualification_run_id"`
+	QualificationRunAttempt int64  `json:"qualification_run_attempt"`
+	Bundle                  Bundle `json:"bundle"`
+	Worker                  Worker `json:"worker"`
+	SBOM                    SBOM   `json:"sbom"`
 }
 
 type Bundle struct {
@@ -95,10 +96,12 @@ func (m Manifest) Validate() error {
 		return errors.New("unsupported Workflow Release Manifest schema")
 	case validateSemver(m.Version) != nil:
 		return fmt.Errorf("version: %w", validateSemver(m.Version))
-	case !hex40Pattern.MatchString(m.SourceCommit):
+	case !hex40Pattern.MatchString(m.CandidateSourceCommit):
 		return errors.New("source commit must be a lowercase 40-character Git object ID")
-	case m.GitHubActionsRunID <= 0:
+	case m.QualificationRunID <= 0:
 		return errors.New("GitHub Actions run ID must be positive")
+	case m.QualificationRunAttempt <= 0:
+		return errors.New("GitHub Actions run attempt must be positive")
 	case m.Bundle.Name != BundleAssetName:
 		return fmt.Errorf("Bundle name must be %s", BundleAssetName)
 	case !hex64Pattern.MatchString(m.Bundle.SHA256):
@@ -151,13 +154,14 @@ func NormalizeSHA256(value string) (string, error) {
 }
 
 type ManifestOptions struct {
-	Config             Config
-	SourceCommit       string
-	GitHubActionsRunID int64
-	BundlePath         string
-	WorkerImage        string
-	Tools              Tools
-	SBOMPath           string
+	Config                  Config
+	CandidateSourceCommit   string
+	QualificationRunID      int64
+	QualificationRunAttempt int64
+	BundlePath              string
+	WorkerImage             string
+	Tools                   Tools
+	SBOMPath                string
 }
 
 func CreateManifest(options ManifestOptions) (Manifest, error) {
@@ -173,13 +177,14 @@ func CreateManifest(options ManifestOptions) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("hash Worker SBOM: %w", err)
 	}
 	manifest := Manifest{
-		SchemaVersion:      1,
-		Version:            options.Config.Version,
-		SourceCommit:       options.SourceCommit,
-		GitHubActionsRunID: options.GitHubActionsRunID,
-		Bundle:             Bundle{Name: BundleAssetName, SHA256: bundleDigest},
-		Worker:             Worker{Image: options.WorkerImage, Tools: options.Tools},
-		SBOM:               SBOM{Name: SBOMAssetName, Format: "spdx-json", SHA256: sbomDigest, Scan: Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+		SchemaVersion:           1,
+		Version:                 options.Config.Version,
+		CandidateSourceCommit:   options.CandidateSourceCommit,
+		QualificationRunID:      options.QualificationRunID,
+		QualificationRunAttempt: options.QualificationRunAttempt,
+		Bundle:                  Bundle{Name: BundleAssetName, SHA256: bundleDigest},
+		Worker:                  Worker{Image: options.WorkerImage, Tools: options.Tools},
+		SBOM:                    SBOM{Name: SBOMAssetName, Format: "spdx-json", SHA256: sbomDigest, Scan: Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
 	}
 	if err := manifest.Validate(); err != nil {
 		return Manifest{}, err

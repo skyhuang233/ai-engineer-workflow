@@ -11,6 +11,13 @@ absolute local Workflow Home (default `%LOCALAPPDATA%\AgentWorkflow`) and one
 classic GitHub PAT with `repo,workflow`; never put the PAT in command arguments
 or ordinary output.
 
+PAT verification must succeed before any GitHub mutation. Never call gh repo create or push the Onboarding target directly. Repository creation, baseline push, and contract Pull Request creation are owned exclusively by the exact approved `workflow onboarding apply` execution.
+
+If the current unpublished directory is not yet a Git repository, ask whether
+to initialize it. After acceptance run exactly `git init -b main`.
+Never initialize an unpublished repository with the machine's implicit default branch;
+the first Delivery Plan must use the supported `main` delivery base.
+
 The download contract is one atomic private Workflow Release. Query only the
 fixed repository in `trust/release-policy.json` with the Control Plane PAT.
 Accept only a published, immutable, non-prerelease `workflow-vX.Y.Z` Release,
@@ -22,10 +29,12 @@ fail closed; never fall back to `platform-v*` or `worker-v*`.
 
 Download only `workflow-release.json` first and authenticate its bytes against
 the GitHub asset digest. Before downloading either other asset, run the
-PowerShell bootstrap verifier, require the Release tag to resolve directly to
-the manifest `source_commit`, and require its successful Actions run to have
-that same head SHA, event `push`, and the trusted publisher path
-`.github/workflows/publish-workflow.yml`. The verifier enforces schema 1 with
+PowerShell bootstrap verifier. Treat manifest `candidate_source_commit` and
+`qualification_run_id` and `qualification_run_attempt` as qualified-candidate provenance. Separately require
+the annotated Release tag to identify both an owner-created two-parent main
+merge containing that candidate, require the authoritative qualification to
+have completed before the merge, and require a successful `push` run of
+`.github/workflows/publish-workflow.yml` for the merge commit. The verifier enforces schema 1 with
 exact case-sensitive fields: unknown, duplicate, absent, mistyped, or invalid
 values fail. It does not execute downloaded code. Then download the Bundle and
 SBOM, verify their GitHub asset digests, and require those digests to equal the
@@ -36,19 +45,64 @@ listed SHA-256. Reject unsafe, duplicate, absent, or unlisted archive entries.
 Do not use a split checksum file, a Bootstrap Plan, an installed-CLI bridge, a
 legacy resolver, or an arbitrary version selector.
 
+Release-branch qualification has one explicit test-only acquisition boundary.
+When the qualification harness sets `WORKFLOW_SETUP_QUALIFICATION=1`, require
+absolute `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, exact
+`WORKFLOW_SETUP_CANDIDATE_VERSION`, and full lowercase
+`WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`, positive
+`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID`, and positive
+`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT` values. Resolve that directory only
+through `scripts/resolve-workflow-candidate.ps1`, then continue with the same
+Bundle verification, consent, installation, readiness, and Repository
+Onboarding steps below. Never enter this path during ordinary setup, never
+fall back between candidate and published acquisition, and never describe a
+candidate result as an installed published Release.
+
 Use the repository-owned scripts in this order. `$downloadRoot` must be a new
 empty temporary directory outside Workflow Home. The resolver authenticates
 the manifest and publisher before acquiring the other two assets; the Bundle
 verifier authenticates and inspects the archive before `$launcher` is assigned
 or invoked:
 
+Use pwsh for every Setup script and Launcher command except the native powershell.exe PAT verification shown below. Windows PowerShell 5.1 is not a supported host for the manifest and Bundle scripts. Never create a helper script inside the Onboarding target repository; if a temporary script is unavoidable, place it in a new temporary directory outside the repository and remove it before continuing.
+
 ```powershell
-$release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
+$patVerification = $pat | powershell.exe -NoProfile -NonInteractive -File `
+  "$skillRoot\scripts\verify-github-pat.ps1" `
+  -Owner $owner -RepositoryName $repositoryName `
+  -Visibility $visibility -PublicationState $publicationState | ConvertFrom-Json
+# verify-github-pat.ps1 reads [Console]::In.
+# Do not pipe the PAT to verify-github-pat.ps1 through PowerShell's call operator (`| &`); invoke the native powershell.exe process exactly as above so it receives standard input.
+if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
+  $release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
+    -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `
+    -ExpectedVersion $env:WORKFLOW_SETUP_CANDIDATE_VERSION `
+    -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT `
+    -ExpectedQualificationRunID $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID `
+    -ExpectedQualificationRunAttempt $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT | ConvertFrom-Json
+} else {
+  $release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
+}
 $bundle = & "$skillRoot\scripts\verify-windows-bundle.ps1" `
   -BundlePath $release.bundle_path `
   -ExpectedSHA256 $release.bundle_sha256 `
   -ExpectedVersion $release.version `
   -ExpectedWorkerImage $release.worker_image | ConvertFrom-Json
+$preparedBundle = & "$skillRoot\scripts\extract-verified-windows-bundle.ps1" `
+  -BundlePath $release.bundle_path `
+  -WorkingDirectory $downloadRoot `
+  -VerifiedVersion $bundle.version `
+  -VerifiedBundleDigest $bundle.bundle_digest `
+  -ExpectedVersion $release.version `
+  -ExpectedSHA256 $release.bundle_sha256 | ConvertFrom-Json
+$version = [string]$preparedBundle.version
+$bundleDigest = [string]$preparedBundle.bundle_digest
+$verifiedExtractedBundle = [string]$preparedBundle.extracted_bundle
+$verifiedReleaseManifest = @{
+  manifest_path=[string]$release.manifest_path
+  manifest_sha256=[string]$release.manifest_sha256
+  source_commit=[string]$release.source_commit
+}
 $launcher = Join-Path $verifiedExtractedBundle 'setup\workflow-setup.exe'
 ```
 
@@ -84,8 +138,24 @@ fields, but stop on unknown statuses or malformed known evidence.
    automatic rollback.
 5. Use the active versioned CLI only for Repository Onboarding. Generate,
    display, approve, apply, and verify the exact Onboarding Plan Digest for
-   this current repository. Finish only at Platform Ready and Repository
-   Admitted.
+   this current repository.
+   Send the exact `$plan.onboarding_plan` as one JSON object on stdin using the
+   command shape below; do not join, reconstruct, or
+   wrap native command output.
+   Do not reuse an earlier approved digest after any plan command failure:
+   regenerate the complete Plan, display its current
+   projection and digest, and obtain approval again.
+   An `incomplete` result whose preceding effects are satisfied and whose only
+   required effect is `repository-contract-pr` is the expected human merge
+   gate, not a plan or command failure. Preserve and report that exact Plan
+   Digest and Pull Request, then pause for the repository owner. Do not generate or apply another Onboarding Plan before the owner merges that exact Pull Request.
+   After the owner confirms the merge, do not generate a new Plan or mutate the
+   local branch directly. Resume the immutable stored Plan by calling
+   `onboarding apply` with its preserved approved Digest and no stdin; the CLI
+   reloads the exact canonical Plan from the active-generation Store. Then
+   verify Repository Admission with that same Digest. Any other incomplete result
+   is a blocker and must not be retried by guessing. Finish only at Platform
+   Ready and Repository Admitted.
 
 The Launcher owns generation state, migration, active-work fencing, Docker and
 worker preparation, PATH reconciliation, and Control Plane lifecycle. The
@@ -103,7 +173,8 @@ $state = $verify | & $dispatcher setup verify | ConvertFrom-Json
 # Explicit upgrade only:
 $preflight = @{schema_version=1;operation='inspect';purpose='active_work_preflight';workflow_home=$workflowHome} | ConvertTo-Json -Compress
 $preflight | & $dispatcher setup inspect | ConvertFrom-Json
-$target = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner} | ConvertTo-Json -Compress
+$targetRequest = @{schema_version=1;operation='inspect';purpose='target_state';workflow_home=$workflowHome;target_version=$version;bundle_digest=$bundleDigest;github_owner=$owner;verified_release_manifest=$verifiedReleaseManifest}
+$target = $targetRequest | ConvertTo-Json -Depth 16 -Compress
 $inspection = $target | & $launcher | ConvertFrom-Json
 # Do not invent or submit an empty consent surface. A fresh/changed target
 # returns the exact field `required_capabilities`; present those values, then
@@ -122,11 +193,14 @@ if ($inspection.status -eq 'consent_required') {
 } else {
   throw "Unexpected target_state status: $($inspection.status)"
 }
+$applyRequest.verified_release_manifest = $verifiedReleaseManifest
 $apply = $applyRequest | ConvertTo-Json -Depth 16 -Compress
 $apply | & $launcher | ConvertFrom-Json
 # Repository authority is only the active versioned CLI, never the launcher:
 $plan = & $dispatcher onboarding plan --workflow-home $workflowHome --repo $repo | ConvertFrom-Json
 $plan.onboarding_plan | ConvertTo-Json -Depth 100 -Compress | & $dispatcher onboarding apply --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
+# Only after the owner confirms the exact Onboarding Pull Request was merged:
+& $dispatcher onboarding apply --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
 & $dispatcher onboarding verify --workflow-home $workflowHome --repo $repo --onboarding-plan-digest $plan.onboarding_plan_digest
 ```
 

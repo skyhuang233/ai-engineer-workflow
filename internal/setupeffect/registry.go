@@ -25,14 +25,14 @@ type Descriptor struct {
 
 var descriptors = []Descriptor{
 	{Kind: "create_repository", PlanKind: RepositoryOnboarding, Actions: []string{"create"}, Required: []string{"owner", "authenticated_login", "name", "private", "approval_absent_repository"}, Engine: StandardEffect},
-	{Kind: "initial_baseline", PlanKind: RepositoryOnboarding, Actions: []string{"commit_and_push"}, Required: []string{"branch", "files_json", "repository", "source_url"}, Engine: StandardEffect},
+	{Kind: "initial_baseline", PlanKind: RepositoryOnboarding, Actions: []string{"commit_and_push"}, Required: []string{"branch", "files_json", "repository", "source_url"}, Optional: []string{"bootstrap_files_json"}, Engine: StandardEffect},
 	{Kind: "publish_history", PlanKind: RepositoryOnboarding, Actions: []string{"push"}, Required: []string{"branch", "head"}, Optional: []string{"new_repository"}, Engine: StandardEffect},
 	{Kind: "github_label", PlanKind: RepositoryOnboarding, Actions: []string{"reconcile"}, Required: []string{"name", "color", "description"}, Engine: StandardEffect},
 	{Kind: "repository_features", PlanKind: RepositoryOnboarding, Actions: []string{"enable"}, Required: []string{"issues", "actions", "allowed_actions"}, Engine: StandardEffect},
 	{Kind: "repository_variable", PlanKind: RepositoryOnboarding, Actions: []string{"reconcile"}, Required: []string{"name", "value"}, Engine: StandardEffect},
 	{Kind: "repository_contract_pr", PlanKind: RepositoryOnboarding, Actions: []string{"create_check_merge"}, Required: []string{"base_branch", "base_head", "source_url", "before_files_json", "files_json", "manifest_digest", "required_checks_json", "merge_method"}, Optional: []string{"base_head_effect_id"}, Engine: StandardEffect},
 	{Kind: "repository_admission", PlanKind: RepositoryOnboarding, Actions: []string{"verify_and_record"}, Required: []string{"default_branch", "manifest_digest", "contract_version"}, Optional: []string{"labels_json", "actions_allowed"}, Engine: AdmissionEffect},
-	{Kind: "local_fast_forward", PlanKind: RepositoryOnboarding, Actions: []string{"fast_forward_if_safe"}, Required: []string{"repository", "branch", "pre_merge_head", "merge_head_effect_id"}, Engine: StandardEffect},
+	{Kind: "local_fast_forward", PlanKind: RepositoryOnboarding, Actions: []string{"fast_forward_if_safe"}, Required: []string{"repository", "branch", "pre_merge_head", "merge_head_effect_id"}, Optional: []string{"pre_merge_head_effect_id"}, Engine: StandardEffect},
 }
 
 var byKind = func() map[string]Descriptor {

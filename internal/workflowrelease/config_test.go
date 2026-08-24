@@ -7,16 +7,24 @@ import (
 	"testing"
 )
 
-func TestLoadConfigAcceptsTheUnpublishedWorkflowBaseline(t *testing.T) {
+func TestLoadRepositoryConfig(t *testing.T) {
 	config, err := LoadConfig(filepath.Join("..", "..", "config", "workflow-release.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.DockerDesktop.Version != "4.86.0" {
+		t.Fatalf("Docker Desktop version = %q", config.DockerDesktop.Version)
+	}
+}
+
+func TestDecodeConfigAcceptsTheUnpublishedWorkflowBaseline(t *testing.T) {
+	raw := `{"schema_version":1,"version":"0.0.0","docker_desktop":{"version":"4.86.0","installer_url":"https://example.test/docker.exe","windows_amd64_sha256":"` + strings.Repeat("a", 64) + `"}}`
+	config, err := DecodeConfig([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if config.Version != "0.0.0" {
 		t.Fatalf("version = %q, want unpublished baseline 0.0.0", config.Version)
-	}
-	if config.DockerDesktop.Version != "4.86.0" {
-		t.Fatalf("Docker Desktop version = %q", config.DockerDesktop.Version)
 	}
 }
 
