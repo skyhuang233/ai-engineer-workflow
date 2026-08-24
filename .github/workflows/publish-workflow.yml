@@ -36,10 +36,10 @@ jobs:
     outputs:
       version: ${{ steps.admission.outputs.version }}
       tag: ${{ steps.admission.outputs.tag }}
-      candidate_source_commit: ${{ steps.admission.outputs.head_sha }}
+      candidate_source_commit: ${{ steps.candidate.outputs.source_commit }}
       merge_commit: ${{ github.sha }}
-      qualification_run_id: ${{ steps.qualification.outputs.run_id }}
-      qualification_run_attempt: ${{ steps.qualification.outputs.run_attempt }}
+      qualification_run_id: ${{ steps.candidate.outputs.qualification_run_id }}
+      qualification_run_attempt: ${{ steps.candidate.outputs.qualification_run_attempt }}
       qualification_completed_at: ${{ steps.qualification.outputs.completed_at }}
       merged_at: ${{ steps.admission.outputs.merged_at }}
       manifest_sha256: ${{ steps.candidate.outputs.manifest_sha256 }}
@@ -204,6 +204,9 @@ jobs:
             -ExpectedQualificationRunID $env:EXPECTED_QUALIFICATION_RUN_ID `
             -ExpectedQualificationRunAttempt $env:EXPECTED_QUALIFICATION_RUN_ATTEMPT | ConvertFrom-Json
           if ([string]$candidate.manifest_sha256 -cne '${{ steps.stored-candidate.outputs.manifest_sha256 }}') { throw 'qualified candidate manifest differs from immutable registry identity' }
+          "source_commit=$($candidate.source_commit)" >> $env:GITHUB_OUTPUT
+          "qualification_run_id=$($candidate.qualification_run_id)" >> $env:GITHUB_OUTPUT
+          "qualification_run_attempt=$($candidate.qualification_run_attempt)" >> $env:GITHUB_OUTPUT
           "manifest_sha256=$($candidate.manifest_sha256)" >> $env:GITHUB_OUTPUT
           "worker_image=$($candidate.worker_image)" >> $env:GITHUB_OUTPUT
       - name: Preflight Workflow Release target
