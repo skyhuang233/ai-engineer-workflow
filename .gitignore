@@ -1,3 +1,6 @@
 .agents/skills/
 /.scratch
 /docs
+/AGENTS.md
+/CONTEXT.md
+/test/e2e/setup

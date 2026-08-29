@@ -178,11 +178,6 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"docker create $reference",
 		"docker cp \"${container}:/qualified/.\" build/release",
 		"approved workflow-v0.0.1 candidate registry identity differs from its qualification evidence",
-		"Qualify exact candidate setup and full delivery operation", "test/e2e/setup/setup-e2e.ps1",
-		"if: github.head_ref != 'release-0.0.1'",
-		"-GitHubOwner $env:WORKFLOW_SETUP_E2E_GITHUB_OWNER",
-		"-DifferentOwnerRepository $env:WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY",
-		"-OwnerMergeTimeoutMinutes 120",
 		"Verify approved workflow-v0.0.1 functional qualification",
 		"if: github.head_ref == 'release-0.0.1'",
 		"$allowedQualificationOnlyChanges = @(",
@@ -201,7 +196,7 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 		"repos/skyhuang233/wf-use/pulls/5",
 		"repos/skyhuang233/wf-use/issues/2/comments?per_page=100",
 		"Delivered/Completed evidence is incomplete",
-		"WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT", "workflow-release-qualification",
+		"workflow-release-qualification",
 		`$maximumAttempts = 3`,
 		`Start-Sleep -Seconds (5 * $attempt)`,
 		"if: always()",
@@ -224,6 +219,8 @@ func TestCandidateWorkflowCoversDevelopAndMainDryRun(t *testing.T) {
 	for _, forbidden := range []string{
 		"secrets.WORKFLOW_SETUP_E2E_PAT", "secrets.WORKFLOW_SETUP_E2E_CLEANUP_TOKEN",
 		"vars.WORKFLOW_SETUP_E2E_GITHUB_OWNER", "vars.WORKFLOW_SETUP_E2E_DIFFERENT_OWNER_REPOSITORY",
+		"test/e2e/setup/setup-e2e.ps1", "test/e2e/setup/codex-driver.ps1",
+		"Qualify exact candidate setup and full delivery operation",
 	} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("candidate workflow overwrites qualification-runner input with unconfigured GitHub value %q", forbidden)
