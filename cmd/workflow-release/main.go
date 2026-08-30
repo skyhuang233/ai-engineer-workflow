@@ -82,7 +82,7 @@ func runAssemble(arguments []string) error {
 	bundleManifest := platformrelease.BundleManifest{
 		SchemaVersion: 1, SetupProtocolVersion: 1, Version: config.Version,
 		Compatibility: platformrelease.Compatibility{
-			OS: "windows", Architecture: "amd64", DatabaseSchema: 63, WorkerImage: *workerImage,
+			OS: "windows", Architecture: "amd64", DatabaseSchema: 64, WorkerImage: *workerImage,
 			DockerDesktopVersion: config.DockerDesktop.Version, DockerInstallerURL: config.DockerDesktop.InstallerURL,
 			DockerInstallerSHA256: config.DockerDesktop.WindowsAMD64SHA256,
 		},

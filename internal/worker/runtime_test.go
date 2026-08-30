@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/skyhuang233/workflow/internal/executionauth"
 )
 
 func init() {
@@ -109,6 +111,17 @@ func TestDockerArgsIncludeAuditedGatewayHostMapping(t *testing.T) {
 	}
 	if !containsArgs(args, "--security-opt", "seccomp=unconfined") {
 		t.Fatalf("docker args omit bubblewrap-compatible seccomp policy: %#v", args)
+	}
+}
+
+func TestDockerArgsPassAPIKeyByInheritedEnvironmentOnly(t *testing.T) {
+	args := dockerArgs(Spec{ImageDigest: "sha256:image", Environment: map[string]string{executionauth.APIKeyEnvironment: "never-in-argv"}})
+	if !containsArgs(args, "--env", executionauth.APIKeyEnvironment) || strings.Contains(strings.Join(args, " "), "never-in-argv") {
+		t.Fatalf("API key Docker rendering exposed its value: %#v", args)
+	}
+	environment := dockerChildEnvironment(Spec{Environment: map[string]string{executionauth.APIKeyEnvironment: "current-key"}})
+	if !containsEnvironment(environment, executionauth.APIKeyEnvironment+"=current-key") {
+		t.Fatalf("Docker child environment omitted API key: %#v", environment)
 	}
 }
 
@@ -439,6 +452,15 @@ func TestDockerRuntimeRefusesAmbiguousLegacyWorkflowContainers(t *testing.T) {
 func containsArgs(args []string, first, second string) bool {
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == first && args[i+1] == second {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnvironment(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
 			return true
 		}
 	}

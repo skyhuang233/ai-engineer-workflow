@@ -14,13 +14,22 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/deliverysource"
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
 )
 
 type WorkspaceManager struct {
-	RootDir               string
-	CodexStateRoot        string
+	RootDir        string
+	CodexStateRoot string
+	// Authentication is the explicit host selection used only when creating a
+	// new Ticket Session. Existing sessions read their immutable snapshot.
+	Authentication executionauth.Selection
+	// CurrentAuthentication reloads the host selection for new Sessions and
+	// API-key Runs. It is set by long-lived Control Plane entry points.
+	CurrentAuthentication func(context.Context) (executionauth.Selection, error)
+	// CodexAuthFile remains a migration seam for legacy direct callers. Runtime
+	// configuration never persists or supplies it.
 	CodexAuthFile         string
 	RefreshDeliverySource func(context.Context, string) (string, error)
 }
@@ -90,7 +99,7 @@ func (m WorkspaceManager) AdmitCodexAuthentication(ctx context.Context, db *stor
 	if _, _, err := m.sessionPaths("admission"); err != nil {
 		return err
 	}
-	return codexauth.ValidateChatGPT(m.CodexAuthFile)
+	return m.newSessionAuthentication()
 }
 
 func (m WorkspaceManager) ProvisionCodexAuthentication(ctx context.Context, sessionID string, existing bool) error {
@@ -119,9 +128,8 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 			return store.SessionProvisioningResult{}, fmt.Errorf("persisted %s path does not match configured Session path", persisted.name)
 		}
 	}
-	authPath := filepath.Join(state, codexauth.FileName)
 	if provisioning.Existing {
-		if err := codexauth.ValidateChatGPT(authPath); err != nil {
+		if _, err := executionauth.ReadSession(state); err != nil {
 			failure := &store.SessionAuthenticationFailure{}
 			if provisioning.CurrentRunID != "" {
 				failure.DiagnosticsPath, _ = m.writeMinimalAuthenticationDiagnostic(provisioning.CurrentRunID)
@@ -130,10 +138,11 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 		}
 		return store.SessionProvisioningResult{}, nil
 	}
-	if err := os.MkdirAll(state, 0o755); err != nil {
-		return store.SessionProvisioningResult{}, fmt.Errorf("create Ticket Session Codex state: %w", err)
+	selection, err := m.newSessionSelection()
+	if err != nil {
+		return store.SessionProvisioningResult{}, err
 	}
-	if err := codexauth.SeedNew(m.CodexAuthFile, state); err != nil {
+	if err := executionauth.WriteNewSession(selection, state); err != nil {
 		return store.SessionProvisioningResult{}, err
 	}
 	return store.SessionProvisioningResult{Rollback: func() error {
@@ -148,6 +157,68 @@ func (m WorkspaceManager) ProvisionCodexSession(_ context.Context, provisioning 
 		}
 		return nil
 	}}, nil
+}
+
+func (m WorkspaceManager) newSessionSelection() (executionauth.Selection, error) {
+	selection := m.Authentication
+	if m.CurrentAuthentication != nil {
+		var err error
+		selection, err = m.CurrentAuthentication(context.Background())
+		if err != nil {
+			return executionauth.Selection{}, err
+		}
+	}
+	if selection.Mode == "" && m.CodexAuthFile != "" {
+		selection = executionauth.Selection{Mode: executionauth.CodexLogin, CodexAuthFile: m.CodexAuthFile}
+	}
+	if selection.Mode == executionauth.CodexLogin && selection.CodexAuthFile == "" {
+		source, err := codexauth.ResolveDoctorVerifiedChatGPT(context.Background())
+		if err != nil {
+			return executionauth.Selection{}, fmt.Errorf("Codex Login Execution is not ready; run codex login outside Setup: %w", err)
+		}
+		selection.CodexAuthFile = source
+	}
+	if err := selection.Validate(); err != nil {
+		return executionauth.Selection{}, err
+	}
+	if selection.Mode == executionauth.CodexLogin {
+		if err := codexauth.ValidateChatGPT(selection.CodexAuthFile); err != nil {
+			return executionauth.Selection{}, err
+		}
+	}
+	return selection, nil
+}
+
+func (m WorkspaceManager) newSessionAuthentication() error {
+	_, err := m.newSessionSelection()
+	return err
+}
+
+// WorkerEnvironment derives an existing Session's immutable endpoint/model
+// from its snapshot and reads only the API key from the current host selection.
+func (m WorkspaceManager) WorkerEnvironment(ws workspace) (map[string]string, error) {
+	selection, err := executionauth.ReadSession(ws.CodexState)
+	if err != nil {
+		return nil, err
+	}
+	environment := map[string]string{"CODEX_HOME": ws.CodexState}
+	if selection.Mode == executionauth.APIKey {
+		current := m.Authentication
+		if m.CurrentAuthentication != nil {
+			current, err = m.CurrentAuthentication(context.Background())
+			if err != nil {
+				return nil, err
+			}
+		}
+		key := strings.TrimSpace(current.APIKey)
+		if key == "" {
+			return nil, errors.New("API-key execution is no longer ready")
+		}
+		environment[executionauth.BaseURLEnvironment] = selection.BaseURL
+		environment[executionauth.APIKeyEnvironment] = key
+		environment[executionauth.ModelEnvironment] = selection.Model
+	}
+	return environment, nil
 }
 
 func (m WorkspaceManager) writeMinimalAuthenticationDiagnostic(runID string) (string, error) {
@@ -944,7 +1015,11 @@ func (m WorkspaceManager) status(ctx context.Context, ws workspace) (commit, bra
 }
 
 func (m WorkspaceManager) authenticationRedactor(ws workspace) (codexauth.Redactor, error) {
-	if m.CodexAuthFile == "" {
+	selection, err := executionauth.ReadSession(ws.CodexState)
+	if err != nil {
+		return codexauth.Redactor{}, err
+	}
+	if selection.Mode != executionauth.CodexLogin {
 		return codexauth.Redactor{}, nil
 	}
 	return codexauth.NewRedactor(filepath.Join(ws.CodexState, codexauth.FileName))

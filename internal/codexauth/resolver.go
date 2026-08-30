@@ -36,6 +36,13 @@ func ResolveChatGPT(ctx context.Context) (string, error) {
 	return (Resolver{}).ResolveChatGPT(ctx)
 }
 
+// ResolveDoctorVerifiedChatGPT accepts only the source reported by Codex
+// doctor under its active CODEX_HOME. Worker execution authentication must not
+// accept the legacy integration override as a credential source.
+func ResolveDoctorVerifiedChatGPT(ctx context.Context) (string, error) {
+	return (Resolver{LookupEnvironment: func(string) string { return "" }}).ResolveChatGPT(ctx)
+}
+
 func (r Resolver) ResolveChatGPT(ctx context.Context) (string, error) {
 	lookup := r.LookupEnvironment
 	if lookup == nil {

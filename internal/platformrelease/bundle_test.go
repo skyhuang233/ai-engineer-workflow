@@ -29,7 +29,7 @@ func TestAssembleBundleCreatesExactlyOneSelfContainedAsset(t *testing.T) {
 		}
 	}
 	output := filepath.Join(root, "release", "workflow-windows-amd64.zip")
-	manifest := BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
+	manifest := BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: "0.0.1", Compatibility: Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 64, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}}
 	if err := AssembleBundle(BundleAssembleOptions{Output: output, SetupExecutable: setup, WorkflowExecutable: workflow, PayloadDirectory: payload, Manifest: manifest}); err != nil {
 		t.Fatal(err)
 	}

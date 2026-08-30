@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 63
+	latestSchemaVersion = 64
 )
 
 var (
@@ -1802,19 +1802,18 @@ SELECT backup_path, kind, reference_path, checksum_sha256, available FROM contro
     root_issue_number INTEGER NOT NULL DEFAULT 0,
     workspace_root TEXT NOT NULL,
     state_root TEXT NOT NULL,
-    codex_auth_file TEXT NOT NULL,
     github_api_url TEXT NOT NULL DEFAULT 'https://api.github.com',
     poll_interval_seconds INTEGER NOT NULL DEFAULT 60,
     workspace_retention_seconds INTEGER NOT NULL DEFAULT 604800,
     max_parallel_runs INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 )`,
-			`INSERT OR IGNORE INTO repository_runtime_configurations(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,codex_auth_file,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
+			`INSERT OR IGNORE INTO repository_runtime_configurations(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
 SELECT r.repository,
        COALESCE((SELECT json_extract(j.value,'$.parameters.default_branch') FROM setup_plans p, json_each(p.canonical_json,'$.effects') j WHERE p.kind='repository_onboarding' AND json_extract(p.canonical_json,'$.target.github_repository')=r.repository AND json_extract(j.value,'$.kind')='repository_admission' ORDER BY p.created_at DESC LIMIT 1), ''),
        COALESCE((SELECT json_extract(p.canonical_json,'$.target.repository_path') FROM setup_plans p WHERE p.kind='repository_onboarding' AND json_extract(p.canonical_json,'$.target.github_repository')=r.repository ORDER BY p.created_at DESC LIMIT 1), ''),
        COALESCE((SELECT root_issue_number FROM plans WHERE repository=r.repository ORDER BY updated_at DESC LIMIT 1), 0),
-       '', '', '', 'https://api.github.com', 60, 604800, 1, r.verified_at
+       '', '', 'https://api.github.com', 60, 604800, 1, r.verified_at
 FROM repository_admissions r`,
 		}
 		for _, statement := range statements {
@@ -1885,6 +1884,35 @@ FROM repository_admissions r`,
 			return fmt.Errorf("migration 63: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (63, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 64 {
+		statements := []string{
+			`CREATE TABLE repository_runtime_configurations_v64 (
+    repository TEXT PRIMARY KEY REFERENCES repository_admissions(repository),
+    default_branch TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    root_issue_number INTEGER NOT NULL DEFAULT 0,
+    workspace_root TEXT NOT NULL,
+    state_root TEXT NOT NULL,
+    github_api_url TEXT NOT NULL DEFAULT 'https://api.github.com',
+    poll_interval_seconds INTEGER NOT NULL DEFAULT 60,
+    workspace_retention_seconds INTEGER NOT NULL DEFAULT 604800,
+    max_parallel_runs INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+)`,
+			`INSERT INTO repository_runtime_configurations_v64(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
+SELECT repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at FROM repository_runtime_configurations`,
+			`DROP TABLE repository_runtime_configurations`,
+			`ALTER TABLE repository_runtime_configurations_v64 RENAME TO repository_runtime_configurations`,
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migration 64: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (64, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -108,7 +109,6 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	source := flags.String("source", "", "absolute local repository path")
 	defaultBranch := flags.String("default-branch", "", "canonical default branch")
 	maxParallel := flags.Int("max-parallel-runs", 0, "optional maximum parallel Worker Runs")
-	codexAuthFile := flags.String("codex-auth-file", "", "absolute Codex authentication source supplied by the invoking integration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -129,6 +129,9 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 		return err
 	}
 	defer database.Close()
+	if _, err := resolveWorkerExecutionAuthentication(ctx); err != nil {
+		return err
+	}
 	var config store.RepositoryRuntimeConfiguration
 	if *repository != "" {
 		config, err = database.RepositoryRuntimeConfiguration(ctx, *repository)
@@ -166,31 +169,12 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	if *maxParallel > 0 {
 		config.MaxParallelRuns = *maxParallel
 	}
-	if *codexAuthFile != "" {
-		if !filepath.IsAbs(*codexAuthFile) {
-			return errors.New("explicit Codex authentication source must be absolute")
-		}
-		absoluteAuth, authErr := filepath.Abs(*codexAuthFile)
-		if authErr != nil {
-			return fmt.Errorf("resolve explicit Codex authentication source: %w", authErr)
-		}
-		config.CodexAuthFile = filepath.Clean(absoluteAuth)
-		if authErr := codexauth.ValidateChatGPT(config.CodexAuthFile); authErr != nil {
-			return fmt.Errorf("validate explicit Codex authentication source: %w", authErr)
-		}
-	}
 	repositoryKey := strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(strings.ToLower(config.Repository))
 	if config.WorkspaceRoot == "" {
 		config.WorkspaceRoot = filepath.Join(layout.Workspaces, repositoryKey)
 	}
 	if config.StateRoot == "" {
 		config.StateRoot = filepath.Join(layout.State, "codex", repositoryKey)
-	}
-	if config.CodexAuthFile == "" {
-		config.CodexAuthFile, err = codexauth.ResolveChatGPT(ctx)
-		if err != nil {
-			return fmt.Errorf("resolve invoking Codex login: %w", err)
-		}
 	}
 	config.UpdatedAt = time.Now().UTC()
 	if err := config.Ready(); err != nil {
@@ -200,6 +184,58 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 		return err
 	}
 	return json.NewEncoder(output).Encode(map[string]any{"status": "configured", "repository": config.Repository, "root_issue_number": config.RootIssueNumber})
+}
+
+func resolveWorkerExecutionAuthentication(ctx context.Context) (executionauth.Selection, error) {
+	selection, err := executionauth.ResolveCurrentSelection(ctx, nil)
+	if err != nil {
+		return executionauth.Selection{}, fmt.Errorf("Worker execution authentication is not ready: %w", err)
+	}
+	return selection, nil
+}
+
+func reloadWorkerExecutionAuthentication(context.Context) (executionauth.Selection, error) {
+	if _, err := executionauth.ReloadCurrentUser(); err != nil {
+		return executionauth.Selection{}, fmt.Errorf("reload current-user Worker execution authentication: %w", err)
+	}
+	selection, err := executionauth.CurrentProcessSelection()
+	if err != nil {
+		return executionauth.Selection{}, fmt.Errorf("Worker execution authentication is not ready: %w", err)
+	}
+	return selection, nil
+}
+
+func runExecutionAuthentication(args []string) {
+	flags := flag.NewFlagSet("execution-auth", flag.ExitOnError)
+	mode := flags.String("mode", "", "Worker execution mode: api_key or codex_login")
+	baseURL := flags.String("base-url", "", "OpenAI-compatible API endpoint for api_key mode")
+	apiKeyStdin := flags.Bool("api-key-stdin", false, "read API key for api_key mode from standard input")
+	model := flags.String("model", "", "model for api_key mode")
+	_ = flags.Parse(args)
+	selection := executionauth.Selection{Mode: executionauth.Mode(*mode), BaseURL: *baseURL, Model: *model}
+	if selection.Mode == executionauth.CodexLogin {
+		source, err := codexauth.ResolveDoctorVerifiedChatGPT(context.Background())
+		if err != nil {
+			fail(fmt.Errorf("Codex Login Execution is not ready; run codex login outside Setup: %w", err))
+		}
+		selection.CodexAuthFile = source
+	} else if selection.Mode == executionauth.APIKey {
+		if !*apiKeyStdin {
+			fail(errors.New("api_key mode requires --api-key-stdin so the API key is not placed in command arguments"))
+		}
+		key, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fail(fmt.Errorf("read API key from standard input: %w", err))
+		}
+		selection.APIKey = strings.TrimSpace(string(key))
+		if err := executionauth.ProbeAPI(context.Background(), selection); err != nil {
+			fail(err)
+		}
+	}
+	if err := executionauth.CommitCurrentUser(selection); err != nil {
+		fail(err)
+	}
+	fmt.Printf("Worker execution authentication configured: %s\n", selection.Mode)
 }
 
 func runtimeLayout(args []string, name string) (workflowhome.Layout, error) {

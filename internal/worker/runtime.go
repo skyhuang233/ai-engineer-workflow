@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/workerrun"
 )
 
@@ -163,6 +164,13 @@ func IsGitHubCredentialName(name string) bool {
 		strings.Contains(name, "GITHUB_OAUTH")
 }
 
+// IsSecretEnvironmentName identifies values that Docker must inherit from its
+// own child environment rather than receive through argv. This protects the
+// API key from Docker command diagnostics and audit records.
+func IsSecretEnvironmentName(name string) bool {
+	return strings.EqualFold(name, executionauth.APIKeyEnvironment)
+}
+
 // ProcessRuntime is the host-process adapter used by local development and
 // tests. Production container adapters implement Runtime and receive the same
 // fully-audited Spec. It intentionally passes only the explicit environment.
@@ -270,6 +278,7 @@ func (r DockerRuntime) Run(ctx context.Context, spec Spec) (Result, error) {
 		return Result{}, CertifiedNoLaunchError{Err: err}
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = dockerChildEnvironment(spec)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -313,6 +322,7 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		}
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = dockerChildEnvironment(spec)
 	var createStdout, createStderr bytes.Buffer
 	cmd.Stdout = &createStdout
 	cmd.Stderr = &createStderr
@@ -355,6 +365,7 @@ func (r DockerRuntime) runWithStartAdmission(ctx context.Context, name string, s
 		return rejectPrepared(err)
 	}
 	cmd = exec.CommandContext(ctx, name, "container", "start", "--attach", containerID)
+	cmd.Env = dockerChildEnvironment(spec)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -444,7 +455,11 @@ func dockerArgs(spec Spec) []string {
 			if key == "CODEX_HOME" {
 				value = containerPath(value, spec.Mounts)
 			}
-			args = append(args, "--env", key+"="+value)
+			if IsSecretEnvironmentName(key) {
+				args = append(args, "--env", key)
+			} else {
+				args = append(args, "--env", key+"="+value)
+			}
 		}
 	}
 	args = append(args, spec.ImageDigest)
@@ -456,6 +471,27 @@ func dockerArgs(spec Spec) []string {
 		args = append(args, containerPath(value, spec.Mounts))
 	}
 	return args
+}
+
+func dockerChildEnvironment(spec Spec) []string {
+	values := append([]string(nil), os.Environ()...)
+	for name, value := range spec.Environment {
+		if IsSecretEnvironmentName(name) {
+			values = replaceEnvironment(values, name, value)
+		}
+	}
+	return values
+}
+
+func replaceEnvironment(values []string, name, value string) []string {
+	prefix := name + "="
+	for index, item := range values {
+		if strings.HasPrefix(strings.ToUpper(item), strings.ToUpper(prefix)) {
+			values[index] = prefix + value
+			return values
+		}
+	}
+	return append(values, prefix+value)
 }
 
 func (r DockerRuntime) ContainerRunning(ctx context.Context, runID string) (bool, error) {

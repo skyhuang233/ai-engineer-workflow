@@ -87,6 +87,18 @@ fields, but stop on unknown statuses or malformed known evidence.
    this current repository. Finish only at Platform Ready and Repository
    Admitted.
 
+After the active Launcher verifies `platform_ready` and before Repository
+Onboarding, obtain one explicit Worker Execution Authentication selection. Do
+not infer a mode from an API key, endpoint, model, or Codex cache. For
+`codex_login`, run the active CLI's `execution-auth --mode codex_login`; if it
+reports not ready, tell the user to run `codex login` outside Setup and stop.
+Do not start a browser login or ask for an auth-file path. For `api_key`, ask
+for endpoint, model, and key; put the key only on standard input to
+`execution-auth --mode api_key --base-url <endpoint> --model <model>
+--api-key-stdin`. The command performs the isolated probe before saving any
+selection, and its failure leaves the prior mode and values unchanged. Never
+put the API key in an argument, Setup Plan, output, or repository data.
+
 The Launcher owns generation state, migration, active-work fencing, Docker and
 worker preparation, PATH reconciliation, and Control Plane lifecycle. The
 skill only owns conversation, current-repository identity, bundle acquisition,
