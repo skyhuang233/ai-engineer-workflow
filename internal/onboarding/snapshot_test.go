@@ -2,6 +2,8 @@ package onboarding
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +47,30 @@ func TestApprovalSnapshotAcceptsOnlyEvidenceBoundInitialBaselineTransition(t *te
 	}
 	if err := VerifyApprovalSnapshotTransitions(ctx, snapshot, ApprovalTransitions{InitialBaselineHead: head}); err == nil {
 		t.Fatalf("third dirty state was accepted: %v", err)
+	}
+}
+
+func TestApprovalSnapshotBindsBootstrappedInitialBaseline(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	discovery, err := Discover(ctx, repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := []byte("name: workflow-contract\n")
+	sum := sha256.Sum256(workflow)
+	initial := []BaselineFile{{Path: ".github/workflows/workflow-contract.yml", SHA256: hex.EncodeToString(sum[:]), Mode: "100644"}}
+	snapshot, err := captureApprovalSnapshot(ctx, discovery, "owner/repo", []BaselineFile{}, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := CreateInitialBaselineWithBootstrap(ctx, repo, "main", initial, map[string][]byte{".github/workflows/workflow-contract.yml": workflow}, "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyApprovalSnapshotTransitions(ctx, snapshot, ApprovalTransitions{InitialBaselineHead: head}); err != nil {
+		t.Fatal(err)
 	}
 }
 

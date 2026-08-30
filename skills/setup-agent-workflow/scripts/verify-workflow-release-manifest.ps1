@@ -97,7 +97,7 @@ $json = [IO.File]::ReadAllText($resolvedManifest, $utf8)
 $document = [System.Text.Json.JsonDocument]::Parse($json)
 try {
   $root = $document.RootElement
-  Assert-ExactObject $root '$' @('schema_version','version','source_commit','github_actions_run_id','bundle','worker','sbom')
+  Assert-ExactObject $root '$' @('schema_version','version','candidate_source_commit','qualification_run_id','qualification_run_attempt','bundle','worker','sbom')
 
   $schema = Get-RequiredProperty $root 'schema_version'
   if ($schema.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $schema.GetRawText() -cne '1') { throw '$.schema_version must equal integer 1' }
@@ -109,8 +109,9 @@ try {
     }
   }
   if ($version -cne $expectedVersion) { throw '$.version does not match the Release tag' }
-  $sourceCommit = Assert-String (Get-RequiredProperty $root 'source_commit') '$.source_commit' '^[0-9a-f]{40}$'
-  $runID = Assert-PositiveInteger (Get-RequiredProperty $root 'github_actions_run_id') '$.github_actions_run_id'
+  $sourceCommit = Assert-String (Get-RequiredProperty $root 'candidate_source_commit') '$.candidate_source_commit' '^[0-9a-f]{40}$'
+  $runID = Assert-PositiveInteger (Get-RequiredProperty $root 'qualification_run_id') '$.qualification_run_id'
+  $runAttempt = Assert-PositiveInteger (Get-RequiredProperty $root 'qualification_run_attempt') '$.qualification_run_attempt'
 
   $bundle = Get-RequiredProperty $root 'bundle'
   Assert-ExactObject $bundle '$.bundle' @('name','sha256')
@@ -153,8 +154,9 @@ try {
   [pscustomobject]@{
     schema_version = 1
     version = $version
-    source_commit = $sourceCommit
-    github_actions_run_id = $runID
+    candidate_source_commit = $sourceCommit
+    qualification_run_id = $runID
+    qualification_run_attempt = $runAttempt
     bundle_sha256 = $bundleDigest
     worker_image = $workerImage
     sbom_sha256 = $sbomDigest

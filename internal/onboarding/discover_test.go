@@ -68,6 +68,33 @@ func TestDiscoverAllowsUnrelatedDirtyAndBlocksManagedDirty(t *testing.T) {
 	}
 }
 
+func TestDiscoverTreatsGitNormalizedLineEndingsAsCleanManagedBlock(t *testing.T) {
+	repo := newRepo(t)
+	managedLF := []byte(ManagedBlockStart + "\nmanaged contract\n" + ManagedBlockEnd + "\n")
+	managedCRLF := bytes.ReplaceAll(managedLF, []byte("\n"), []byte("\r\n"))
+	git(t, repo, "config", "core.autocrlf", "true")
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), managedCRLF, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "add", "AGENTS.md")
+	git(t, repo, "commit", "-m", "add managed contract")
+	if status := testGitOutput(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("Git did not normalize the line-ending-only change: %q", status)
+	}
+	head := testGitOutput(t, repo, "rev-parse", "HEAD")
+	if _, err := Discover(context.Background(), repo, StaticRemoteHead{DefaultBranch: "main", Head: head}); err != nil {
+		t.Fatalf("clean managed block with Git-normalized line endings was rejected: %v", err)
+	}
+
+	tampered := bytes.Replace(managedCRLF, []byte("managed contract"), []byte("tampered contract"), 1)
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Discover(context.Background(), repo, StaticRemoteHead{DefaultBranch: "main", Head: head}); err == nil || !strings.Contains(err.Error(), "local AGENTS.md change") {
+		t.Fatalf("changed managed block was accepted: %v", err)
+	}
+}
+
 func TestDiscoverBlocksRenameWhenEitherPathCrossesManagedBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name, source, destination string

@@ -69,7 +69,12 @@ func (c RepositoryRuntimeConfiguration) Ready() error {
 	return nil
 }
 
-func (s *Store) RecordRepositoryRuntimeConfiguration(ctx context.Context, value RepositoryRuntimeConfiguration) error {
+const (
+	repositoryRuntimePreserveConflict = ` ON CONFLICT(repository) DO NOTHING`
+	repositoryRuntimeReplaceConflict  = ` ON CONFLICT(repository) DO UPDATE SET default_branch=excluded.default_branch,source_path=excluded.source_path,root_issue_number=excluded.root_issue_number,workspace_root=excluded.workspace_root,state_root=excluded.state_root,github_api_url=excluded.github_api_url,poll_interval_seconds=excluded.poll_interval_seconds,workspace_retention_seconds=excluded.workspace_retention_seconds,max_parallel_runs=excluded.max_parallel_runs,updated_at=excluded.updated_at`
+)
+
+func recordRepositoryRuntimeConfiguration(ctx context.Context, executor repositoryRecordExecutor, value RepositoryRuntimeConfiguration, conflictAction string) error {
 	if err := value.Validate(); err != nil {
 		return err
 	}
@@ -79,10 +84,14 @@ func (s *Store) RecordRepositoryRuntimeConfiguration(ctx context.Context, value 
 		}
 		return filepath.Clean(path)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO repository_runtime_configurations(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET default_branch=excluded.default_branch,source_path=excluded.source_path,root_issue_number=excluded.root_issue_number,workspace_root=excluded.workspace_root,state_root=excluded.state_root,github_api_url=excluded.github_api_url,poll_interval_seconds=excluded.poll_interval_seconds,workspace_retention_seconds=excluded.workspace_retention_seconds,max_parallel_runs=excluded.max_parallel_runs,updated_at=excluded.updated_at`,
+	_, err := executor.ExecContext(ctx, `INSERT INTO repository_runtime_configurations(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`+conflictAction,
 		value.Repository, value.DefaultBranch, cleanOptionalPath(value.SourcePath), value.RootIssueNumber, cleanOptionalPath(value.WorkspaceRoot), cleanOptionalPath(value.StateRoot), value.GitHubAPIURL, int64(value.PollInterval/time.Second), int64(value.WorkspaceRetention/time.Second), value.MaxParallelRuns, formatTimestamp(value.UpdatedAt))
 	return err
+}
+
+func (s *Store) RecordRepositoryRuntimeConfiguration(ctx context.Context, value RepositoryRuntimeConfiguration) error {
+	return recordRepositoryRuntimeConfiguration(ctx, s.db, value, repositoryRuntimeReplaceConflict)
 }
 
 func (s *Store) RepositoryRuntimeConfiguration(ctx context.Context, repository string) (RepositoryRuntimeConfiguration, error) {

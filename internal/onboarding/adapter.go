@@ -2,9 +2,11 @@ package onboarding
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,7 +23,6 @@ type RepositoryRemote interface {
 	OnboardingPull(context.Context, string, string, string, []RequiredCheck) (PullReadback, error)
 	OnboardingBranch(context.Context, string, string) (RepositoryBranch, bool, error)
 	CreateOrUpdateOnboardingPull(context.Context, OnboardingPullRequest) (PullReadback, error)
-	MergeOnboardingPull(context.Context, string, int64, string, string) (string, error)
 	VerifyOnboardingContent(context.Context, string, string, map[string][]byte) error
 	CreateRepository(context.Context, string, string, string, bool) error
 	ReconcileLabel(context.Context, string, Label) error
@@ -45,15 +46,15 @@ var (
 
 // RepositoryBranch is a readback of a GitHub branch ref and its object ID.
 // The adapter deliberately carries both values: a default branch name alone is
-// not authority to apply or merge an immutable Onboarding Plan.
+// not authority to apply an immutable Onboarding Plan.
 type RepositoryBranch struct {
 	Name string
 	Head string
 }
 
 // OnboardingPullRequest contains only the immutable identity required to
-// create or re-read an Onboarding Pull Request. It intentionally has no merge
-// method: approved merge authority is a later, separately guarded transition.
+// create or re-read an Onboarding Pull Request. It intentionally cannot express
+// merge authority; only an owner-merged pull request can satisfy this effect.
 type OnboardingPullRequest struct {
 	Repository, Branch, Head, Base, BaseHead, Digest string
 	Files                                            map[string][]byte
@@ -78,16 +79,17 @@ type OnboardingBranchWriter interface {
 }
 
 type RepositoryAdapter struct {
-	Remote         RepositoryRemote
-	Credential     GitCredential
-	Owner          string
-	PlanDigest     string
-	Store          *store.Store
-	MergeHeads     map[string]string
-	Created        map[string]bool
-	BaselineHead   map[string]string
-	RepositoryPath string
-	BranchWriter   OnboardingBranchWriter
+	Remote             RepositoryRemote
+	Credential         GitCredential
+	Owner              string
+	AuthenticatedLogin string
+	PlanDigest         string
+	Store              *store.Store
+	MergeHeads         map[string]string
+	Created            map[string]bool
+	BaselineHead       map[string]string
+	RepositoryPath     string
+	BranchWriter       OnboardingBranchWriter
 }
 
 func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.Effect) (setupcontract.EffectStatus, string, error) {
@@ -158,6 +160,11 @@ func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.E
 		if record.OnboardingPlanDigestSHA256 != a.PlanDigest || record.ContractVersion != effect.Parameters["contract_version"] || record.ManifestDigestSHA256 != effect.Parameters["manifest_digest"] || !record.Eligible {
 			return setupcontract.EffectConflicting, "Repository Admission record differs from the exact approved onboarding", nil
 		}
+		if _, err := a.Store.RepositoryRuntimeConfiguration(ctx, effect.Subject); errors.Is(err, store.ErrNotFound) {
+			return setupcontract.EffectRequired, "Repository Runtime Configuration seed is absent", nil
+		} else if err != nil {
+			return setupcontract.EffectFailed, "", err
+		}
 		if err := a.Remote.VerifyContract(ctx, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"]); err != nil {
 			if errors.Is(err, ErrRepositoryContractNotFound) {
 				return setupcontract.EffectRequired, "managed Repository Contract is absent", nil
@@ -166,10 +173,15 @@ func (a *RepositoryAdapter) Readback(ctx context.Context, effect setupcontract.E
 		}
 		return setupcontract.EffectSatisfied, "Repository Contract is live", nil
 	case "initial_baseline":
-		head, err := gitOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD")
+		heads, err := gitOutput(ctx, effect.Subject, "rev-list", "--max-parents=0", "HEAD")
 		if err != nil {
 			return setupcontract.EffectRequired, "Initial Repository Baseline is absent", nil
 		}
+		roots := strings.Fields(heads)
+		if len(roots) != 1 || !isGitObjectID(roots[0]) {
+			return setupcontract.EffectConflicting, "Initial Repository Baseline history is ambiguous", nil
+		}
+		head := roots[0]
 		var files []BaselineFile
 		if json.Unmarshal([]byte(effect.Parameters["files_json"]), &files) != nil {
 			return setupcontract.EffectFailed, "", errors.New("invalid Initial Repository Baseline files")
@@ -243,7 +255,8 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 		if decodeErr != nil {
 			return setupcontract.EffectFailed, "", decodeErr
 		}
-		if verifyErr := a.Remote.VerifyOnboardingContent(ctx, effect.Subject, branch, files); verifyErr != nil {
+		contentRef := onboardingPullContentRef(pull, branch)
+		if verifyErr := a.Remote.VerifyOnboardingContent(ctx, effect.Subject, contentRef, files); verifyErr != nil {
 			if errors.Is(verifyErr, ErrManagedContentNotFound) {
 				pull.ContentMatches = false
 			} else {
@@ -251,7 +264,7 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 			}
 		}
 	}
-	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead)
+	decision, err := DecideOnboardingPull(pull, a.PlanDigest, branch, base, baseHead, a.AuthenticatedLogin)
 	if err != nil || decision == PullConflict {
 		return setupcontract.EffectConflicting, "Onboarding Pull Request identity or content drifted from the exact approved digest", nil
 	}
@@ -288,8 +301,8 @@ func (a *RepositoryAdapter) readbackOnboardingPull(ctx context.Context, effect s
 
 func requiredChecksForEffect(effect setupcontract.Effect) ([]RequiredCheck, error) {
 	var checks []RequiredCheck
-	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || len(checks) == 0 {
-		return nil, errors.New("Onboarding Pull Request lacks approved required checks")
+	if err := json.Unmarshal([]byte(effect.Parameters["required_checks_json"]), &checks); err != nil || checks == nil {
+		return nil, errors.New("Onboarding Pull Request approved required checks are invalid")
 	}
 	return CanonicalRequiredChecks(checks), nil
 }
@@ -340,14 +353,28 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 		if err := a.Remote.VerifyContract(ctx, effect.Subject, effect.Parameters["default_branch"], effect.Parameters["manifest_digest"]); err != nil {
 			return err
 		}
-		return a.Store.RecordRepositoryAdmission(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: nowUTC()})
+		now := nowUTC()
+		return a.Store.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, store.RepositoryAdmission{Repository: effect.Subject, OnboardingPlanDigestSHA256: a.PlanDigest, ContractVersion: effect.Parameters["contract_version"], ManifestDigestSHA256: effect.Parameters["manifest_digest"], Eligible: true, VerifiedAt: now}, store.RepositoryRuntimeConfiguration{
+			Repository:         effect.Subject,
+			DefaultBranch:      effect.Parameters["default_branch"],
+			SourcePath:         a.RepositoryPath,
+			GitHubAPIURL:       "https://api.github.com",
+			PollInterval:       time.Minute,
+			WorkspaceRetention: 7 * 24 * time.Hour,
+			MaxParallelRuns:    1,
+			UpdatedAt:          now,
+		})
 	case "initial_baseline":
 		var files []BaselineFile
 		if err := json.Unmarshal([]byte(effect.Parameters["files_json"]), &files); err != nil {
 			return err
 		}
 		if _, err := gitOutput(ctx, effect.Subject, "rev-parse", "--verify", "HEAD"); err != nil {
-			head, createErr := CreateInitialBaseline(ctx, effect.Subject, effect.Parameters["branch"], files, "Initial Repository Baseline\n\nOnboarding-Plan-SHA256: "+a.PlanDigest)
+			bootstrap, decodeErr := decodeBootstrapFiles(effect.Parameters["bootstrap_files_json"])
+			if decodeErr != nil {
+				return decodeErr
+			}
+			head, createErr := CreateInitialBaselineWithBootstrap(ctx, effect.Subject, effect.Parameters["branch"], files, bootstrap, "Initial Repository Baseline\n\nOnboarding-Plan-SHA256: "+a.PlanDigest)
 			if createErr != nil {
 				return createErr
 			}
@@ -371,11 +398,42 @@ func (a *RepositoryAdapter) Apply(ctx context.Context, effect setupcontract.Effe
 		if remote.Name != effect.Parameters["branch"] || remote.Head != merge {
 			return errors.New("GitHub default branch differs from the approved onboarding merge")
 		}
-		return SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], effect.Parameters["pre_merge_head"], merge, a.Credential)
+		preMergeHead := effect.Parameters["pre_merge_head"]
+		if preMergeHead == "" {
+			baselineEffectID := effect.Parameters["pre_merge_head_effect_id"]
+			if baselineEffectID == "" {
+				// Compatibility for an already-approved zero-commit v0.0.1 Plan.
+				baselineEffectID = "initial-baseline"
+			}
+			preMergeHead = a.BaselineHead[baselineEffectID]
+		}
+		if !isGitObjectID(preMergeHead) {
+			return errors.New("approved local pre-merge head evidence is unavailable")
+		}
+		return SafeFastForward(ctx, effect.Subject, effect.Parameters["repository"], effect.Parameters["branch"], preMergeHead, merge, a.Credential)
 	default:
 		return fmt.Errorf("Repository Onboarding effect %q requires its guarded Git primitive", effect.Kind)
 	}
 	return nil
+}
+
+func decodeBootstrapFiles(raw string) (map[string][]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	encoded := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &encoded); err != nil {
+		return nil, errors.New("invalid Initial Repository Baseline bootstrap files")
+	}
+	result := make(map[string][]byte, len(encoded))
+	for path, value := range encoded {
+		data, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || filepath.ToSlash(filepath.Clean(filepath.FromSlash(path))) != path || path == "." || filepath.IsAbs(path) || strings.HasPrefix(path, "../") {
+			return nil, errors.New("invalid Initial Repository Baseline bootstrap file")
+		}
+		result[path] = data
+	}
+	return result, nil
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }

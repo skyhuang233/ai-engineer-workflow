@@ -7,7 +7,7 @@ Agent Workflow turns a Windows machine into a single-host Control Plane and admi
 Install the manually invoked Codex skill:
 
 ```powershell
-npx skills@latest add skyhuang233/ai-engineer-workflow --skill setup-agent-workflow --agent codex -g -y
+npx skills@latest add "skyhuang233/ai-engineer-workflow#workflow-v0.0.1" --skill setup-agent-workflow --agent codex -g -y
 ```
 
 Open Codex in the repository directory and invoke:
@@ -16,7 +16,7 @@ Open Codex in the repository directory and invoke:
 $setup-agent-workflow
 ```
 
-The skill first checks whether the current directory is a Git repository. It then presents at most two complete approvals: a Platform Bootstrap Plan for host changes and an Onboarding Plan for repository changes. An approved Platform Bootstrap can create the selected Workflow Home when it is absent; Repository Onboarding requires that bootstrap database and never creates the home itself. A classic GitHub PAT with `repo` and `workflow` scopes is stored in plaintext under the current user's Workflow Home; the PAT is available to trusted host components but never to Worker containers.
+The skill first checks whether the current directory is a Git repository. It then presents at most two complete approvals: Platform Setup Consent for host capabilities and an Onboarding Plan for repository changes. Accepted Platform Setup Consent can create the selected Workflow Home when it is absent; Repository Onboarding requires a ready active generation and never creates the home itself. A classic GitHub PAT with `repo` and `workflow` scopes is stored in plaintext under the current user's Workflow Home; the PAT is available to trusted host components but never to Worker containers.
 
 Platform installation resolves the highest stable immutable `workflow-vX.Y.Z`
 release from this canonical repository. A Workflow Release contains exactly
@@ -31,7 +31,8 @@ Go toolchain. It also rebuilds the pinned GitHub CLI release commit with the
 security-fixed `golang.org/x/mod` dependency and verifies the deterministic
 binary hash recorded in the manifest. The Workflow Release—not a separate
 no-mistakes Release—is the supply-chain boundary; Doctor verifies the final
-assets, direct source tag, publisher run, and immutable Worker digest.
+assets, candidate qualification, owner merge and annotated provenance tag, publisher run and attempt,
+and immutable Worker digest.
 
 Platform and Worker are released atomically under one product version. Legacy
 split-release artifacts and tags have been retired. Until the first owner-approved
@@ -43,4 +44,4 @@ The Control Plane is supported and validated only on a current-user Windows host
 
 The Control Plane runs only for the current session. Inspect it with `workflow status`, read its logs with `workflow logs`, stop it with `workflow stop`, and start it manually with `workflow serve`. Setup does not install a service, configure startup, recover after reboot, or uninstall the platform.
 
-Repository Onboarding records the canonical repository, default branch, local source, Workspace roots, and Codex login source in Workflow Home. The installed Workflow Skill Bundle automatically binds a successfully published Delivery Plan Root to that record; no extra setup command or approval is required. `workflow serve` runs polling, reconciliation, Gateway, and scheduler loops only while the repository remains admitted and its runtime record is complete. Suspending one repository cancels only that repository's runtime.
+Repository Onboarding records the canonical repository, default branch, and local source in Workflow Home, seeding its runtime record. The installed Workflow Skill Bundle automatically binds a newly created or activated Delivery Plan Root and completes that record before execution; no extra setup command or approval is required. `workflow serve` runs polling, reconciliation, Gateway, and scheduler loops only while the repository remains admitted and its runtime record is complete. Suspending one repository cancels only that repository's runtime.

@@ -1,23 +1,34 @@
-package workerrelease
+package workerruntime
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
+
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
 type ToolProvenance struct {
-	CodexVersion      string `json:"codex_version"`
-	GitHubCLIVersion  string `json:"github_cli_version"`
-	GoVersion         string `json:"go_version"`
-	NoMistakesVersion string `json:"no_mistakes_version"`
+	Version           string
+	SourceCommit      string
+	ImageReference    string
+	CodexVersion      string
+	GitHubCLIVersion  string
+	GoVersion         string
+	NoMistakesVersion string
 }
 
 func DecodeToolProvenance(raw []byte) (ToolProvenance, error) {
-	var provenance ToolProvenance
-	if err := json.Unmarshal(raw, &provenance); err != nil {
-		return ToolProvenance{}, fmt.Errorf("decode Workflow Release tool provenance: %w", err)
+	manifest, err := workflowrelease.DecodeManifest(raw)
+	if err != nil {
+		return ToolProvenance{}, err
+	}
+	provenance := ToolProvenance{
+		Version: manifest.Version, SourceCommit: manifest.CandidateSourceCommit,
+		ImageReference:    manifest.Worker.Image,
+		CodexVersion:      manifest.Worker.Tools.Codex.Version,
+		GitHubCLIVersion:  manifest.Worker.Tools.GitHubCLI.Version,
+		GoVersion:         manifest.Worker.Tools.Go.Version,
+		NoMistakesVersion: manifest.Worker.Tools.NoMistakes.Version,
 	}
 	if _, err := provenance.ToolVersions(); err != nil {
 		return ToolProvenance{}, err

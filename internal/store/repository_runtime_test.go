@@ -81,6 +81,82 @@ func TestRepositoryRuntimeConfigurationPreservesIncompleteHostPaths(t *testing.T
 	}
 }
 
+func TestRepositoryAdmissionWithInitialRuntimeConfigurationRollsBackAndRetries(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	admission := RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: repeatHex('a'), ContractVersion: "1", ManifestDigestSHA256: repeatHex('b'), Eligible: true, VerifiedAt: now}
+	runtime := RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "main", SourcePath: filepath.Join(t.TempDir(), "repo"), GitHubAPIURL: "https://api.github.com", PollInterval: time.Minute, WorkspaceRetention: 7 * 24 * time.Hour, MaxParallelRuns: 1, UpdatedAt: now}
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER fail_runtime_seed BEFORE INSERT ON repository_runtime_configurations BEGIN SELECT RAISE(ABORT, 'runtime seed failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, admission, runtime); err == nil {
+		t.Fatal("runtime seed failure committed Repository Admission")
+	}
+	if _, err := db.RepositoryAdmission(ctx, admission.Repository); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed transaction left Repository Admission: %v", err)
+	}
+	if _, err := db.RepositoryRuntimeConfiguration(ctx, runtime.Repository); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed transaction left runtime configuration: %v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER fail_runtime_seed`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, admission, runtime); err != nil {
+		t.Fatalf("retry admission: %v", err)
+	}
+	if _, err := db.RepositoryAdmission(ctx, admission.Repository); err != nil {
+		t.Fatalf("retry did not record Repository Admission: %v", err)
+	}
+	if _, err := db.RepositoryRuntimeConfiguration(ctx, runtime.Repository); err != nil {
+		t.Fatalf("retry did not seed runtime configuration: %v", err)
+	}
+}
+
+func TestRepositoryAdmissionWithInitialRuntimeConfigurationPreservesExistingRuntime(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	admission := RepositoryAdmission{Repository: "owner/repo", OnboardingPlanDigestSHA256: repeatHex('a'), ContractVersion: "1", ManifestDigestSHA256: repeatHex('b'), Eligible: true, VerifiedAt: now}
+	existing := RepositoryRuntimeConfiguration{Repository: "owner/repo", DefaultBranch: "trunk", SourcePath: filepath.Join(t.TempDir(), "existing-repo"), RootIssueNumber: 42, WorkspaceRoot: filepath.Join(t.TempDir(), "workspaces"), StateRoot: filepath.Join(t.TempDir(), "state"), CodexAuthFile: filepath.Join(t.TempDir(), "auth.json"), GitHubAPIURL: "https://github.example/api/v3", PollInterval: 2 * time.Minute, WorkspaceRetention: 24 * time.Hour, MaxParallelRuns: 3, UpdatedAt: now}
+	if err := db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, admission, existing); err != nil {
+		t.Fatal(err)
+	}
+	updatedAdmission := admission
+	updatedAdmission.ContractVersion = "2"
+	updatedAdmission.ManifestDigestSHA256 = repeatHex('c')
+	updatedAdmission.VerifiedAt = now.Add(time.Hour)
+	replacementSeed := existing
+	replacementSeed.DefaultBranch = "main"
+	replacementSeed.SourcePath = filepath.Join(t.TempDir(), "replacement-repo")
+	replacementSeed.RootIssueNumber = 0
+	replacementSeed.UpdatedAt = now.Add(time.Hour)
+	if err := db.RecordRepositoryAdmissionWithInitialRuntimeConfiguration(ctx, updatedAdmission, replacementSeed); err != nil {
+		t.Fatal(err)
+	}
+	gotAdmission, err := db.RepositoryAdmission(ctx, admission.Repository)
+	if err != nil || gotAdmission.ContractVersion != "2" || gotAdmission.ManifestDigestSHA256 != repeatHex('c') {
+		t.Fatalf("updated Repository Admission = %#v, %v", gotAdmission, err)
+	}
+	gotRuntime, err := db.RepositoryRuntimeConfiguration(ctx, existing.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRuntime := existing
+	wantRuntime.CodexAuthFile = ""
+	if gotRuntime != wantRuntime {
+		t.Fatalf("existing runtime configuration changed: got %#v want %#v", gotRuntime, wantRuntime)
+	}
+}
+
 func TestMigration58BackfillsIdentitySourceBranchAndExistingRoot(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "workflow.db")

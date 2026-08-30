@@ -11,7 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/store"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
@@ -39,11 +40,13 @@ func runAssemble(arguments []string) error {
 	configPath := flags.String("config", "", "Workflow Release configuration")
 	toolchainPath := flags.String("toolchain", "", "toolchain configuration")
 	workflowExecutable := flags.String("workflow-exe", "", "Windows amd64 workflow.exe")
+	workflowVersionExecutable := flags.String("workflow-version-exe", "", "host-native workflow executable used to verify the version")
 	setupExecutable := flags.String("setup-exe", "", "Windows amd64 workflow-setup.exe")
 	payload := flags.String("payload", "", "staged package payload root")
 	output := flags.String("output", "", "empty release output directory")
-	sourceCommit := flags.String("source-commit", "", "accepted source commit")
-	runID := flags.Int64("github-actions-run-id", 0, "publisher Actions run ID")
+	sourceCommit := flags.String("candidate-source-commit", "", "qualified candidate source commit")
+	runID := flags.Int64("qualification-run-id", 0, "qualification Actions run ID")
+	runAttempt := flags.Int64("qualification-run-attempt", 0, "qualification Actions run attempt")
 	workerImage := flags.String("worker-image", "", "immutable Worker image reference")
 	sbom := flags.String("sbom", "", "generated SPDX JSON SBOM")
 	if err := flags.Parse(arguments); err != nil {
@@ -55,14 +58,17 @@ func runAssemble(arguments []string) error {
 	for name, value := range map[string]string{
 		"config": *configPath, "toolchain": *toolchainPath,
 		"workflow-exe": *workflowExecutable, "setup-exe": *setupExecutable, "payload": *payload,
-		"output": *output, "source-commit": *sourceCommit, "worker-image": *workerImage, "sbom": *sbom,
+		"output": *output, "candidate-source-commit": *sourceCommit, "worker-image": *workerImage, "sbom": *sbom,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("-%s is required", name)
 		}
 	}
 	if *runID <= 0 {
-		return errors.New("-github-actions-run-id must be positive")
+		return errors.New("-qualification-run-id must be positive")
+	}
+	if *runAttempt <= 0 {
+		return errors.New("-qualification-run-attempt must be positive")
 	}
 	config, err := workflowrelease.LoadConfig(*configPath)
 	if err != nil {
@@ -72,22 +78,26 @@ func runAssemble(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	if err := verifyWorkflowExecutableVersion(*workflowExecutable, config.Version); err != nil {
+	versionExecutable := strings.TrimSpace(*workflowVersionExecutable)
+	if versionExecutable == "" {
+		versionExecutable = *workflowExecutable
+	}
+	if err := verifyWorkflowExecutableVersion(versionExecutable, config.Version); err != nil {
 		return err
 	}
 	if err := requireEmptyDirectory(*output); err != nil {
 		return err
 	}
 	bundlePath := filepath.Join(*output, workflowrelease.BundleAssetName)
-	bundleManifest := platformrelease.BundleManifest{
+	bundleManifest := workflowbundle.BundleManifest{
 		SchemaVersion: 1, SetupProtocolVersion: 1, Version: config.Version,
-		Compatibility: platformrelease.Compatibility{
-			OS: "windows", Architecture: "amd64", DatabaseSchema: 64, WorkerImage: *workerImage,
+		Compatibility: workflowbundle.Compatibility{
+			OS: "windows", Architecture: "amd64", DatabaseSchema: store.LatestSchemaVersion, WorkerImage: *workerImage,
 			DockerDesktopVersion: config.DockerDesktop.Version, DockerInstallerURL: config.DockerDesktop.InstallerURL,
 			DockerInstallerSHA256: config.DockerDesktop.WindowsAMD64SHA256,
 		},
 	}
-	if err := platformrelease.AssembleBundle(platformrelease.BundleAssembleOptions{
+	if err := workflowbundle.AssembleBundle(workflowbundle.BundleAssembleOptions{
 		Output: bundlePath, SetupExecutable: *setupExecutable, WorkflowExecutable: *workflowExecutable,
 		PayloadDirectory: *payload, Manifest: bundleManifest,
 	}); err != nil {
@@ -102,7 +112,7 @@ func runAssemble(arguments []string) error {
 		return fmt.Errorf("stage Worker SBOM: %w", err)
 	}
 	manifest, err := workflowrelease.CreateManifest(workflowrelease.ManifestOptions{
-		Config: config, SourceCommit: *sourceCommit, GitHubActionsRunID: *runID, BundlePath: bundlePath,
+		Config: config, CandidateSourceCommit: *sourceCommit, QualificationRunID: *runID, QualificationRunAttempt: *runAttempt, BundlePath: bundlePath,
 		WorkerImage: *workerImage, Tools: toolchain.Tools(), SBOMPath: sbomPath,
 	})
 	if err != nil {

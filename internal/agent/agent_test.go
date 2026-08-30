@@ -18,9 +18,11 @@ import (
 
 	"github.com/skyhuang233/workflow/internal/agent"
 	"github.com/skyhuang233/workflow/internal/delivery"
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/plan"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/worker"
+	"github.com/skyhuang233/workflow/internal/workflowrelease"
 )
 
 type fakeRuntime struct {
@@ -48,6 +50,23 @@ type fakeRuntime struct {
 	deliveryOrigin                string
 	isolatedRuns                  []string
 	isolationErr                  error
+}
+
+func testWorkspaceManager(root string) agent.WorkspaceManager {
+	return agent.WorkspaceManager{
+		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+		Authentication: executionauth.Selection{Mode: executionauth.APIKey, BaseURL: "https://api.example.test/v1", APIKey: "test-api-key", Model: "test-model"},
+	}
+}
+
+func provisionLegacySession(t *testing.T, root string, manager agent.WorkspaceManager, sessionID string) {
+	t.Helper()
+	if err := os.RemoveAll(filepath.Join(root, "codex", sessionID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ProvisionCodexAuthentication(context.Background(), sessionID, false); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type blockingFailureRuntime struct {
@@ -231,7 +250,7 @@ func TestControllerCreatesIndependentWorkspaceObjectCopies(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace"))
@@ -285,7 +304,7 @@ func TestControllerIsolatesUncertainAgentBeforeFailureHandling(t *testing.T) {
 	}
 	controller := agent.Controller{
 		Store:     db,
-		Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Workspace: testWorkspaceManager(root),
 		Runtime:   runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail uncertainly")); err == nil {
@@ -308,7 +327,7 @@ func TestControllerCreatesLFOnlyTicketWorkspaceDespiteHostAutoCRLF(t *testing.T)
 
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	runtime := &fakeRuntime{dirty: true, err: errors.New("stop after workspace creation"), results: []worker.Result{{ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "create the workspace"))
@@ -382,7 +401,7 @@ func TestControllerNormalizesExistingCRLFTicketWorkspaceDuringRecovery(t *testin
 
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "recover the workspace")); err == nil || !strings.Contains(err.Error(), "workspace was not clean") {
@@ -571,9 +590,7 @@ func TestControllerRedactsCodexCredentialsFromAllFailureDiagnostics(t *testing.T
 		},
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
-	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
-		t.Fatal(err)
-	}
+	provisionLegacySession(t, root, controller.Workspace, claim.SessionID)
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail safely")); err == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
@@ -615,6 +632,9 @@ func TestWorkspaceManagerAdmitsExistingSessionAuthenticationWithoutHostSource(t 
 	manager := agent.WorkspaceManager{
 		RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: stateRoot,
 		CodexAuthFile: filepath.Join(root, "missing-host-auth.json"),
+		CurrentAuthentication: func(context.Context) (executionauth.Selection, error) {
+			return executionauth.Selection{}, errors.New("host login is unavailable")
+		},
 	}
 	if err := manager.AdmitCodexAuthentication(ctx, db, claim.VersionID, claim.TicketID); err != nil {
 		t.Fatalf("existing Ticket Session authentication was coupled to host source: %v", err)
@@ -694,9 +714,7 @@ func TestControllerRedactsPreAndPostRefreshCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"), CodexAuthFile: authSource}
-	if err := manager.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
-		t.Fatal(err)
-	}
+	provisionLegacySession(t, root, manager, claim.SessionID)
 	runtime := &fakeRuntime{
 		dirty:         true,
 		err:           errors.New("worker failed after refresh"),
@@ -768,6 +786,7 @@ func TestControllerBacksOffInitialDeliverySourceHostFailure(t *testing.T) {
 		Store: db,
 		Workspace: agent.WorkspaceManager{
 			RootDir: workspaceRoot, CodexStateRoot: filepath.Join(root, "codex"),
+			Authentication: executionauth.Selection{Mode: executionauth.APIKey, BaseURL: "https://api.example.test/v1", APIKey: "test-api-key", Model: "test-model"},
 		},
 		Runtime: runtime,
 		Now:     func() time.Time { return failureNow },
@@ -795,6 +814,7 @@ func TestControllerTerminalizesInitialDeliverySourceIntegrityFailure(t *testing.
 		Store: db,
 		Workspace: agent.WorkspaceManager{
 			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+			Authentication: executionauth.Selection{Mode: executionauth.APIKey, BaseURL: "https://api.example.test/v1", APIKey: "test-api-key", Model: "test-model"},
 		},
 		Runtime: &fakeRuntime{},
 	}
@@ -897,9 +917,7 @@ func TestControllerRecordsMinimalDiagnosticWhenCodexAuthenticationCannotBeRedact
 		},
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
-	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
-		t.Fatal(err)
-	}
+	provisionLegacySession(t, root, controller.Workspace, claim.SessionID)
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth corruption")); err == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
@@ -955,9 +973,7 @@ func TestControllerAuditsDeliveryBeforePostRunAuthenticationInspection(t *testin
 		},
 		Runtime: runtime, GatewayURL: "http://gateway.test",
 	}
-	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
-		t.Fatal(err)
-	}
+	provisionLegacySession(t, root, controller.Workspace, claim.SessionID)
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "authentication cache is unavailable") {
 		t.Fatalf("post-delivery authentication error = %v", err)
 	}
@@ -999,7 +1015,7 @@ func TestControllerFencesDeliveryStartAfterConcurrentTerminalization(t *testing.
 		return nil
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); !errors.Is(err, store.ErrWorkerLaunched) {
@@ -1042,7 +1058,7 @@ func TestControllerAuditsDeliveryAfterRecoveryExpiresLease(t *testing.T) {
 		return nil
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); !errors.Is(err, store.ErrInvalidClaim) {
@@ -1103,7 +1119,7 @@ func TestControllerPersistsDeliveryAuditBeforePostDockerProcessLoss(t *testing.T
 		panic("control plane process lost")
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, GatewayURL: "http://gateway.test",
 	}
 	var processLost bool
@@ -1155,6 +1171,7 @@ func TestControllerRecordsRunFailureWhenDiagnosticFilesystemIsUnavailable(t *tes
 		Store: db,
 		Workspace: agent.WorkspaceManager{
 			RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex"),
+			Authentication: executionauth.Selection{Mode: executionauth.APIKey, BaseURL: "https://api.example.test/v1", APIKey: "test-api-key", Model: "test-model"},
 		},
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
@@ -1192,9 +1209,7 @@ func TestControllerOmitsDetailedDiagnosticsWhenWorkerDeletesCodexAuthentication(
 		},
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
-	if err := controller.Workspace.ProvisionCodexAuthentication(ctx, claim.SessionID, false); err != nil {
-		t.Fatal(err)
-	}
+	provisionLegacySession(t, root, controller.Workspace, claim.SessionID)
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "fail after auth deletion")); err == nil {
 		t.Fatal("failed worker run returned nil error")
 	}
@@ -1224,7 +1239,7 @@ func TestControllerSnapshotsAndRestoresAnAbnormalWorkerRun(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	runtime := &fakeRuntime{dirty: true, ignoredFile: true, err: errors.New("worker crashed"), results: []worker.Result{{Output: []byte(`{"type":"thread.started","thread_id":"codex-failed"}` + "\n" + `{"type":"result","summary":"partial"}`), ContainerID: "container-failed"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket")); err == nil {
@@ -1283,7 +1298,7 @@ func TestControllerBlocksReplacementUntilAgentRunFinishes(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	expired := agent.Controller{Store: db, Workspace: manager, Runtime: blockingFailureRuntime{started: started, release: release}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
@@ -1338,7 +1353,7 @@ func TestControllerBlocksReplacementUntilAgentRunFinishes(t *testing.T) {
 }
 
 func createClaim(t *testing.T, ctx context.Context, root string) (*store.Store, store.PlanVersion, store.TicketClaim) {
-	return createClaimWithProvisioner(t, ctx, root, nil)
+	return createClaimWithProvisioner(t, ctx, root, testWorkspaceManager(root).ProvisionCodexSession)
 }
 
 func createClaimWithProvisioner(t *testing.T, ctx context.Context, root string, provisioner store.SessionProvisioner) (*store.Store, store.PlanVersion, store.TicketClaim) {
@@ -1375,7 +1390,7 @@ func TestControllerRejectsImplementationCandidateWithNullCommit(t *testing.T) {
 	defer db.Close()
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutputWithCommit("codex-session", "implemented", nil), ContainerID: "container-1"}}}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "structured result must name the workspace HEAD commit") {
@@ -1431,7 +1446,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	first := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "implemented"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket"))
@@ -1467,7 +1482,7 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 		t.Fatalf("Codex worker received Delivery Controller environment = %#v", first.specs[0].Environment)
 	}
 	t.Log("Ticket Agent Worker launched with no GitHub token and can reach GitHub writes only through the credential-isolated Gateway")
-	if first.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+	if first.specs[0].ImageDigest != "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("worker did not use Active Worker Image: %#v", first.specs[0])
 	}
 	if first.specs[1].Environment["NO_MISTAKES_RUN_ID"] == claim.RunID || first.specs[1].Environment["NO_MISTAKES_LEASE_TOKEN"] == claim.LeaseToken || first.specs[1].Environment["NO_MISTAKES_LEASE_GENERATION"] != fmt.Sprint(claim.LeaseGeneration+1) || first.specs[1].Environment["NO_MISTAKES_REPOSITORY"] != "owner/repo" || first.specs[1].Environment["NO_MISTAKES_BRANCH"] != "ticket-1" || first.specs[1].Environment["NO_MISTAKES_COMMIT_SHA"] != candidate.Commit {
@@ -1517,7 +1532,7 @@ func TestControllerRequiresGatewayBeforeCandidateAcceptance(t *testing.T) {
 	defer db.Close()
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"},
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "Gateway URL is required") {
@@ -1537,7 +1552,7 @@ func TestControllerRetryDeliveryRejectsAgentLease(t *testing.T) {
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: &fakeRuntime{}, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if err := controller.RetryDelivery(ctx, claim); !errors.Is(err, store.ErrInvalidClaim) {
@@ -1555,7 +1570,7 @@ func TestControllerRetryDeliveryResumesAfterSourceCredentialRestoration(t *testi
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	controller := agent.Controller{
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
@@ -1625,7 +1640,7 @@ func TestControllerRetryDeliveryUsesRetainedSourceWhenCheckoutIsUnavailable(t *t
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	controller := agent.Controller{
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
@@ -1662,7 +1677,7 @@ func TestControllerRevalidatesDeliverySourceDigestBeforeInitialLaunch(t *testing
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	deliverySource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	runtime := &fakeRuntime{
 		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
@@ -1699,7 +1714,7 @@ func TestControllerSealsDeliverySourceAcrossRuntimeLaunch(t *testing.T) {
 	root := t.TempDir()
 	db, _, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	retainedSource := retainedDeliverySourcePath(t, ctx, db, manager.RootDir, claim)
 	runtime := &fakeRuntime{
 		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
@@ -1739,7 +1754,7 @@ func TestControllerRejectsDeliverySourceURLRewrite(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
 	runtime := &fakeRuntime{
 		results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
@@ -1783,7 +1798,7 @@ func TestControllerRetriesPrecontainerDeliveryTimeout(t *testing.T) {
 	}
 	controller := agent.Controller{
 		Store:     db,
-		Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Workspace: testWorkspaceManager(root),
 		Runtime:   runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		DeliveryLeaseTTL: 5 * time.Second,
 	}
@@ -1808,7 +1823,7 @@ func TestControllerDoesNotRetryUncertainEmptyContainerLaunch(t *testing.T) {
 		deliveryErr: worker.InfrastructureError{Err: errors.New("lost Docker launch response")},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	_, runErr := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
@@ -1840,7 +1855,7 @@ func TestControllerIsolatesUncertainStartedContainerBeforeRetry(t *testing.T) {
 		deliveryErrorResult: worker.Result{ContainerID: "uncertain-container"},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "lost Docker start response") {
@@ -1866,7 +1881,7 @@ func TestControllerRetryDeliveryRevalidatesCorruptRetainedSource(t *testing.T) {
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	controller := agent.Controller{
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
@@ -1913,7 +1928,7 @@ func TestControllerIsolatesDeliverySourceIntegrityExitBeforeRevalidation(t *test
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	runtime := &fakeRuntime{
 		results:             []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}},
 		deliveryErr:         errors.New("exit status 78"),
@@ -1946,7 +1961,7 @@ func TestControllerRetryDeliveryRevalidatesRepinnedModernSource(t *testing.T) {
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	now := time.Now().UTC()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	controller := agent.Controller{
 		Store: db, Workspace: manager,
 		Runtime: &fakeRuntime{
@@ -2039,7 +2054,7 @@ func TestControllerRetryDeliveryPreservesLegacyCandidateWithoutSourceDigest(t *t
 	if _, err := db.BindAgent(ctx, store.AgentBinding{SessionID: claim.SessionID, AgentIdentity: "agent-" + claim.SessionID, WorkspacePath: workspacePath, CodexStatePath: codexStatePath, Branch: "ticket-1"}); err != nil {
 		t.Fatal(err)
 	}
-	oldImage := "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	oldImage := "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	oldTools := map[string]string{"codex": "1.0.0", "go": "1.25.12", "no-mistakes": "v1.0.0"}
 	deliveryClaim, err := db.AcceptCandidateForDelivery(ctx, store.CandidateRevision{
 		RunID: claim.RunID, LeaseToken: claim.LeaseToken, CodexSessionID: "codex-session", CommitSHA: strings.TrimSpace(string(head)),
@@ -2077,8 +2092,8 @@ func TestControllerRetryDeliveryPreservesLegacyCandidateWithoutSourceDigest(t *t
 	}
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version: "0.2.0", SourceCommit: "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`, VerifiedAt: time.Now().UTC(),
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"), VerifiedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2114,7 +2129,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: []byte("run:\n  status: completed\noutcome: failed\n")}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	controller := agent.Controller{Store: db, Workspace: testWorkspaceManager(root), Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "did not pass") {
 		t.Fatalf("failed Delivery Controller error = %v", err)
 	}
@@ -2143,8 +2158,8 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","github_cli_version":"2.98.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -2157,7 +2172,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if len(retryRuntime.specs) != 1 || strings.Join(retryRuntime.specs[0].Command[:3], " ") != "no-mistakes axi run" {
 		t.Fatalf("retry runtime specs = %#v", retryRuntime.specs)
 	}
-	if retryRuntime.specs[0].ImageDigest != "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
+	if retryRuntime.specs[0].ImageDigest != "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" {
 		t.Fatalf("retried delivery image = %q, want Active Worker image", retryRuntime.specs[0].ImageDigest)
 	}
 	if retryRuntime.specs[0].ToolVersions["codex"] != "2.0.0" || retryRuntime.specs[0].ToolVersions["github-cli"] != "2.98.0" || retryRuntime.specs[0].ToolVersions["no-mistakes"] != "v2.0.0" {
@@ -2167,7 +2182,7 @@ func TestControllerRetriesFailedDeliveryAtAcceptedCandidateBoundaryWithActiveWor
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidateImage != "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
+	if candidateImage != "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || candidateTools["codex"] != "1.0.0" {
 		t.Fatalf("accepted Candidate runtime changed during delivery recovery: image=%q tools=%#v", candidateImage, candidateTools)
 	}
 	audit, err := db.WorkerAudit(ctx, retryRunID)
@@ -2213,7 +2228,7 @@ func TestControllerRetriesPreContainerDeliveryInfrastructureFailure(t *testing.T
 		deliveryErrorResult: worker.Result{ContainerID: "cidfile-written-before-certified-failure"},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "Docker daemon unavailable") {
@@ -2245,7 +2260,7 @@ func TestControllerIsolatesPreparedContainerAfterCleanupFailure(t *testing.T) {
 		deliveryErrorResult: worker.Result{ContainerID: "prepared-container"},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "prepared container cleanup failed") {
@@ -2272,7 +2287,7 @@ func TestControllerCertifiedNoLaunchHonorsConfiguredAttemptLimit(t *testing.T) {
 		deliveryErr: worker.CertifiedNoLaunchError{Err: errors.New("Docker daemon unavailable")},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 		MaxWorkerAttempts: 1, Now: func() time.Time { return now },
 	}
@@ -2309,7 +2324,7 @@ func TestControllerRejectsQualityGateWhenOriginRestorationFails(t *testing.T) {
 		},
 	}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	_, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement"))
@@ -2334,15 +2349,15 @@ func TestControllerRejectsActiveWorkerManifestWithoutGitHubCLI(t *testing.T) {
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.2.0",
 		SourceCommit:   "cccccccccccccccccccccccccccccccccccccccc",
-		ImageReference: "ghcr.io/owner/worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"2.0.0","go_version":"1.25.12","no_mistakes_version":"v2.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		ManifestJSON:   strings.Replace(testWorkerReleaseManifest(t, "0.2.0", "cccccccccccccccccccccccccccccccccccccccc", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("d", 64), "2.0.0", "2.98.0", "1.25.12", "v2.0.0"), `"github_cli":{"version":"2.98.0","linux_amd64_sha256":"`+strings.Repeat("e", 64)+`"},`, "", 1),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, GatewayURL: "http://gateway.test",
 	}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil || !strings.Contains(err.Error(), "invalid release manifest") {
@@ -2361,7 +2376,7 @@ func TestControllerPausesHumanQualityGateAndRetriesItsExactAnswer(t *testing.T) 
 	defer db.Close()
 	gateOutput := []byte("run:\n  id: delivery-1\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-17\n  source: no-mistakes\n  finding_id: finding-42\n  action: ask_user\n  reason: choose the migration strategy\n  allowed_answers[2]: proceed, decline\n")
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	controller := agent.Controller{Store: db, Workspace: testWorkspaceManager(root), Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
 		t.Fatalf("run with human gate: %v", err)
 	}
@@ -2413,7 +2428,7 @@ func TestControllerKeepsQualityGateAnswerableUntilHumanDecision(t *testing.T) {
 	defer db.Close()
 	gateOutput := []byte("run:\n  status: waiting\noutcome: waiting-for-human\ngate:\n  id: gate-stale\n  action: ask-user\n  reason: choose a migration strategy\n  allowed_answers[1]: proceed\n")
 	runtime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "implemented"), ContainerID: "container-1"}}, deliveryOutput: gateOutput}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
+	controller := agent.Controller{Store: db, Workspace: testWorkspaceManager(root), Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err != nil {
 		t.Fatal(err)
 	}
@@ -2485,7 +2500,7 @@ func TestControllerPreservesCommittedFailureAndRejectsBranchChanges(t *testing.T
 			root := t.TempDir()
 			db, _, claim := createClaim(t, ctx, root)
 			defer db.Close()
-			manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+			manager := testWorkspaceManager(root)
 			controller := agent.Controller{Store: db, Workspace: manager, Runtime: test.runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 			if _, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement")); err == nil {
 				t.Fatal("abnormal worker run returned nil error")
@@ -2518,7 +2533,7 @@ func TestControllerRejectsCredentialBearingWorkspaceSource(t *testing.T) {
 	defer db.Close()
 	runtime := &fakeRuntime{}
 	controller := agent.Controller{
-		Store: db, Workspace: agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")},
+		Store: db, Workspace: testWorkspaceManager(root),
 		Runtime: runtime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test",
 	}
 	_, err := controller.Run(ctx, agent.RunRequest{Claim: claim, SourceRepository: "https://user:token@github.com/owner/repo.git", Branch: "ticket-1", Prompt: "implement"})
@@ -2539,7 +2554,7 @@ func TestControllerRejectsPersistedExternalWorkspaceRemote(t *testing.T) {
 	root := t.TempDir()
 	db, version, firstClaim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
@@ -2569,7 +2584,7 @@ func TestControllerRejectsCredentialBearingWorkspacePushURL(t *testing.T) {
 	root := t.TempDir()
 	db, version, firstClaim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	if _, err := controller.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement")); err != nil {
@@ -2596,7 +2611,7 @@ func TestControllerRestoresAcceptedCommitWhenCandidateAcceptanceFails(t *testing
 	root := t.TempDir()
 	db, version, firstClaim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	firstRuntime := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session", "first"), ContainerID: "container-1"}}}
 	firstController := agent.Controller{Store: db, Workspace: manager, Runtime: firstRuntime, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0"}, GatewayURL: "http://gateway.test"}
 	accepted, err := firstController.Run(ctx, candidateRequest(firstClaim, source, "ticket-1", "implement"))
@@ -2627,7 +2642,7 @@ func TestWorkspaceManagerReclaimsOnlyClosedSessionAfterRetention(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
 	statePath := filepath.Join(manager.CodexStateRoot, claim.SessionID)
 	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
@@ -2664,7 +2679,7 @@ func TestWorkspaceManagerReclaimsPreBindDeliverySnapshot(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	deliverySourcePath := filepath.Join(manager.RootDir, ".delivery-sources", claim.SessionID, ".delivery-orphan")
 	if err := os.MkdirAll(deliverySourcePath, 0o755); err != nil {
 		t.Fatal(err)
@@ -2685,7 +2700,7 @@ func TestWorkspaceCleanupFailureDoesNotRollbackDeliveredTicket(t *testing.T) {
 	root := t.TempDir()
 	db, version, claim := createClaim(t, ctx, root)
 	defer db.Close()
-	manager := agent.WorkspaceManager{RootDir: filepath.Join(root, "workspaces"), CodexStateRoot: filepath.Join(root, "codex")}
+	manager := testWorkspaceManager(root)
 	workspacePath := filepath.Join(manager.RootDir, claim.SessionID)
 	outsideStatePath := filepath.Join(root, "outside", claim.SessionID)
 	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
@@ -2751,12 +2766,32 @@ func activateTestWorker(t *testing.T, ctx context.Context, db *store.Store) {
 	if err := db.ActivateWorkerRelease(ctx, store.WorkerRelease{
 		Version:        "0.1.0",
 		SourceCommit:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		ImageReference: "ghcr.io/owner/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ManifestJSON:   `{"schema_version":1,"codex_version":"1.0.0","github_cli_version":"2.97.0","go_version":"1.25.12","no_mistakes_version":"v1.0.0"}`,
+		ImageReference: "ghcr.io/skyhuang233/workflow-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ManifestJSON:   testWorkerReleaseManifest(t, "0.1.0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ghcr.io/skyhuang233/workflow-worker@sha256:"+strings.Repeat("b", 64), "1.0.0", "2.97.0", "1.25.12", "v1.0.0"),
 		VerifiedAt:     time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testWorkerReleaseManifest(t *testing.T, version, sourceCommit, image, codexVersion, githubCLIVersion, goVersion, noMistakesVersion string) string {
+	t.Helper()
+	manifest := workflowrelease.Manifest{
+		SchemaVersion: 1, Version: version, CandidateSourceCommit: sourceCommit, QualificationRunID: 1, QualificationRunAttempt: 1,
+		Bundle: workflowrelease.Bundle{Name: workflowrelease.BundleAssetName, SHA256: strings.Repeat("a", 64)},
+		Worker: workflowrelease.Worker{Image: image, Tools: workflowrelease.Tools{
+			Codex:      workflowrelease.CodexTool{Version: codexVersion},
+			GitHubCLI:  workflowrelease.ArchiveTool{Version: githubCLIVersion, LinuxAMD64SHA256: strings.Repeat("e", 64)},
+			Go:         workflowrelease.ArchiveTool{Version: goVersion, LinuxAMD64SHA256: strings.Repeat("f", 64)},
+			NoMistakes: workflowrelease.NoMistakesTool{Version: noMistakesVersion, Repository: "skyhuang233/no-mistakes", Commit: strings.Repeat("2", 40)},
+		}},
+		SBOM: workflowrelease.SBOM{Name: workflowrelease.SBOMAssetName, Format: "spdx-json", SHA256: strings.Repeat("3", 64), Scan: workflowrelease.Scan{Scanner: "grype", SeverityCutoff: "high", OnlyFixed: true}},
+	}
+	raw, err := manifest.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func initRepository(t *testing.T) string {

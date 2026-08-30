@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,13 +16,23 @@ import (
 func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	repositoryRoot := filepath.Join("..", "..")
 	root := t.TempDir()
-
-	workflowExecutable := filepath.Join(root, "workflow.exe")
-	versionProbeSource := filepath.Join(root, "version-probe.go")
-	if err := os.WriteFile(versionProbeSource, []byte("package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"workflow 0.0.0\")}\n"), 0o600); err != nil {
+	configPath := filepath.Join(repositoryRoot, "config", "workflow-release.json")
+	config, err := workflowrelease.LoadConfig(configPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	build := exec.Command("go", "build", "-o", workflowExecutable, versionProbeSource)
+
+	workflowExecutable := filepath.Join(root, "workflow.exe")
+	if err := os.WriteFile(workflowExecutable, []byte("windows workflow"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workflowVersionExecutable := filepath.Join(root, "workflow-version-check.exe")
+	versionProbeSource := filepath.Join(root, "version-probe.go")
+	versionProbe := fmt.Sprintf("package main\nimport \"fmt\"\nfunc main(){fmt.Println(%q)}\n", "workflow "+config.Version)
+	if err := os.WriteFile(versionProbeSource, []byte(versionProbe), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", workflowVersionExecutable, versionProbeSource)
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build Workflow executable: %v\n%s", err, output)
 	}
@@ -47,14 +58,16 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	image := workflowrelease.WorkerRepository + "@sha256:" + strings.Repeat("c", 64)
 	if err := run([]string{
 		"assemble",
-		"-config", filepath.Join(repositoryRoot, "config", "workflow-release.json"),
+		"-config", configPath,
 		"-toolchain", filepath.Join(repositoryRoot, "config", "toolchain.json"),
 		"-workflow-exe", workflowExecutable,
+		"-workflow-version-exe", workflowVersionExecutable,
 		"-setup-exe", setupExecutable,
 		"-payload", payload,
 		"-output", outputDirectory,
-		"-source-commit", strings.Repeat("a", 40),
-		"-github-actions-run-id", "42",
+		"-candidate-source-commit", strings.Repeat("a", 40),
+		"-qualification-run-id", "42",
+		"-qualification-run-attempt", "3",
 		"-worker-image", image,
 		"-sbom", sbom,
 	}); err != nil {
@@ -82,7 +95,7 @@ func TestAssembleProducesOneAtomicWorkflowRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Worker.Image != image || manifest.Version != "0.0.0" || manifest.Worker.Tools.NoMistakes.Commit == "" {
+	if manifest.Worker.Image != image || manifest.Version != config.Version || manifest.QualificationRunAttempt != 3 || manifest.Worker.Tools.NoMistakes.Commit == "" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 }
