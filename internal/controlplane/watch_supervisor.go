@@ -47,6 +47,7 @@ type RepositoryWatchSupervisor struct {
 	Intake   CodeTaskIntake
 	Interval time.Duration
 	Now      func() time.Time
+	Report   func(string, error)
 }
 
 type watchLifetime struct {
@@ -79,7 +80,9 @@ func (s RepositoryWatchSupervisor) Run(ctx context.Context) error {
 			defer close(life.done)
 			// A failure is a runtime log concern. It intentionally leaves no
 			// durable failure field on the Watch and retries on the interval.
-			_ = s.poll(runCtx, initial, now)
+			if err := s.poll(runCtx, initial, now); err != nil {
+				s.report(initial.Repository, err)
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -89,7 +92,11 @@ func (s RepositoryWatchSupervisor) Run(ctx context.Context) error {
 				case <-ticker.C:
 					current, err := s.currentWatch(runCtx, initial.Repository)
 					if err == nil {
-						_ = s.poll(runCtx, current, now)
+						if err := s.poll(runCtx, current, now); err != nil {
+							s.report(initial.Repository, err)
+						}
+					} else {
+						s.report(initial.Repository, err)
 					}
 				}
 			}
@@ -140,6 +147,12 @@ func (s RepositoryWatchSupervisor) Run(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+func (s RepositoryWatchSupervisor) report(repository string, err error) {
+	if s.Report != nil && err != nil {
+		s.Report(repository, err)
 	}
 }
 

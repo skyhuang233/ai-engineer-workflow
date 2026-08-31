@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
+	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/hostsetup"
 	setupjourney "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -83,7 +84,23 @@ func setupCommand(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return json.NewEncoder(output).Encode(result)
+	watch, err := database.RepositoryWatch(context.Background(), result.Repository)
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	native, err := controlplane.NewNativeService(controlplane.NativeServiceOptions{Executable: executable, WorkflowHome: layout.Root})
+	if err != nil {
+		return err
+	}
+	activation, err := setupjourney.Activate(context.Background(), native, database, watch, result.WatchInserted, 2*time.Minute, time.Now)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(map[string]any{"status": "ready", "repository": result, "activation": activation})
 }
 
 var currentWorkingDirectory = os.Getwd

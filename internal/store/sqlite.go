@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	latestSchemaVersion = 64
+	latestSchemaVersion = 65
 )
 
 var (
@@ -1900,6 +1900,21 @@ FROM repository_admissions r`,
 		// This release intentionally does not infer Watches from the legacy
 		// admission/runtime records. Explicit Setup is the reconstruction path.
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (64, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 65 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS code_task_receipts (
+    repository TEXT NOT NULL,
+    github_issue_id INTEGER NOT NULL,
+    task_reference TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    PRIMARY KEY(repository, github_issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 65: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (65, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
