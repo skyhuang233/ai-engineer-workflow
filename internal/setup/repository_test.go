@@ -56,6 +56,11 @@ func (f *fakeGitHub) CreatePrivateRepository(context.Context, RepositoryAddress)
 	f.repository.Exists = true
 	return nil
 }
+func (f *fakeGitHub) SetDefaultBranch(_ context.Context, _ RepositoryAddress, branch string) error {
+	f.calls = append(f.calls, "default:"+branch)
+	f.repository.DefaultBranch = branch
+	return nil
+}
 func (f *fakeGitHub) EnableIssues(context.Context, RepositoryAddress) error {
 	f.calls = append(f.calls, "issues")
 	return nil
@@ -86,7 +91,7 @@ func TestRepositoryReconcilerMovesForwardAndCreatesOneWatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Initialized || !result.BaselineMade || !result.Created || !result.Published || !result.IssuesEnabled || !result.WatchInserted {
+	if !result.Initialized || !result.BaselineMade || !result.Created || !result.Published || !result.Defaulted || !result.IssuesEnabled || !result.WatchInserted {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	if watches.repository != "owner/repository" || watches.boundary != 99 || !watches.registered.Equal(now) {

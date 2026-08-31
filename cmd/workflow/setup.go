@@ -238,8 +238,9 @@ func parseGitHubRemote(remote string) (setupjourney.RepositoryAddress, bool) {
 
 type ghSetupGitHub struct{}
 type ghRepositoryJSON struct {
-	FullName  string `json:"full_name"`
-	HasIssues bool   `json:"has_issues"`
+	FullName      string `json:"full_name"`
+	HasIssues     bool   `json:"has_issues"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 func (ghSetupGitHub) Repository(ctx context.Context, address setupjourney.RepositoryAddress) (setupjourney.GitHubRepository, error) {
@@ -257,7 +258,7 @@ func (ghSetupGitHub) Repository(ctx context.Context, address setupjourney.Reposi
 	if !strings.EqualFold(value.FullName, address.String()) {
 		return setupjourney.GitHubRepository{}, errors.New("GitHub returned a different repository")
 	}
-	return setupjourney.GitHubRepository{Exists: true, IssuesEnabled: value.HasIssues}, nil
+	return setupjourney.GitHubRepository{Exists: true, IssuesEnabled: value.HasIssues, DefaultBranch: value.DefaultBranch}, nil
 }
 func (ghSetupGitHub) CreatePrivateRepository(ctx context.Context, address setupjourney.RepositoryAddress) error {
 	endpoint := "user/repos"
@@ -278,6 +279,13 @@ func (ghSetupGitHub) EnableIssues(ctx context.Context, address setupjourney.Repo
 	output, err := runSetupCommand(ctx, "", "gh", "api", "--method", "PATCH", "repos/"+address.String(), "-F", "has_issues=true")
 	if err != nil {
 		return fmt.Errorf("gh api enable Issues: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+func (ghSetupGitHub) SetDefaultBranch(ctx context.Context, address setupjourney.RepositoryAddress, branch string) error {
+	output, err := runSetupCommand(ctx, "", "gh", "api", "--method", "PATCH", "repos/"+address.String(), "-f", "default_branch="+branch)
+	if err != nil {
+		return fmt.Errorf("gh api set default branch: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

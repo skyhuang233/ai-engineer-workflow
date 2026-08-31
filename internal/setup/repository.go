@@ -64,11 +64,13 @@ type Local interface {
 type GitHubRepository struct {
 	Exists        bool
 	IssuesEnabled bool
+	DefaultBranch string
 }
 
 type GitHub interface {
 	Repository(context.Context, RepositoryAddress) (GitHubRepository, error)
 	CreatePrivateRepository(context.Context, RepositoryAddress) error
+	SetDefaultBranch(context.Context, RepositoryAddress, string) error
 	EnableIssues(context.Context, RepositoryAddress) error
 	LatestIssueID(context.Context, RepositoryAddress) (int64, error)
 }
@@ -84,6 +86,7 @@ type Result struct {
 	BaselineMade  bool
 	Created       bool
 	Published     bool
+	Defaulted     bool
 	IssuesEnabled bool
 	WatchInserted bool
 	RegisteredAt  time.Time
@@ -167,6 +170,12 @@ func (r RepositoryReconciler) Reconcile(ctx context.Context, address RepositoryA
 	case PublicationAlreadyPresent:
 	default:
 		return result, errors.New("unknown repository publication state")
+	}
+	if result.Created && remote.DefaultBranch != local.Branch {
+		if err := r.GitHub.SetDefaultBranch(ctx, address, local.Branch); err != nil {
+			return result, fmt.Errorf("set initial GitHub default branch: %w", err)
+		}
+		result.Defaulted = true
 	}
 	if !remote.IssuesEnabled {
 		if err := r.GitHub.EnableIssues(ctx, address); err != nil {
