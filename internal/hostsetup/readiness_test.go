@@ -20,9 +20,6 @@ func TestVerifyDockerWorkerUsesSelectedMountsAndCleansMarkers(t *testing.T) {
 	calls := 0
 	executor := commandExecutorFunc(func(_ context.Context, args []string) ([]byte, error) {
 		calls++
-		if calls == 1 {
-			return []byte("linux/x86_64\n"), nil
-		}
 		joined := strings.Join(args, " ")
 		if strings.HasPrefix(joined, "docker rm -f ") {
 			if !strings.Contains(joined, "workflow-setup-docker-") {
@@ -53,8 +50,8 @@ func TestVerifyDockerWorkerUsesSelectedMountsAndCleansMarkers(t *testing.T) {
 	if err := VerifyDockerWorker(context.Background(), executor, "ghcr.io/owner/worker@sha256:"+strings.Repeat("a", 64), state, workspace); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 3 {
-		t.Fatalf("calls=%d, want info, run, and explicit rm", calls)
+	if calls != 2 {
+		t.Fatalf("calls=%d, want run and explicit rm", calls)
 	}
 	for _, root := range []string{state, workspace} {
 		entries, err := os.ReadDir(root)
@@ -73,9 +70,6 @@ func TestDockerWorkerVerifierAggregatesPrimaryAndEveryCleanupFailure(t *testing.
 	verifier := DockerWorkerVerifier{
 		Executor: commandExecutorFunc(func(_ context.Context, _ []string) ([]byte, error) {
 			calls++
-			if calls == 1 {
-				return []byte("linux/amd64"), nil
-			}
 			return []byte("probe failed"), errors.New("container failure")
 		}),
 		RemoveAll: func(path string) error { return errors.New("cleanup " + filepath.Base(path)) },
@@ -101,9 +95,6 @@ func TestDockerWorkerVerifierTracksDeterministicCleanupResources(t *testing.T) {
 		},
 		Executor: commandExecutorFunc(func(_ context.Context, args []string) ([]byte, error) {
 			joined := strings.Join(args, " ")
-			if strings.Contains(joined, " info ") {
-				return []byte("linux/amd64"), nil
-			}
 			if strings.Contains(joined, " run ") {
 				if !strings.Contains(joined, "--name workflow-setup-docker-abcdef123456") || !strings.Contains(joined, "setup-probe-id=abcdef123456") {
 					t.Fatalf("nondeterministic probe command: %s", joined)

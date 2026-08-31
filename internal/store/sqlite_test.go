@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if opened != nil {
 		opened.Close()
 	}
-	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), "schema 63") {
+	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), fmt.Sprintf("schema %d", latestSchemaVersion)) {
 		t.Fatalf("read-only old schema err=%v", err)
 	}
 	after, err := os.Stat(path)
@@ -116,7 +117,7 @@ func TestOpenActivatedRejectsOlderAndNewerSchemaWithoutChangingGenerationFiles(t
 					t.Fatal(err)
 				}
 				defer raw.Close()
-				if _, err := raw.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(64,'future')`); err != nil {
+				if _, err := raw.Exec(fmt.Sprintf(`INSERT INTO schema_migrations(version,applied_at) VALUES(%d,'future')`, latestSchemaVersion+1)); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
@@ -174,7 +175,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 	}
 	t.Run("older ledger with stable contract", func(t *testing.T) {
 		path := newCurrent(t)
-		mutate(t, path, `DELETE FROM schema_migrations WHERE version = 63`)
+		mutate(t, path, fmt.Sprintf(`DELETE FROM schema_migrations WHERE version = %d`, latestSchemaVersion))
 		maintenance, err := OpenForLauncherMaintenance(ctx, path)
 		if err != nil {
 			t.Fatal(err)
@@ -196,7 +197,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 		}
 		defer raw.Close()
 		var version int
-		if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 62 {
+		if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != latestSchemaVersion-1 {
 			t.Fatalf("old maintenance ledger=%d,%v", version, err)
 		}
 	})
@@ -204,7 +205,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 		name      string
 		statement string
 	}{
-		{name: "future ledger", statement: `INSERT INTO schema_migrations(version, applied_at) VALUES(64, 'future')`},
+		{name: "future ledger", statement: fmt.Sprintf(`INSERT INTO schema_migrations(version, applied_at) VALUES(%d, 'future')`, latestSchemaVersion+1)},
 		{name: "missing fence contract", statement: `DROP TABLE platform_maintenance_fences`},
 	} {
 		t.Run(test.name, func(t *testing.T) {

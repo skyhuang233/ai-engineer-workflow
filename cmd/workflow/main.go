@@ -156,6 +156,10 @@ func main() {
 	switch os.Args[1] {
 	case "--version", "version":
 		fmt.Fprintln(os.Stdout, "workflow "+Version)
+	case "setup":
+		if err := setupCommand(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
 	case "onboarding":
 		if err := onboardingCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
 			fail(err)
@@ -226,6 +230,7 @@ func validateWorkflowBuildVersion() error {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  workflow setup [--workflow-home <absolute>] [--database <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow onboarding plan|apply|verify [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
