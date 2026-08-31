@@ -164,36 +164,8 @@ func main() {
 		if err := watchServiceCommand(os.Args[2:], os.Stdout); err != nil {
 			fail(err)
 		}
-	case "onboarding":
-		if err := onboardingCommand(os.Args[2:], os.Stdin, os.Stdout); err != nil {
-			fail(err)
-		}
 	case "github":
 		if err := githubCommand(os.Args[2:], os.Stdout); err != nil {
-			fail(err)
-		}
-	case "serve":
-		if err := serveCommand(os.Args[2:], os.Stdout); err != nil {
-			fail(err)
-		}
-	case "serve-child":
-		if err := serveChildCommand(os.Args[2:]); err != nil {
-			fail(err)
-		}
-	case "status":
-		if err := runtimeStatusCommand(os.Args[2:], os.Stdout); err != nil {
-			fail(err)
-		}
-	case "logs":
-		if err := runtimeLogsCommand(os.Args[2:], os.Stdout); err != nil {
-			fail(err)
-		}
-	case "stop":
-		if err := runtimeStopCommand(os.Args[2:], os.Stdout); err != nil {
-			fail(err)
-		}
-	case "runtime-configure":
-		if err := runtimeConfigureCommand(os.Args[2:], os.Stdout); err != nil {
 			fail(err)
 		}
 	case "doctor":
@@ -236,7 +208,6 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  workflow setup [--workflow-home <absolute>] [--database <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow watch-service --workflow-home <absolute>")
-	fmt.Fprintln(os.Stderr, "  workflow onboarding plan|apply|verify [--workflow-home <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
