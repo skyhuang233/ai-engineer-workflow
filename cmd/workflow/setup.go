@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
+	"github.com/skyhuang233/workflow/internal/hostsetup"
 	setupjourney "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -51,6 +53,19 @@ func setupCommand(args []string, output io.Writer) error {
 		return err
 	}
 	defer database.Close()
+	workerRelease, err := database.ActiveWorkerRelease(context.Background())
+	if errors.Is(err, store.ErrNotFound) {
+		return errors.New("Worker runtime is not prepared; complete Platform Preparation before repository reconciliation")
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := (setupjourney.PlatformPreparer{
+		WorkerImage: workerRelease.ImageReference, StateRoot: layout.State, WorkspaceRoot: layout.Workspaces,
+		Probe: dockerWorkerProbe{}, Authentication: codexLoginAuthentication{},
+	}).Prepare(context.Background()); err != nil {
+		return err
+	}
 
 	local := gitSetupLocal{Directory: currentWorkingDirectory}
 	resolved, err := local.Resolve(context.Background())
@@ -266,4 +281,19 @@ type storeWatchAdapter struct{ store *store.Store }
 func (a storeWatchAdapter) RecordWatch(ctx context.Context, repository string, registered time.Time, cursor int64) (time.Time, bool, error) {
 	watch, inserted, err := a.store.RecordRepositoryWatch(ctx, store.RepositoryWatch{Repository: repository, RegisteredAt: registered, IssueCursor: cursor})
 	return watch.RegisteredAt, inserted, err
+}
+
+type dockerWorkerProbe struct{}
+
+func (dockerWorkerProbe) Verify(ctx context.Context, image, stateRoot, workspaceRoot string) error {
+	return hostsetup.VerifyDockerWorker(ctx, nil, image, stateRoot, workspaceRoot)
+}
+
+type codexLoginAuthentication struct{}
+
+func (codexLoginAuthentication) Ready(ctx context.Context) (string, bool, error) {
+	if _, err := codexauth.ResolveChatGPT(ctx); err != nil {
+		return "API key or Codex login", false, nil
+	}
+	return "Codex login", true, nil
 }
