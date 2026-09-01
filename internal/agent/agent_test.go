@@ -1438,15 +1438,15 @@ func TestControllerDelegatesDeliveryCycleToNoMistakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	activateTestWorker(t, ctx, db)
+	manager := testWorkspaceManager(root)
 	claim, err := db.ClaimReady(ctx, store.ClaimRequest{
 		VersionID: version.ID, TicketID: 1, Owner: "agent-owner", MaxParallelRuns: 1,
-		LeaseTTL: time.Minute, Now: time.Now().UTC(),
+		LeaseTTL: time.Minute, Now: time.Now().UTC(), ProvisionSession: manager.ProvisionCodexSession,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	manager := testWorkspaceManager(root)
 	first := &fakeRuntime{results: []worker.Result{{Output: codexOutput("codex-session-1", "implemented"), ContainerID: "container-1"}}}
 	controller := agent.Controller{Store: db, Workspace: manager, Runtime: first, ImageDigest: "sha256:image-1", ToolVersions: map[string]string{"codex": "1.0.0", "git": "2.0.0"}, GatewayURL: "http://gateway.test"}
 	candidate, err := controller.Run(ctx, candidateRequest(claim, source, "ticket-1", "implement the ticket"))
@@ -2098,7 +2098,9 @@ func TestControllerRetryDeliveryPreservesLegacyCandidateWithoutSourceDigest(t *t
 		t.Fatal(err)
 	}
 	runtime := &fakeRuntime{}
-	controller := agent.Controller{Store: db, Workspace: agent.WorkspaceManager{RootDir: root, CodexStateRoot: filepath.Join(root, "codex")}, Runtime: runtime, GatewayURL: "http://gateway.test", SourceRepository: source}
+	manager := testWorkspaceManager(root)
+	manager.RootDir = root
+	controller := agent.Controller{Store: db, Workspace: manager, Runtime: runtime, GatewayURL: "http://gateway.test", SourceRepository: source}
 	if err := controller.RetryDelivery(ctx, deliveryClaim); err != nil {
 		t.Fatalf("recover legacy delivery: %v", err)
 	}
