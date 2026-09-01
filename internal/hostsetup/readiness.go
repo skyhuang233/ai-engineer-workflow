@@ -58,14 +58,14 @@ func (v DockerWorkerVerifier) Verify(ctx context.Context, image, stateRoot, work
 	if image == "" || !filepath.IsAbs(stateRoot) || !filepath.IsAbs(workspaceRoot) {
 		return errors.New("Docker readiness requires an immutable image and absolute state/workspace roots")
 	}
+	var err error
 	if v.ProbeID != "" && !cleanupProbeIDPattern.MatchString(v.ProbeID) {
 		return errors.New("Docker readiness cleanup identity is invalid")
 	}
-	info, err := executor.Run(ctx, []string{"docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"})
-	engine := strings.TrimSpace(string(info))
-	if err != nil || engine != "linux/x86_64" && engine != "linux/amd64" {
-		return fmt.Errorf("Docker Engine must be Linux amd64: %w (%s)", err, engine)
-	}
+	// The selected Worker itself is the compatibility proof. In particular,
+	// reported engine architecture is not a gate: a compatible context may use
+	// emulation, while an apparently matching context can still reject the
+	// mounts or host-gateway path this Worker needs.
 	stateProbe := filepath.Join(stateRoot, ".setup-readiness-"+v.ProbeID)
 	if v.ProbeID == "" {
 		stateProbe, err = os.MkdirTemp(stateRoot, ".setup-readiness-")

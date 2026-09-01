@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	LatestSchemaVersion = 64
+	LatestSchemaVersion = 66
 	sqliteBusyTimeout   = 5 * time.Second
 )
 
@@ -1890,8 +1890,38 @@ FROM repository_admissions r`,
 		}
 	}
 	if applied < 64 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS repository_watches (
+			repository TEXT PRIMARY KEY,
+			registered_at TEXT NOT NULL,
+			issue_cursor INTEGER NOT NULL CHECK(issue_cursor >= 0),
+			last_successful_poll_at TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+			return fmt.Errorf("migration 64: %w", err)
+		}
+		// This release intentionally does not infer Watches from the legacy
+		// admission/runtime records. Explicit Setup is the reconstruction path.
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (64, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 65 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS code_task_receipts (
+			repository TEXT NOT NULL,
+			github_issue_id INTEGER NOT NULL,
+			task_reference TEXT NOT NULL,
+			snapshot_json TEXT NOT NULL,
+			accepted_at TEXT NOT NULL,
+			PRIMARY KEY(repository, github_issue_id)
+		)`); err != nil {
+			return fmt.Errorf("migration 65: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (65, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 66 {
 		statements := []string{
-			`CREATE TABLE repository_runtime_configurations_v64 (
+			`CREATE TABLE repository_runtime_configurations_v66 (
     repository TEXT PRIMARY KEY REFERENCES repository_admissions(repository),
     default_branch TEXT NOT NULL,
     source_path TEXT NOT NULL,
@@ -1904,17 +1934,17 @@ FROM repository_admissions r`,
     max_parallel_runs INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 )`,
-			`INSERT INTO repository_runtime_configurations_v64(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
+			`INSERT INTO repository_runtime_configurations_v66(repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at)
 SELECT repository,default_branch,source_path,root_issue_number,workspace_root,state_root,github_api_url,poll_interval_seconds,workspace_retention_seconds,max_parallel_runs,updated_at FROM repository_runtime_configurations`,
 			`DROP TABLE repository_runtime_configurations`,
-			`ALTER TABLE repository_runtime_configurations_v64 RENAME TO repository_runtime_configurations`,
+			`ALTER TABLE repository_runtime_configurations_v66 RENAME TO repository_runtime_configurations`,
 		}
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("migration 64: %w", err)
+				return fmt.Errorf("migration 66: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (64, ?)", formatTimestamp(time.Now())); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (66, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}

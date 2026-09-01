@@ -26,11 +26,11 @@ type Layout struct {
 func Resolve(override string) (Layout, error) {
 	root := strings.TrimSpace(override)
 	if root == "" {
-		localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
-		if localAppData == "" {
-			return Layout{}, errors.New("LOCALAPPDATA is required to resolve Workflow Home")
+		var err error
+		root, err = defaultWorkflowHomeRoot()
+		if err != nil {
+			return Layout{}, err
 		}
-		root = filepath.Join(localAppData, DirectoryName)
 	}
 	if !filepath.IsAbs(root) {
 		return Layout{}, errors.New("Workflow Home must be an absolute local path")
