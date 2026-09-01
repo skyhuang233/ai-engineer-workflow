@@ -65,6 +65,25 @@ func TestInitialBaselineUsesTemporaryIndexAndExactApprovedFiles(t *testing.T) {
 	}
 }
 
+func TestInitialBaselineSeedsApprovedWorkflowCheckProducer(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	git(t, "", "init", "-b", "main", repo)
+	workflow := []byte("name: workflow-contract\n")
+	sum := sha256.Sum256(workflow)
+	approved := []BaselineFile{{Path: ".github/workflows/workflow-contract.yml", SHA256: hex.EncodeToString(sum[:]), Mode: "100644"}}
+	head, err := CreateInitialBaselineWithBootstrap(context.Background(), repo, "main", approved, map[string][]byte{".github/workflows/workflow-contract.yml": workflow}, "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyInitialBaseline(context.Background(), repo, head, approved); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(repo, ".github", "workflows", "workflow-contract.yml"))
+	if err != nil || string(data) != string(workflow) {
+		t.Fatalf("seeded workflow = %q, %v", data, err)
+	}
+}
+
 func TestBaselineFilesPreservesWhitespaceAndNewlinesFromNULTerminatedGitPaths(t *testing.T) {
 	want := []string{" leading.txt", "line\nbreak.txt", "trailing .txt"}
 	got, err := parseNULTerminatedGitPaths([]byte("trailing .txt\x00line\nbreak.txt\x00 leading.txt\x00"))

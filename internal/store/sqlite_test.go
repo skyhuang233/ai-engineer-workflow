@@ -55,7 +55,7 @@ func TestOpenReadOnlyRejectsOldSchemaWithoutMigrationOrBackup(t *testing.T) {
 	if opened != nil {
 		opened.Close()
 	}
-	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), fmt.Sprintf("schema %d", latestSchemaVersion)) {
+	if !errors.Is(err, ErrSchemaUpgradeRequired) || !strings.Contains(err.Error(), "schema 59") || !strings.Contains(err.Error(), fmt.Sprintf("schema %d", LatestSchemaVersion)) {
 		t.Fatalf("read-only old schema err=%v", err)
 	}
 	after, err := os.Stat(path)
@@ -117,7 +117,7 @@ func TestOpenActivatedRejectsOlderAndNewerSchemaWithoutChangingGenerationFiles(t
 					t.Fatal(err)
 				}
 				defer raw.Close()
-				if _, err := raw.Exec(fmt.Sprintf(`INSERT INTO schema_migrations(version,applied_at) VALUES(%d,'future')`, latestSchemaVersion+1)); err != nil {
+				if _, err := raw.Exec(fmt.Sprintf(`INSERT INTO schema_migrations(version,applied_at) VALUES(%d,'future')`, LatestSchemaVersion+1)); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
@@ -175,7 +175,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 	}
 	t.Run("older ledger with stable contract", func(t *testing.T) {
 		path := newCurrent(t)
-		mutate(t, path, fmt.Sprintf(`DELETE FROM schema_migrations WHERE version = %d`, latestSchemaVersion))
+		mutate(t, path, fmt.Sprintf(`DELETE FROM schema_migrations WHERE version = %d`, LatestSchemaVersion))
 		maintenance, err := OpenForLauncherMaintenance(ctx, path)
 		if err != nil {
 			t.Fatal(err)
@@ -197,7 +197,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 		}
 		defer raw.Close()
 		var version int
-		if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != latestSchemaVersion-1 {
+		if err := raw.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != LatestSchemaVersion-1 {
 			t.Fatalf("old maintenance ledger=%d,%v", version, err)
 		}
 	})
@@ -205,7 +205,7 @@ func TestOpenForLauncherMaintenanceAllowsCompatibleOlderLedgerAndFailsClosedOthe
 		name      string
 		statement string
 	}{
-		{name: "future ledger", statement: fmt.Sprintf(`INSERT INTO schema_migrations(version, applied_at) VALUES(%d, 'future')`, latestSchemaVersion+1)},
+		{name: "future ledger", statement: fmt.Sprintf(`INSERT INTO schema_migrations(version, applied_at) VALUES(%d, 'future')`, LatestSchemaVersion+1)},
 		{name: "missing fence contract", statement: `DROP TABLE platform_maintenance_fences`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -297,6 +297,63 @@ func TestOpenForRuntimeSkipsMigrationDiscoveryAndHoldsRestoreBarrier(t *testing.
 	}
 }
 
+func TestOpenActivatedRuntimeWriteWaitsForShortSQLiteContention(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "workflow.db")
+	seed, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeStore, err := OpenActivated(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeStore.Close()
+
+	blocker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	blocker.SetMaxOpenConns(1)
+	connection, err := blocker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_, releaseErr := connection.ExecContext(context.Background(), "ROLLBACK")
+		released <- releaseErr
+	}()
+
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	writeErr := runtimeStore.RecordRepositoryAdmission(writeCtx, RepositoryAdmission{
+		Repository:                 "owner/repo",
+		OnboardingPlanDigestSHA256: strings.Repeat("a", 64),
+		ContractVersion:            "1",
+		ManifestDigestSHA256:       strings.Repeat("b", 64),
+		Eligible:                   true,
+		VerifiedAt:                 time.Now().UTC(),
+	})
+	releaseErr := <-released
+	if releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	if writeErr != nil {
+		t.Fatalf("runtime write failed during short SQLite contention: %v", writeErr)
+	}
+}
+
 func TestSQLiteMigrationActivationAndRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	ctx := context.Background()
@@ -356,8 +413,8 @@ func TestCurrentSchemaVersionMatchesLatestMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != latestSchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, latestSchemaVersion)
+	if version != LatestSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, LatestSchemaVersion)
 	}
 }
 

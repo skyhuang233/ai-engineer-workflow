@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -66,7 +67,8 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 	}
 	switch operation {
 	case "plan":
-		plan, err := onboarding.Plan(ctx, onboarding.PlanOptions{RepositoryPath: *repositoryPath, WorkflowHome: *home, Owner: session.owner, AuthenticatedLogin: session.login, Remote: githubRemoteHead{remote: githubOnboardingRemote{client: session.client, owner: session.owner}}, Policy: session.client, Publication: session.client, PlatformReleaseDigest: strings.TrimPrefix(active.BundleDigest, "sha256:")})
+		remote := githubOnboardingRemote{client: session.client, owner: session.owner}
+		plan, err := onboarding.Plan(ctx, onboarding.PlanOptions{RepositoryPath: *repositoryPath, WorkflowHome: *home, Owner: session.owner, AuthenticatedLogin: session.login, Remote: githubRemoteHead{remote: remote}, Labels: requiredWorkflowLabels(), Policy: session.client, Publication: session.client, State: onboardingCurrentState{Client: session.client, Store: database}, PlatformReleaseDigest: strings.TrimPrefix(active.BundleDigest, "sha256:")})
 		if err != nil {
 			return err
 		}
@@ -87,6 +89,13 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if len(bytes.TrimSpace(raw)) == 0 {
+			record, readErr := database.SetupPlanByDigest(ctx, *approvedDigest)
+			if readErr != nil {
+				return errors.New("stored approved Onboarding Plan is unavailable")
+			}
+			raw = []byte(record.CanonicalJSON)
+		}
 		plan, _, _, err := setupcontract.ParsePlan(raw)
 		if err != nil {
 			var envelope struct {
@@ -103,8 +112,11 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		if plan.Kind != setupcontract.RepositoryOnboarding {
 			return errors.New("onboarding apply accepts only an Onboarding Plan")
 		}
+		if err := requireApprovedOnboardingRepositoryPath(*repositoryPath, plan.Target.RepositoryPath); err != nil {
+			return err
+		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: *repositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, AuthenticatedLogin: session.login, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		result, err := (onboarding.Executor{Store: database, Adapter: adapter}).Apply(ctx, raw, *approvedDigest, strings.TrimPrefix(active.BundleDigest, "sha256:"))
 		if err != nil {
 			return err
@@ -125,8 +137,11 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 		if parseErr != nil || digest != *approvedDigest {
 			return errors.New("stored Onboarding Plan is not the exact approved digest")
 		}
+		if err := requireApprovedOnboardingRepositoryPath(*repositoryPath, plan.Target.RepositoryPath); err != nil {
+			return err
+		}
 		client := session.client.WithOnboardingIdentity(session.owner, session.login, plan.Target.GitHubRepository)
-		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, PlanDigest: *approvedDigest, Store: database, RepositoryPath: *repositoryPath}
+		adapter := &onboarding.RepositoryAdapter{Remote: githubOnboardingRemote{client: client, owner: session.owner}, Credential: onboarding.GitCredential{Username: "x-access-token", Token: session.token}, Owner: session.owner, AuthenticatedLogin: session.login, PlanDigest: *approvedDigest, Store: database, RepositoryPath: plan.Target.RepositoryPath}
 		for _, effect := range plan.Effects {
 			status, _, readErr := adapter.Readback(ctx, effect)
 			if readErr != nil || status != setupcontract.EffectSatisfied {
@@ -150,6 +165,17 @@ func onboardingCommand(args []string, input io.Reader, output io.Writer) error {
 	default:
 		return errors.New("unknown onboarding operation")
 	}
+}
+
+func requireApprovedOnboardingRepositoryPath(requested, approved string) error {
+	samePath, err := workflowhome.SameFilesystemPath(requested, approved)
+	if err != nil {
+		return err
+	}
+	if !samePath {
+		return errors.New("onboarding repository path differs from the approved Onboarding Plan")
+	}
+	return nil
 }
 
 type onboardingSession struct {

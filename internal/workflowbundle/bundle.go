@@ -1,4 +1,4 @@
-package platformrelease
+package workflowbundle
 
 import (
 	"archive/zip"
@@ -25,7 +25,7 @@ var (
 	workerImagePattern = regexp.MustCompile(`^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_./-]+@sha256:[0-9a-f]{64}$`)
 )
 
-func ValidatePlatformVersion(value string) error {
+func ValidateVersion(value string) error {
 	parts := versionPattern.FindStringSubmatch(value)
 	if parts == nil {
 		return errors.New("version must be a bare semantic version core")
@@ -68,7 +68,7 @@ func (m BundleManifest) Validate() error {
 	if m.SchemaVersion != 1 || m.SetupProtocolVersion != 1 {
 		return errors.New("unsupported Windows Bundle manifest schema")
 	}
-	if err := ValidatePlatformVersion(m.Version); err != nil {
+	if err := ValidateVersion(m.Version); err != nil {
 		return err
 	}
 	if m.Compatibility.OS != "windows" || m.Compatibility.Architecture != "amd64" || m.Compatibility.DatabaseSchema <= 0 || !workerImagePattern.MatchString(m.Compatibility.WorkerImage) || strings.TrimSpace(m.Compatibility.DockerDesktopVersion) == "" || !strings.HasPrefix(m.Compatibility.DockerInstallerURL, "https://") || !sha256Pattern.MatchString(m.Compatibility.DockerInstallerSHA256) {
@@ -204,6 +204,7 @@ func deterministicBundleZip(files map[string][]byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
+
 func safeBundlePath(name string) bool {
 	cleaned := path.Clean(name)
 	return name != "platform-release.json" && name != "" && cleaned == name && !strings.HasPrefix(name, "../") && !strings.HasPrefix(name, "/") && !strings.Contains(name, "\\")

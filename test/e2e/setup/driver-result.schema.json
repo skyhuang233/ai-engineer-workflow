@@ -2,16 +2,24 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["scenario", "platform_ready", "repository_admitted", "temporary_repositories", "blocker"],
+  "required": ["scenario", "platform_ready", "repository_admitted", "temporary_repositories", "blocker", "gate_kind", "onboarding_plan_digest", "pull_request", "pull_head", "merge_method", "delivery_plan", "ticket", "ticket_status", "plan_status"],
   "properties": {
     "scenario": { "type": "string", "minLength": 1 },
     "platform_ready": { "type": "boolean" },
     "repository_admitted": { "type": "boolean" },
     "temporary_repositories": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/workflow-setup-e2e-[A-Za-z0-9_.-]+$" },
-      "uniqueItems": true
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/wf-e2e-[0-9a-f]{12}-[a-z0-9-]+$" }
     },
-    "blocker": { "type": ["string", "null"] }
+    "blocker": { "type": ["string", "null"] },
+    "gate_kind": { "type": ["string", "null"], "enum": ["repository_onboarding", "worker_delivery", null] },
+    "onboarding_plan_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+    "pull_request": { "type": ["string", "null"], "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/wf-e2e-[0-9a-f]{12}-[a-z0-9-]+/pull/[1-9][0-9]*$" },
+    "pull_head": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "merge_method": { "type": ["string", "null"], "enum": ["merge", "squash", "rebase", null] },
+    "delivery_plan": { "type": ["integer", "null"], "minimum": 1 },
+    "ticket": { "type": ["integer", "null"], "minimum": 1 },
+    "ticket_status": { "type": ["string", "null"] },
+    "plan_status": { "type": ["string", "null"] }
   }
 }

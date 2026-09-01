@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/skyhuang233/workflow/internal/platformrelease"
+	"github.com/skyhuang233/workflow/internal/workflowbundle"
 )
 
 const (
@@ -35,25 +35,25 @@ type WorkerImageCapabilityTarget struct {
 	Image string `json:"image"`
 }
 
-func (e Engine) bundleCompatibility() (platformrelease.Compatibility, error) {
+func (e Engine) bundleCompatibility() (workflowbundle.Compatibility, error) {
 	if strings.TrimSpace(e.BundleRoot) == "" {
-		return platformrelease.Compatibility{}, errors.New("launcher bundle root is required")
+		return workflowbundle.Compatibility{}, errors.New("launcher bundle root is required")
 	}
 	raw, err := os.ReadFile(filepath.Join(e.BundleRoot, "platform-release.json"))
 	if err != nil {
-		return platformrelease.Compatibility{}, fmt.Errorf("read Bundle manifest: %w", err)
+		return workflowbundle.Compatibility{}, fmt.Errorf("read Bundle manifest: %w", err)
 	}
-	var manifest platformrelease.BundleManifest
+	var manifest workflowbundle.BundleManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return platformrelease.Compatibility{}, fmt.Errorf("decode Bundle manifest: %w", err)
+		return workflowbundle.Compatibility{}, fmt.Errorf("decode Bundle manifest: %w", err)
 	}
 	if err := manifest.Validate(); err != nil {
-		return platformrelease.Compatibility{}, err
+		return workflowbundle.Compatibility{}, err
 	}
 	return manifest.Compatibility, nil
 }
 
-func (e Engine) dockerConsentTarget(ctx context.Context, compatibility platformrelease.Compatibility) (DockerCapabilityTarget, error) {
+func (e Engine) dockerConsentTarget(ctx context.Context, compatibility workflowbundle.Compatibility) (DockerCapabilityTarget, error) {
 	observed := ""
 	if e.DependencyInspector != nil {
 		version, err := e.DependencyInspector.DockerVersion(ctx)
@@ -93,7 +93,7 @@ func (target DockerCapabilityTarget) valid() error {
 	return nil
 }
 
-func validateDockerCapability(target DockerCapabilityTarget, compatibility platformrelease.Compatibility) error {
+func validateDockerCapability(target DockerCapabilityTarget, compatibility workflowbundle.Compatibility) error {
 	if err := target.valid(); err != nil {
 		return err
 	}

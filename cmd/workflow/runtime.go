@@ -196,6 +196,14 @@ func runtimeConfigureCommand(args []string, output io.Writer) error {
 	if err := config.Ready(); err != nil {
 		return fmt.Errorf("complete repository runtime configuration: %w", err)
 	}
+	for name, path := range map[string]string{
+		"workspace root": config.WorkspaceRoot,
+		"state root":     config.StateRoot,
+	} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("create repository runtime %s: %w", name, err)
+		}
+	}
 	if err := database.RecordRepositoryRuntimeConfiguration(ctx, config); err != nil {
 		return err
 	}

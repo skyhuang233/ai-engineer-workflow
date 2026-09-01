@@ -14,13 +14,16 @@ try {
   $bundleDigest = (Get-FileHash -LiteralPath $global:workflowResolutionBundle -Algorithm SHA256).Hash.ToLowerInvariant()
   $sbomDigest = (Get-FileHash -LiteralPath $global:workflowResolutionSBOM -Algorithm SHA256).Hash.ToLowerInvariant()
   $global:workflowResolutionFixture = Join-Path $scratch 'workflow-release.json'
+  $global:workflowResolutionQualificationCompletedAt = '2026-08-19T01:00:00Z'
+  $global:workflowResolutionCandidateCommit = 'a' * 40
+  $global:workflowResolutionSuccessfulPublisherAttempt = 3
   $manifestJSON = [IO.File]::ReadAllText($fixture).Replace(('b' * 64), $bundleDigest).Replace(('3' * 64), $sbomDigest)
   [IO.File]::WriteAllText($global:workflowResolutionFixture, $manifestJSON, [Text.UTF8Encoding]::new($false))
   $manifestDigest = (Get-FileHash -LiteralPath $global:workflowResolutionFixture -Algorithm SHA256).Hash.ToLowerInvariant()
   $releasePage = @(
     @{tag_name='platform-v99.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
     @{tag_name='workflow-v0.0.0';draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-18T00:00:00Z';assets=@()},
-    @{tag_name='workflow-v0.0.1';target_commitish=('a' * 40);draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
+    @{tag_name='workflow-v0.0.1';target_commitish=('b' * 40);body="Immutable atomic Agent Workflow release.`n`nPublisher Run: 456`nPublisher Attempt: 2";author=@{login='github-actions[bot]';type='Bot'};draft=$false;prerelease=$false;immutable=$true;published_at='2026-08-19T00:00:00Z';assets=@(
       @{name='workflow-windows-amd64.zip';state='uploaded';size=(Get-Item $global:workflowResolutionBundle).Length;digest=('sha256:'+$bundleDigest)},
       @{name='workflow-release.json';state='uploaded';size=(Get-Item $global:workflowResolutionFixture).Length;digest=('sha256:'+$manifestDigest)},
       @{name='worker-sbom.spdx.json';state='uploaded';size=(Get-Item $global:workflowResolutionSBOM).Length;digest=('sha256:'+$sbomDigest)}
@@ -36,8 +39,21 @@ try {
     if ($argv[0] -ceq 'api') {
       $endpoint = $argv[-1]
       if ($endpoint -like 'repos/*/releases?*') { Write-Output $global:workflowResolutionRelease; return }
-      if ($endpoint -like 'repos/*/git/ref/tags/*') { Write-Output '{"object":{"type":"commit","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'; return }
-      if ($endpoint -like 'repos/*/actions/runs/123') { Write-Output '{"path":".github/workflows/publish-workflow.yml","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":"push","status":"completed","conclusion":"success"}'; return }
+      if ($endpoint -like 'repos/*/git/ref/tags/*') { Write-Output '{"object":{"type":"tag","sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}'; return }
+      if ($endpoint -like 'repos/*/git/tags/*') { Write-Output '{"tag":"workflow-v0.0.1","message":"Workflow publisher provenance\nrun_id=456\nrun_attempt=2","object":{"type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}'; return }
+      if ($endpoint -like 'repos/*/commits/*/pulls') { Write-Output '[{"number":7,"merged_at":"2026-08-19T02:00:00Z","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base":{"ref":"main"}}]'; return }
+      if ($endpoint -like 'repos/*/pulls/7') { Write-Output (@{number=7;merged_at='2026-08-19T02:00:00Z';merge_commit_sha=('b'*40);base=@{ref='main'};head=@{ref='release-0.0.1';sha=$global:workflowResolutionCandidateCommit};merged_by=@{login='skyhuang233';type='User'}} | ConvertTo-Json -Depth 5 -Compress); return }
+      if ($endpoint -like 'repos/*/git/commits/*') { Write-Output '{"parents":[{"sha":"cccccccccccccccccccccccccccccccccccccccc"},{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}'; return }
+      if ($endpoint -like 'repos/*/actions/workflows/worker-contract.yml') { Write-Output '{"id":2,"path":".github/workflows/worker-contract.yml","state":"active"}'; return }
+      if ($endpoint -like 'repos/*/actions/runs/123/attempts/4') { Write-Output (@{id=123;run_attempt=4;workflow_id=2;path='.github/workflows/worker-contract.yml';head_sha=('a'*40);event='pull_request';status='completed';conclusion='success';updated_at=$global:workflowResolutionQualificationCompletedAt;pull_requests=@(@{number=7})} | ConvertTo-Json -Depth 5 -Compress); return }
+      if ($endpoint -like 'repos/*/actions/workflows/publish-workflow.yml') { Write-Output '{"id":3,"path":".github/workflows/publish-workflow.yml","state":"active"}'; return }
+      if ($endpoint -like 'repos/*/actions/runs/456/attempts/*') {
+        $attempt = [long]($endpoint.Split('/')[-1])
+        $conclusion = $(if ($attempt -eq $global:workflowResolutionSuccessfulPublisherAttempt) { 'success' } else { 'failure' })
+        Write-Output (@{id=456;run_attempt=$attempt;workflow_id=3;path='.github/workflows/publish-workflow.yml';head_sha=('b'*40);head_branch='main';event='push';status='completed';conclusion=$conclusion} | ConvertTo-Json -Compress)
+        return
+      }
+      if ($endpoint -like 'repos/*/actions/runs/456') { Write-Output '{"id":456,"run_attempt":4,"workflow_id":3,"path":".github/workflows/publish-workflow.yml","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head_branch":"main","event":"push","status":"completed","conclusion":"failure"}'; return }
       throw "Unexpected mocked gh api endpoint: $endpoint"
     }
     if ($argv[0] -ceq 'release' -and $argv[1] -ceq 'download') {
@@ -58,20 +74,39 @@ try {
   $download = Join-Path $scratch 'success'
   $result = & $resolver -DownloadDirectory $download | ConvertFrom-Json
   if ([string]$result.tag -cne 'workflow-v0.0.1') { throw 'Resolver did not select the highest eligible semantic version' }
+  if ([string]$result.manifest_sha256 -cne $manifestDigest) { throw 'Resolver did not preserve the verified manifest digest' }
+  if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'api repos/*/actions/runs/456/attempts/3' }).Count -ne 1) { throw 'Resolver did not accept the historical successful publisher retry attempt' }
   $downloads = @($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' })
   if ($downloads.Count -ne 3 -or $downloads[0] -notlike '*--pattern workflow-release.json*') { throw 'Resolver did not authenticate the manifest before downloading other assets' }
 
   $releaseObjects = @($global:workflowResolutionRelease | ConvertFrom-Json)
   $selected = @($releaseObjects | Where-Object tag_name -EQ 'workflow-v0.0.1')[0]
-  $selected.target_commitish = ('b' * 40)
+  $selected.body = 'manually published'
   $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
   $global:workflowResolutionCalls.Clear()
   $accepted = $true
   try { & $resolver -DownloadDirectory (Join-Path $scratch 'target-mismatch') *> $null } catch { $accepted = $false }
-  if ($accepted) { throw 'Resolver accepted a Release target different from the manifest source commit' }
+  if ($accepted) { throw 'Resolver accepted a Release without exact publisher provenance' }
   if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' }).Count -ne 1) { throw 'Resolver downloaded Bundle or SBOM before rejecting the Release target' }
 
-  $selected.target_commitish = ('a' * 40)
+  $selected.body = "Immutable atomic Agent Workflow release.`n`nPublisher Run: 456`nPublisher Attempt: 2"
+  $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
+  $global:workflowResolutionQualificationCompletedAt = '2026-08-19T03:00:00Z'
+  $global:workflowResolutionCalls.Clear()
+  $accepted = $true
+  try { & $resolver -DownloadDirectory (Join-Path $scratch 'post-merge-qualification') *> $null } catch { $accepted = $false }
+  if ($accepted) { throw 'Resolver accepted qualification completed after owner merge' }
+  if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' }).Count -ne 1) { throw 'Resolver downloaded Bundle or SBOM before rejecting post-merge qualification' }
+
+  $global:workflowResolutionQualificationCompletedAt = '2026-08-19T01:00:00Z'
+  $global:workflowResolutionCandidateCommit = 'd' * 40
+  $global:workflowResolutionCalls.Clear()
+  $accepted = $true
+  try { & $resolver -DownloadDirectory (Join-Path $scratch 'candidate-head-mismatch') *> $null } catch { $accepted = $false }
+  if ($accepted) { throw 'Resolver accepted an owner merge whose Pull Request head differs from the qualified candidate' }
+  if (@($global:workflowResolutionCalls | Where-Object { $_ -like 'release download*' }).Count -ne 1) { throw 'Resolver downloaded Bundle or SBOM before rejecting candidate head mismatch' }
+
+  $global:workflowResolutionCandidateCommit = 'a' * 40
   $selected.assets += [pscustomobject]@{name='unexpected.txt';state='uploaded';size=1;digest=('sha256:'+('4'*64))}
   $global:workflowResolutionRelease = @(,$releaseObjects) | ConvertTo-Json -Depth 10 -Compress
   $global:workflowResolutionCalls.Clear()
@@ -83,6 +118,6 @@ try {
   Write-Output 'Workflow Release resolution ordering and exact-asset tests passed.'
 } finally {
   Remove-Item Function:\global:gh -ErrorAction SilentlyContinue
-  Remove-Variable workflowResolutionFixture,workflowResolutionBundle,workflowResolutionSBOM,workflowResolutionRelease,workflowResolutionCalls -Scope Global -ErrorAction SilentlyContinue
+  Remove-Variable workflowResolutionFixture,workflowResolutionBundle,workflowResolutionSBOM,workflowResolutionRelease,workflowResolutionCalls,workflowResolutionQualificationCompletedAt,workflowResolutionCandidateCommit,workflowResolutionSuccessfulPublisherAttempt -Scope Global -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $scratch -Recurse -Force
 }

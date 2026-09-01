@@ -93,8 +93,7 @@ func TestOnboardingMutationClientRejectsAnotherRepositoryAndLoginBeforeNetwork(t
 	)
 	_, err = client.CreateOnboardingPullRequest(context.Background(), "owner/other", PullRequestCreate{Title: "onboard", Head: "head", Base: "main"})
 	errorsFound = append(errorsFound, err)
-	_, err = client.MergeOnboardingPullRequest(context.Background(), "owner/other", 7, strings.Repeat("a", 40), "squash")
-	errorsFound = append(errorsFound, err, client.DeleteBranch(context.Background(), "owner/other", "branch"))
+	errorsFound = append(errorsFound, client.DeleteBranch(context.Background(), "owner/other", "branch"))
 	for index, err := range errorsFound {
 		if err == nil {
 			t.Fatalf("mutation %d accepted an unapproved identity", index)
@@ -245,8 +244,6 @@ func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"number":7,"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`))
-		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/merge":
-			_, _ = w.Write([]byte(`{"merged":true,"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`))
 		default:
 			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 		}
@@ -263,10 +260,6 @@ func TestOnboardingRepositoryAndPullRequestMutations(t *testing.T) {
 	pr, err := client.CreateOnboardingPullRequest(context.Background(), "owner/repo", PullRequestCreate{Title: "Onboard", Head: "workflow/onboard", Base: "main", Body: "digest"})
 	if err != nil || pr.Number != 7 {
 		t.Fatalf("pr=%#v %v", pr, err)
-	}
-	merge, err := client.MergeOnboardingPullRequest(context.Background(), "owner/repo", 7, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "squash")
-	if err != nil || !merge.Merged {
-		t.Fatalf("merge=%#v %v", merge, err)
 	}
 }
 

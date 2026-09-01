@@ -45,10 +45,8 @@ ready and the owner merges it to `main`.
 
 ### Issue tracker
 
-Issues and PRDs are tracked in this repository's GitHub Issues. See
-`docs/agents/issue-tracker.md`.
+Issues and PRDs are tracked in this repository's GitHub Issues.
 
 ### Domain docs
 
-Single-context layout: root `CONTEXT.md` and `docs/adr/`. See
-`docs/agents/domain.md`.
+Single-context layout: root `CONTEXT.md` and `docs/adr/`.

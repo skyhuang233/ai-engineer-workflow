@@ -5,11 +5,37 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	workflowgithub "github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/onboarding"
 )
+
+func TestGitHubOnboardingRemoteCarriesHumanMergerIdentity(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[{"number":7}]`))
+		case r.URL.Path == "/repos/owner/repo/pulls/7":
+			_, _ = w.Write([]byte(`{"number":7,"state":"closed","merged_at":"2026-08-21T00:00:00Z","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_by":{"login":"owner","type":"User"},"head":{"sha":"` + head + `","ref":"workflow/onboarding-digest"},"base":{"sha":"cccccccccccccccccccccccccccccccccccccccc","ref":"main"}}`))
+		case r.URL.Path == "/repos/owner/repo/pulls/7/reviews":
+			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/repos/owner/repo/commits/"+head+"/check-runs":
+			_, _ = w.Write([]byte(`{"check_runs":[]}`))
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	remote := githubOnboardingRemote{client: workflowgithub.NewClient(server.URL, "token", server.Client()), owner: "owner"}
+	pull, err := remote.OnboardingPull(context.Background(), "owner/repo", "workflow/onboarding-digest", "main", nil)
+	if err != nil || pull.MergedBy != "owner" || pull.MergedByType != "User" {
+		t.Fatalf("pull merger = %q/%q, err=%v", pull.MergedBy, pull.MergedByType, err)
+	}
+}
 
 type onboardingRoundTripper func(*http.Request) (*http.Response, error)
 

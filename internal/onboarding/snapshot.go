@@ -24,6 +24,7 @@ type ApprovalSnapshot struct {
 	StatusSHA256           string         `json:"status_sha256"`
 	ManagedBoundarySHA256  string         `json:"managed_boundary_sha256"`
 	ZeroBaseline           []BaselineFile `json:"zero_baseline,omitempty"`
+	InitialBaseline        []BaselineFile `json:"initial_baseline,omitempty"`
 	GlobalExcludesPath     string         `json:"global_excludes_path,omitempty"`
 	GlobalExcludesSHA256   string         `json:"global_excludes_sha256,omitempty"`
 	ProxyEnvironmentSHA256 string         `json:"proxy_environment_sha256"`
@@ -41,6 +42,10 @@ type ApprovalTransitions struct {
 }
 
 func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedRepository string, zeroBaseline []BaselineFile) (string, error) {
+	return captureApprovalSnapshot(ctx, discovery, intendedRepository, zeroBaseline, zeroBaseline)
+}
+
+func captureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedRepository string, zeroBaseline, initialBaseline []BaselineFile) (string, error) {
 	status, err := gitBytes(ctx, discovery.Root, "status", "--porcelain=v2", "-z", "--untracked-files=all")
 	if err != nil {
 		return "", err
@@ -59,7 +64,7 @@ func CaptureApprovalSnapshot(ctx context.Context, discovery Discovery, intendedR
 	snapshot := ApprovalSnapshot{
 		Root: discovery.Root, Branch: discovery.Branch, Head: discovery.Head, HasCommits: discovery.HasCommits,
 		Origin: discovery.Origin, Repository: discovery.Repository, AuthenticatedCloneURL: cloneURL,
-		StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: zeroBaseline,
+		StatusSHA256: digestSnapshotBytes(status), ManagedBoundarySHA256: managed, ZeroBaseline: zeroBaseline, InitialBaseline: initialBaseline,
 	}
 	proxy, _, proxyErr := currentHostProxyEnvironment()
 	if proxyErr != nil {
@@ -178,7 +183,7 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 	if !baselineTransition && actual.StatusSHA256 != wantStatus {
 		return errors.New("onboarding discovery dirty state drifted from the approved snapshot")
 	}
-	if actual.ManagedBoundarySHA256 != expected.ManagedBoundarySHA256 && head != transitions.MergedHead {
+	if actual.ManagedBoundarySHA256 != expected.ManagedBoundarySHA256 && !baselineTransition && head != transitions.MergedHead {
 		return errors.New("onboarding managed boundary drifted without the approved merge evidence")
 	}
 	if !expected.HasCommits && !hasCommits {
@@ -189,19 +194,23 @@ func VerifyApprovalSnapshotTransitions(ctx context.Context, encoded string, tran
 		}
 	}
 	if baselineTransition {
-		if err := VerifyInitialBaseline(ctx, root, head, expected.ZeroBaseline); err != nil {
+		initialBaseline := expected.InitialBaseline
+		if initialBaseline == nil {
+			initialBaseline = expected.ZeroBaseline
+		}
+		if err := VerifyInitialBaseline(ctx, root, head, initialBaseline); err != nil {
 			return err
 		}
 		workingBaseline, baselineErr := BaselineSnapshot(ctx, root)
 		if baselineErr != nil {
 			return baselineErr
 		}
-		expectedBaselineJSON, _ := json.Marshal(expected.ZeroBaseline)
+		expectedBaselineJSON, _ := json.Marshal(initialBaseline)
 		workingBaselineJSON, _ := json.Marshal(workingBaseline)
 		if string(expectedBaselineJSON) != string(workingBaselineJSON) {
 			return errors.New("Initial Repository Baseline working tree drifted from the approved snapshot")
 		}
-		if err := verifyBaselineSnapshot(ctx, root, expected.ZeroBaseline); err != nil {
+		if err := verifyBaselineSnapshot(ctx, root, initialBaseline); err != nil {
 			return err
 		}
 	}

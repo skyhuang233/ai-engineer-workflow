@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -114,7 +115,7 @@ func dispatch(args []string, input io.Reader, output io.Writer) error {
 		return errors.New("workflow dispatcher requires a ready active generation")
 	}
 	database := filepath.Join(home, "platform", "generations", active.Generation, "workflow.db")
-	return delegateWithEnvironment(filepath.Join(home, "platform", "generations", active.Generation, "workflow.exe"), args, nil, output, []string{
+	return delegateWithEnvironment(filepath.Join(home, "platform", "generations", active.Generation, "workflow.exe"), args, input, output, []string{
 		"WORKFLOW_ACTIVE_HOME=" + home,
 		"WORKFLOW_ACTIVE_GENERATION=" + active.Generation,
 		"WORKFLOW_ACTIVE_DATABASE=" + database,
@@ -135,22 +136,16 @@ func workflowHomeArg(args []string) (string, error) {
 }
 
 func delegate(executable string, args []string, input []byte, output io.Writer) error {
-	return delegateWithEnvironment(executable, args, input, output, nil)
+	return delegateWithEnvironment(executable, args, bytes.NewReader(input), output, nil)
 }
 
-func delegateWithEnvironment(executable string, args []string, input []byte, output io.Writer, environment []string) error {
+func delegateWithEnvironment(executable string, args []string, input io.Reader, output io.Writer, environment []string) error {
 	command := exec.Command(executable, args...)
 	command.Stderr = os.Stderr
 	command.Stdout = output
+	command.Stdin = input
 	if len(environment) > 0 {
 		command.Env = append(os.Environ(), environment...)
-	}
-	if input != nil {
-		stdin, err := command.StdinPipe()
-		if err != nil {
-			return err
-		}
-		go func() { _, _ = stdin.Write(input); _ = stdin.Close() }()
 	}
 	return command.Run()
 }
