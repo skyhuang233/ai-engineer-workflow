@@ -1,5 +1,6 @@
 .agents/skills/
 /.scratch
+/.worktrees
 /docs
 /AGENTS.md
 /CONTEXT.md
