@@ -45,19 +45,6 @@ listed SHA-256. Reject unsafe, duplicate, absent, or unlisted archive entries.
 Do not use a split checksum file, a Bootstrap Plan, an installed-CLI bridge, a
 legacy resolver, or an arbitrary version selector.
 
-Release-branch qualification has one explicit test-only acquisition boundary.
-When the qualification harness sets `WORKFLOW_SETUP_QUALIFICATION=1`, require
-absolute `WORKFLOW_SETUP_CANDIDATE_DIRECTORY`, exact
-`WORKFLOW_SETUP_CANDIDATE_VERSION`, and full lowercase
-`WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT`, positive
-`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID`, and positive
-`WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT` values. Resolve that directory only
-through `scripts/resolve-workflow-candidate.ps1`, then continue with the same
-Bundle verification, consent, installation, readiness, and Repository
-Onboarding steps below. Never enter this path during ordinary setup, never
-fall back between candidate and published acquisition, and never describe a
-candidate result as an installed published Release.
-
 Use the repository-owned scripts in this order. `$downloadRoot` must be a new
 empty temporary directory outside Workflow Home. The resolver authenticates
 the manifest and publisher before acquiring the other two assets; the Bundle
@@ -73,16 +60,7 @@ $patVerification = $pat | powershell.exe -NoProfile -NonInteractive -File `
   -Visibility $visibility -PublicationState $publicationState | ConvertFrom-Json
 # verify-github-pat.ps1 reads [Console]::In.
 # Do not pipe the PAT to verify-github-pat.ps1 through PowerShell's call operator (`| &`); invoke the native powershell.exe process exactly as above so it receives standard input.
-if ($env:WORKFLOW_SETUP_QUALIFICATION -ceq '1') {
-  $release = & "$skillRoot\scripts\resolve-workflow-candidate.ps1" `
-    -CandidateDirectory $env:WORKFLOW_SETUP_CANDIDATE_DIRECTORY `
-    -ExpectedVersion $env:WORKFLOW_SETUP_CANDIDATE_VERSION `
-    -ExpectedSourceCommit $env:WORKFLOW_SETUP_CANDIDATE_SOURCE_COMMIT `
-    -ExpectedQualificationRunID $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ID `
-    -ExpectedQualificationRunAttempt $env:WORKFLOW_SETUP_CANDIDATE_QUALIFICATION_RUN_ATTEMPT | ConvertFrom-Json
-} else {
-  $release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
-}
+$release = & "$skillRoot\scripts\resolve-workflow-release.ps1" -DownloadDirectory $downloadRoot | ConvertFrom-Json
 $bundle = & "$skillRoot\scripts\verify-windows-bundle.ps1" `
   -BundlePath $release.bundle_path `
   -ExpectedSHA256 $release.bundle_sha256 `
