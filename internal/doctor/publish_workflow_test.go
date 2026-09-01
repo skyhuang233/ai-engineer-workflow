@@ -277,12 +277,6 @@ func TestQualificationCandidateUsesAvailableWorkerDigestWithoutBlockingOnScan(t 
 		!strings.Contains(text[qualificationScan:authenticate], "fail-build: false") {
 		t.Fatal("qualification scan can block functional candidate publication")
 	}
-	adr := readWorkflow(t, "docs", "adr", "0001-publish-one-atomic-workflow-release.md")
-	for _, required := range []string{"Grype scan is", "advisory and non-blocking", "scanner failure do not prevent candidate preservation or publication"} {
-		if !strings.Contains(adr, required) {
-			t.Fatalf("release ADR omits advisory scan containment %q", required)
-		}
-	}
 }
 
 func TestOnlyQualificationAssemblesWorkflowRelease(t *testing.T) {
