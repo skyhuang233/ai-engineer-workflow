@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
 	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/hostsetup"
@@ -318,8 +320,16 @@ type executionAuthentication struct{}
 
 func (executionAuthentication) Ready(ctx context.Context) (string, bool, error) {
 	selection, err := executionauth.ResolveCurrentSelection(ctx, nil)
-	if err != nil {
-		return "API key or Codex login", false, nil
+	if err == nil {
+		return string(selection.Mode), true, nil
 	}
-	return string(selection.Mode), true, nil
+	// The Windows selection is deliberately explicit and HKCU-backed.  macOS
+	// has no equivalent persistence capability, so retain the direct-Setup
+	// Codex-login behavior that predates explicit Windows modes.
+	if runtime.GOOS != "windows" {
+		if _, loginErr := codexauth.ResolveDoctorVerifiedChatGPT(ctx); loginErr == nil {
+			return string(executionauth.CodexLogin), true, nil
+		}
+	}
+	return "API key or Codex login", false, nil
 }

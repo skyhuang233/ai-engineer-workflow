@@ -221,6 +221,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow setup [--workflow-home <absolute>] [--database <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow watch-service --workflow-home <absolute>")
 	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
+	fmt.Fprintln(os.Stderr, "  workflow execution-auth --mode <api_key|codex_login> [--base-url <endpoint> --model <model> --api-key-stdin]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
