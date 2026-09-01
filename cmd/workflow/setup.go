@@ -326,7 +326,7 @@ func (executionAuthentication) Ready(ctx context.Context) (string, bool, error) 
 	// The Windows selection is deliberately explicit and HKCU-backed.  macOS
 	// has no equivalent persistence capability, so retain the direct-Setup
 	// Codex-login behavior that predates explicit Windows modes.
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" && strings.TrimSpace(os.Getenv(executionauth.ModeEnvironment)) == "" {
 		if _, loginErr := codexauth.ResolveDoctorVerifiedChatGPT(ctx); loginErr == nil {
 			return string(executionauth.CodexLogin), true, nil
 		}

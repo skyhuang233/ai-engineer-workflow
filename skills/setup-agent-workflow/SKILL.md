@@ -60,8 +60,10 @@ complete `codex login` outside Setup and stop. For `api_key`, pass the key only
 on standard input to `execution-auth --mode api_key --base-url <endpoint>
 --model <model> --api-key-stdin`. It probes before persisting the selection, so
 a failure leaves the previous selection unchanged. Never put an API key in an
-argument, output, or repository data. On macOS, a verified Codex login is the
-available direct-Setup authentication path.
+argument, output, or repository data. macOS has no durable selection backend:
+when no mode is supplied, its legacy direct-Setup path accepts only a verified
+Codex login. An explicitly supplied but invalid mode is a blocker and must not
+fall back to a login cache.
 
 ## 4. Run direct Setup
 
