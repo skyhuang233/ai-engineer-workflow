@@ -23,7 +23,7 @@ const (
 	StateProjecting     = "projecting"
 	StateActive         = "active"
 	StateCompleted      = "completed"
-	LatestSchemaVersion = 63
+	LatestSchemaVersion = 65
 	sqliteBusyTimeout   = 5 * time.Second
 )
 
@@ -1887,6 +1887,36 @@ FROM repository_admissions r`,
 			return fmt.Errorf("migration 63: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (63, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 64 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS repository_watches (
+    repository TEXT PRIMARY KEY,
+    registered_at TEXT NOT NULL,
+    issue_cursor INTEGER NOT NULL CHECK(issue_cursor >= 0),
+    last_successful_poll_at TEXT NOT NULL DEFAULT ''
+)`); err != nil {
+			return fmt.Errorf("migration 64: %w", err)
+		}
+		// This release intentionally does not infer Watches from the legacy
+		// admission/runtime records. Explicit Setup is the reconstruction path.
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (64, ?)", formatTimestamp(time.Now())); err != nil {
+			return err
+		}
+	}
+	if applied < 65 {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS code_task_receipts (
+    repository TEXT NOT NULL,
+    github_issue_id INTEGER NOT NULL,
+    task_reference TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    PRIMARY KEY(repository, github_issue_id)
+)`); err != nil {
+			return fmt.Errorf("migration 65: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (65, ?)", formatTimestamp(time.Now())); err != nil {
 			return err
 		}
 	}
