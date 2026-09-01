@@ -50,7 +50,22 @@ The script never places Workflow on `PATH`. Run Setup only by this absolute
 path. Until `workflow-v0.0.1` exists, report the release blackout rather than
 falling back to a legacy asset.
 
-## 3. Run direct Setup
+## 3. Configure Worker execution authentication
+
+Before direct Setup, obtain one explicit Worker Execution Authentication
+selection. Never infer a mode from an API key, endpoint, model, or Codex
+cache. On Windows, configure `codex_login` with the installed executable's
+`execution-auth --mode codex_login`; if it reports not ready, ask the user to
+complete `codex login` outside Setup and stop. For `api_key`, pass the key only
+on standard input to `execution-auth --mode api_key --base-url <endpoint>
+--model <model> --api-key-stdin`. It probes before persisting the selection, so
+a failure leaves the previous selection unchanged. Never put an API key in an
+argument, output, or repository data. macOS has no durable selection backend:
+when no mode is supplied, its legacy direct-Setup path accepts only a verified
+Codex login. An explicitly supplied but invalid mode is a blocker and must not
+fall back to a login cache.
+
+## 4. Run direct Setup
 
 Invoke one direct reconciliation command. It prepares the selected Worker
 container plumbing, reads Worker authentication readiness, reconciles Git and
@@ -68,7 +83,7 @@ immediate rerun. A Codex-login prerequisite is an external interactive pause:
 wait for the user to confirm login, rerun preflight, and invoke the same
 absolute command again.
 
-## 4. Completion and blockers
+## 5. Completion and blockers
 
 `Repository Ready` requires a Watch successful-poll timestamp after the new
 Watch registration or native-service registration performed in this run. An

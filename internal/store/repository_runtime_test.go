@@ -35,6 +35,9 @@ func TestRepositoryRuntimeConfigurationRoundTrip(t *testing.T) {
 	if got.Repository != value.Repository || got.DefaultBranch != value.DefaultBranch || got.RootIssueNumber != 42 || got.PollInterval != time.Minute || got.WorkspaceRetention != 7*24*time.Hour || got.MaxParallelRuns != 2 || !got.UpdatedAt.Equal(now) {
 		t.Fatalf("configuration = %#v", got)
 	}
+	if got.CodexAuthFile != "" {
+		t.Fatalf("repository runtime persisted a host-scoped Codex auth source: %#v", got)
+	}
 	values, err := db.RepositoryRuntimeConfigurations(ctx)
 	if err != nil || len(values) != 1 {
 		t.Fatalf("configurations = %#v, %v", values, err)
@@ -147,8 +150,10 @@ func TestRepositoryAdmissionWithInitialRuntimeConfigurationPreservesExistingRunt
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotRuntime != existing {
-		t.Fatalf("existing runtime configuration changed: got %#v want %#v", gotRuntime, existing)
+	wantRuntime := existing
+	wantRuntime.CodexAuthFile = ""
+	if gotRuntime != wantRuntime {
+		t.Fatalf("existing runtime configuration changed: got %#v want %#v", gotRuntime, wantRuntime)
 	}
 }
 

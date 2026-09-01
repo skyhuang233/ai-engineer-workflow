@@ -86,7 +86,7 @@ func (r commandRepositoryRunner) processArguments(config store.RepositoryRuntime
 	workerURL := "http://host.docker.internal:" + strconv.Itoa(port)
 	credentialPath := `state\credentials\github.pat`
 	gateway := []string{"gateway", "--database", databasePath, "--listen", listen, "--control-token", controlToken, "--github-url", config.GitHubAPIURL, "--owner", r.Owner, "--credential-relative-path", credentialPath}
-	poll := []string{"poll-github", "--database", databasePath, "--repository", config.Repository, "--root", strconv.FormatInt(config.RootIssueNumber, 10), "--github-url", config.GitHubAPIURL, "--source", config.SourcePath, "--workspace-root", config.WorkspaceRoot, "--state-root", config.StateRoot, "--codex-auth-file", config.CodexAuthFile, "--workspace-retention", config.WorkspaceRetention.String(), "--gateway-url", workerURL, "--gateway-control-url", controlURL, "--gateway-control-token", controlToken, "--interval", config.PollInterval.String(), "--max-parallel-runs", strconv.Itoa(config.MaxParallelRuns), "--owner", r.Owner, "--credential-relative-path", credentialPath}
+	poll := []string{"poll-github", "--database", databasePath, "--repository", config.Repository, "--root", strconv.FormatInt(config.RootIssueNumber, 10), "--github-url", config.GitHubAPIURL, "--source", config.SourcePath, "--workspace-root", config.WorkspaceRoot, "--state-root", config.StateRoot, "--workspace-retention", config.WorkspaceRetention.String(), "--gateway-url", workerURL, "--gateway-control-url", controlURL, "--gateway-control-token", controlToken, "--interval", config.PollInterval.String(), "--max-parallel-runs", strconv.Itoa(config.MaxParallelRuns), "--owner", r.Owner, "--credential-relative-path", credentialPath}
 	return gateway, poll
 }
 

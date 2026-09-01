@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/launcher"
 	"github.com/skyhuang233/workflow/internal/store"
 	"github.com/skyhuang233/workflow/internal/workflowhome"
@@ -17,6 +18,10 @@ import (
 
 func TestRuntimeConfigureCreatesCleanRepositoryRuntimeDirectories(t *testing.T) {
 	ctx := context.Background()
+	t.Setenv(executionauth.ModeEnvironment, string(executionauth.APIKey))
+	t.Setenv(executionauth.BaseURLEnvironment, "https://api.example.test/v1")
+	t.Setenv(executionauth.APIKeyEnvironment, "test-api-key")
+	t.Setenv(executionauth.ModelEnvironment, "test-model")
 	layout, err := workflowhome.Resolve(filepath.Join(t.TempDir(), "workflow-home"))
 	if err != nil {
 		t.Fatal(err)
@@ -66,17 +71,11 @@ func TestRuntimeConfigureCreatesCleanRepositoryRuntimeDirectories(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(platformPath, "active.json"), activeJSON, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	authFile := filepath.Join(t.TempDir(), "auth.json")
-	if err := os.WriteFile(authFile, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","account_id":"account","id_token":"id","refresh_token":"refresh"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	var output bytes.Buffer
 	if err := runtimeConfigureCommand([]string{
 		"--workflow-home", layout.Root,
 		"--source", sourcePath,
 		"--root", "2",
-		"--codex-auth-file", authFile,
 	}, &output); err != nil {
 		t.Fatal(err)
 	}

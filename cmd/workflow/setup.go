@@ -10,12 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/skyhuang233/workflow/internal/codexauth"
 	"github.com/skyhuang233/workflow/internal/controlplane"
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/hostsetup"
 	setupjourney "github.com/skyhuang233/workflow/internal/setup"
 	"github.com/skyhuang233/workflow/internal/store"
@@ -63,7 +65,7 @@ func setupCommand(args []string, output io.Writer) error {
 	}
 	if _, err := (setupjourney.PlatformPreparer{
 		WorkerImage: workerRelease.ImageReference, StateRoot: layout.State, WorkspaceRoot: layout.Workspaces,
-		Probe: dockerWorkerProbe{}, Authentication: codexLoginAuthentication{},
+		Probe: dockerWorkerProbe{}, Authentication: executionAuthentication{},
 	}).Prepare(context.Background()); err != nil {
 		return err
 	}
@@ -314,11 +316,20 @@ func (dockerWorkerProbe) Verify(ctx context.Context, image, stateRoot, workspace
 	return hostsetup.VerifyDockerWorker(ctx, nil, image, stateRoot, workspaceRoot)
 }
 
-type codexLoginAuthentication struct{}
+type executionAuthentication struct{}
 
-func (codexLoginAuthentication) Ready(ctx context.Context) (string, bool, error) {
-	if _, err := codexauth.ResolveChatGPT(ctx); err != nil {
-		return "API key or Codex login", false, nil
+func (executionAuthentication) Ready(ctx context.Context) (string, bool, error) {
+	selection, err := executionauth.ResolveCurrentSelection(ctx, nil)
+	if err == nil {
+		return string(selection.Mode), true, nil
 	}
-	return "Codex login", true, nil
+	// The Windows selection is deliberately explicit and HKCU-backed.  macOS
+	// has no equivalent persistence capability, so retain the direct-Setup
+	// Codex-login behavior that predates explicit Windows modes.
+	if runtime.GOOS != "windows" && strings.TrimSpace(os.Getenv(executionauth.ModeEnvironment)) == "" {
+		if _, loginErr := codexauth.ResolveDoctorVerifiedChatGPT(ctx); loginErr == nil {
+			return string(executionauth.CodexLogin), true, nil
+		}
+	}
+	return "API key or Codex login", false, nil
 }

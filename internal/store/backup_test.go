@@ -48,7 +48,7 @@ func TestOnlineBackupRestoreDrillAndOperationalMetrics(t *testing.T) {
 	}
 	workspaceRoot := t.TempDir()
 	if runtime.GOOS == "windows" {
-		workspaceRoot, err = os.MkdirTemp(filepath.VolumeName(os.TempDir())+string(os.PathSeparator), "wf-")
+		workspaceRoot, err = os.MkdirTemp(os.TempDir(), "wf-")
 		if err != nil {
 			t.Fatal(err)
 		}

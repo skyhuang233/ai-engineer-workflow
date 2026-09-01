@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/skyhuang233/workflow/internal/credential"
 	"github.com/skyhuang233/workflow/internal/delivery"
 	"github.com/skyhuang233/workflow/internal/doctor"
+	"github.com/skyhuang233/workflow/internal/executionauth"
 	"github.com/skyhuang233/workflow/internal/github"
 	"github.com/skyhuang233/workflow/internal/githubcredential"
 	workerisolation "github.com/skyhuang233/workflow/internal/isolation"
@@ -146,6 +148,14 @@ type githubTokenProvider interface {
 }
 
 func main() {
+	// The persisted selection is a Windows host setting.  Other supported
+	// platforms retain their existing Codex-login setup behavior rather than
+	// failing every command because that persistence backend is unavailable.
+	if runtime.GOOS == "windows" {
+		if _, err := executionauth.ReloadCurrentUser(); err != nil {
+			fail(fmt.Errorf("reload current-user Worker execution authentication: %w", err))
+		}
+	}
 	if err := validateWorkflowBuildVersion(); err != nil {
 		fail(err)
 	}
@@ -168,6 +178,8 @@ func main() {
 		if err := githubCommand(os.Args[2:], os.Stdout); err != nil {
 			fail(err)
 		}
+	case "execution-auth":
+		runExecutionAuthentication(os.Args[2:])
 	case "doctor":
 		runDoctor(os.Args[2:])
 	case "run-ticket":
@@ -209,6 +221,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  workflow setup [--workflow-home <absolute>] [--database <absolute>]")
 	fmt.Fprintln(os.Stderr, "  workflow watch-service --workflow-home <absolute>")
 	fmt.Fprintln(os.Stderr, "  workflow github <operation> --repo <absolute> [options]")
+	fmt.Fprintln(os.Stderr, "  workflow execution-auth --mode <api_key|codex_login> [--base-url <endpoint> --model <model> --api-key-stdin]")
 	fmt.Fprintln(os.Stderr, "  workflow doctor --workflow-repository owner/repository [--config path] [--database path] [--codex-auth-file path] [--report path]")
 	fmt.Fprintln(os.Stderr, "  workflow run-ticket [options]")
 	fmt.Fprintln(os.Stderr, "  workflow gateway [options]")
@@ -431,7 +444,6 @@ func runTicket(args []string) {
 	source := flags.String("source", "", "absolute local repository path")
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
-	codexAuthFile := flags.String("codex-auth-file", defaultCodexAuthFile(), "absolute host ChatGPT auth.json used to seed the Ticket Session")
 	prompt := flags.String("prompt", "", "Worker prompt")
 	reviewFeedback := flags.String("review-feedback", "", "human pull-request feedback to queue for the next revision round")
 	branch := flags.String("branch", "", "ticket branch")
@@ -440,8 +452,8 @@ func runTicket(args []string) {
 	expectAbsent := flags.Bool("expect-remote-absent", true, "require the ticket branch to be absent")
 	githubURL := flags.String("github-url", "https://api.github.com", "GitHub API base URL")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *codexAuthFile == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
-		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, ChatGPT authentication, Gateway URL, and exactly one remote-head expectation")
+	if *repository == "" || *rootNumber <= 0 || *ticketID == 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || (*expectedHead != "") == *expectAbsent {
+		fmt.Fprintln(os.Stderr, "run-ticket requires repository, root, ticket-id, source, workspace-root, state-root, Worker execution authentication, Gateway URL, and exactly one remote-head expectation")
 		os.Exit(2)
 	}
 	resolvedDatabase, err := activeCommandDatabase(*databasePath)
@@ -465,7 +477,7 @@ func runTicket(args []string) {
 		fail(err)
 	}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CurrentAuthentication: reloadWorkerExecutionAuthentication,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	snapshot, err := client.ReadPlan(ctx, *repository, *rootNumber)
@@ -630,7 +642,6 @@ func runPollGitHub(args []string) {
 	source := flags.String("source", "", "absolute local repository path for review revisions")
 	workspaceRoot := flags.String("workspace-root", "", "absolute Ticket Workspace root")
 	stateRoot := flags.String("state-root", "", "absolute Codex state root")
-	codexAuthFile := flags.String("codex-auth-file", defaultCodexAuthFile(), "absolute host ChatGPT auth.json used to seed Ticket Sessions")
 	workspaceRetention := flags.Duration("workspace-retention", 7*24*time.Hour, "retention period before closed Ticket Workspaces are reclaimed")
 	gatewayURL := flags.String("gateway-url", "", "credential-isolated GitHub Write Gateway URL")
 	gatewayControlURLOverride := flags.String("gateway-control-url", "", "optional host-side Gateway URL; defaults to gateway-url")
@@ -642,8 +653,8 @@ func runPollGitHub(args []string) {
 	runtimeCredentialPath := flags.String("credential-relative-path", `state\credentials\github.pat`, "Workflow Home relative PAT path (internal runtime mode)")
 	runtimeMaxWorkerAttempts := flags.Int("max-worker-attempts", 3, "maximum attempts in internal runtime mode")
 	_ = flags.Parse(args)
-	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *codexAuthFile == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
-		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and ChatGPT authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
+	if *repository == "" || *rootNumber <= 0 || *source == "" || *workspaceRoot == "" || *stateRoot == "" || *gatewayURL == "" || *gatewayControlToken == "" || *interval <= 0 || *maxParallelRuns <= 0 || *workspaceRetention <= 0 {
+		fmt.Fprintln(os.Stderr, "poll-github requires repository, approved plan root, workspace and Worker execution authentication configuration, Gateway URL and control credential, positive interval, and positive parallelism")
 		os.Exit(2)
 	}
 	resolvedDatabase, err := activeCommandDatabase(*databasePath)
@@ -675,8 +686,12 @@ func runPollGitHub(args []string) {
 		}
 	}
 	provider := &verifiedGitHubPATSource{Database: db, Config: config}
+	authentication, err := executionauth.CurrentProcessSelection()
+	if err != nil {
+		fail(err)
+	}
 	workspaceManager := agent.WorkspaceManager{
-		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, CodexAuthFile: *codexAuthFile,
+		RootDir: *workspaceRoot, CodexStateRoot: *stateRoot, Authentication: authentication, CurrentAuthentication: reloadWorkerExecutionAuthentication,
 		RefreshDeliverySource: deliverySourceRefresher(db, provider, *githubURL, *repository),
 	}
 	runtime := worker.DockerRuntime{DiskPath: *workspaceRoot, ControlPlaneID: controlPlaneContainerID(*databasePath)}

@@ -984,7 +984,7 @@ func TestUpgradeRejectsFutureOrMaintenanceIncompatibleActiveGenerationBeforeFenc
 					t.Fatal(err)
 				}
 				defer raw.Close()
-				if _, err := raw.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(64, 'future')`); err != nil {
+				if _, err := raw.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, 'future')`, store.LatestSchemaVersion+1); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
@@ -1074,7 +1074,7 @@ func TestUpgradeFencesAndMigratesCandidateFromOlderMaintenanceCompatibleGenerati
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`DELETE FROM schema_migrations WHERE version = 63; PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	if _, err := raw.Exec(`DELETE FROM schema_migrations WHERE version = ?; PRAGMA wal_checkpoint(TRUNCATE)`, store.LatestSchemaVersion); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -1105,12 +1105,12 @@ func TestUpgradeFencesAndMigratesCandidateFromOlderMaintenanceCompatibleGenerati
 			t.Fatalf("schema %q=%d,%v want %d", path, got, err, want)
 		}
 	}
-	assertSchemaVersion(oldDatabase, 62)
+	assertSchemaVersion(oldDatabase, store.LatestSchemaVersion-1)
 	active, err := ReadActive(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSchemaVersion(filepath.Join(home, "platform", "generations", active.Generation, "workflow.db"), 63)
+	assertSchemaVersion(filepath.Join(home, "platform", "generations", active.Generation, "workflow.db"), store.LatestSchemaVersion)
 	backups, err := filepath.Glob(filepath.Join(home, "backups", "*.db"))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("maintenance backup=%v,%v", backups, err)
@@ -1372,7 +1372,7 @@ func writeTestBundleVersion(t *testing.T, root, version string, files map[string
 		sum := sha256.Sum256(data)
 		inventory = append(inventory, workflowbundle.BundleFile{Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))})
 	}
-	manifest := workflowbundle.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: version, Compatibility: workflowbundle.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: 63, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}, Files: inventory}
+	manifest := workflowbundle.BundleManifest{SchemaVersion: 1, SetupProtocolVersion: 1, Version: version, Compatibility: workflowbundle.Compatibility{OS: "windows", Architecture: "amd64", DatabaseSchema: store.LatestSchemaVersion, DockerDesktopVersion: "4.86.0", DockerInstallerURL: "https://example.test/docker.exe", DockerInstallerSHA256: strings.Repeat("b", 64), WorkerImage: "ghcr.io/skyhuang233/workflow-worker@sha256:" + strings.Repeat("a", 64)}, Files: inventory}
 	raw, err := manifest.Canonical()
 	if err != nil {
 		t.Fatal(err)

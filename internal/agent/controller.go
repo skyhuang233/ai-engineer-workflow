@@ -165,8 +165,9 @@ func (c Controller) Run(ctx context.Context, request RunRequest) (Candidate, err
 	if session.CodexSessionID != "" {
 		command = []string{"codex", "exec", "--sandbox", "danger-full-access", "resume", "--json", "--output-schema", schemaPath, "--skip-git-repo-check", session.CodexSessionID, request.Prompt}
 	}
-	environment := map[string]string{
-		"CODEX_HOME": ws.CodexState,
+	environment, err := c.Workspace.WorkerEnvironment(ws)
+	if err != nil {
+		return c.failRunWithRedactor(ctx, request, ws, session, baseCommit, codexAuthenticationFailure, "", nil)
 	}
 	spec := worker.Spec{
 		RunID: request.Claim.RunID, RunKind: store.RunAgent,
@@ -399,8 +400,11 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 	if err != nil {
 		return c.failDeliveryController(ctx, deliveryClaim, err)
 	}
-	deliveryEnvironment := map[string]string{
-		"CODEX_HOME":                         ws.CodexState,
+	deliveryEnvironment, err := c.Workspace.WorkerEnvironment(ws)
+	if err != nil {
+		return c.failDeliveryController(ctx, deliveryClaim, errors.New(codexAuthenticationFailure))
+	}
+	for key, value := range map[string]string{
 		"GIT_CONFIG_COUNT":                   "0",
 		"GIT_CONFIG_GLOBAL":                  "/dev/null",
 		"GIT_CONFIG_NOSYSTEM":                "1",
@@ -421,6 +425,8 @@ func (c Controller) runDeliveryController(ctx context.Context, deliveryClaim sto
 		"NO_MISTAKES_EXPECT_REMOTE_ABSENT":   fmt.Sprint(publication.ExpectRemoteAbsent),
 		"NO_MISTAKES_PULL_REQUEST_TITLE":     publication.Title,
 		"NO_MISTAKES_PULL_REQUEST_BODY":      publication.Body,
+	} {
+		deliveryEnvironment[key] = value
 	}
 	deliveryEnvironment["NO_MISTAKES_GATEWAY_URL"] = gatewayURL
 	if gate, answer, err := c.Store.DeliveryQualityGateAnswer(ctx, session.SessionID); err == nil {
